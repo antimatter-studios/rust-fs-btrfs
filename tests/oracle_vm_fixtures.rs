@@ -29,6 +29,10 @@ use fs_btrfs::superblock::{Superblock, SUPER_INFO_OFFSET};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// `BTRFS_FEATURE_INCOMPAT_METADATA_UUID`. When clear, the on-disk
+/// metadata_uuid field is unused and the effective value is the fsid.
+const METADATA_UUID_INCOMPAT: u64 = 1 << 10;
+
 /// One parsed line of a `dump-super` report.
 ///
 /// The tool prints `key<TAB>value`, with flag words followed by
@@ -215,13 +219,41 @@ fn superblock_agrees_with_dump_super() {
             );
             checked += 1;
         }
+        // metadata_uuid needs care, because the reference tooling changed
+        // what it prints. When the METADATA_UUID feature is off, the
+        // on-disk field is all zeros and the effective metadata UUID is
+        // simply the fsid. btrfs-progs 6.2 printed the effective value;
+        // 6.6.3 prints the raw zeros. Both describe the same state, so
+        // accept either and pin down the part that actually matters:
+        // this driver must report the EFFECTIVE uuid, since it is what
+        // tree node headers are stamped with and what their identity
+        // checks are compared against.
         if let Some(theirs) = d.strs.get("metadata_uuid") {
-            assert_eq!(
-                &uuid_string(&sb.metadata_uuid),
-                theirs,
-                "{label}: metadata_uuid disagrees with dump-super — this offset was \
-                 derived from struct field ordering, not from a published table"
-            );
+            const ALL_ZERO: &str = "00000000-0000-0000-0000-000000000000";
+            let feature_on = d
+                .nums
+                .get("incompat_flags")
+                .is_some_and(|f| f & METADATA_UUID_INCOMPAT != 0);
+            let ours = uuid_string(&sb.metadata_uuid);
+            if feature_on {
+                assert_eq!(
+                    &ours, theirs,
+                    "{label}: the METADATA_UUID feature is set, so the driver and \
+                     dump-super must agree exactly on metadata_uuid"
+                );
+            } else {
+                assert_eq!(
+                    ours,
+                    uuid_string(&sb.fsid),
+                    "{label}: with METADATA_UUID off the effective metadata uuid is \
+                     the fsid; this driver reported something else"
+                );
+                assert!(
+                    theirs == ALL_ZERO || theirs == &ours,
+                    "{label}: dump-super reported metadata_uuid {theirs}, which is \
+                     neither the raw zeros nor the fsid"
+                );
+            }
             checked += 1;
         }
 
