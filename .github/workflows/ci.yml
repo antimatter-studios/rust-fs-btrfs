@@ -120,6 +120,16 @@ jobs:
       # and unmount cleanly. The default geometry is a hard requirement;
       # the rest are mounted too, and a failure on any of them fails the
       # job with the list named.
+      # This MUST run before the mount step below. Mounting a Btrfs
+      # filesystem advances its generation counter and rewrites the
+      # superblock, so an image that has been mounted no longer matches
+      # the dump taken straight out of mkfs -- the comparison would fail
+      # on `generation` for reasons that have nothing to do with the
+      # parser. The sibling XFS gate hit the same trap with its
+      # free-space counters.
+      - name: Run the oracle test against the fixtures
+        run: cargo test --test oracle_vm_fixtures -- --nocapture
+
       - name: Loop-mount with the in-kernel btrfs driver
         run: |
           set -euo pipefail
@@ -132,7 +142,13 @@ jobs:
             mnt="/mnt/$name"
             sudo mkdir -p "$mnt"
             echo "::group::mount $name"
-            if sudo mount -t btrfs -o loop "$img" "$mnt"; then
+            # Mount a copy. Mounting mutates the filesystem -- generation
+            # bump, superblock rewrite, possible log replay -- and the
+            # fixtures must stay byte-identical to what mkfs produced so
+            # they keep matching their dumps.
+            work="/tmp/mount-$name.img"
+            cp --sparse=always "$img" "$work"
+            if sudo mount -t btrfs -o loop "$work" "$mnt"; then
               # A mount that succeeds but cannot do IO is not a pass.
               echo "kernel round-trip" | sudo tee "$mnt/probe.txt" >/dev/null
               sudo sync
@@ -148,6 +164,7 @@ jobs:
               echo "$name: the in-kernel btrfs driver REFUSED this image" >&2
               failed+=("$name")
             fi
+            rm -f "$work"
             echo "::endgroup::"
           done
           if [ "${#failed[@]}" -gt 0 ]; then
@@ -180,9 +197,6 @@ jobs:
       # require every field to match what the reference dump reports.
       # Fixtures were written to .vm-share above, which is where the test
       # looks for them.
-      - name: Run the oracle test against the fixtures
-        run: cargo test --test oracle_vm_fixtures -- --nocapture
-
       - name: Upload fixtures on failure
         if: failure()
         uses: actions/upload-artifact@v4
