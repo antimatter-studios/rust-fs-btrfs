@@ -1,0 +1,40 @@
+[package]
+name = "am-fs-btrfs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Pure-Rust Btrfs filesystem driver. Exposes a C ABI (fs_btrfs_*) suitable for FFI from C/C++/Swift/Go."
+repository = "https://github.com/antimatter-studios/rust-fs-btrfs"
+
+[lib]
+name = "fs_btrfs"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Btrfs lets the volume pick its metadata hash at mkfs time, so a reader
+# has to carry all four. Every crate below is permissive-licensed
+# (MIT / Apache-2.0 / BSL-1.0); no GPL or LGPL anywhere in the tree.
+#
+# csum_type 0 — CRC32C (Castagnoli). Apache-2.0.
+crc32c = "0.6"
+# csum_type 1 — XXH64, seed 0. MIT.
+twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
+# csum_type 2 — SHA-256. MIT OR Apache-2.0.
+sha2 = "0.10"
+# csum_type 3 — BLAKE2b truncated to 256 bits. MIT.
+blake2b_simd = "1.0"
+# Block-device trait surface shared with the sister fs-* drivers and the
+# img-* disk-image readers.
+am-fs-core = { path = "../rust-fs-core", version = "0.2" }
+
+[dev-dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "unwind"  # required for catch_unwind at the FFI boundary
+
+[profile.dev]
+opt-level = 1
+panic = "unwind"
