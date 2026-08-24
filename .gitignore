@@ -1,0 +1,27 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Test artifacts
+test-disks/*.img
+test-disks/[0-9]*/
+test-disks/test-run/
+!test-disks/.gitkeep
+
+# VM harness scratch (per-VM Vagrant state, cached boot assets).
+# Produced by scripts/vm.sh. Re-runnable, never in source control.
+.qemu/
+**/.vagrant/
+test-disks/.vm-cache/
+.claude/
+# VM harness shared dir (images exchanged with the oracle VM)
+.vm-share/

@@ -1,0 +1,195 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      # The crate has a path dep on am-fs-core (../rust-fs-core).
+      # Clone the sibling repo alongside so cargo can resolve it.
+      # Anonymous HTTPS clone — rust-fs-core is public.
+      - name: Clone sibling rust-fs-core
+        run: git clone --depth 1 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --release
+
+  # The gate that actually decides whether this driver reads Btrfs.
+  #
+  # The unit suite can only prove the parser agrees with the fixtures we
+  # hand-built, and those fixtures were built from the same reading of the
+  # spec as the parser — so a misread field is consistent with itself and
+  # passes. This job removes that circularity: real filesystems, built by
+  # the canonical mkfs.btrfs, described by the canonical dump tool, and
+  # accepted by the in-kernel driver.
+  #
+  # It is a required check, not an optional confirmation. In the sister
+  # XFS driver the equivalent job found three live parser bugs on its
+  # first run, with the whole unit suite green.
+  #
+  # No VM here: GitHub's Linux runners are already Linux. The Vagrant VM
+  # in tests/vagrant exists only so macOS developers can run this same
+  # gate locally, and it builds the same geometry matrix from the same
+  # scripts/fixture-geometries.sh list.
+  kernel-gate:
+    name: validate against kernel btrfs driver
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone sibling rust-fs-core
+        run: git clone --depth 1 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-kgate-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install btrfs-progs
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq btrfs-progs
+          btrfs --version
+          mkfs.btrfs --version
+          # The exotic checksum algorithms live in separate crypto
+          # modules. Load them now so a mount of an xxhash/sha256/blake2
+          # image is not the first thing that discovers they are missing.
+          sudo modprobe btrfs
+          sudo modprobe xxhash_generic || echo "note: xxhash_generic unavailable"
+          sudo modprobe sha256_generic || echo "note: sha256_generic unavailable"
+          sudo modprobe blake2b_generic || echo "note: blake2b_generic unavailable"
+
+      # Same matrix, same naming, same output directory as the VM builder
+      # a developer runs on macOS. Aborts if the default geometry cannot
+      # be built, and prints a loud block for any geometry it had to skip.
+      - name: Build the fixture matrix
+        run: bash scripts/build-fixtures-native.sh
+
+      # `btrfs check` is the reference consistency checker. If it rejects
+      # an image, the fixture is bad and nothing downstream means
+      # anything — better to fail here than to chase a phantom parser bug.
+      - name: Reference-check every fixture
+        run: |
+          set -euo pipefail
+          bad=0
+          for img in .vm-share/btrfs-*.img; do
+            echo "::group::btrfs check $(basename "$img")"
+            if sudo btrfs check --readonly "$img"; then
+              echo "OK $(basename "$img")"
+            else
+              echo "btrfs check REJECTED $(basename "$img")" >&2
+              bad=1
+            fi
+            echo "::endgroup::"
+          done
+          [ "$bad" -eq 0 ] || { echo "reference checker rejected a fixture" >&2; exit 1; }
+
+      # Proof that the kernel itself accepts these images: loop-mount each
+      # one with the in-kernel btrfs driver, write and read a file back,
+      # and unmount cleanly. The default geometry is a hard requirement;
+      # the rest are mounted too, and a failure on any of them fails the
+      # job with the list named.
+      - name: Loop-mount with the in-kernel btrfs driver
+        run: |
+          set -euo pipefail
+          # Start from a clean ring buffer so the dmesg scrape below only
+          # sees what these mounts produced.
+          sudo dmesg -C
+          failed=()
+          for img in .vm-share/btrfs-*.img; do
+            name="$(basename "$img" .img)"
+            mnt="/mnt/$name"
+            sudo mkdir -p "$mnt"
+            echo "::group::mount $name"
+            if sudo mount -t btrfs -o loop "$img" "$mnt"; then
+              # A mount that succeeds but cannot do IO is not a pass.
+              echo "kernel round-trip" | sudo tee "$mnt/probe.txt" >/dev/null
+              sudo sync
+              got="$(sudo cat "$mnt/probe.txt")"
+              sudo umount "$mnt"
+              if [ "$got" != "kernel round-trip" ]; then
+                echo "$name: read-back mismatch" >&2
+                failed+=("$name")
+              else
+                echo "$name: kernel mounted, wrote and read back cleanly"
+              fi
+            else
+              echo "$name: the in-kernel btrfs driver REFUSED this image" >&2
+              failed+=("$name")
+            fi
+            echo "::endgroup::"
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "kernel rejected: ${failed[*]}" >&2
+            exit 1
+          fi
+
+      # The kernel is chatty when it is unhappy and silent when it is not.
+      # Anything above info level about btrfs during those mounts means
+      # the image is malformed in a way the mount itself tolerated —
+      # exactly the class of defect a self-consistent parser produces.
+      - name: Scrape dmesg for btrfs complaints
+        run: |
+          set -euo pipefail
+          # Kept inside the workspace so the failure artifact below can
+          # collect it alongside the superblock dumps.
+          sudo dmesg > .vm-share/dmesg.txt
+          echo "::group::btrfs kernel log"
+          grep -i btrfs .vm-share/dmesg.txt || echo "(no btrfs lines)"
+          echo "::endgroup::"
+          if grep -Ei 'BTRFS (warning|error|critical|alert|emerg)' .vm-share/dmesg.txt; then
+            echo >&2
+            echo "the kernel logged btrfs warnings/errors for these images." >&2
+            echo "a mount that succeeds while the kernel complains is not a pass." >&2
+            exit 1
+          fi
+          echo "kernel logged no btrfs warnings or errors."
+
+      # Finally the driver itself: parse the same images on the host and
+      # require every field to match what the reference dump reports.
+      # Fixtures were written to .vm-share above, which is where the test
+      # looks for them.
+      - name: Run the oracle test against the fixtures
+        run: cargo test --test oracle_vm_fixtures -- --nocapture
+
+      - name: Upload fixtures on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btrfs-fixtures
+          path: |
+            .vm-share/*.superdump
+            .vm-share/dmesg.txt
+          if-no-files-found: warn
+          retention-days: 7
