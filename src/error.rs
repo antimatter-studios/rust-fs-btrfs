@@ -145,3 +145,144 @@ impl From<fs_core::Error> for Error {
 
 /// Result alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    //! The `Display` text here is what reaches a user when a volume will
+    //! not mount, and what a maintainer reads in a bug report. Each
+    //! message is required to name the values that identify the problem:
+    //! "checksum mismatch" without saying *where* costs an afternoon.
+
+    use super::*;
+
+    #[test]
+    fn not_btrfs_shows_the_magic_it_found() {
+        let e = Error::NotBtrfs {
+            magic: *b"NOTABTRF",
+        };
+        let s = e.to_string();
+        assert!(!s.is_empty());
+        assert!(
+            s.to_lowercase().contains("btrfs"),
+            "message should name the format: {s}"
+        );
+    }
+
+    #[test]
+    fn checksum_mismatch_names_the_structure_and_offset() {
+        let e = Error::ChecksumMismatch {
+            what: "superblock",
+            offset: 65536,
+        };
+        let s = e.to_string();
+        assert!(s.contains("superblock"), "structure missing from: {s}");
+        assert!(
+            s.contains("65536") || s.contains("10000"),
+            "offset missing: {s}"
+        );
+    }
+
+    #[test]
+    fn identity_mismatch_names_both_addresses() {
+        let e = Error::BlockIdentityMismatch {
+            what: "tree block",
+            expected: 0x1000,
+            found: 0x2000,
+        };
+        let s = e.to_string();
+        assert!(s.contains("tree block"), "structure missing from: {s}");
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn unmapped_logical_names_the_address() {
+        let e = Error::UnmappedLogical(0xdead_beef);
+        let s = e.to_string();
+        assert!(
+            s.contains("deadbeef") || s.contains("3735928559"),
+            "address missing from: {s}"
+        );
+    }
+
+    #[test]
+    fn unsupported_checksum_names_the_type() {
+        let e = Error::UnsupportedChecksum(99);
+        assert!(e.to_string().contains("99"));
+    }
+
+    #[test]
+    fn string_carrying_variants_keep_their_detail() {
+        for (e, needle) in [
+            (Error::Io("device went away".into()), "device went away"),
+            (Error::BadSuperblock("nodesize 7".into()), "nodesize 7"),
+            (Error::UnsupportedFeature("raid5".into()), "raid5"),
+            (Error::BadChunkItem("zero stripes".into()), "zero stripes"),
+            (Error::UnsupportedProfile("raid6".into()), "raid6"),
+        ] {
+            let s = e.to_string();
+            assert!(s.contains(needle), "{e:?} lost its detail: {s}");
+        }
+    }
+
+    /// Every variant must render as non-empty text, so a variant added
+    /// later without a match arm cannot slip through as a blank message.
+    #[test]
+    fn every_variant_renders_non_empty() {
+        let all = [
+            Error::Io("x".into()),
+            Error::NotBtrfs { magic: [0; 8] },
+            Error::BadSuperblock("x".into()),
+            Error::ChecksumMismatch {
+                what: "x",
+                offset: 0,
+            },
+            Error::UnsupportedChecksum(0),
+            Error::BlockIdentityMismatch {
+                what: "x",
+                expected: 0,
+                found: 1,
+            },
+            Error::UnsupportedFeature("x".into()),
+            Error::BadChunkItem("x".into()),
+            Error::UnmappedLogical(0),
+            Error::UnsupportedProfile("x".into()),
+            Error::DirtyLog,
+            Error::NotFound,
+            Error::NotADirectory,
+            Error::NotAFile,
+            Error::ReadOnly,
+        ];
+        for e in all {
+            assert!(!e.to_string().is_empty(), "{e:?} rendered as empty text");
+        }
+    }
+
+    #[test]
+    fn unit_variants_say_something_useful() {
+        for (e, expect) in [
+            (Error::NotFound, "no such"),
+            (Error::NotADirectory, "not a directory"),
+            (Error::NotAFile, "not a regular file"),
+            (Error::ReadOnly, "read-only"),
+        ] {
+            let s = e.to_string().to_lowercase();
+            assert!(
+                s.contains(expect),
+                "{e:?} rendered as {s:?}, which does not mention {expect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wraps_a_device_error() {
+        let e: Error = fs_core::Error::ReadOnly.into();
+        assert!(matches!(e, Error::Io(_)), "device errors become Io");
+        assert!(!e.to_string().is_empty());
+    }
+
+    #[test]
+    fn implements_std_error() {
+        fn assert_is_error<T: std::error::Error>() {}
+        assert_is_error::<Error>();
+    }
+}
