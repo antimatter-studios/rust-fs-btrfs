@@ -56,8 +56,50 @@ for geom in "${BTRFS_GEOMETRIES[@]}"; do
     fi
 done
 
+# ---------------------------------------------------------------------
+# Populated fixtures: mounted and filled so the fs tree grows past a
+# single leaf. Without at least one of these, internal-node parsing and
+# multi-level descent are exercised only by hand-built blocks.
+# Requires root for the loop mount, which CI has.
+# ---------------------------------------------------------------------
+for spec in "${BTRFS_POPULATED[@]}"; do
+    name="${spec%%:*}"; rest="${spec#*:}"
+    args="${rest%%:*}"; rest="${rest#*:}"
+    count="${rest%%:*}"; size="${rest##*:}"
+    img="$SHARE/btrfs-$name.img"
+    dump="$SHARE/btrfs-$name.superdump"
+
+    rm -f "$img" "$dump"
+    truncate -s "$size" "$img"
+
+    # shellcheck disable=SC2086  # $args is a deliberate argument list
+    if ! mkfs.btrfs $args -f "$img" >/dev/null 2>&1; then
+        rm -f "$img"
+        echo "SKIP  $name (mkfs.btrfs rejected: $args)"
+        skipped+=("$name")
+        continue
+    fi
+
+    mnt="$(mktemp -d)"
+    if ! sudo mount -o loop "$img" "$mnt" 2>/dev/null; then
+        rmdir "$mnt"; rm -f "$img"
+        echo "SKIP  $name (could not loop-mount to populate it)"
+        skipped+=("$name")
+        continue
+    fi
+    sudo mkdir -p "$mnt/many"
+    # xargs -P keeps this to a few seconds rather than a few minutes.
+    seq 1 "$count" | sudo xargs -P4 -I{} sh -c "echo {} > $mnt/many/f{}.txt"
+    sync
+    sudo umount "$mnt"; rmdir "$mnt"
+
+    btrfs inspect-internal dump-super -f "$img" > "$dump"
+    echo "BUILT $name ($count files)"
+    built+=("$name")
+done
+
 echo
-echo "Built ${#built[@]} of ${#BTRFS_GEOMETRIES[@]} geometries into $SHARE"
+echo "Built ${#built[@]} of $(( ${#BTRFS_GEOMETRIES[@]} + ${#BTRFS_POPULATED[@]} )) fixtures into $SHARE"
 
 if [ "${#skipped[@]}" -gt 0 ]; then
     echo

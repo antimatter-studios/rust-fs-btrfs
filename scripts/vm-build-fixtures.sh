@@ -65,3 +65,37 @@ fi
 
 echo
 echo "Now run: cargo test --test oracle_vm_fixtures -- --nocapture"
+
+# ---------------------------------------------------------------------
+# Populated fixtures: mounted inside the VM and filled so the fs tree
+# grows past a single leaf. tests/fstree_oracle.rs fails outright if no
+# fixture has a multi-level tree, so this pass is not optional cover.
+# ---------------------------------------------------------------------
+for spec in "${BTRFS_POPULATED[@]}"; do
+    name="${spec%%:*}"; rest="${spec#*:}"
+    args="${rest%%:*}"; rest="${rest#*:}"
+    count="${rest%%:*}"; size="${rest##*:}"
+    "$REPO/scripts/vm.sh" run "
+        set -e
+        cd /share
+        rm -f btrfs-$name.img btrfs-$name.superdump
+        truncate -s $size btrfs-$name.img
+        if ! mkfs.btrfs $args -f btrfs-$name.img >/dev/null 2>&1; then
+            rm -f btrfs-$name.img
+            echo 'SKIP  $name (mkfs.btrfs rejected this geometry)'
+            exit 0
+        fi
+        mnt=\$(mktemp -d)
+        mount -o loop btrfs-$name.img \$mnt
+        mkdir -p \$mnt/many
+        seq 1 $count | xargs -P4 -I{} sh -c \"echo {} > \$mnt/many/f{}.txt\"
+        sync
+        umount \$mnt; rmdir \$mnt
+        btrfs inspect-internal dump-super -f btrfs-$name.img > btrfs-$name.superdump
+        echo 'BUILT $name ($count files)'
+    "
+done
+
+echo
+echo "Populated fixtures built. Now run:"
+echo "  cargo test --test fstree_oracle -- --nocapture"

@@ -40,3 +40,25 @@ BTRFS_GEOMETRIES=(
 # minimum device size with room for several block groups, small enough
 # that ten of them are cheap to build and to share with the guest.
 BTRFS_FIXTURE_SIZE="${BTRFS_FIXTURE_SIZE:-400M}"
+
+# ---------------------------------------------------------------------
+# Populated fixtures.
+#
+# The geometries above are all freshly-made filesystems, and every tree
+# on one of those is a single leaf. That leaves internal-node parsing,
+# the KeyPtr layout and the descent loop itself exercised only by
+# hand-built blocks — which this project does not count as validated.
+#
+# These entries are mounted and filled with enough files to push the fs
+# tree above level 0 (both reach level 2). tests/fstree_oracle.rs walks
+# them and fails outright if no fixture has a multi-level tree, so the
+# gap cannot silently reopen.
+#
+# Each entry is "<name>:<mkfs.btrfs args>:<file count>:<image size>".
+# ---------------------------------------------------------------------
+
+# shellcheck disable=SC2034  # consumed by the scripts that source this
+BTRFS_POPULATED=(
+    "deep4k:-n 4096:20000:2G"
+    "deep16k:-n 16384:60000:2G"
+)
