@@ -242,6 +242,10 @@ impl DiskKey {
             )));
         }
         Ok(DiskKey {
+            // The key is a packed 17-byte record with no padding, so
+            // `offset` starts at an unaligned byte 9. Reading it as if
+            // the struct were aligned would skip three bytes into the
+            // wrong field.
             objectid: le64(buf, 0),
             key_type: buf[8],
             // Deliberately unaligned: the on-disk struct is packed, so

@@ -728,8 +728,17 @@ impl Superblock {
     /// size fields must bracket each other. Each of those fails loudly if
     /// a field is read at the wrong offset.
     fn validate(&self) -> Result<()> {
-        let bad = |m: String| Err(Error::BadSuperblock(m));
+        self.validate_geometry()?;
+        self.validate_tree_roots()?;
+        self.validate_sys_chunk_array()?;
+        self.validate_device_identity()?;
+        Ok(())
+    }
 
+    /// Sizes, counts and capacities: the numbers describing the device
+    /// itself, independent of any tree it holds.
+    fn validate_geometry(&self) -> Result<()> {
+        let bad = |m: String| Err(Error::BadSuperblock(m));
         if !SUPER_OFFSETS.contains(&self.bytenr) {
             return bad(format!(
                 "bytenr {:#x} is not one of the superblock mirror offsets {SUPER_OFFSETS:#x?}",
@@ -783,6 +792,14 @@ impl Superblock {
                 self.bytes_used, self.total_bytes
             ));
         }
+        Ok(())
+    }
+
+    /// The three tree roots the superblock points at: their depth must be
+    /// within the format's maximum tree height, their addresses must be
+    /// sector-aligned, and the two that are mandatory must be present.
+    fn validate_tree_roots(&self) -> Result<()> {
+        let bad = |m: String| Err(Error::BadSuperblock(m));
         for (name, level) in [
             ("root_level", self.root_level),
             ("chunk_root_level", self.chunk_root_level),
@@ -812,6 +829,14 @@ impl Superblock {
         if self.root == 0 {
             return bad("root tree address is zero".into());
         }
+        Ok(())
+    }
+
+    /// The bootstrap chunk mapping embedded in the superblock. Without at
+    /// least one usable entry the chunk tree cannot be located, and
+    /// nothing else on the volume can be read.
+    fn validate_sys_chunk_array(&self) -> Result<()> {
+        let bad = |m: String| Err(Error::BadSuperblock(m));
         // The system chunk array must be able to hold at least one
         // (key, chunk item, stripe) triple, otherwise the chunk tree is
         // unreachable. 17 (key) + 48 (chunk header) + 32 (one stripe)
@@ -824,6 +849,12 @@ impl Superblock {
                 self.sys_chunk_array_size
             ));
         }
+        Ok(())
+    }
+
+    /// The device's own record of which filesystem it belongs to.
+    fn validate_device_identity(&self) -> Result<()> {
+        let bad = |m: String| Err(Error::BadSuperblock(m));
         // Every device carries the identity of the filesystem it belongs
         // to. Skipped while an fsid change is in flight or when this is a
         // seed device, because in those states the two legitimately
