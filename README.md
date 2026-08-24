@@ -27,18 +27,18 @@ not a roadmap.
 
 | Area | Support |
 |------|---------|
-| Superblock (primary at 64 KiB) | in progress |
-| Superblock mirrors (64 MiB, 256 GiB) | in progress |
-| Checksum: **crc32c** | in progress |
-| Checksum: **xxhash64**, **sha256**, **blake2b** | planned |
-| System chunk array → chunk tree bootstrap | planned |
-| Chunk tree / logical→physical mapping | planned |
+| Superblock (primary at 64 KiB) | done — 216 field comparisons against dump-super |
+| Superblock mirrors (64 MiB, 256 GiB) | parsed; mirror-selection policy pending |
+| Checksum: **crc32c** | done |
+| Checksum: **xxhash64**, **sha256**, **blake2b** | done — all four verified against real media |
+| System chunk array → chunk tree bootstrap | done |
+| Chunk tree / logical→physical mapping | done (from the bootstrap array; full tree walk pending) |
 | B-tree node + leaf traversal | planned |
 | Root tree, fs tree, extent tree | planned |
 | Inodes, directory items, extent data | planned |
-| Profiles: single, dup | planned |
-| Profiles: raid0/1/10/5/6 | not planned yet |
-| Mixed block groups (`mkfs.btrfs -M`) | planned |
+| Profiles: single, dup, raid0, raid1, raid10 | done |
+| Profiles: raid5/6 | refused explicitly, not guessed |
+| Mixed block groups (`mkfs.btrfs -M`) | reads; covered by the fixture matrix |
 | Subvolumes and snapshots | planned |
 | Compression (zlib / lzo / zstd extents) | planned |
 | Write path | **out of scope** — this is a reader |

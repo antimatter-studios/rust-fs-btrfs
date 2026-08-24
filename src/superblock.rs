@@ -648,9 +648,10 @@ impl Superblock {
         let label_end = label_raw.iter().position(|&b| b == 0).unwrap_or(LABEL_SIZE);
         let label = String::from_utf8_lossy(&label_raw[..label_end]).into_owned();
 
+        let fsid = uuid_at(buf, offsets::FSID);
         let sb = Superblock {
             csum,
-            fsid: uuid_at(buf, offsets::FSID),
+            fsid,
             bytenr: le64(buf, offsets::BYTENR),
             flags: le64(buf, offsets::FLAGS),
             generation: le64(buf, offsets::GENERATION),
@@ -679,7 +680,18 @@ impl Superblock {
             label,
             cache_generation: le64(buf, offsets::CACHE_GENERATION),
             uuid_tree_generation: le64(buf, offsets::UUID_TREE_GENERATION),
-            metadata_uuid: uuid_at(buf, offsets::METADATA_UUID),
+            // The on-disk field is written only when the METADATA_UUID
+            // feature is enabled; without it the field is all zeros and
+            // the metadata UUID *is* the fsid. Verified against real
+            // media: mkfs.btrfs leaves 0x23b zeroed, while the reference
+            // tooling reports metadata_uuid identical to fsid. Returning
+            // the raw zeros here would make every tree node fail its
+            // identity check on an ordinary filesystem.
+            metadata_uuid: if le64(buf, offsets::INCOMPAT_FLAGS) & incompat::METADATA_UUID != 0 {
+                uuid_at(buf, offsets::METADATA_UUID)
+            } else {
+                fsid
+            },
             nr_global_roots: le64(buf, offsets::NR_GLOBAL_ROOTS),
             sys_chunk_array,
         };
