@@ -121,6 +121,13 @@ pub struct fs_btrfs_fs {
 pub struct fs_btrfs_dir_iter {
     entries: Vec<DirEntry>,
     next: usize,
+    /// Storage for the entry most recently returned.
+    ///
+    /// `dir_next` hands back a borrowed pointer rather than filling a
+    /// caller-supplied struct, matching the sibling drivers. The pointer
+    /// stays valid until the next call on the same iterator, which is
+    /// what the header promises.
+    current: fs_btrfs_dirent_t,
 }
 
 /// Attributes of one filesystem object.
@@ -333,6 +340,33 @@ pub unsafe extern "C" fn fs_btrfs_mount_with_callbacks(
     })
 }
 
+/// Mount over an existing `fs_core` device handle.
+///
+/// This is how the FSKit extension mounts a *partition* rather than a
+/// whole disk: the host wraps the block-device resource as an
+/// `FsCoreDevice`, slices the partition out of it, and hands the slice
+/// here. Without it a caller could only ever mount from offset zero.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a live `FsCoreDevice` from `fs_core`.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_mount_with_fs_core_device(
+    handle: *mut fs_core::ffi::FsCoreDevice,
+) -> *mut fs_btrfs_fs {
+    guard(std::ptr::null_mut(), || {
+        if handle.is_null() {
+            set_error("fs_core handle is NULL".into(), EIO);
+            return std::ptr::null_mut();
+        }
+        // This driver is read-only, so only the read half of the device
+        // trait is needed.
+        let dev: std::sync::Arc<dyn fs_core::BlockDevice> = unsafe { (*handle).inner().clone() };
+        let read: std::sync::Arc<dyn BlockRead> = dev;
+        mount_device(read)
+    })
+}
+
 /// Release a mounted-filesystem handle. Safe to call with NULL.
 ///
 /// # Safety
@@ -490,7 +524,11 @@ pub unsafe extern "C" fn fs_btrfs_dir_open(
             return std::ptr::null_mut();
         };
         match unsafe { &*fs }.fs.list_path(path) {
-            Ok(entries) => Box::into_raw(Box::new(fs_btrfs_dir_iter { entries, next: 0 })),
+            Ok(entries) => Box::into_raw(Box::new(fs_btrfs_dir_iter {
+                entries,
+                next: 0,
+                current: unsafe { std::mem::zeroed() },
+            })),
             Err(e) => {
                 record(&e);
                 std::ptr::null_mut()
@@ -507,16 +545,15 @@ pub unsafe extern "C" fn fs_btrfs_dir_open(
 #[no_mangle]
 pub unsafe extern "C" fn fs_btrfs_dir_next(
     iter: *mut fs_btrfs_dir_iter,
-    out: *mut fs_btrfs_dirent_t,
-) -> c_int {
-    guard(-1, || {
-        if iter.is_null() || out.is_null() {
-            set_error("iter or out is NULL".into(), EIO);
-            return -1;
+) -> *const fs_btrfs_dirent_t {
+    guard(std::ptr::null(), || {
+        if iter.is_null() {
+            set_error("iter is NULL".into(), EIO);
+            return std::ptr::null();
         }
         let it = unsafe { &mut *iter };
         let Some(e) = it.entries.get(it.next) else {
-            return 0;
+            return std::ptr::null();
         };
         it.next += 1;
 
@@ -529,16 +566,14 @@ pub unsafe extern "C" fn fs_btrfs_dir_next(
         for (slot, b) in name.iter_mut().zip(&e.name[..n]) {
             *slot = *b as c_char;
         }
-        unsafe {
-            *out = fs_btrfs_dirent_t {
-                inode: e.ino,
-                file_type: file_type_code(e.ftype) as u8,
-                name_len: n as u8,
-                is_subvolume: u8::from(!e.is_inode()),
-                name,
-            };
-        }
-        1
+        it.current = fs_btrfs_dirent_t {
+            inode: e.ino,
+            file_type: file_type_code(e.ftype) as u8,
+            name_len: n as u8,
+            is_subvolume: u8::from(!e.is_inode()),
+            name,
+        };
+        &it.current
     })
 }
 
@@ -570,8 +605,8 @@ pub unsafe extern "C" fn fs_btrfs_dir_close(iter: *mut fs_btrfs_dir_iter) {
 pub unsafe extern "C" fn fs_btrfs_read_file(
     fs: *mut fs_btrfs_fs,
     path: *const c_char,
-    offset: u64,
     buf: *mut c_void,
+    offset: u64,
     length: u64,
 ) -> i64 {
     guard(-1, || {

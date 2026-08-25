@@ -157,12 +157,17 @@ fn iterates_a_directory_to_completion() {
 
     let mut names = Vec::new();
     loop {
-        let mut e: fs_btrfs_dirent_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe { fs_btrfs_dir_next(iter, &mut e) };
-        assert!(rc >= 0, "dir_next failed: {}", last_error());
-        if rc == 0 {
+        let ptr = unsafe { fs_btrfs_dir_next(iter) };
+        if ptr.is_null() {
+            assert_eq!(
+                fs_btrfs_last_errno(),
+                0,
+                "a clean end of directory must not set an errno: {}",
+                last_error()
+            );
             break;
         }
+        let e = unsafe { &*ptr };
         let name = unsafe { CStr::from_ptr(e.name.as_ptr()) }
             .to_string_lossy()
             .into_owned();
@@ -177,8 +182,7 @@ fn iterates_a_directory_to_completion() {
     }
 
     // Past the end it must keep returning 0 rather than wrapping.
-    let mut e: fs_btrfs_dirent_t = unsafe { std::mem::zeroed() };
-    assert_eq!(unsafe { fs_btrfs_dir_next(iter, &mut e) }, 0);
+    assert!(unsafe { fs_btrfs_dir_next(iter) }.is_null());
     unsafe { fs_btrfs_dir_close(iter) };
 
     for want in ["inline.txt", "plain.bin", "sparse.bin", "link-short", "sub"] {
@@ -204,8 +208,8 @@ fn reads_file_contents() {
         fs_btrfs_read_file(
             fs,
             cstr("/inline.txt").as_ptr(),
-            0,
             buf.as_mut_ptr().cast::<c_void>(),
+            0,
             buf.len() as u64,
         )
     };
@@ -218,8 +222,8 @@ fn reads_file_contents() {
         fs_btrfs_read_file(
             fs,
             cstr("/inline.txt").as_ptr(),
-            6,
             tail.as_mut_ptr().cast::<c_void>(),
+            6,
             tail.len() as u64,
         )
     };
@@ -230,8 +234,8 @@ fn reads_file_contents() {
         fs_btrfs_read_file(
             fs,
             cstr("/inline.txt").as_ptr(),
-            n as u64,
             buf.as_mut_ptr().cast::<c_void>(),
+            n as u64,
             buf.len() as u64,
         )
     };
@@ -253,8 +257,8 @@ fn sparse_regions_read_as_zeros() {
         fs_btrfs_read_file(
             fs,
             cstr("/sparse.bin").as_ptr(),
-            0,
             buf.as_mut_ptr().cast::<c_void>(),
+            0,
             buf.len() as u64,
         )
     };
@@ -332,8 +336,8 @@ fn a_compressed_file_fails_with_enotsup_not_garbage() {
         fs_btrfs_read_file(
             fs,
             cstr("/compressed.txt").as_ptr(),
-            0,
             buf.as_mut_ptr().cast::<c_void>(),
+            0,
             buf.len() as u64,
         )
     };
@@ -365,8 +369,8 @@ fn an_uncompressed_file_on_the_same_volume_still_reads() {
         fs_btrfs_read_file(
             fs,
             cstr("/plain.bin").as_ptr(),
-            0,
             buf.as_mut_ptr().cast::<c_void>(),
+            0,
             buf.len() as u64,
         )
     };
@@ -417,8 +421,8 @@ fn reading_a_directory_as_a_file_reports_eisdir() {
         fs_btrfs_read_file(
             fs,
             cstr("/sub").as_ptr(),
-            0,
             buf.as_mut_ptr().cast::<c_void>(),
+            0,
             buf.len() as u64,
         )
     };
@@ -465,7 +469,6 @@ fn mounting_a_missing_path_reports_enoent() {
 fn null_pointers_fail_instead_of_crashing() {
     let mut attr = zeroed_attr();
     let mut info: fs_btrfs_volume_info_t = unsafe { std::mem::zeroed() };
-    let mut dirent: fs_btrfs_dirent_t = unsafe { std::mem::zeroed() };
     let mut buf = [0u8; 8];
     let mut cbuf = [0 as c_char; 8];
     let p = cstr("/x");
@@ -484,13 +487,13 @@ fn null_pointers_fail_instead_of_crashing() {
         );
         assert_eq!(fs_btrfs_stat_ino(std::ptr::null_mut(), 1, &mut attr), -1);
         assert!(fs_btrfs_dir_open(std::ptr::null_mut(), p.as_ptr()).is_null());
-        assert_eq!(fs_btrfs_dir_next(std::ptr::null_mut(), &mut dirent), -1);
+        assert!(fs_btrfs_dir_next(std::ptr::null_mut()).is_null());
         assert_eq!(
             fs_btrfs_read_file(
                 std::ptr::null_mut(),
                 p.as_ptr(),
-                0,
                 buf.as_mut_ptr().cast::<c_void>(),
+                0,
                 buf.len() as u64
             ),
             -1
@@ -525,7 +528,7 @@ fn null_output_pointers_fail_instead_of_crashing() {
         );
         assert_eq!(fs_btrfs_stat_ino(fs, 256, std::ptr::null_mut()), -1);
         assert_eq!(
-            fs_btrfs_read_file(fs, cstr("/inline.txt").as_ptr(), 0, std::ptr::null_mut(), 8),
+            fs_btrfs_read_file(fs, cstr("/inline.txt").as_ptr(), std::ptr::null_mut(), 0, 8),
             -1
         );
         assert_eq!(
@@ -620,8 +623,8 @@ fn mounts_over_a_caller_supplied_reader() {
         fs_btrfs_read_file(
             fs,
             cstr("/inline.txt").as_ptr(),
-            0,
             buf.as_mut_ptr().cast::<c_void>(),
+            0,
             buf.len() as u64,
         )
     };

@@ -25,6 +25,8 @@
 extern "C" {
 #endif
 
+struct FsCoreDevice;
+
 typedef struct fs_btrfs_fs fs_btrfs_fs_t;
 typedef struct fs_btrfs_dir_iter fs_btrfs_dir_iter_t;
 
@@ -109,6 +111,13 @@ int fs_btrfs_last_errno(void);
 
 fs_btrfs_fs_t *fs_btrfs_mount(const char *device_path);
 fs_btrfs_fs_t *fs_btrfs_mount_with_callbacks(const fs_btrfs_blockdev_cfg_t *cfg);
+/*
+ * Mount over an existing fs_core device handle. This is how a caller
+ * mounts a PARTITION rather than a whole disk: wrap the block device
+ * as an FsCoreDevice, slice the partition out, and pass the slice.
+ */
+fs_btrfs_fs_t *fs_btrfs_mount_with_fs_core_device(struct FsCoreDevice *handle);
+
 void fs_btrfs_umount(fs_btrfs_fs_t *fs);
 int fs_btrfs_get_volume_info(fs_btrfs_fs_t *fs, fs_btrfs_volume_info_t *out);
 
@@ -121,8 +130,12 @@ int fs_btrfs_stat_ino(fs_btrfs_fs_t *fs, uint64_t inode, fs_btrfs_attr_t *out);
 /* ---- directories ---- */
 
 fs_btrfs_dir_iter_t *fs_btrfs_dir_open(fs_btrfs_fs_t *fs, const char *path);
-/* 1 = filled, 0 = end of directory, -1 = failure. */
-int fs_btrfs_dir_next(fs_btrfs_dir_iter_t *iter, fs_btrfs_dirent_t *out);
+/*
+ * Next entry, or NULL at end of directory (and on failure — check
+ * fs_btrfs_last_errno to tell them apart; it is 0 at a clean end).
+ * Owned by the iterator; valid only until the next call on it.
+ */
+const fs_btrfs_dirent_t *fs_btrfs_dir_next(fs_btrfs_dir_iter_t *iter);
 void fs_btrfs_dir_close(fs_btrfs_dir_iter_t *iter);
 
 /* ---- file contents ---- */
@@ -133,7 +146,7 @@ void fs_btrfs_dir_close(fs_btrfs_dir_iter_t *iter);
  * occupied them, so returning their contents would disclose it.
  */
 int64_t fs_btrfs_read_file(fs_btrfs_fs_t *fs, const char *path,
-                           uint64_t offset, void *buf, uint64_t length);
+                           void *buf, uint64_t offset, uint64_t length);
 
 /* Length written excluding the terminator, or -1. Truncates to bufsize. */
 int fs_btrfs_readlink(fs_btrfs_fs_t *fs, const char *path,
