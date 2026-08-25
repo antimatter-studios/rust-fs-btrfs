@@ -84,3 +84,15 @@ BTRFS_RICH_NAME="rich"
 BTRFS_RICH_SIZE="600M"
 # shellcheck disable=SC2034
 BTRFS_RICH_MOUNT_OPTS="compress=zstd"
+
+# One fixture per compression algorithm Btrfs defines, because the three
+# are decoded by entirely different code and only one of them can be got
+# right by accident. zstd and zlib are ordinary streams of their format;
+# LZO is wrapped in framing Btrfs invented, and that framing only becomes
+# visible in a file long enough to span several sectors.
+#
+# `compress=`, not `compress-force=`: the incompressible file must stay
+# an ordinary extent, so that a driver which simply refused (or mangled)
+# every read cannot pass by reading nothing.
+# shellcheck disable=SC2034
+BTRFS_COMPRESSION_ALGOS="zlib lzo zstd"

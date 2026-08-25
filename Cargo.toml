@@ -26,6 +26,16 @@ blake2b_simd = "1.0"
 # Block-device trait surface shared with the sister fs-* drivers and the
 # img-* disk-image readers.
 am-fs-core = { path = "../rust-fs-core", version = "0.2" }
+# Decompressors, one per compression type Btrfs defines. All three are
+# pure Rust with no C bindings, and permissively licensed like the rest.
+#
+# compression 1 — zlib. MIT OR Zlib OR Apache-2.0.
+miniz_oxide = "0.9.1"
+# compression 2 — LZO1X, in the segmented framing Btrfs wraps it in. MIT,
+# and ours: see src/compression.rs for the framing.
+am-lzo1x = "0.1.0"
+# compression 3 — zstd. MIT.
+ruzstd = "0.9.0"
 
 [dev-dependencies]
 

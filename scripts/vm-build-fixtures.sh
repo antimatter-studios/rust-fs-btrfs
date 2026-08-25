@@ -132,3 +132,60 @@ build_rich() {
     fi
 }
 build_rich vm
+
+# ---------------------------------------------------------------------
+# One fixture per compression algorithm, each with a manifest the kernel
+# generated. The manifest is the whole point: it records what Linux says
+# each file contains, so the driver's decoders are checked against the
+# encoder that produced the bytes rather than against themselves.
+# ---------------------------------------------------------------------
+build_compressed() {
+    local algo="$1"
+    local img="btrfs-comp-$algo.img"
+    local script="
+        set -e
+        cd \"\$SHARE_DIR\"
+        rm -f $img btrfs-comp-$algo.manifest btrfs-comp-$algo.compression
+        truncate -s $BTRFS_RICH_SIZE $img
+        mkfs.btrfs -f $img >/dev/null 2>&1
+        mnt=\$(mktemp -d)
+        mount -o loop,compress=$algo $img \$mnt
+
+        # Long enough to span many sectors, which is the only way the LZO
+        # segment framing shows up at all.
+        python3 -c \"print('the quick brown fox jumps over the lazy dog '*40000)\" > \$mnt/big.txt
+        # Compressible but under one sector, so the single-segment case
+        # is covered too.
+        python3 -c \"print('ab'*200)\" > \$mnt/small.txt
+        # Incompressible: must stay an ordinary extent and still read.
+        dd if=/dev/urandom of=\$mnt/plain.bin bs=1M count=2 status=none
+        # Tiny enough to live inline in its own item.
+        echo 'inline and compressible aaaaaaaaaaaaaaaaaaaaaaaa' > \$mnt/inline.txt
+        sync; umount \$mnt; rmdir \$mnt
+
+        # What the kernel says each file holds, read back through its own
+        # driver on a read-only mount so the image is not disturbed.
+        mnt=\$(mktemp -d)
+        mount -o ro $img \$mnt
+        ( cd \$mnt
+          find . -mindepth 1 -type f | sort | while read -r p; do
+            printf '%s\\t%s\\t%s\\n' \"\${p#.}\" \"\$(stat -c%s \"\$p\")\" \"\$(sha256sum \"\$p\" | cut -d' ' -f1)\"
+          done
+        ) > btrfs-comp-$algo.manifest
+        umount \$mnt; rmdir \$mnt
+
+        # Which compression types actually ended up on disk. If this says
+        # only 'none', the mount option was ignored and the fixture is
+        # not testing what it claims to.
+        btrfs inspect-internal dump-tree -t 5 $img 2>/dev/null | \
+            grep -o 'extent compression [0-9]* ([a-z]*)' | sort -u \
+            > btrfs-comp-$algo.compression
+
+        echo \"BUILT comp-$algo (\$(wc -l < btrfs-comp-$algo.manifest) files, \$(tr '\\n' ' ' < btrfs-comp-$algo.compression))\"
+    "
+    SHARE_DIR=/share "$REPO/scripts/vm.sh" run "SHARE_DIR=/share; $script"
+}
+
+for algo in $BTRFS_COMPRESSION_ALGOS; do
+    build_compressed "$algo"
+done
