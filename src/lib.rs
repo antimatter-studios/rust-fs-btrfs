@@ -55,6 +55,7 @@ pub mod error;
 pub mod fs;
 pub mod inode;
 pub mod superblock;
+pub mod write;
 
 pub use chunk::{Chunk, ChunkMap, ChunkProfile, Mapping};
 pub use error::{Error, Result};

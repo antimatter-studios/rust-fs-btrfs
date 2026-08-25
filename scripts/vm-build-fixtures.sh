@@ -134,6 +134,33 @@ build_rich() {
 build_rich vm
 
 # ---------------------------------------------------------------------
+# The nodatacow fixture: the one shape of file Btrfs writes in place.
+#
+# A `chattr +C` directory makes its files NODATACOW|NODATASUM, which is
+# what lets a driver overwrite their blocks without a transaction — no
+# new extent, no checksum item, no tree rewrite. The ordinary file
+# beside it is the control: a driver that ignored the flag and wrote in
+# place regardless would corrupt it while looking correct on the other,
+# so tests/write_oracle.rs requires that one to be refused.
+# ---------------------------------------------------------------------
+"$REPO/scripts/vm.sh" run "
+    set -e
+    cd /share
+    img=btrfs-nodatacow.img
+    rm -f \$img
+    truncate -s $BTRFS_RICH_SIZE \$img
+    mkfs.btrfs -f \$img >/dev/null 2>&1
+    mnt=\$(mktemp -d)
+    mount -o loop \$img \$mnt
+    mkdir \$mnt/nc
+    chattr +C \$mnt/nc
+    dd if=/dev/urandom of=\$mnt/nc/inplace.bin bs=4096 count=64 status=none
+    dd if=/dev/urandom of=\$mnt/cow.bin bs=4096 count=64 status=none
+    sync; umount \$mnt; rmdir \$mnt
+    echo 'BUILT nodatacow'
+"
+
+# ---------------------------------------------------------------------
 # One fixture per compression algorithm, each with a manifest the kernel
 # generated. The manifest is the whole point: it records what Linux says
 # each file contains, so the driver's decoders are checked against the
