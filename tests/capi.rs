@@ -693,3 +693,194 @@ fn last_error_is_never_null() {
     assert!(!fs_btrfs_last_error().is_null());
     assert!(!last_error().is_empty());
 }
+
+// ---------------------------------------------------------------------
+// Writing
+//
+// These work on a copy of the nodatacow fixture, because they change it.
+// The copy is removed when the guard drops, including on a panic: every
+// other suite here treats each `.img` in `.vm-share` as a fixture, so
+// one left behind fails unrelated tests.
+// ---------------------------------------------------------------------
+
+const EROFS: i32 = 30;
+const ENOTSUP_ERRNO: i32 = if cfg!(target_os = "macos") { 45 } else { 95 };
+
+/// The `chattr +C` file, and the ordinary one beside it.
+const INPLACE_PATH: &str = "/nc/inplace.bin";
+const COW_PATH: &str = "/cow.bin";
+
+struct WritableCopy(PathBuf);
+
+impl WritableCopy {
+    fn new(name: &str) -> Option<Self> {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".vm-share")
+            .join("btrfs-nodatacow.img");
+        if !src.exists() {
+            return None;
+        }
+        let dst = src.with_file_name(name);
+        std::fs::copy(&src, &dst).ok()?;
+        Some(WritableCopy(dst))
+    }
+    fn open_rw(&self) -> *mut fs_btrfs_fs {
+        let c = cstr(self.0.to_str().unwrap());
+        let fs = unsafe { fs_btrfs_mount_rw(c.as_ptr()) };
+        assert!(!fs.is_null(), "mount_rw failed: {}", last_error());
+        fs
+    }
+    fn open_ro(&self) -> *mut fs_btrfs_fs {
+        let c = cstr(self.0.to_str().unwrap());
+        let fs = unsafe { fs_btrfs_mount(c.as_ptr()) };
+        assert!(!fs.is_null(), "mount failed: {}", last_error());
+        fs
+    }
+}
+
+impl Drop for WritableCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A read-only handle must say it cannot write, and must refuse.
+#[test]
+fn a_read_only_handle_says_so_and_refuses() {
+    let Some(copy) = WritableCopy::new("btrfscapi-ro.img") else {
+        eprintln!("no nodatacow fixture — skipping");
+        return;
+    };
+    let fs = copy.open_ro();
+    assert_eq!(unsafe { fs_btrfs_is_writable(fs) }, 0);
+
+    let data = b"nope";
+    let n = unsafe {
+        fs_btrfs_write_file(
+            fs,
+            cstr(INPLACE_PATH).as_ptr(),
+            data.as_ptr().cast::<c_void>(),
+            0,
+            data.len() as u64,
+        )
+    };
+    assert_eq!(n, -1, "a read-only handle wrote something");
+    assert_eq!(fs_btrfs_last_errno(), EROFS, "{}", last_error());
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+/// `can_write_in_place` must agree with what a write actually does —
+/// for both answers. A caller that trusts it should never be surprised
+/// in either direction.
+#[test]
+fn can_write_in_place_agrees_with_the_write() {
+    let Some(copy) = WritableCopy::new("btrfscapi-agree.img") else {
+        eprintln!("no nodatacow fixture — skipping");
+        return;
+    };
+    let fs = copy.open_rw();
+    assert_eq!(unsafe { fs_btrfs_is_writable(fs) }, 1);
+
+    let inplace = cstr(INPLACE_PATH);
+    let cow = cstr(COW_PATH);
+    assert_eq!(
+        unsafe { fs_btrfs_can_write_in_place(fs, inplace.as_ptr()) },
+        1,
+        "the nodatacow file should be writable: {}",
+        last_error()
+    );
+    assert_eq!(
+        unsafe { fs_btrfs_can_write_in_place(fs, cow.as_ptr()) },
+        0,
+        "an ordinary copy-on-write file should not be"
+    );
+
+    let payload = b"through the C ABI";
+    let n = unsafe {
+        fs_btrfs_write_file(
+            fs,
+            inplace.as_ptr(),
+            payload.as_ptr().cast::<c_void>(),
+            4096,
+            payload.len() as u64,
+        )
+    };
+    assert_eq!(n, payload.len() as i64, "{}", last_error());
+
+    let refused = unsafe {
+        fs_btrfs_write_file(
+            fs,
+            cow.as_ptr(),
+            payload.as_ptr().cast::<c_void>(),
+            0,
+            payload.len() as u64,
+        )
+    };
+    assert_eq!(refused, -1, "a copy-on-write file was written");
+    assert_eq!(fs_btrfs_last_errno(), ENOTSUP_ERRNO, "{}", last_error());
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+/// A write must be readable back through the ABI.
+#[test]
+fn a_write_round_trips_through_the_abi() {
+    let Some(copy) = WritableCopy::new("btrfscapi-roundtrip.img") else {
+        eprintln!("no nodatacow fixture — skipping");
+        return;
+    };
+    let fs = copy.open_rw();
+    let path = cstr(INPLACE_PATH);
+    let payload = b"round trip through the ABI";
+
+    let n = unsafe {
+        fs_btrfs_write_file(
+            fs,
+            path.as_ptr(),
+            payload.as_ptr().cast::<c_void>(),
+            16384,
+            payload.len() as u64,
+        )
+    };
+    assert_eq!(n, payload.len() as i64, "{}", last_error());
+
+    let mut back = vec![0u8; payload.len()];
+    let r = unsafe {
+        fs_btrfs_read_file(
+            fs,
+            path.as_ptr(),
+            back.as_mut_ptr().cast::<c_void>(),
+            16384,
+            back.len() as u64,
+        )
+    };
+    assert_eq!(r, payload.len() as i64, "{}", last_error());
+    assert_eq!(
+        &back, payload,
+        "the bytes read back are not the ones written"
+    );
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+/// Writing past the end needs an allocation, and must say so as
+/// unsupported rather than as a bad argument.
+#[test]
+fn writing_past_the_end_is_enotsup() {
+    let Some(copy) = WritableCopy::new("btrfscapi-pastend.img") else {
+        eprintln!("no nodatacow fixture — skipping");
+        return;
+    };
+    let fs = copy.open_rw();
+    let data = b"beyond";
+    let n = unsafe {
+        fs_btrfs_write_file(
+            fs,
+            cstr(INPLACE_PATH).as_ptr(),
+            data.as_ptr().cast::<c_void>(),
+            1 << 30,
+            data.len() as u64,
+        )
+    };
+    assert_eq!(n, -1);
+    assert_eq!(fs_btrfs_last_errno(), ENOTSUP_ERRNO, "{}", last_error());
+    unsafe { fs_btrfs_umount(fs) };
+}

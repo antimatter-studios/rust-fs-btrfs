@@ -701,3 +701,157 @@ pub unsafe extern "C" fn fs_btrfs_readlink(
         }
     })
 }
+
+// ---------------------------------------------------------------------
+// Writing
+//
+// Btrfs is copy-on-write, so almost nothing can be written in place. The
+// exception is a file marked NODATACOW — `chattr +C` — whose blocks are
+// overwritten where they lie and carry no checksums. Those, and only
+// those, can be written without a transaction engine.
+//
+// Everything else is refused with ENOTSUP by name, so a caller can tell
+// "this filesystem cannot do that yet" from "you passed something wrong".
+// ---------------------------------------------------------------------
+
+/// Mount the image or device at `device_path` for reading **and
+/// writing**.
+///
+/// Returns NULL if the device cannot be written, if the volume's log
+/// tree is non-empty, or for any reason [`fs_btrfs_mount`] would.
+///
+/// # Safety
+///
+/// `device_path` must be NULL or a NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_mount_rw(device_path: *const c_char) -> *mut fs_btrfs_fs {
+    guard(std::ptr::null_mut(), || {
+        let Some(path) = (unsafe { borrow_str(device_path, "device_path") }) else {
+            return std::ptr::null_mut();
+        };
+        match FileDevice::open_rw(path) {
+            Ok(dev) => match Filesystem::mount_rw(Arc::new(dev)) {
+                Ok(fs) => Box::into_raw(Box::new(fs_btrfs_fs { fs })),
+                Err(e) => {
+                    record(&e);
+                    std::ptr::null_mut()
+                }
+            },
+            Err(e) => {
+                set_error(format!("opening {path} for writing failed: {e}"), EIO);
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Whether this handle can write.
+///
+/// Lets a caller ask rather than discover: presenting a volume as
+/// writable and then failing every write is worse than knowing up front.
+///
+/// # Safety
+///
+/// `fs` must be a live handle or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_is_writable(fs: *mut fs_btrfs_fs) -> c_int {
+    guard(0, || {
+        if fs.is_null() {
+            return 0;
+        }
+        c_int::from(unsafe { &*fs }.fs.is_writable())
+    })
+}
+
+/// Whether `path` can be written in place.
+///
+/// Answers the question a caller actually has — "will a write to this
+/// file succeed?" — without making them attempt one and interpret the
+/// failure. A file qualifies only if it is NODATACOW, unchecksummed,
+/// and its extents are unshared, uncompressed and really allocated.
+///
+/// Returns 1 for yes, 0 for no, −1 if the file could not be examined.
+///
+/// # Safety
+///
+/// `fs` must be a live handle and `path` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_can_write_in_place(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+) -> c_int {
+    guard(-1, || {
+        if fs.is_null() {
+            set_error("fs is NULL".into(), EIO);
+            return -1;
+        }
+        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+            return -1;
+        };
+        let fs = &unsafe { &*fs }.fs;
+        let found = match fs.lookup_path(path) {
+            Ok(i) => i,
+            Err(e) => {
+                record(&e);
+                return -1;
+            }
+        };
+        match fs.can_write_in_place(found.ino) {
+            Ok(yes) => c_int::from(yes),
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
+}
+
+/// Overwrite `length` bytes of an existing file at `offset`.
+///
+/// Returns the number of bytes written, or −1 with the error recorded.
+/// The whole range is written or none of it is.
+///
+/// Only a NODATACOW file can be written, and only where its extents are
+/// unshared, uncompressed and really allocated. Everything else — an
+/// ordinary copy-on-write file, a snapshotted extent, a compressed or
+/// inline one, a hole, or a write past the end — is refused with
+/// ENOTSUP, because each needs a transaction this driver cannot make.
+///
+/// # Safety
+///
+/// `fs` must be a live handle; `path` NUL-terminated; `buf` readable for
+/// `length` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_write_file(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+    buf: *const c_void,
+    offset: u64,
+    length: u64,
+) -> i64 {
+    guard(-1, || {
+        if fs.is_null() || buf.is_null() {
+            set_error("fs or buf is NULL".into(), EIO);
+            return -1;
+        }
+        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+            return -1;
+        };
+        let fs = &unsafe { &*fs }.fs;
+        let found = match fs.lookup_path(path) {
+            Ok(i) => i,
+            Err(e) => {
+                record(&e);
+                return -1;
+            }
+        };
+        let data = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), length as usize) };
+        match fs.write_at(found.ino, offset, data) {
+            Ok(n) => n as i64,
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
+}

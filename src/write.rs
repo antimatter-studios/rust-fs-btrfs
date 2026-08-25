@@ -125,6 +125,39 @@ impl Filesystem {
         Ok(done)
     }
 
+    /// Whether `ino` can be written in place at all.
+    ///
+    /// Answers the question a caller actually has before offering a file
+    /// as editable, rather than making them attempt a write and read the
+    /// refusal. It applies the same conditions the write does, to the
+    /// whole file rather than to one range — a file is reported writable
+    /// only if every extent of it could be overwritten.
+    ///
+    /// A file with no extents at all — empty, or entirely holes — is
+    /// reported writable, since there is nothing there that would have
+    /// to be refused. Any write to it would still be refused for
+    /// exceeding its size, which is the correct answer for a different
+    /// reason.
+    pub fn can_write_in_place(&self, ino: u64) -> Result<bool> {
+        let inode = self.read_inode(ino)?;
+        if !inode.is_regular_file() {
+            return Ok(false);
+        }
+        if inode.flags & (INODE_NODATACOW | INODE_NODATASUM) != (INODE_NODATACOW | INODE_NODATASUM)
+        {
+            return Ok(false);
+        }
+        for piece in self.file_extents(ino)? {
+            if piece.compressed || piece.logical.is_none() {
+                return Ok(false);
+            }
+            if self.extent_refs(piece.extent_start)? != 1 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Where each part of the write lands, as (logical address, length).
     ///
     /// Every refusal happens here, while the file is still untouched.
