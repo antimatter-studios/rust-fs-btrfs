@@ -34,6 +34,7 @@
 
 use crate::btree::{Tree, TreeGeometry};
 use crate::chunk::{Chunk, ChunkMap, DiskKey};
+use crate::compression::{self, Compression};
 use crate::dir::{self, DirEntry, DIR_INDEX_KEY};
 use crate::error::{Error, Result};
 use crate::inode::{Inode, FIRST_FREE_OBJECTID, INODE_ITEM_KEY};
@@ -110,10 +111,29 @@ fn le64(b: &[u8], off: usize) -> u64 {
 
 /// One resolved piece of a file's contents.
 enum Piece<'a> {
-    /// Data stored inside the item itself.
-    Inline(&'a [u8]),
+    /// Data stored inside the item itself, already decoded.
+    Inline(std::borrow::Cow<'a, [u8]>),
     /// Data on disk: logical address, and the length to read.
     Regular { logical: u64, len: u64 },
+    /// A compressed run on disk that must be decoded whole, then sliced.
+    ///
+    /// The compressed unit is the entire extent, so unlike [`Piece::Regular`]
+    /// the reference's `offset` cannot be folded into the address — it
+    /// indexes the *decoded* bytes, and seeking by it on disk would land
+    /// in the middle of a compressed stream. See [`crate::compression`].
+    Compressed {
+        /// Start of the compressed run.
+        logical: u64,
+        /// Its length on disk.
+        disk_len: u64,
+        /// What the whole run decodes to.
+        ram_len: u64,
+        /// Where this reference starts within the decoded bytes.
+        offset: u64,
+        /// How much of the decoded bytes this reference covers.
+        len: u64,
+        algo: Compression,
+    },
     /// A hole or an unwritten preallocated extent.
     ///
     /// Carries no length: the output buffer is zeroed before any extent
@@ -351,15 +371,8 @@ impl Filesystem {
         );
         let kind = data[file_extent::TYPE];
 
-        // Refuse rather than return the raw bytes: a compressed extent
-        // read without decompressing looks exactly like a successful
-        // read of corrupt data, which a caller cannot detect.
-        if compression != 0 {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino}: extent uses compression type {compression}, which this driver \
-                 does not decode"
-            )));
-        }
+        let algo = Compression::from_byte(compression)
+            .map_err(|e| Error::UnsupportedFeature(format!("inode {ino}: {e}")))?;
         if encryption != 0 || other != 0 {
             return Err(Error::UnsupportedFeature(format!(
                 "inode {ino}: extent is encoded (encryption {encryption}, other {other})"
@@ -370,7 +383,19 @@ impl Filesystem {
             EXTENT_INLINE => {
                 let end = data.len();
                 let start = file_extent::INLINE_DATA.min(end);
-                Ok(Piece::Inline(&data[start..end]))
+                let raw = &data[start..end];
+                // An inline extent may be compressed too, and there is no
+                // offset to apply: the item holds the whole thing.
+                Ok(Piece::Inline(if algo.is_compressed() {
+                    std::borrow::Cow::Owned(compression::decompress(
+                        algo,
+                        raw,
+                        ram_bytes as usize,
+                        self.sb.sectorsize as usize,
+                    )?)
+                } else {
+                    std::borrow::Cow::Borrowed(raw)
+                }))
             }
             EXTENT_REGULAR | EXTENT_PREALLOC => {
                 if data.len() < file_extent::REGULAR_SIZE {
@@ -390,6 +415,16 @@ impl Filesystem {
                 if disk_bytenr == 0 || kind == EXTENT_PREALLOC {
                     let _ = num_bytes;
                     return Ok(Piece::Zeros);
+                }
+                if algo.is_compressed() {
+                    return Ok(Piece::Compressed {
+                        logical: disk_bytenr,
+                        disk_len: le64(data, file_extent::DISK_NUM_BYTES),
+                        ram_len: ram_bytes,
+                        offset,
+                        len: num_bytes,
+                        algo,
+                    });
                 }
                 Ok(Piece::Regular {
                     logical: disk_bytenr + offset,
@@ -435,6 +470,28 @@ impl Filesystem {
                     if n > 0 {
                         Self::read_logical(&self.device, &self.map, logical, &mut out[at..at + n])?;
                     }
+                }
+                Piece::Compressed {
+                    logical,
+                    disk_len,
+                    ram_len,
+                    offset: within,
+                    len,
+                    algo,
+                } => {
+                    let mut packed = vec![0u8; disk_len as usize];
+                    Self::read_logical(&self.device, &self.map, logical, &mut packed)?;
+                    let decoded = compression::decompress(
+                        algo,
+                        &packed,
+                        ram_len as usize,
+                        self.sb.sectorsize as usize,
+                    )?;
+                    // `within` indexes the decoded bytes, which is the
+                    // whole reason this is not a Regular read.
+                    let from = (within as usize).min(decoded.len());
+                    let take = (len as usize).min(decoded.len() - from).min(size - at);
+                    out[at..at + take].copy_from_slice(&decoded[from..from + take]);
                 }
             }
         }

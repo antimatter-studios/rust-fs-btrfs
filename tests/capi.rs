@@ -32,7 +32,6 @@ const EIO: i32 = 5;
 const ENOTDIR: i32 = 20;
 const EISDIR: i32 = 21;
 const ERANGE: i32 = 34;
-const ENOTSUP: i32 = if cfg!(target_os = "macos") { 45 } else { 95 };
 
 fn fixture() -> Option<PathBuf> {
     let p = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -336,11 +335,16 @@ fn readlink_refuses_a_buffer_too_small_for_the_target() {
 // Error reporting
 // ---------------------------------------------------------------------
 
-/// The single most important refusal in this driver, surfaced through
-/// the ABI. Returning the compressed bytes would look to a caller
-/// exactly like a successful read of a corrupt file.
+/// A compressed extent must reach a C caller decoded.
+///
+/// This used to assert the opposite: that the read was refused with
+/// ENOTSUP, because returning the compressed bytes would look to a
+/// caller exactly like a successful read of a corrupt file. Now that the
+/// driver decodes them, the same reasoning sets the bar for this test —
+/// it is not enough for the call to succeed, the bytes it wrote have to
+/// be the file's.
 #[test]
-fn a_compressed_file_fails_with_enotsup_not_garbage() {
+fn a_compressed_file_is_decoded_through_the_abi() {
     let Some(fs) = mount() else {
         eprintln!("no fixture — skipping");
         return;
@@ -355,17 +359,19 @@ fn a_compressed_file_fails_with_enotsup_not_garbage() {
             buf.len() as u64,
         )
     };
-    assert_eq!(n, -1, "a compressed extent must not be read as raw bytes");
     assert_eq!(
-        fs_btrfs_last_errno(),
-        ENOTSUP,
-        "a feature this driver declines is ENOTSUP, got {}",
-        fs_btrfs_last_errno()
-    );
-    assert!(
-        last_error().contains("compression"),
-        "the message should name compression: {}",
+        n,
+        buf.len() as i64,
+        "a compressed extent should fill the buffer, got {n} ({})",
         last_error()
+    );
+    // The fixture is one sentence repeated, so the decoded bytes are
+    // known without consulting anything else.
+    let text = std::str::from_utf8(&buf).expect("the fixture is ASCII");
+    assert!(
+        text.starts_with("the quick brown fox jumps over the lazy dog "),
+        "decoded to something else: {:?}",
+        &text[..60]
     );
     unsafe { fs_btrfs_umount(fs) };
 }

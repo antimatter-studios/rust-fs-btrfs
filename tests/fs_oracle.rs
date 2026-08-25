@@ -244,14 +244,18 @@ fn rich() -> Option<Filesystem> {
     p.exists().then(|| mount(&p, "btrfs-rich"))
 }
 
-/// A compressed extent must be refused, not returned raw.
+/// A compressed extent must come back as the file the kernel wrote.
 ///
-/// This is the single most important refusal in the driver. Returning
-/// the compressed bytes would look to a caller exactly like a successful
-/// read of a corrupt file — there is no signal distinguishing them — so
-/// silently wrong data would reach a user who has no way to notice.
+/// This replaces the refusal that stood here before compression was
+/// decoded. The refusal existed because returning compressed bytes looks
+/// to a caller exactly like a successful read of a corrupt file, with no
+/// signal to tell them apart — so the bar for removing it is that the
+/// bytes now match what Linux says the file holds, not merely that a
+/// read succeeds. That comparison lives in `compression_oracle.rs`,
+/// which drives it from kernel-generated manifests for all three
+/// algorithms. This keeps a direct check on the original fixture.
 #[test]
-fn refuses_compressed_extents_rather_than_returning_raw_bytes() {
+fn reads_a_compressed_file_written_by_the_kernel() {
     let Some(fs) = rich() else {
         eprintln!("no rich fixture — skipping");
         return;
@@ -259,19 +263,25 @@ fn refuses_compressed_extents_rather_than_returning_raw_bytes() {
     let f = fs
         .lookup_path("/compressed.txt")
         .expect("compressed.txt should exist");
-    match fs.read_file(f.ino) {
-        Err(fs_btrfs::Error::UnsupportedFeature(m)) => {
-            assert!(
-                m.contains("compression"),
-                "the refusal should name compression: {m}"
-            );
-        }
-        Ok(data) => panic!(
-            "a compressed extent was read as {} bytes of raw data instead of being refused",
-            data.len()
-        ),
-        Err(other) => panic!("expected an unsupported-feature refusal, got {other}"),
-    }
+    let data = fs.read_file(f.ino).expect("compressed.txt must decode");
+    assert_eq!(
+        data.len() as u64,
+        f.size,
+        "decoded length disagrees with the inode's size"
+    );
+    // The fixture is one sentence repeated, so its content is known
+    // without needing the manifest to say so.
+    let text = String::from_utf8(data).expect("the fixture is ASCII");
+    assert!(
+        text.starts_with("the quick brown fox jumps over the lazy dog "),
+        "decoded to something other than the fixture's text: {:?}",
+        &text[..text.len().min(60)]
+    );
+    assert_eq!(
+        text.matches("the quick brown fox").count(),
+        20000,
+        "decoded the wrong number of repetitions"
+    );
 }
 
 /// An incompressible file written through the same compressing mount
