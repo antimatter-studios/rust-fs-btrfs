@@ -148,7 +148,13 @@ void fs_btrfs_dir_close(fs_btrfs_dir_iter_t *iter);
 int64_t fs_btrfs_read_file(fs_btrfs_fs_t *fs, const char *path,
                            void *buf, uint64_t offset, uint64_t length);
 
-/* Length written excluding the terminator, or -1. Truncates to bufsize. */
+/*
+ * Length written excluding the terminator, or -1.
+ *
+ * A buffer too small for the target plus its terminator is REFUSED with
+ * ERANGE rather than truncated — a truncated target is a path to
+ * somewhere else, and a caller following it could not tell.
+ */
 int fs_btrfs_readlink(fs_btrfs_fs_t *fs, const char *path,
                       char *buf, size_t bufsize);
 

@@ -49,6 +49,8 @@ const EIO: c_int = 5;
 const ENOTDIR: c_int = 20;
 const EISDIR: c_int = 21;
 const EROFS_ERRNO: c_int = 30;
+/// `ERANGE` — a result did not fit the caller's buffer.
+const ERANGE: c_int = 34;
 /// `ENOTSUP` is 45 on Darwin and 95 on Linux.
 const fn enotsup() -> c_int {
     if cfg!(target_os = "macos") {
@@ -667,12 +669,30 @@ pub unsafe extern "C" fn fs_btrfs_readlink(
         };
         match fs.read_link(found.ino) {
             Ok(target) => {
-                // Always leave room for the terminator.
-                let n = target.len().min(bufsize - 1);
+                // Refuse rather than truncate. A truncated symlink target
+                // is a path to somewhere else, and a caller following it
+                // has no way to tell — so a buffer that cannot hold the
+                // whole target plus its terminator is an error, not a
+                // partial success. ERANGE tells the caller to retry with
+                // a larger buffer, which is the standard idiom.
+                //
+                // The sibling EROFS driver already behaved this way; the
+                // family now agrees.
+                if target.len() + 1 > bufsize {
+                    set_error(
+                        format!(
+                            "readlink buffer holds {bufsize} bytes, need {} for the target \
+                             and its terminator",
+                            target.len() + 1
+                        ),
+                        ERANGE,
+                    );
+                    return -1;
+                }
                 let out = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), bufsize) };
-                out[..n].copy_from_slice(&target[..n]);
-                out[n] = 0;
-                n as c_int
+                out[..target.len()].copy_from_slice(&target);
+                out[target.len()] = 0;
+                target.len() as c_int
             }
             Err(e) => {
                 record(&e);
