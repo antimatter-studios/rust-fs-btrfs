@@ -62,3 +62,25 @@ BTRFS_POPULATED=(
     "deep4k:-n 4096:20000:2G"
     "deep16k:-n 16384:60000:2G"
 )
+
+# ---------------------------------------------------------------------
+# The "rich" fixture.
+#
+# Written through a COMPRESSING mount and holding a deliberately varied
+# tree: a highly compressible file (so zstd actually engages), an
+# incompressible one (so the same image still has a plain extent), a
+# small file stored inline in its item, a sparse file that is nearly all
+# holes, a symlink, and a nested directory.
+#
+# It is what proves the driver refuses a compressed extent by name while
+# still reading everything else on the same filesystem. Without the
+# incompressible file, a driver that simply refused every read would pass
+# the compression test just as well.
+# ---------------------------------------------------------------------
+
+# shellcheck disable=SC2034  # consumed by the scripts that source this
+BTRFS_RICH_NAME="rich"
+# shellcheck disable=SC2034
+BTRFS_RICH_SIZE="600M"
+# shellcheck disable=SC2034
+BTRFS_RICH_MOUNT_OPTS="compress=zstd"

@@ -284,18 +284,29 @@ pub mod incompat {
     ///
     /// The exclusions are deliberate, not accidental:
     ///
-    /// - [`COMPRESS_LZO`] / [`COMPRESS_ZSTD`] — the bit means *some*
-    ///   extent may be compressed, and a reader with no decompressor
-    ///   would silently hand back ciphertext-looking garbage. Un-gate
-    ///   these when the decompression path lands.
     /// - [`RAID56`] — parity reconstruction is not implemented, and
     ///   guessing at a RAID5 stripe layout is worse than refusing.
     /// - [`ZONED`], [`EXTENT_TREE_V2`], [`RAID_STRIPE_TREE`],
     ///   [`SIMPLE_QUOTA`], [`REMAP_TREE`] — each restructures something
     ///   the read path depends on.
+    ///
+    /// [`COMPRESS_LZO`] and [`COMPRESS_ZSTD`] ARE accepted, which was
+    /// not always so. The concern that kept them out was a reader
+    /// handing back compressed bytes as if they were file contents — a
+    /// failure a caller cannot detect. That risk is now handled where it
+    /// actually arises: the extent decoder refuses a compressed extent
+    /// by name, so a compressed file errors and an uncompressed one
+    /// reads normally.
+    ///
+    /// Refusing the whole mount instead was the worse trade. The bit
+    /// means *some* extent may be compressed, not that the layout is
+    /// unreadable, so gating on it made an entire filesystem
+    /// unmountable because one file happened to compress well.
     pub const SUPPORTED: u64 = MIXED_BACKREF
         | DEFAULT_SUBVOL
         | MIXED_GROUPS
+        | COMPRESS_LZO
+        | COMPRESS_ZSTD
         | BIG_METADATA
         | EXTENDED_IREF
         | SKINNY_METADATA
@@ -1239,8 +1250,6 @@ mod tests {
     #[test]
     fn rejects_known_but_unimplemented_incompat_features() {
         for bit in [
-            incompat::COMPRESS_LZO,
-            incompat::COMPRESS_ZSTD,
             incompat::RAID56,
             incompat::ZONED,
             incompat::EXTENT_TREE_V2,

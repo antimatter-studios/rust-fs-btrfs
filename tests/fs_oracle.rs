@@ -230,3 +230,169 @@ fn path_spellings_are_tolerated() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// The `rich` fixture: written through a compressing mount, and holding
+// a symlink, a sparse file and an inline file. It exercises the paths a
+// plain mkfs image never reaches.
+// ---------------------------------------------------------------------
+
+fn rich() -> Option<Filesystem> {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".vm-share")
+        .join("btrfs-rich.img");
+    p.exists().then(|| mount(&p, "btrfs-rich"))
+}
+
+/// A compressed extent must be refused, not returned raw.
+///
+/// This is the single most important refusal in the driver. Returning
+/// the compressed bytes would look to a caller exactly like a successful
+/// read of a corrupt file — there is no signal distinguishing them — so
+/// silently wrong data would reach a user who has no way to notice.
+#[test]
+fn refuses_compressed_extents_rather_than_returning_raw_bytes() {
+    let Some(fs) = rich() else {
+        eprintln!("no rich fixture — skipping");
+        return;
+    };
+    let f = fs
+        .lookup_path("/compressed.txt")
+        .expect("compressed.txt should exist");
+    match fs.read_file(f.ino) {
+        Err(fs_btrfs::Error::UnsupportedFeature(m)) => {
+            assert!(
+                m.contains("compression"),
+                "the refusal should name compression: {m}"
+            );
+        }
+        Ok(data) => panic!(
+            "a compressed extent was read as {} bytes of raw data instead of being refused",
+            data.len()
+        ),
+        Err(other) => panic!("expected an unsupported-feature refusal, got {other}"),
+    }
+}
+
+/// An incompressible file written through the same compressing mount
+/// stays a plain extent, so it must still read correctly. Without this,
+/// the test above would pass equally well on a driver that refused
+/// everything.
+#[test]
+fn still_reads_uncompressed_files_from_a_compressing_mount() {
+    let Some(fs) = rich() else {
+        eprintln!("no rich fixture — skipping");
+        return;
+    };
+    let f = fs.lookup_path("/plain.bin").expect("plain.bin");
+    let data = fs.read_file(f.ino).expect("plain.bin must still read");
+    assert_eq!(data.len() as u64, f.size, "short read of an ordinary file");
+    assert!(
+        data.iter().any(|&b| b != 0),
+        "random data read back as all zeros"
+    );
+}
+
+/// A small file lives inline in its item rather than in an extent.
+#[test]
+fn reads_an_inline_file() {
+    let Some(fs) = rich() else {
+        eprintln!("no rich fixture — skipping");
+        return;
+    };
+    let data = fs.read_path("/inline.txt").expect("inline.txt");
+    assert_eq!(String::from_utf8_lossy(&data), "small inline\n");
+}
+
+/// A sparse file is almost entirely holes, which must read as zeros
+/// rather than as whatever previously occupied those blocks.
+#[test]
+fn sparse_regions_read_as_zeros() {
+    let Some(fs) = rich() else {
+        eprintln!("no rich fixture — skipping");
+        return;
+    };
+    let f = fs.lookup_path("/sparse.bin").expect("sparse.bin");
+    let data = fs.read_file(f.ino).expect("sparse read");
+    assert_eq!(data.len(), 8 * 1024 * 1024);
+    assert!(
+        data.iter().all(|&b| b == 0),
+        "a hole did not read back as zeros"
+    );
+}
+
+#[test]
+fn resolves_a_symlink_target() {
+    let Some(fs) = rich() else {
+        eprintln!("no rich fixture — skipping");
+        return;
+    };
+    let l = fs.lookup_path("/link-short").expect("link-short");
+    assert!(l.is_symlink(), "link-short should be a symlink");
+    let target = fs.read_link(l.ino).expect("readlink");
+    assert_eq!(String::from_utf8_lossy(&target), "inline.txt");
+
+    // readlink on something that is not a link is refused.
+    let f = fs.lookup_path("/inline.txt").expect("inline.txt");
+    assert!(matches!(
+        fs.read_link(f.ino),
+        Err(fs_btrfs::Error::NotAFile)
+    ));
+}
+
+/// Reads at an offset must agree with reading the whole file and
+/// slicing, which catches an offset mishandled in the extent walk.
+#[test]
+fn partial_reads_agree_with_whole_file_reads() {
+    let Some(fs) = rich() else {
+        eprintln!("no rich fixture — skipping");
+        return;
+    };
+    let f = fs.lookup_path("/plain.bin").expect("plain.bin");
+    let whole = fs.read_file(f.ino).expect("whole");
+    for &(off, len) in &[
+        (0u64, 100usize),
+        (4095, 2),
+        (4096, 4096),
+        (1_000_003, 9973),
+        (whole.len() as u64 - 10, 10),
+    ] {
+        let mut buf = vec![0u8; len];
+        let n = fs.read_at(f.ino, off, &mut buf).expect("read_at");
+        assert_eq!(
+            &buf[..n],
+            &whole[off as usize..off as usize + n],
+            "read_at({off}, {len}) disagrees with the whole-file read"
+        );
+    }
+}
+
+/// Nested directories resolve, and a directory's own listing round-trips
+/// through path resolution.
+#[test]
+fn walks_nested_directories() {
+    let Some(fs) = rich() else {
+        eprintln!("no rich fixture — skipping");
+        return;
+    };
+    let data = fs.read_path("/sub/nested/file.txt").expect("nested file");
+    assert_eq!(String::from_utf8_lossy(&data), "nested\n");
+
+    let listing = fs.list_path("/sub").expect("list /sub");
+    assert_eq!(listing.len(), 1);
+    assert_eq!(listing[0].name, b"nested");
+}
+
+/// An inode number that names nothing must be NotFound rather than a
+/// panic or an empty success.
+#[test]
+fn an_unknown_inode_is_not_found() {
+    let Some(fs) = rich() else {
+        eprintln!("no rich fixture — skipping");
+        return;
+    };
+    assert!(matches!(
+        fs.read_inode(999_999_999),
+        Err(fs_btrfs::Error::NotFound)
+    ));
+}

@@ -116,3 +116,36 @@ if [ ! -f "$SHARE/btrfs-default.img" ]; then
     echo "the default geometry failed to build — aborting" >&2
     exit 1
 fi
+
+# ---------------------------------------------------------------------
+# The rich fixture: a compressing mount over a varied tree. See
+# fixture-geometries.sh for why each file is there.
+# ---------------------------------------------------------------------
+build_rich() {
+    local run="$1"   # how to execute a shell snippet: "local" or "vm"
+    local img="btrfs-$BTRFS_RICH_NAME.img"
+    local script="
+        set -e
+        cd \"\$SHARE_DIR\"
+        rm -f $img btrfs-$BTRFS_RICH_NAME.superdump
+        truncate -s $BTRFS_RICH_SIZE $img
+        mkfs.btrfs -f $img >/dev/null 2>&1
+        mnt=\$(mktemp -d)
+        mount -o loop,$BTRFS_RICH_MOUNT_OPTS $img \$mnt
+        python3 -c \"print('the quick brown fox jumps over the lazy dog '*20000)\" > \$mnt/compressed.txt
+        dd if=/dev/urandom of=\$mnt/plain.bin bs=1M count=2 status=none
+        echo 'small inline' > \$mnt/inline.txt
+        truncate -s 8M \$mnt/sparse.bin
+        ln -s inline.txt \$mnt/link-short
+        mkdir -p \$mnt/sub/nested && echo nested > \$mnt/sub/nested/file.txt
+        sync; umount \$mnt; rmdir \$mnt
+        btrfs inspect-internal dump-super -f $img > btrfs-$BTRFS_RICH_NAME.superdump
+        echo 'BUILT $BTRFS_RICH_NAME (compressing mount)'
+    "
+    if [ "$run" = "vm" ]; then
+        SHARE_DIR=/share "$REPO/scripts/vm.sh" run "SHARE_DIR=/share; $script"
+    else
+        SHARE_DIR="$SHARE" sudo -E bash -c "SHARE_DIR=\"$SHARE\"; $script"
+    fi
+}
+build_rich local
