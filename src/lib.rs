@@ -47,6 +47,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod btree;
+pub mod capi;
 pub mod chunk;
 pub mod dir;
 pub mod error;
