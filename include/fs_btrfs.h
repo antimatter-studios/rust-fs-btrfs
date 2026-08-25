@@ -158,6 +158,57 @@ int64_t fs_btrfs_read_file(fs_btrfs_fs_t *fs, const char *path,
 int fs_btrfs_readlink(fs_btrfs_fs_t *fs, const char *path,
                       char *buf, size_t bufsize);
 
+/* ---- writing ---- */
+
+/*
+ * Btrfs is copy-on-write: a change normally allocates a new block,
+ * records a new checksum, rewrites the B-tree path to the root and
+ * commits a new generation. None of that is possible without a
+ * transaction engine, so almost nothing here can be written in place.
+ *
+ * The exception is a file marked NODATACOW -- `chattr +C` -- whose
+ * blocks are overwritten where they lie and carry no checksums. Those,
+ * and only those, can be written.
+ *
+ * NODATACOW is not on its own enough. It promises in-place writes only
+ * while the extent belongs to one file; a snapshot makes it shared, and
+ * the next write must copy first so the snapshot keeps seeing what it
+ * saw. Sharing is checked before any write.
+ *
+ * Everything outside that is refused with ENOTSUP, so a caller can tell
+ * "this is not supported yet" from "you passed something wrong".
+ */
+
+/*
+ * Mount for reading and writing. Returns NULL if the device cannot be
+ * written, if the volume's log tree is non-empty, or for any reason
+ * fs_btrfs_mount would.
+ */
+fs_btrfs_fs_t *fs_btrfs_mount_rw(const char *device_path);
+
+/* Whether this handle can write. Ask rather than discover. */
+int fs_btrfs_is_writable(fs_btrfs_fs_t *fs);
+
+/*
+ * Whether `path` can be written in place: NODATACOW, unchecksummed, and
+ * with every extent unshared, uncompressed and really allocated.
+ *
+ * Returns 1 for yes, 0 for no, -1 if the file could not be examined.
+ * Lets a caller decide what to offer without attempting a write and
+ * interpreting the failure.
+ */
+int fs_btrfs_can_write_in_place(fs_btrfs_fs_t *fs, const char *path);
+
+/*
+ * Overwrite `length` bytes of an existing file at `offset`. Returns the
+ * number written, or -1. The whole range is written or none of it is.
+ *
+ * Refused with ENOTSUP for an ordinary copy-on-write file, a snapshotted
+ * extent, a compressed or inline one, a hole, or a write past the end.
+ */
+int64_t fs_btrfs_write_file(fs_btrfs_fs_t *fs, const char *path,
+                            const void *buf, uint64_t offset, uint64_t length);
+
 #ifdef __cplusplus
 }
 #endif
