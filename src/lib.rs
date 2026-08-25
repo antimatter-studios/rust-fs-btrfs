@@ -48,7 +48,9 @@
 
 pub mod btree;
 pub mod chunk;
+pub mod dir;
 pub mod error;
+pub mod inode;
 pub mod superblock;
 
 pub use chunk::{Chunk, ChunkMap, ChunkProfile, Mapping};
