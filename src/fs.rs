@@ -39,7 +39,7 @@ use crate::dir::{self, DirEntry, DIR_INDEX_KEY};
 use crate::error::{Error, Result};
 use crate::inode::{Inode, FIRST_FREE_OBJECTID, INODE_ITEM_KEY};
 use crate::superblock::{Superblock, SUPER_INFO_OFFSET};
-use fs_core::BlockRead;
+use fs_core::{BlockDevice, BlockRead};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -60,8 +60,9 @@ pub const EXTENT_DATA_KEY: u8 = 108;
 /// Corroborated against real media: a wrong value here yields an address
 /// whose tree block fails its own identity check rather than producing
 /// plausible garbage.
-mod root_item {
+pub(crate) mod root_item {
     pub const BYTENR: usize = 176;
+    #[allow(dead_code)]
     pub const LEVEL: usize = 238;
 }
 
@@ -143,11 +144,31 @@ enum Piece<'a> {
     Zeros,
 }
 
+/// One extent of a file, located both in the file and on the volume.
+pub(crate) struct FileExtent {
+    /// Offset within the file where this extent begins.
+    pub start: u64,
+    /// How much of the file it covers.
+    pub len: u64,
+    /// Where its bytes are, when they can be written in place at all.
+    pub logical: Option<u64>,
+    /// Start of the whole extent run, which is what the extent tree
+    /// keys its reference count by.
+    pub extent_start: u64,
+    /// Whether the bytes on disk are compressed.
+    pub compressed: bool,
+}
+
 /// A mounted Btrfs filesystem.
 pub struct Filesystem {
-    device: Arc<dyn BlockRead>,
-    sb: Superblock,
-    map: ChunkMap,
+    pub(crate) device: Arc<dyn BlockRead>,
+    /// The same device again, present only when the volume was opened
+    /// for writing. Kept separately so that "can this mount write" is a
+    /// property of the type: the write path cannot compile without
+    /// going through this field.
+    pub(crate) writable: Option<Arc<dyn BlockDevice>>,
+    pub(crate) sb: Superblock,
+    pub(crate) map: ChunkMap,
     fs_tree_root: u64,
     /// Every item in the fs tree, keyed by its on-disk key.
     ///
@@ -162,6 +183,54 @@ pub struct Filesystem {
 impl Filesystem {
     /// Open `device` as a Btrfs filesystem.
     pub fn mount(device: Arc<dyn BlockRead>) -> Result<Self> {
+        Self::open(device, None)
+    }
+
+    /// Open `device` for reading **and writing**.
+    ///
+    /// Writing is opt-in rather than inferred from the device being
+    /// writable: a driver able to write should not do so merely because
+    /// nothing stopped it.
+    ///
+    /// The refusal of a non-empty log tree applies here as to a
+    /// read-only mount, and matters more — writing to a volume whose log
+    /// holds changes the trees have not seen would layer new data on top
+    /// of state that is about to be replayed over it.
+    pub fn mount_rw(device: Arc<dyn BlockDevice>) -> Result<Self> {
+        if !device.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        Self::open(device.clone(), Some(device))
+    }
+
+    /// Whether this mount can write.
+    pub fn is_writable(&self) -> bool {
+        self.writable.is_some()
+    }
+
+    /// Write to a logical address, following the chunk map exactly as
+    /// the read path does — a write that ignored a chunk boundary would
+    /// run past the end of one device and into another.
+    pub(crate) fn write_logical(
+        device: &Arc<dyn BlockDevice>,
+        map: &ChunkMap,
+        logical: u64,
+        buf: &[u8],
+    ) -> Result<()> {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let m = map.map(logical + done as u64)?;
+            let n = (m.len as usize).min(buf.len() - done);
+            if n == 0 {
+                return Err(Error::UnmappedLogical(logical + done as u64));
+            }
+            device.write_at(m.physical, &buf[done..done + n])?;
+            done += n;
+        }
+        Ok(())
+    }
+
+    fn open(device: Arc<dyn BlockRead>, writable: Option<Arc<dyn BlockDevice>>) -> Result<Self> {
         let mut sb_buf = vec![0u8; 4096];
         device.read_at(SUPER_INFO_OFFSET, &mut sb_buf)?;
         let sb = Superblock::parse_at(&sb_buf, SUPER_INFO_OFFSET)?;
@@ -224,6 +293,7 @@ impl Filesystem {
 
         let mut fs = Filesystem {
             device,
+            writable,
             sb,
             map,
             fs_tree_root,
@@ -234,7 +304,7 @@ impl Filesystem {
     }
 
     /// Read `buf.len()` bytes at a logical address through `map`.
-    fn read_logical(
+    pub(crate) fn read_logical(
         device: &Arc<dyn BlockRead>,
         map: &ChunkMap,
         logical: u64,
@@ -435,6 +505,56 @@ impl Filesystem {
                 "inode {ino}: extent type {other} is not a defined value (ram_bytes {ram_bytes})"
             ))),
         }
+    }
+
+    /// One extent of a file, as the write planner needs to see it.
+    ///
+    /// The read path consumes `Piece` and copies immediately; a writer
+    /// has to decide whether a range may be written at all before
+    /// touching any of it, which needs the pieces as a list with their
+    /// file offsets attached.
+    pub(crate) fn file_extents(&self, ino: u64) -> Result<Vec<FileExtent>> {
+        let mut out = Vec::new();
+        for ((objectid, key_type, offset), data) in self
+            .items
+            .range((ino, EXTENT_DATA_KEY, 0)..=(ino, EXTENT_DATA_KEY, u64::MAX))
+        {
+            if *objectid != ino || *key_type != EXTENT_DATA_KEY {
+                break;
+            }
+            let start = *offset;
+            match self.decode_extent(data, ino)? {
+                // Inline data lives in the item, so there is no block to
+                // overwrite; preallocated and holes have nothing behind
+                // them. All three are reported with no logical address,
+                // and the planner refuses them by name.
+                Piece::Inline(bytes) => out.push(FileExtent {
+                    start,
+                    len: bytes.len() as u64,
+                    logical: None,
+                    extent_start: 0,
+                    compressed: false,
+                }),
+                Piece::Zeros => {}
+                Piece::Regular { logical, len } => out.push(FileExtent {
+                    start,
+                    len,
+                    logical: Some(logical),
+                    // `logical` already has the reference's offset folded
+                    // in; the extent item is keyed by the run's start.
+                    extent_start: le64(data, file_extent::DISK_BYTENR),
+                    compressed: false,
+                }),
+                Piece::Compressed { len, .. } => out.push(FileExtent {
+                    start,
+                    len,
+                    logical: None,
+                    extent_start: le64(data, file_extent::DISK_BYTENR),
+                    compressed: true,
+                }),
+            }
+        }
+        Ok(out)
     }
 
     /// Read a whole file.
