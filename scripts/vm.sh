@@ -23,9 +23,25 @@ SHARE="$REPO/.vm-share"
 
 mkdir -p "$SHARE"
 
+# Check the host has what the VM needs before trying to boot it.
+#
+# Without this the first symptom of a missing tool is a Vagrant error
+# that names a plugin or, worse, a guest that imports and then never
+# boots. The repository knows what it requires; it should say so.
+require_host_tools() {
+    local checker="$REPO/scripts/install-host-tools.sh"
+    [ -x "$checker" ] || return 0
+    if ! "$checker" --quiet; then
+        echo
+        echo "The VM cannot start until these are installed." >&2
+        exit 1
+    fi
+}
+
 vm_up() {
     # `vagrant status` is authoritative but slow-ish; only boot when the
     # machine is not already running.
+    require_host_tools
     if ! (cd "$VAGRANT_DIR" && vagrant status --machine-readable 2>/dev/null \
             | grep -q ',state,running'); then
         echo "[vm] booting Debian arm64 oracle (first run provisions, ~2 min)..." >&2
