@@ -9,15 +9,17 @@
 # hardware acceleration, so there is no emulation penalty and no
 # third-party hypervisor to install.
 #
-# Prerequisites (macOS/arm64):
-#   brew install antimatter-studios/tap/qemu
-#   brew install antimatter-studios/tap/virtiofsd
-#   vagrant plugin install vagrant-qemu-christhomas
-#   vagrant plugin install vagrant-notify-forwarder-christhomas
+# Prerequisites are installed by scripts/install-host-tools.sh, which is
+# where they are listed and why. They were a comment here, which meant a
+# new machine discovered what was missing by hitting an error; a script
+# can both explain and fix. scripts/vm.sh checks it before every boot.
 #
 # CI does not use this file. GitHub's Linux runners are already Linux and
 # run mkfs + loop-mount natively; this VM gives developers the same gate.
 
+# These two checks duplicate scripts/install-host-tools.sh on purpose:
+# that script only runs when the VM is started through scripts/vm.sh, and
+# `vagrant up` run directly here must not get further than this.
 unless Vagrant.has_plugin?("vagrant-qemu-christhomas")
   raise "Install required plugin: vagrant plugin install vagrant-qemu-christhomas"
 end
@@ -125,4 +127,14 @@ Vagrant.configure("2") do |config|
     mkfs.btrfs --version
     btrfs --version
   SHELL
+
+  # fsstress and fsx, the two stress generators from the filesystem test
+  # suite. Kept in their own named provisioner so a box that already has
+  # the oracle tooling can pick them up with
+  # `vagrant provision --provision-with stress-tools` rather than a full
+  # re-provision. The script explains why they are built rather than
+  # installed, and why nothing from that source tree may enter this
+  # repository.
+  config.vm.provision "stress-tools", type: "shell",
+                      path: "provision-stress-tools.sh"
 end
