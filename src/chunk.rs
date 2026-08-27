@@ -64,10 +64,31 @@ pub const DEFAULT_STRIPE_LEN: u64 = 64 * 1024;
 
 /// Well-known key type numbers.
 pub mod key_type {
+    /// `BTRFS_EXTENT_ITEM_KEY` — an allocated run. Its key's `offset`
+    /// is the run's length in bytes.
+    pub const EXTENT_ITEM: u8 = 168;
+    /// `BTRFS_METADATA_ITEM_KEY` — an allocated tree block, under the
+    /// `SKINNY_METADATA` feature. Its key's `offset` is the block's
+    /// LEVEL, not a length: the length is always `nodesize`. Reading it
+    /// as a length is the mistake the feature invites, and it produces
+    /// extents of length 0, 1 and 2.
+    pub const METADATA_ITEM: u8 = 169;
     /// `BTRFS_DEV_ITEM_KEY`.
     pub const DEV_ITEM: u8 = 216;
     /// `BTRFS_CHUNK_ITEM_KEY`.
     pub const CHUNK_ITEM: u8 = 228;
+    /// `BTRFS_BLOCK_GROUP_ITEM_KEY` — one allocation region. Filed
+    /// under the region's first byte, with its length as the `offset`.
+    pub const BLOCK_GROUP_ITEM: u8 = 192;
+    /// `BTRFS_FREE_SPACE_INFO_KEY` — how a block group's free space is
+    /// recorded, extents or a bitmap.
+    pub const FREE_SPACE_INFO: u8 = 198;
+    /// `BTRFS_FREE_SPACE_EXTENT_KEY` — one free run. The item has no
+    /// body; the key is the whole of it.
+    pub const FREE_SPACE_EXTENT: u8 = 199;
+    /// `BTRFS_FREE_SPACE_BITMAP_KEY` — free space as one bit per
+    /// sector.
+    pub const FREE_SPACE_BITMAP: u8 = 200;
 }
 
 /// Well-known objectid numbers.
@@ -86,6 +107,9 @@ pub mod objectid {
     pub const DEV_TREE: u64 = 4;
     /// `BTRFS_FS_TREE_OBJECTID`.
     pub const FS_TREE: u64 = 5;
+    /// `BTRFS_FREE_SPACE_TREE_OBJECTID` — the tree recording what is
+    /// free, as opposed to the extent tree recording what is not.
+    pub const FREE_SPACE_TREE: u64 = 10;
     /// `BTRFS_FIRST_CHUNK_TREE_OBJECTID` — the objectid every chunk item
     /// is filed under.
     pub const FIRST_CHUNK_TREE: u64 = 256;

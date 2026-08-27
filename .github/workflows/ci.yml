@@ -175,6 +175,14 @@ jobs:
       - name: Re-encode every kernel node
         run: cargo test --test node_write_oracle -- --nocapture
 
+      # Btrfs records allocation twice — the extent tree holds what is
+      # taken, the free-space tree holds the complement. Deriving one
+      # from the other and requiring them to agree is a check neither
+      # source can make of itself, and it is what catches a SKINNY
+      # metadata item read as a length.
+      - name: Cross-check free space against the kernel's own record
+        run: cargo test --test free_space_oracle -- --nocapture
+
       - name: Loop-mount with the in-kernel btrfs driver
         run: |
           set -euo pipefail
