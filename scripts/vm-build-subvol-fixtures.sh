@@ -11,6 +11,9 @@
 #   ./scripts/vm-build-subvol-fixtures.sh
 set -euo pipefail
 
+# Bring the machine down when this finishes, however it finishes.
+source "$(dirname "${BASH_SOURCE[0]}")/vm-session.sh"
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Only .vm-share is mounted in the guest, at /share — the repository is

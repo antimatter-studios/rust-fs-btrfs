@@ -92,6 +92,31 @@ case "${1:-}" in
                 # those is a running VM, which is all this promises.
                 ;;
         esac
+
+        # The forwarded SSH port outlives the process that held it.
+        #
+        # Halting can force-kill QEMU, and the host forwarding rule stays
+        # bound for a few seconds afterwards. The next `up` then fails
+        # with "Could not set up host forwarding rule" -- which looks
+        # like a broken VM and is really the previous one still letting
+        # go. It became a routine failure the moment every wrapper
+        # started tearing down, because that made back-to-back
+        # boot-teardown-boot the normal pattern rather than a rare one.
+        #
+        # So teardown is not finished until the port is free.
+        port=$(sed -n 's/.*ssh_port *= *\([0-9][0-9]*\).*/\1/p' \
+                "$VAGRANT_DIR/Vagrantfile" | head -1)
+        if [ -n "$port" ]; then
+            for _ in $(seq 1 30); do
+                lsof -nP -iTCP:"$port" >/dev/null 2>&1 || break
+                sleep 1
+            done
+            if lsof -nP -iTCP:"$port" >/dev/null 2>&1; then
+                echo "vm: port $port is still bound 30s after halt; the next boot will \
+fail to forward it." >&2
+                exit 1
+            fi
+        fi
         ;;
     destroy)
         (cd "$VAGRANT_DIR" && vagrant destroy -f)
