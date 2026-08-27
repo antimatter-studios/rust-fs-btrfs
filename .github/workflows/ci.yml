@@ -132,6 +132,22 @@ jobs:
       # on `generation` for reasons that have nothing to do with the
       # parser. The sibling XFS gate hit the same trap with its
       # free-space counters.
+      # The subvolume fixture, which needs to mount and so cannot come
+      # from build-fixtures-native.sh. Same script the VM runner calls —
+      # deliberately one copy, so CI and a developer's local run cannot
+      # mean different things.
+      #
+      # Without this, tests/subvol_oracle.rs finds no fixture and skips,
+      # which reads exactly like passing. It did, on the run that added
+      # it.
+      - name: Build the subvolume fixture
+        run: sudo bash scripts/build-subvol-fixtures.sh
+
+      # Compared against `btrfs subvolume list` for the same filesystem,
+      # which is the reference a user would check against.
+      - name: Compare the subvolume listing against btrfs-progs
+        run: cargo test --test subvol_oracle -- --nocapture
+
       - name: Run the oracle test against the fixtures
         run: cargo test --test oracle_vm_fixtures -- --nocapture
 
