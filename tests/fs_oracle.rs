@@ -138,6 +138,24 @@ fn every_listed_name_resolves_to_the_inode_it_named() {
         let root = fs.root_inode().expect("root");
         for e in fs.read_dir(root.ino).expect("listing") {
             let name = String::from_utf8_lossy(&e.name).into_owned();
+
+            // A subvolume is listed in its parent directory but names a
+            // tree rather than an inode, so there is nothing in this
+            // tree to resolve it to. The refusal has to be the specific
+            // one — a generic NotFound for a name that is plainly there
+            // would pass this check while telling a reader the opposite
+            // of the truth.
+            if !e.is_inode() {
+                let err = fs
+                    .lookup(root.ino, &e.name)
+                    .expect_err("a subvolume entry cannot resolve to an inode here");
+                assert!(
+                    err.to_string().contains("subvolume"),
+                    "{label}: `{name}` names a subvolume, and the refusal should say so: {err}"
+                );
+                continue;
+            }
+
             let found = fs
                 .lookup(root.ino, &e.name)
                 .unwrap_or_else(|err| panic!("{label}: `{name}` was listed but not found: {err}"));

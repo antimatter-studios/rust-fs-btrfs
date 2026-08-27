@@ -54,6 +54,7 @@ pub mod dir;
 pub mod error;
 pub mod fs;
 pub mod inode;
+pub mod subvol;
 pub mod superblock;
 pub mod write;
 

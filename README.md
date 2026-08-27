@@ -47,7 +47,8 @@ not.
 | Profiles: single, dup, raid0, raid1, raid10 | done |
 | Profiles: raid5/6 | refused explicitly, not guessed |
 | Mixed block groups (`mkfs.btrfs -M`) | reads; covered by the fixture matrix |
-| Subvolumes and snapshots | planned |
+| Subvolumes and snapshots: listing | done — id, path, parent, snapshot and read-only flags, checked against `btrfs subvolume list` |
+| Subvolumes and snapshots: reading inside one | planned — the entry is found and refused by name, not misresolved |
 | Compression (zlib / lzo / zstd extents) | done — all three, verified against files the kernel wrote |
 | Write path: overwrite in place | done — `nodatacow` files only, no journal needed |
 | Write path: anything copy-on-write | planned — see `docs/transaction-format.md` |
