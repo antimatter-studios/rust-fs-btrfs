@@ -47,6 +47,13 @@ use std::sync::Arc;
 /// filesystem namespace.
 pub const FS_TREE_OBJECTID: u64 = 5;
 
+/// One item of the root tree: `(objectid, key_type, offset, data)`.
+///
+/// Named because the tuple is what the root tree actually holds — a key
+/// in three parts and an opaque body whose meaning depends on the type —
+/// and a struct here would invent a shape the format does not have.
+pub type RootTreeItem = (u64, u8, u64, Vec<u8>);
+
 /// `BTRFS_ROOT_ITEM_KEY`.
 pub const ROOT_ITEM_KEY: u8 = 132;
 
@@ -347,6 +354,29 @@ impl Filesystem {
         &self.sb
     }
 
+    /// Every item in the root tree.
+    ///
+    /// The root tree is the index of trees: one `ROOT_ITEM` per
+    /// subvolume saying where its tree lives, and reference items
+    /// naming them. This hands the raw items back so a caller can see
+    /// what is actually there rather than only what is understood.
+    ///
+    /// # Errors
+    ///
+    /// As the B-tree walk.
+    pub fn root_tree_items(&self) -> Result<Vec<RootTreeItem>> {
+        let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
+            Self::read_logical(&self.device, &self.map, logical, buf)
+        };
+        let tree = Tree::from_superblock(&self.sb, &read);
+        let mut out = Vec::new();
+        tree.for_each(self.sb.root, &mut |key: &DiskKey, data: &[u8]| {
+            out.push((key.objectid, key.key_type, key.offset, data.to_vec()));
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
     /// Read one inode by objectid.
     pub fn read_inode(&self, ino: u64) -> Result<Inode> {
         let data = self
@@ -399,6 +429,21 @@ impl Filesystem {
             .into_iter()
             .find(|e| e.name == name)
             .ok_or(Error::NotFound)?;
+
+        // A subvolume is a directory entry whose location names a tree
+        // rather than an inode, so there is nothing in THIS tree to
+        // return. Saying so is the point: reading the entry's objectid
+        // as an inode number finds an unrelated inode of the same
+        // number, or nothing, and `NotFound` for a name that is plainly
+        // there sends the reader looking in the wrong place entirely.
+        if !hit.is_inode() {
+            return Err(Error::UnsupportedFeature(format!(
+                "{:?} names subvolume {} rather than an inode in this tree; reading \
+                 inside a subvolume is not implemented — `subvolumes()` lists them",
+                String::from_utf8_lossy(name),
+                hit.ino
+            )));
+        }
         self.read_inode(hit.ino)
     }
 
