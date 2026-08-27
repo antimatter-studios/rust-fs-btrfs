@@ -332,6 +332,28 @@ impl Filesystem {
         Ok(())
     }
 
+    /// A handle over the same device, reading a different tree.
+    ///
+    /// Used by [`Filesystem::open_subvolume`]. The device, superblock
+    /// and chunk map are shared — they describe the volume rather than
+    /// any one tree — and only the root and the items loaded from it
+    /// differ.
+    ///
+    /// The write capability is deliberately not carried across; see the
+    /// note on `open_subvolume`.
+    pub(crate) fn reroot(&self, fs_tree_root: u64) -> Result<Self> {
+        let mut fs = Filesystem {
+            device: self.device.clone(),
+            writable: None,
+            sb: self.sb.clone(),
+            map: self.map.clone(),
+            fs_tree_root,
+            items: BTreeMap::new(),
+        };
+        fs.load_fs_tree()?;
+        Ok(fs)
+    }
+
     fn load_fs_tree(&mut self) -> Result<()> {
         let device = self.device.clone();
         let map = self.map.clone();

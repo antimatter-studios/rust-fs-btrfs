@@ -313,3 +313,138 @@ fn every_subvolume_has_a_root_of_its_own() {
         expected.keys().collect::<Vec<_>>()
     );
 }
+
+/// Reading inside a subvolume gives that subvolume's contents.
+///
+/// The manifest recorded what each one holds, taken from the mounted
+/// filesystem with `find`. This opens each and compares.
+///
+/// # The case the whole fixture is built around
+///
+/// `sub` gained `after.txt` AFTER `snap` was taken. So a driver that
+/// resolved a snapshot to its parent's *current* tree — the easy
+/// mistake, since a snapshot shares its parent's blocks when taken —
+/// reads `after.txt` inside `snap`, where it has never existed.
+///
+/// Counting names would not catch that. Comparing them does.
+#[test]
+fn each_subvolume_reads_its_own_contents() {
+    let Some(fs) = mount() else {
+        eprintln!("no subvolume fixture — skipping");
+        return;
+    };
+    let expected = contents();
+    if expected.is_empty() {
+        eprintln!("the manifest recorded no contents — skipping");
+        return;
+    }
+
+    let subs = fs.subvolumes().expect("list");
+    let mut checked = 0usize;
+
+    for s in &subs {
+        // `top` is a directory in the default subvolume rather than a
+        // subvolume of its own, so it is checked through the default
+        // handle below.
+        let Some(want) = expected.get(&s.path) else {
+            continue;
+        };
+
+        let view = fs
+            .open_subvolume(s.id)
+            .unwrap_or_else(|e| panic!("opening subvolume {} ({}): {e}", s.id, s.path));
+
+        let root = view.root_inode().expect("its root");
+        let mut got: Vec<String> = view
+            .read_dir(root.ino)
+            .unwrap_or_else(|e| panic!("listing {}: {e}", s.path))
+            .into_iter()
+            .filter(|e| e.is_inode())
+            .map(|e| String::from_utf8_lossy(&e.name).into_owned())
+            .collect();
+        got.sort();
+
+        let mut want = want.clone();
+        want.sort();
+
+        assert_eq!(
+            got, want,
+            "subvolume {:?} holds {got:?}, the manifest recorded {want:?}",
+            s.path
+        );
+        checked += 1;
+    }
+
+    assert!(
+        checked >= 3,
+        "only {checked} subvolumes were compared against the manifest"
+    );
+
+    // Stated separately because it is the point of the fixture: the
+    // snapshot must NOT hold what its parent gained afterwards.
+    let snap = subs.iter().find(|s| s.name == b"snap").expect("snap");
+    let view = fs.open_subvolume(snap.id).expect("open snap");
+    let root = view.root_inode().expect("root");
+    let names: Vec<String> = view
+        .read_dir(root.ino)
+        .expect("list")
+        .into_iter()
+        .map(|e| String::from_utf8_lossy(&e.name).into_owned())
+        .collect();
+
+    assert!(
+        names.iter().any(|n| n == "b.txt"),
+        "the snapshot should hold what its parent held when it was taken: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "after.txt"),
+        "the snapshot holds a file its parent gained AFTER it was taken, so it is \
+         being resolved to the parent's current tree rather than its own: {names:?}"
+    );
+
+    eprintln!(
+        "{checked} subvolumes read their own contents; the snapshot correctly \
+         lacks the file its parent gained afterwards"
+    );
+}
+
+/// A file inside a subvolume reads back with the right bytes.
+///
+/// Listing names proves the tree is the right one; reading a file proves
+/// the extents in it resolve against the same chunk map, which is shared
+/// with the parent filesystem and is the piece most likely to be wired
+/// up wrongly when a handle is re-rooted.
+#[test]
+fn a_file_inside_a_subvolume_reads_back() {
+    let Some(fs) = mount() else {
+        eprintln!("no subvolume fixture — skipping");
+        return;
+    };
+    let subs = fs.subvolumes().expect("list");
+    let sub = subs.iter().find(|s| s.name == b"sub").expect("sub");
+
+    let view = fs.open_subvolume(sub.id).expect("open sub");
+    let inode = view
+        .lookup_path("/b.txt")
+        .expect("the file the fixture wrote into `sub`");
+    let bytes = view.read_file(inode.ino).expect("read it");
+
+    assert_eq!(
+        String::from_utf8_lossy(&bytes).trim(),
+        "in sub",
+        "the file inside the subvolume did not read back what was written to it"
+    );
+
+    // And the same path does not exist in the default subvolume, which
+    // is what says the two handles really are looking at different
+    // trees.
+    assert!(
+        fs.lookup_path("/b.txt").is_err(),
+        "`/b.txt` exists only inside `sub`, so the default tree must not find it"
+    );
+
+    eprintln!(
+        "read {:?} from inside `sub`",
+        String::from_utf8_lossy(&bytes).trim()
+    );
+}
