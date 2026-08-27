@@ -140,6 +140,24 @@ pub fn chunk_tree_uuid_of(block: &[u8]) -> [u8; 16] {
 pub fn build_leaf(sb: &Superblock, id: BlockIdentity, items: &[LeafItem]) -> Result<Vec<u8>> {
     let nodesize = sb.nodesize as usize;
 
+    // A leaf IS level 0. `build_node` already refuses the mirror of
+    // this, and without it the level was the one identity field nothing
+    // checked: a leaf built at level 2 holds items where a reader
+    // descending the tree expects key pointers, and it reads them as
+    // pointers rather than failing.
+    //
+    // The gap showed up as a surviving mutation. Removing the write of
+    // `level` altogether changed nothing any leaf test could see, since
+    // a leaf's level is zero and an unwritten byte is zero too.
+    if id.level != 0 {
+        return Err(Error::UnsupportedFeature(format!(
+            "a leaf is level 0 by definition and this one claims level {}; a block \
+             holding items at a level above the leaves is one a descent reads as \
+             key pointers",
+            id.level
+        )));
+    }
+
     let needed = space_needed(items);
     if needed > nodesize {
         return Err(Error::UnsupportedFeature(format!(
