@@ -42,7 +42,8 @@
 //! the reader here rejects it — which is the behaviour that catches a
 //! copy-on-write writer that forgot the block moved.
 
-use crate::btree::{header_offsets as o, HEADER_SIZE, ITEM_SIZE, LEAF_DATA_OFFSET};
+use crate::btree::KeyPtr;
+use crate::btree::{header_offsets as o, HEADER_SIZE, ITEM_SIZE, KEY_PTR_SIZE, LEAF_DATA_OFFSET};
 use crate::chunk::{DiskKey, DISK_KEY_SIZE};
 use crate::error::{Error, Result};
 use crate::superblock::{Superblock, CSUM_SIZE};
@@ -178,6 +179,88 @@ pub fn build_leaf(sb: &Superblock, id: BlockIdentity, items: &[LeafItem]) -> Res
         block[k + 4..k + 8].copy_from_slice(&(item.data.len() as u32).to_le_bytes());
 
         block[data_end..data_end + item.data.len()].copy_from_slice(item.data);
+    }
+
+    stamp_checksum(&mut block, sb);
+    Ok(block)
+}
+
+/// How many key pointers fit in one node.
+///
+/// A node is its header and then nothing but key pointers — there is no
+/// data end to grow back towards, which is why this is a plain division
+/// where a leaf needs [`space_needed`].
+pub fn key_ptr_capacity(sb: &Superblock) -> usize {
+    (sb.nodesize as usize - HEADER_SIZE) / KEY_PTR_SIZE
+}
+
+/// Build an internal node — a block of pointers to child blocks.
+///
+/// # How a node differs from a leaf
+///
+/// A leaf grows from both ends and the free space is in the middle. A
+/// node grows from one end only: header, then key pointers, then slack
+/// to the end of the block. So there is no offset to compute and no
+/// direction to get backwards, and the two failure modes are different
+/// ones — the order of the pointers, and what each pointer's key says.
+///
+/// **Each key is the smallest key in the subtree below it**, not the
+/// largest and not the key of the child's first item as stored. Descent
+/// takes the last child whose key is less than or equal to the one
+/// being looked for, so a key that is too large skips a subtree that
+/// held the answer — and does it silently, because the search still
+/// terminates and still returns "not found".
+///
+/// `level` is the node's own height, one above its children. A node
+/// whose level does not match its children's is a tree a reader walks
+/// off the bottom of.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] if the pointers do not fit in one block
+/// — splitting is the caller's decision — if they are not sorted, or if
+/// `level` is zero, which would claim to be a leaf while holding
+/// pointers.
+pub fn build_node(sb: &Superblock, id: BlockIdentity, ptrs: &[KeyPtr]) -> Result<Vec<u8>> {
+    let nodesize = sb.nodesize as usize;
+
+    if id.level == 0 {
+        return Err(Error::UnsupportedFeature(
+            "a node holding key pointers cannot be at level 0, which is what a leaf is".to_string(),
+        ));
+    }
+
+    let capacity = key_ptr_capacity(sb);
+    if ptrs.len() > capacity {
+        return Err(Error::UnsupportedFeature(format!(
+            "{} key pointers need more than the {capacity} a {nodesize}-byte node holds; \
+             splitting a node is not implemented",
+            ptrs.len()
+        )));
+    }
+
+    // Same reason as a leaf: the descent bisects on this order, so an
+    // unsorted node is not slow, it is wrong.
+    for pair in ptrs.windows(2) {
+        if !key_before(&pair[0].key, &pair[1].key) {
+            return Err(Error::UnsupportedFeature(format!(
+                "node key pointers are out of order: {:?} is not before {:?}",
+                pair[0].key, pair[1].key
+            )));
+        }
+    }
+
+    let mut block = vec![0u8; nodesize];
+    write_header(&mut block, sb, id, ptrs.len() as u32);
+
+    for (i, ptr) in ptrs.iter().enumerate() {
+        let at = LEAF_DATA_OFFSET + i * KEY_PTR_SIZE;
+        write_key(&mut block[at..], &ptr.key);
+        // The struct is packed, so both u64s start on odd offsets — 17
+        // and 25 past the start of the pointer. Nothing pads them.
+        let k = at + DISK_KEY_SIZE;
+        block[k..k + 8].copy_from_slice(&ptr.blockptr.to_le_bytes());
+        block[k + 8..k + 16].copy_from_slice(&ptr.generation.to_le_bytes());
     }
 
     stamp_checksum(&mut block, sb);
