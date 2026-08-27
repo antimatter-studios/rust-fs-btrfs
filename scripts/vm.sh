@@ -8,6 +8,8 @@
 #   vm.sh put <file>    copy a file into the shared directory, echo guest path
 #   vm.sh down          halt the VM (state is kept; next `up` is fast)
 #   vm.sh status        say whether the VM is running (exit 0 = running)
+#   vm.sh reap          stop a VM nothing cleaned up (the safety net)
+#   vm.sh hold          mark the VM as deliberately left running
 #   vm.sh destroy       delete the VM entirely
 #
 # The VM is the real-Linux oracle: mkfs.btrfs, the in-kernel Btrfs driver
@@ -21,6 +23,10 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VAGRANT_DIR="$REPO/tests/vagrant/debian"
 SHARE="$REPO/.vm-share"
+# Set when someone asked for the machine directly, so `reap` leaves it
+# alone. Inside .vagrant/, which is already gitignored, and beside the
+# machine state it describes.
+HOLD="$VAGRANT_DIR/.vagrant/keep-running"
 
 mkdir -p "$SHARE"
 
@@ -102,6 +108,7 @@ case "${1:-}" in
         # A teardown that says it worked while the VM is still up is the
         # exact failure the defer was added to prevent, and it is worse
         # than one that fails loudly: nobody looks again at a green run.
+        rm -f "$HOLD"
         (cd "$VAGRANT_DIR" && vagrant halt) || true
         state=$(cd "$VAGRANT_DIR" && vagrant status --machine-readable 2>/dev/null \
                 | sed -n 's/.*,state,//p' | head -1)
@@ -135,7 +142,52 @@ case "${1:-}" in
                 ;;
         esac
         ;;
+    hold)
+        # "I want this machine up; do not reap it."
+        #
+        # Distinct from KEEP_VM, which says "do not tear down between
+        # the steps of THIS run". This one outlives the process that set
+        # it, because the thing it records also does: a person who ran
+        # `chore vm:up` to work in the guest.
+        mkdir -p "$(dirname "$HOLD")"
+        : > "$HOLD"
+        echo 'vm: held — reap will leave it running until vm.sh down.' >&2
+        ;;
+    reap)
+        # The safety net, run from chores.yml as `lifecycle: after_all`
+        # so ANY chore invocation cleans up a machine that nothing else
+        # did.
+        #
+        # `defer:` is the primary teardown and stays the primary
+        # teardown: it fails the task when it fails, which is what makes
+        # a leak impossible to miss. But it only covers a task that
+        # reached the step that registered it. It cannot cover a bare
+        # `cargo test` — several suites shell out to this script and
+        # boot the machine — or a run that was killed outright. This
+        # can, on the next chore invocation of any kind.
+        #
+        # It fails SOFT, and that is deliberate rather than a
+        # limitation: chore prints an after_all failure without failing
+        # the run, which is right for a net. Turning an unrelated
+        # `chore build` red because somebody else left a VM up would
+        # teach people to ignore it.
+        #
+        # The probe is a process check, not `vagrant status`, because
+        # this runs on every invocation: ~20ms against ~1s, which is
+        # what makes it affordable to have always on.
+        if ! pgrep -f "$VAGRANT_DIR/.vagrant/machines" >/dev/null 2>&1; then
+            exit 0
+        fi
+        if [ -f "$HOLD" ]; then
+            echo "[vm] left running: it was asked for with \`chore vm:up\`. \`chore vm:down\` stops it." >&2
+            exit 0
+        fi
+        echo "vm: a machine was left running by something that did not clean up — stopping it." >&2
+        echo "    (a bare \`cargo test\` boots it; \`chore test\` tears it down.)" >&2
+        exec "${BASH_SOURCE[0]}" down
+        ;;
     destroy)
+        rm -f "$HOLD"
         (cd "$VAGRANT_DIR" && vagrant destroy -f)
         ;;
     *)

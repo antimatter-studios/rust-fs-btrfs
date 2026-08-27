@@ -45,6 +45,20 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --release
 
+      # The VM-teardown guards, which decide whether a machine is left
+      # running. They stub pgrep and vagrant, so they need neither.
+      #
+      # These existed and ran nowhere: the same hole the fixture oracles
+      # had, in the tests written to close it.
+      - name: VM teardown and reaper semantics
+        run: |
+          set -euo pipefail
+          for t in tests/scripts/*.sh; do
+            echo "::group::$t"
+            bash "$t"
+            echo "::endgroup::"
+          done
+
   # The gate that actually decides whether this driver reads Btrfs.
   #
   # The unit suite can only prove the parser agrees with the fixtures we
