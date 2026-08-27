@@ -149,6 +149,11 @@ case "${1:-}" in
         # the steps of THIS run". This one outlives the process that set
         # it, because the thing it records also does: a person who ran
         # `chore vm:up` to work in the guest.
+        #
+        # A lifecycle hook can see `{{.TASK}}`, the invoked task's name,
+        # so it is fair to ask why a file on disk is needed at all. It
+        # is because that only describes the CURRENT invocation. The
+        # machine has to survive the next one, and the one after that.
         mkdir -p "$(dirname "$HOLD")"
         : > "$HOLD"
         echo 'vm: held — reap will leave it running until vm.sh down.' >&2

@@ -148,6 +148,14 @@ tasks:
     # after_all reaper leaves it alone. Without it this task would boot
     # a VM and the lifecycle hook would stop it again on the way out —
     # the one case where an unconditional net is wrong.
+    #
+    # NOT replaceable with `{{.TASK}}`, which a lifecycle hook does have
+    # and which names the invoked task. That would stop `chore vm:up`
+    # reaping its own machine and nothing more: the requirement is that
+    # the machine survives `chore build` an hour later, and by then
+    # `{{.TASK}}` says `build`. The mark has to outlive the invocation
+    # that set it, because so does the machine — which is also why
+    # `down` and `destroy` clear it rather than leaving it to go stale.
     cmds:
       - './scripts/vm.sh up'
       - './scripts/vm.sh hold'
