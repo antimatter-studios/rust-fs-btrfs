@@ -183,6 +183,12 @@ jobs:
       - name: Cross-check free space against the kernel's own record
         run: cargo test --test free_space_oracle -- --nocapture
 
+      # An allocation is not made until the extent tree records it.
+      # The item's shape follows a feature bit rather than the struct
+      # definition, so it is rebuilt from the kernel's own.
+      - name: Re-encode every allocation record
+        run: cargo test --test extent_write_oracle -- --nocapture
+
       - name: Loop-mount with the in-kernel btrfs driver
         run: |
           set -euo pipefail

@@ -53,6 +53,7 @@ pub mod chunk;
 pub mod compression;
 pub mod dir;
 pub mod error;
+pub mod extent_write;
 pub mod fs;
 pub mod inode;
 pub mod subvol;

@@ -349,6 +349,28 @@ impl Filesystem {
         Ok(Some(merge_adjacent(out)))
     }
 
+    /// Walk the extent tree, handing every item to `visit`.
+    ///
+    /// The extent tree is what the filesystem believes is allocated, so
+    /// this is how anything that must agree with that belief -- an
+    /// allocator, a checker, a test rebuilding the kernel's own items --
+    /// gets to see it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a tree read failure.
+    pub fn for_each_extent_item(&self, visit: &mut dyn FnMut(&DiskKey, &[u8])) -> Result<()> {
+        let root = self.tree_root(objectid::EXTENT_TREE)?;
+        let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
+            Self::read_logical(&self.device, &self.map, logical, buf)
+        };
+        let tree = Tree::from_superblock(&self.sb, &read);
+        tree.for_each(root, &mut |key: &DiskKey, data: &[u8]| {
+            visit(key, data);
+            Ok(true)
+        })
+    }
+
     /// Look up a tree's root address by its objectid.
     ///
     /// # Errors
