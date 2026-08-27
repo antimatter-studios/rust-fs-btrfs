@@ -69,7 +69,29 @@ case "${1:-}" in
         echo "/share/$(basename "$2")"
         ;;
     down)
-        (cd "$VAGRANT_DIR" && vagrant halt)
+        # Halt, then CONFIRM. `vagrant halt` reporting success is not the
+        # same as the machine being down, and this runs as a `defer:` in
+        # chores.yml — so its exit status is the only thing standing
+        # between a leaked QEMU process and a green test run.
+        #
+        # A teardown that says it worked while the VM is still up is the
+        # exact failure the defer was added to prevent, and it is worse
+        # than one that fails loudly: nobody looks again at a green run.
+        (cd "$VAGRANT_DIR" && vagrant halt) || true
+        state=$(cd "$VAGRANT_DIR" && vagrant status --machine-readable 2>/dev/null \
+                | sed -n 's/.*,state,//p' | head -1)
+        case "$state" in
+            running)
+                echo "vm: halt did not stop the machine — it is still running." >&2
+                echo "    Left as it is rather than force-killed; \`vm.sh destroy\` reclaims it." >&2
+                exit 1
+                ;;
+            *)
+                # poweroff, not_created, aborted, or a status that could
+                # not be read because the machine was never made. None of
+                # those is a running VM, which is all this promises.
+                ;;
+        esac
         ;;
     destroy)
         (cd "$VAGRANT_DIR" && vagrant destroy -f)
