@@ -165,6 +165,16 @@ jobs:
       - name: Run the oracle test against the fixtures
         run: cargo test --test oracle_vm_fixtures -- --nocapture
 
+      # Rebuild every tree block the kernel wrote and require the bytes
+      # back. These run HERE, not in the fixture-less job, because
+      # without fixtures they find nothing and report success — which is
+      # what the leaf oracle did until this step existed.
+      - name: Re-encode every kernel leaf
+        run: cargo test --test tree_write_oracle -- --nocapture
+
+      - name: Re-encode every kernel node
+        run: cargo test --test node_write_oracle -- --nocapture
+
       - name: Loop-mount with the in-kernel btrfs driver
         run: |
           set -euo pipefail
