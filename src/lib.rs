@@ -56,6 +56,7 @@ pub mod fs;
 pub mod inode;
 pub mod subvol;
 pub mod superblock;
+pub mod tree_write;
 pub mod write;
 
 pub use chunk::{Chunk, ChunkMap, ChunkProfile, Mapping};
