@@ -49,6 +49,7 @@ not.
 | Mixed block groups (`mkfs.btrfs -M`) | reads; covered by the fixture matrix |
 | Subvolumes and snapshots: listing | done — id, path, parent, snapshot and read-only flags, checked against `btrfs subvolume list` |
 | Subvolumes and snapshots: reading inside one | done — `open_subvolume` gives a handle over that tree; read-only |
+| A path that crosses into a subvolume | not yet — `lookup_path("/sub/x")` stops at the boundary and says which subvolume to open. An inode number means nothing without its tree, so crossing has to hand back both |
 | Compression (zlib / lzo / zstd extents) | done — all three, verified against files the kernel wrote |
 | Write path: overwrite in place | done — `nodatacow` files only, no journal needed |
 | Write path: anything copy-on-write | planned — see `docs/transaction-format.md` |
