@@ -10,6 +10,9 @@
 #   ./scripts/vm-build-commit-fixtures.sh
 set -euo pipefail
 
+# Bring the machine down when this finishes, however it finishes.
+source "$(dirname "${BASH_SOURCE[0]}")/vm-session.sh"
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 guest_path="$("$REPO/scripts/vm.sh" put "$REPO/scripts/build-commit-fixtures.sh")"
 "$REPO/scripts/vm.sh" run "BTRFS_FIXTURE_DIR=/share bash '$guest_path'"
