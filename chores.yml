@@ -114,6 +114,12 @@ tasks:
     desc: Halt the oracle VM, keeping its disk image
     cmds: ['./scripts/vm.sh down']
 
+  vm:status:
+    desc: Say whether the oracle VM is running
+    # "Is anything still up?" had no answer short of reading `ps` for a
+    # qemu command line. Every leak was found that way, after the fact.
+    cmds: ['./scripts/vm.sh status']
+
   vm:destroy:
     desc: Destroy the oracle VM, reclaiming its disk image
     # Halting keeps the image and a re-boot is quick; destroying reclaims
@@ -123,12 +129,65 @@ tasks:
     cmds: ['./scripts/vm.sh destroy']
 
   fixtures:
-    desc: Build the test fixtures in the oracle VM
+    desc: 'Build test fixtures: chore fixtures [--set geometry|subvol|commit|all] [--only name,name]'
+    args:
+      - name: set
+        desc: which set to build; every set by default
+      - name: only
+        desc: 'rebuild just these fixtures, comma separated (e.g. --only deep16k)'
+    vars:
+      set: all
+      only: ''
     # Same reasoning as `test`. Building fixtures is the other thing that
     # boots the VM, and the one that runs longest unattended.
+    #
+    # THIS USED TO RUN ONLY vm-build-fixtures.sh. The subvolume and
+    # commit fixtures cannot be produced by build-fixtures-native.sh —
+    # they need to mount — so `chore fixtures` left them missing, and the
+    # three oracles that read them found nothing and SKIPPED. A skipped
+    # oracle reads exactly like a passing one, which is how the leaf
+    # oracle went unnoticed running against no fixtures at all. CI builds
+    # all three; this now builds the same three.
     cmds:
       - defer: ./scripts/vm.sh down
-      - ./scripts/vm-build-fixtures.sh
+      - |
+        set -euo pipefail
+        # One boot for the whole run, one teardown at the end.
+        #
+        # Each wrapper now tears the machine down when it finishes, which
+        # is right when it is run on its own and wrong three in a row:
+        # build, halt, boot, build, halt, boot. KEEP_VM tells them to
+        # leave it up. The `defer:` above is what brings it down — once,
+        # whether this succeeded or failed, and chore fails the task if
+        # that teardown fails.
+        export KEEP_VM=1
+        # Rebuilding one fixture instead of the matrix. The full set
+        # takes the better part of an hour, most of it filling two deep
+        # trees with tens of thousands of files, so an interrupted run
+        # used to mean rebuilding all of it to repair the one image that
+        # was half written.
+        export BTRFS_ONLY='{{.only}}'
+        ./scripts/vm.sh up
+        run() {
+          echo "==> $1"
+          "./scripts/$1"
+        }
+        case "{{.set}}" in
+          geometry) run vm-build-fixtures.sh ;;
+          subvol)   run vm-build-subvol-fixtures.sh ;;
+          commit)   run vm-build-commit-fixtures.sh ;;
+          all)
+            # Geometry first: most suites read those. The other two are
+            # independent of it and of each other.
+            run vm-build-fixtures.sh
+            run vm-build-subvol-fixtures.sh
+            run vm-build-commit-fixtures.sh
+            ;;
+          *)
+            echo "unknown set '{{.set}}' — one of: geometry subvol commit all" >&2
+            exit 2
+            ;;
+        esac
 
   fixtures:clean:
     desc: Remove the built fixtures (they are regenerable, and large)

@@ -7,6 +7,7 @@
 #   vm.sh share         print the host path of the shared directory
 #   vm.sh put <file>    copy a file into the shared directory, echo guest path
 #   vm.sh down          halt the VM (state is kept; next `up` is fast)
+#   vm.sh status        say whether the VM is running (exit 0 = running)
 #   vm.sh destroy       delete the VM entirely
 #
 # The VM is the real-Linux oracle: mkfs.btrfs, the in-kernel Btrfs driver
@@ -45,7 +46,31 @@ vm_up() {
     if ! (cd "$VAGRANT_DIR" && vagrant status --machine-readable 2>/dev/null \
             | grep -q ',state,running'); then
         echo "[vm] booting Debian arm64 oracle (first run provisions, ~2 min)..." >&2
-        (cd "$VAGRANT_DIR" && vagrant up)
+        # Retried, because the forwarded SSH port is not always free the
+        # instant the previous machine stops:
+        #
+        #   qemu-system-aarch64: Could not set up host forwarding rule
+        #
+        # This became routine once every wrapper started tearing down,
+        # which made stop-then-start the normal pattern. Waiting for the
+        # port to look free was tried first and does not work — `lsof`
+        # reports it free while qemu still cannot bind it — so the retry
+        # is here, where the failure actually happens, and covers every
+        # cause rather than the one that was guessed at.
+        for attempt in 1 2 3; do
+            if (cd "$VAGRANT_DIR" && vagrant up); then
+                break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+                echo "vm: the machine would not boot after 3 attempts." >&2
+                exit 1
+            fi
+            echo "[vm] boot failed, retrying in 5s (attempt $attempt of 3)..." >&2
+            sleep 5
+            # A half-started machine holds the resources the next attempt
+            # needs, so it is stopped before trying again.
+            (cd "$VAGRANT_DIR" && vagrant halt -f) >/dev/null 2>&1 || true
+        done
     fi
 }
 
@@ -93,30 +118,22 @@ case "${1:-}" in
                 ;;
         esac
 
-        # The forwarded SSH port outlives the process that held it.
-        #
-        # Halting can force-kill QEMU, and the host forwarding rule stays
-        # bound for a few seconds afterwards. The next `up` then fails
-        # with "Could not set up host forwarding rule" -- which looks
-        # like a broken VM and is really the previous one still letting
-        # go. It became a routine failure the moment every wrapper
-        # started tearing down, because that made back-to-back
-        # boot-teardown-boot the normal pattern rather than a rare one.
-        #
-        # So teardown is not finished until the port is free.
-        port=$(sed -n 's/.*ssh_port *= *\([0-9][0-9]*\).*/\1/p' \
-                "$VAGRANT_DIR/Vagrantfile" | head -1)
-        if [ -n "$port" ]; then
-            for _ in $(seq 1 30); do
-                lsof -nP -iTCP:"$port" >/dev/null 2>&1 || break
-                sleep 1
-            done
-            if lsof -nP -iTCP:"$port" >/dev/null 2>&1; then
-                echo "vm: port $port is still bound 30s after halt; the next boot will \
-fail to forward it." >&2
+        ;;
+    status)
+        # Answers the question that used to need `ps | grep qemu`: is the
+        # machine up. Exits 0 when it is running, 1 when it is not, so it
+        # is usable in a condition as well as readable by a person.
+        state=$(cd "$VAGRANT_DIR" && vagrant status --machine-readable 2>/dev/null \
+                | sed -n 's/.*,state,//p' | head -1)
+        case "$state" in
+            running)
+                echo "vm: running"
+                ;;
+            *)
+                echo "vm: not running (${state:-no machine})"
                 exit 1
-            fi
-        fi
+                ;;
+        esac
         ;;
     destroy)
         (cd "$VAGRANT_DIR" && vagrant destroy -f)

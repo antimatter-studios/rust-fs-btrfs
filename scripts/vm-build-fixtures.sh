@@ -19,6 +19,32 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/fixture-geometries.sh
 source "$REPO/scripts/fixture-geometries.sh"
 
+# BTRFS_ONLY — rebuild named fixtures instead of the whole matrix.
+#
+#   BTRFS_ONLY=deep16k ./scripts/vm-build-fixtures.sh
+#   BTRFS_ONLY=deep4k,rich ./scripts/vm-build-fixtures.sh
+#
+# The full matrix takes the better part of an hour, most of it filling
+# the two deep trees with tens of thousands of files. Without this, an
+# interrupted run meant rebuilding all of it to repair the one image
+# that was half written -- which is exactly what happened, and what
+# turned a killed background job into a lost afternoon.
+#
+# Names are the fixture names without the "btrfs-" prefix: the geometry
+# and populated names from fixture-geometries.sh, plus `rich`,
+# `nodatacow`, and `comp-<algo>`.
+wanted() {
+    [ -z "${BTRFS_ONLY:-}" ] && return 0
+    case ",${BTRFS_ONLY}," in
+        *",$1,"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if [ -n "${BTRFS_ONLY:-}" ]; then
+    echo "BTRFS_ONLY=$BTRFS_ONLY — building only those fixtures." >&2
+fi
+
 "$REPO/scripts/vm.sh" up
 
 skipped=()
@@ -28,6 +54,7 @@ skipped=()
 for geom in "${BTRFS_GEOMETRIES[@]}"; do
     name="${geom%%:*}"
     args="${geom#*:}"
+    wanted "$name" || continue
     out="$("$REPO/scripts/vm.sh" run "
         set -e
         cd /share
@@ -78,6 +105,7 @@ for spec in "${BTRFS_POPULATED[@]}"; do
     name="${spec%%:*}"; rest="${spec#*:}"
     args="${rest%%:*}"; rest="${rest#*:}"
     count="${rest%%:*}"; size="${rest##*:}"
+    wanted "$name" || continue
     "$REPO/scripts/vm.sh" run "
         set -e
         cd /share
@@ -134,7 +162,9 @@ build_rich() {
         SHARE_DIR="$SHARE" sudo -E bash -c "SHARE_DIR=\"$SHARE\"; $script"
     fi
 }
-build_rich vm
+if wanted "$BTRFS_RICH_NAME"; then
+    build_rich vm
+fi
 
 # ---------------------------------------------------------------------
 # The nodatacow fixture: the one shape of file Btrfs writes in place.
@@ -146,6 +176,7 @@ build_rich vm
 # place regardless would corrupt it while looking correct on the other,
 # so tests/write_oracle.rs requires that one to be refused.
 # ---------------------------------------------------------------------
+if wanted nodatacow; then
 "$REPO/scripts/vm.sh" run "
     set -e
     cd /share
@@ -162,6 +193,7 @@ build_rich vm
     sync; umount \$mnt; rmdir \$mnt
     echo 'BUILT nodatacow'
 "
+fi
 
 # ---------------------------------------------------------------------
 # One fixture per compression algorithm, each with a manifest the kernel
@@ -217,5 +249,6 @@ build_compressed() {
 }
 
 for algo in $BTRFS_COMPRESSION_ALGOS; do
+    wanted "comp-$algo" || continue
     build_compressed "$algo"
 done
