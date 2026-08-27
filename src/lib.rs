@@ -46,6 +46,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod block_group;
 pub mod btree;
 pub mod capi;
 pub mod chunk;
