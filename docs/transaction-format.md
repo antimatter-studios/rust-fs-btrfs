@@ -179,10 +179,51 @@ environment caps files below that size.
 | `SHARED_BLOCK_REF` (type 182) layout | snapshot a subvolume whose tree is level ≥ 1 |
 | `FREE_SPACE_BITMAP` (type 200) layout | fragment a block group past the extent-vs-bitmap threshold |
 | the inline-ref cap formula | a third nodesize |
-| write ordering and barrier placement | an I/O trace of a live commit; static images cannot show it |
+| ~~write ordering and barrier placement~~ | **settled** — see "The order, observed" below |
 
-Ordering is the one thing above that is reasoned rather than observed. The safe order is
-data, then checksums, then tree blocks leaf-to-root, then a barrier, then superblocks.
+Ordering used to be the one thing above that was reasoned rather than observed. It is
+observed now — see below — and the reasoning was right about the shape and incomplete
+about the end.
+
+## The order, observed
+
+`scripts/trace-commit.sh` records one live commit with `blktrace`, watching the loop
+device the filesystem is mounted on. Only `D` events are kept: the moment each request
+was *dispatched* to the device, which is the order the device sees.
+
+One `touch` and one `sync`, on a filesystem `mkfs.btrfs` made with today's defaults:
+
+```text
+D WSM  76160  32     ┐
+D WSM 141696  32     │ four tree blocks, as two DUP pairs
+D WSM 141728 128     │   16 KiB mirrored at 76160 / 141696
+D WSM  76192 128     ┘   64 KiB mirrored at 141728 / 76192
+D FN                 <- flush
+D WSM    128   8     superblock copy at 64 KiB
+D WSM 131072   8     superblock copy at 64 MiB
+D FN                 <- flush
+```
+
+Identical across three runs.
+
+**What this confirms.** Tree blocks first, then a barrier, then the superblocks. Both
+mirrors of a DUP block are written before the barrier, so a torn write to one leaves the
+other and the barrier still orders both against the superblock.
+
+**What it adds, and what nobody had reasoned.** There is a *second* flush, after the
+superblocks. And the superblocks are written with **no FUA** — the flags are `WSM`,
+write/sync/metadata, not the `A` that force-unit-access would show. So durability of the
+commit point comes from the trailing flush rather than from FUA on the write itself. A
+writer that set FUA and omitted the second flush would be doing something the kernel does
+not do; one that omitted both would have no commit point at all.
+
+**What it does not show.** This filesystem was small enough for two superblock copies,
+and the trace is of a metadata-only commit — no data extents and so no checksum-tree
+leaf. A data write would add both, and the document's reasoning puts them before the
+tree blocks. That part is still reasoned.
+
+The mirrors come out interleaved — `A1 B1 B2 A2` rather than `A1 A2 B1 B2` — which is the
+I/O scheduler and not the filesystem. Nothing should depend on it.
 
 ## An incidental find
 

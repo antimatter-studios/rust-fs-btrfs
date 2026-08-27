@@ -116,7 +116,14 @@ Vagrant.configure("2") do |config|
     #                the oracle tooling
     # xfsprogs    -- so the same box also serves the XFS driver
     # attr/acl    -- setfattr/setfacl for feature-rich fixtures
-    apt-get install -y -qq btrfs-progs xfsprogs attr acl e2fsprogs
+    # blktrace is here for one question the on-disk images cannot answer.
+    # docs/transaction-format.md records write ordering and barrier
+    # placement as "reasoned rather than observed — static images cannot
+    # show it": a finished filesystem shows WHAT was written and never
+    # in what order, nor where the flushes went. A trace of a live commit
+    # does, and it is the only oracle for the part of a copy-on-write
+    # writer that crash-consistency depends on.
+    apt-get install -y -qq btrfs-progs xfsprogs attr acl e2fsprogs blktrace
     modprobe btrfs
     # The exotic checksum algorithms live in separate crypto modules; load
     # them up front so a mount of an xxhash/sha256/blake2 image is not the
