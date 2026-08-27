@@ -24,6 +24,39 @@ vars:
   TRIPLE: aarch64-apple-darwin
   LIBNAME: fs_btrfs
 
+# The safety net for a leaked VM.
+#
+# `defer:` is the primary teardown and stays it: it runs once per task,
+# it is positional so it only registers if the thing it tears down was
+# actually reached, and a `defer:` that fails FAILS AN OTHERWISE-GREEN
+# TASK — which is what makes a machine that would not stop impossible
+# to miss.
+#
+# What `defer:` cannot cover is a path that never reached it. A bare
+# `cargo test` boots the machine — several suites shell out to
+# scripts/vm.sh — with chore not involved at all. A run killed outright
+# (SIGKILL, a background job reaped by its harness) never unwinds
+# anything, in chore or in a shell trap. Both happened here in one
+# afternoon.
+#
+# `after_all` runs once per invocation, on success, on failure and on
+# Ctrl-C, so any LATER chore invocation of any task cleans up what was
+# left behind. `chore build` is enough.
+#
+# It fails SOFT, and that is the right shape for a net rather than a
+# shortcoming: chore prints an after_all failure without failing the
+# run. Turning an unrelated `chore build` red because something else
+# left a VM running would teach people to ignore it. The loud failure
+# stays on `defer:`, where it belongs.
+#
+# `vm.sh reap` probes with a process check, not `vagrant status`: ~20ms
+# against ~1s. That is what makes it affordable on every task rather
+# than wired into the few that use the VM — the objection that kept it
+# out before.
+lifecycle:
+  after_all:
+    - ./scripts/vm.sh reap
+
 tasks:
   staticlib:
     desc: Build the static library and its headers into this crate's dist/
@@ -93,9 +126,12 @@ tasks:
     # the property that matters, because every leak was either a failure
     # path or someone moving on, and neither is fixed by remembering.
     #
-    # It is `defer:` on the tasks that use the VM rather than
-    # `lifecycle: after_all`, which would fire on every invocation —
-    # `chore build` would pay a vagrant status it has no use for.
+    # `defer:` here rather than relying on the `lifecycle: after_all`
+    # reaper at the top of this file, because the two are for different
+    # things. This one is the teardown: it belongs to the task that
+    # booted the machine, and it FAILS THE TASK if the machine will not
+    # stop. The reaper is a net for the paths no defer can reach, and it
+    # fails soft. Having both is the point; either alone leaves a hole.
     cmds:
       - defer: ./scripts/vm.sh down
       - cargo test
@@ -107,8 +143,14 @@ tasks:
       - cargo clippy --all-targets -- -D warnings
 
   vm:up:
-    desc: Boot the oracle VM
-    cmds: ['./scripts/vm.sh up']
+    desc: Boot the oracle VM and keep it up until `chore vm:down`
+    # `hold` marks the machine as deliberately left running, so the
+    # after_all reaper leaves it alone. Without it this task would boot
+    # a VM and the lifecycle hook would stop it again on the way out —
+    # the one case where an unconditional net is wrong.
+    cmds:
+      - './scripts/vm.sh up'
+      - './scripts/vm.sh hold'
 
   vm:down:
     desc: Halt the oracle VM, keeping its disk image
