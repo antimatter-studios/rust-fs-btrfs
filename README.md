@@ -22,8 +22,14 @@ address anything else at all.
 
 ## Status
 
-Under active development. The table is the honest state of the on-disk reader,
+Under active development. The table is the honest state of what is implemented,
 not a roadmap.
+
+It was last wrong in the other direction: it described a reader with the write
+path "out of scope" and B-tree traversal, inodes and compression "planned", all
+of which had been in for some time. A status table that understates is not
+harmless — someone deciding whether this is usable reads it and concludes it is
+not.
 
 | Area | Support |
 |------|---------|
@@ -32,16 +38,20 @@ not a roadmap.
 | Checksum: **crc32c** | done |
 | Checksum: **xxhash64**, **sha256**, **blake2b** | done — all four verified against real media |
 | System chunk array → chunk tree bootstrap | done |
-| Chunk tree / logical→physical mapping | done (from the bootstrap array; full tree walk pending) |
-| B-tree node + leaf traversal | planned |
-| Root tree, fs tree, extent tree | planned |
-| Inodes, directory items, extent data | planned |
+| Chunk tree / logical→physical mapping | done — bootstrap array, then the full tree folded in |
+| B-tree node + leaf traversal | done — walk and keyed search, on multi-level trees |
+| Root tree, fs tree, extent tree | done |
+| Inodes, directory items, extent data | done |
+| Directory listing, lookup, path resolution | done |
+| Symlinks | done |
 | Profiles: single, dup, raid0, raid1, raid10 | done |
 | Profiles: raid5/6 | refused explicitly, not guessed |
 | Mixed block groups (`mkfs.btrfs -M`) | reads; covered by the fixture matrix |
 | Subvolumes and snapshots | planned |
-| Compression (zlib / lzo / zstd extents) | planned |
-| Write path | **out of scope** — this is a reader |
+| Compression (zlib / lzo / zstd extents) | done — all three, verified against files the kernel wrote |
+| Write path: overwrite in place | done — `nodatacow` files only, no journal needed |
+| Write path: anything copy-on-write | planned — see `docs/transaction-format.md` |
+| C ABI (`fs_btrfs_*`) | done, including the write entry points |
 
 ## Test contract
 
