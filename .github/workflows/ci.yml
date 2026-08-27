@@ -143,6 +143,20 @@ jobs:
       - name: Build the subvolume fixture
         run: sudo bash scripts/build-subvol-fixtures.sh
 
+      # Seven superblocks of one filesystem, six commits apart. Six
+      # rather than one because the backup ring has four slots and the
+      # index is (generation - 1) mod 4 — a single commit exercises one
+      # slot, and a writer that hardcoded a slot number would pass.
+      - name: Build the commit fixtures
+        run: sudo bash scripts/build-commit-fixtures.sh
+
+      # Turn each captured superblock into the next one and require the
+      # bytes to match. The superblock is the commit point, so this is
+      # the strongest claim available about a writer that has not yet
+      # written anything.
+      - name: Reproduce each committed superblock
+        run: cargo test --test super_write_oracle -- --nocapture
+
       # Compared against `btrfs subvolume list` for the same filesystem,
       # which is the reference a user would check against.
       - name: Compare the subvolume listing against btrfs-progs
