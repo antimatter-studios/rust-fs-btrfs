@@ -460,9 +460,10 @@ impl Filesystem {
         // there sends the reader looking in the wrong place entirely.
         if !hit.is_inode() {
             return Err(Error::UnsupportedFeature(format!(
-                "{:?} names subvolume {} rather than an inode in this tree; reading \
-                 inside a subvolume is not implemented — `subvolumes()` lists them",
+                "{:?} names subvolume {} rather than an inode in this tree — open it \
+                 with `open_subvolume({})` and look the rest of the path up in there",
                 String::from_utf8_lossy(name),
+                hit.ino,
                 hit.ino
             )));
         }
