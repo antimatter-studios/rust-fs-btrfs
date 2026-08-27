@@ -254,6 +254,54 @@ fn path_of(id: u64, names: &std::collections::BTreeMap<u64, (u64, Vec<u8>)>) -> 
     parts.join("/")
 }
 
+impl Filesystem {
+    /// Open one subvolume as a filesystem of its own.
+    ///
+    /// A subvolume is a separate tree over the same device. Everything
+    /// below the tree — the chunk map, the superblock, the device — is
+    /// shared; only which root the item cache is loaded from differs. So
+    /// the returned handle answers `read_dir`, `lookup`, `read_file` and
+    /// the rest against that subvolume, and paths inside it are absolute
+    /// within it rather than carrying its own path as a prefix.
+    ///
+    /// # Read-only, deliberately
+    ///
+    /// The handle never carries the write capability, even when this one
+    /// does. Writing into a subvolume is not the same operation as
+    /// writing into the default tree — a snapshot shares its blocks with
+    /// its parent until something writes, so a write has to unshare
+    /// before it can proceed, and none of that is implemented. A handle
+    /// that could not write is better than one that could write wrongly.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if no subvolume has that id, and whatever the
+    /// tree walk returns.
+    pub fn open_subvolume(&self, id: u64) -> Result<Filesystem> {
+        let subvol = self
+            .subvolumes()?
+            .into_iter()
+            .find(|s| s.id == id)
+            .ok_or(crate::error::Error::NotFound)?;
+        self.open_subvolume_at(subvol.bytenr)
+    }
+
+    /// Open the subvolume whose tree root is `bytenr`.
+    ///
+    /// Separate from [`Filesystem::open_subvolume`] so a caller that has
+    /// already listed them does not pay for a second walk of the root
+    /// tree to look up something it is holding.
+    ///
+    /// # Errors
+    ///
+    /// As the tree walk. A `bytenr` that is not a tree root fails there
+    /// rather than producing an empty filesystem, because a tree block
+    /// carries its own identity and the walk checks it.
+    pub fn open_subvolume_at(&self, bytenr: u64) -> Result<Filesystem> {
+        self.reroot(bytenr)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
