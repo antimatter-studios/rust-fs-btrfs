@@ -413,6 +413,24 @@ impl Filesystem {
     }
 
     /// The parsed superblock.
+    /// Read one tree block by its logical address.
+    ///
+    /// A writer needs to look at a specific block rather than iterate
+    /// items: to find what is above a leaf, to check what is at an
+    /// address before placing something there.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the read, and the block's own verification — an
+    /// address holding something that is not a tree block of this
+    /// filesystem is an error rather than an empty result.
+    pub fn read_tree_block(&self, logical: u64) -> Result<crate::btree::TreeBlock> {
+        let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
+            Self::read_logical(&self.device, &self.map, logical, buf)
+        };
+        crate::btree::Tree::from_superblock(&self.sb, &read).read_block(logical)
+    }
+
     /// The chunk map — how logical addresses become physical ones.
     ///
     /// Exposed because a WRITER has to reason about placement in a way a
