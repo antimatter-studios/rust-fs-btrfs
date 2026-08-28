@@ -329,11 +329,22 @@ impl Filesystem {
 /// has to update.
 mod root_item {
     /// The tree's root address.
+    ///
+    /// Measured against a real filesystem, not counted from the struct:
+    /// the ROOT_ITEM for the extent tree holds the address the
+    /// superblock's own walk reaches.
     pub const BYTENR: usize = 176;
-    /// The transaction that wrote it.
-    pub const GENERATION: usize = 16;
-    /// Its height.
-    pub const LEVEL: usize = 246;
+    /// The transaction that wrote that root.
+    ///
+    /// AT 160, after the embedded `btrfs_inode_item`. Offset 16 is
+    /// inside that inode and holds something else entirely — a
+    /// ROOT_ITEM whose generation was written there leaves the real
+    /// field stale, and the kernel refuses the tree it names with
+    /// "parent transid verify failed". Which is exactly what `btrfs
+    /// check` said before this was measured.
+    pub const GENERATION: usize = 160;
+    /// Its height, after `drop_progress` and `drop_level`.
+    pub const LEVEL: usize = 238;
 }
 
 /// `BTRFS_ROOT_ITEM_KEY`.
