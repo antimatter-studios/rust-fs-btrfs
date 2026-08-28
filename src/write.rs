@@ -215,7 +215,7 @@ impl Filesystem {
     fn extent_refs(&self, bytenr: u64) -> Result<u64> {
         let root = self.extent_tree_root()?;
         let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical(&self.device, &self.map, logical, buf)
+            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
         };
         let tree = Tree::from_superblock(&self.sb, &read);
 
@@ -249,7 +249,7 @@ impl Filesystem {
     /// The extent tree's root, named by the root tree.
     fn extent_tree_root(&self) -> Result<u64> {
         let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical(&self.device, &self.map, logical, buf)
+            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
         };
         let tree = Tree::from_superblock(&self.sb, &read);
         let mut root = None;

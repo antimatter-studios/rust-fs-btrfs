@@ -169,6 +169,15 @@ pub(crate) struct FileExtent {
 /// A mounted Btrfs filesystem.
 pub struct Filesystem {
     pub(crate) device: Arc<dyn BlockRead>,
+    /// The devices of a pool, by the id chunk stripes reference.
+    ///
+    /// Empty for a single-device filesystem, where [`Self::device`] is
+    /// everything and a mapping's `devid` cannot be anything else. When
+    /// a filesystem spans several devices this holds all of them,
+    /// including the one in [`Self::device`], because a stripe names
+    /// the disk it is on and reading it from any other returns whatever
+    /// happens to be at that offset.
+    pub(crate) devices: BTreeMap<u64, Arc<dyn BlockRead>>,
     /// The same device again, present only when the volume was opened
     /// for writing. Kept separately so that "can this mount write" is a
     /// property of the type: the write path cannot compile without
@@ -279,6 +288,75 @@ impl Filesystem {
     }
 
     fn open(device: Arc<dyn BlockRead>, writable: Option<Arc<dyn BlockDevice>>) -> Result<Self> {
+        Self::open_pool(device, BTreeMap::new(), writable)
+    }
+
+    /// Open a filesystem that spans several devices.
+    ///
+    /// Every device of the pool must be given. A chunk stripe names the
+    /// disk it lives on, so a missing device is not a partial view —
+    /// reads of anything on it return whatever lies at that offset on
+    /// whichever disk was consulted instead, which parses and then fails
+    /// a checksum against a block it was never meant to be. On a
+    /// mirrored pool it may not even fail.
+    ///
+    /// The devices are identified by the `devid` in each one's own
+    /// superblock, not by the order they are passed in.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] when the set is incomplete, when
+    /// two of them are not the same filesystem, or when two claim the
+    /// same device id.
+    pub fn mount_pool(devices: Vec<Arc<dyn BlockRead>>) -> Result<Self> {
+        if devices.is_empty() {
+            return Err(Error::UnsupportedFeature(
+                "a pool needs at least one device".to_string(),
+            ));
+        }
+
+        // Each device's own superblock says which device it is and which
+        // filesystem it belongs to.
+        let mut by_id: BTreeMap<u64, Arc<dyn BlockRead>> = BTreeMap::new();
+        let mut fsid: Option<[u8; 16]> = None;
+        for dev in devices {
+            let mut buf = vec![0u8; 4096];
+            dev.read_at(SUPER_INFO_OFFSET, &mut buf)?;
+            let sb = Superblock::parse_at(&buf, SUPER_INFO_OFFSET)?;
+
+            match fsid {
+                None => fsid = Some(sb.fsid),
+                Some(seen) if seen != sb.fsid => {
+                    return Err(Error::UnsupportedFeature(
+                        "these devices belong to different filesystems".to_string(),
+                    ))
+                }
+                Some(_) => {}
+            }
+
+            let id = sb.dev_item.devid;
+            if by_id.insert(id, dev).is_some() {
+                return Err(Error::UnsupportedFeature(format!(
+                    "two devices both claim to be device {id}"
+                )));
+            }
+        }
+
+        // Read the filesystem through whichever device holds the
+        // superblock's own copy; the rest are reached by devid.
+        let first = by_id
+            .values()
+            .next()
+            .expect("at least one device, checked above")
+            .clone();
+        Self::open_pool(first, by_id, None)
+    }
+
+    fn open_pool(
+        device: Arc<dyn BlockRead>,
+        devices: BTreeMap<u64, Arc<dyn BlockRead>>,
+        writable: Option<Arc<dyn BlockDevice>>,
+    ) -> Result<Self> {
         let mut sb_buf = vec![0u8; 4096];
         device.read_at(SUPER_INFO_OFFSET, &mut sb_buf)?;
         let sb = Superblock::parse_at(&sb_buf, SUPER_INFO_OFFSET)?;
@@ -294,12 +372,14 @@ impl Filesystem {
         // data it does not even fail. Silently reading one disk of a
         // pool as though it were the whole pool is worse than not
         // opening it.
-        if sb.num_devices > 1 {
+        if sb.num_devices > 1 && devices.len() as u64 != sb.num_devices {
             return Err(Error::UnsupportedFeature(format!(
-                "this filesystem spans {} devices and only one was given; reading \
-                 several devices is not implemented, and reading one of them alone \
-                 would return the wrong data rather than fail",
-                sb.num_devices
+                "this filesystem spans {} devices and {} {} given; reading one of them \
+                 alone would return the wrong data rather than fail. Open it with \
+                 `mount_pool`, giving every device.",
+                sb.num_devices,
+                devices.len(),
+                if devices.len() == 1 { "was" } else { "were" }
             )));
         }
 
@@ -361,6 +441,7 @@ impl Filesystem {
 
         let mut fs = Filesystem {
             device,
+            devices,
             writable,
             sb,
             map,
@@ -379,6 +460,48 @@ impl Filesystem {
         buf: &mut [u8],
     ) -> Result<()> {
         Self::read_logical_on(device, map, u64::MAX, logical, buf)
+    }
+
+    /// Read a logical range from whichever device of a pool holds it.
+    ///
+    /// `devices` is empty for a single-device filesystem, and then this
+    /// is [`Self::read_logical`]. Otherwise every mapping is answered by
+    /// the device its `devid` names — which is the whole difference
+    /// between reading a pool and reading one disk of it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] when a mapping names a device that
+    /// was not given. That is not recoverable by trying another: the
+    /// bytes are somewhere this filesystem cannot see.
+    pub(crate) fn read_logical_pool(
+        device: &Arc<dyn BlockRead>,
+        devices: &BTreeMap<u64, Arc<dyn BlockRead>>,
+        map: &ChunkMap,
+        logical: u64,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        if devices.is_empty() {
+            return Self::read_logical(device, map, logical, buf);
+        }
+        let mut done = 0usize;
+        while done < buf.len() {
+            let m = map.map(logical + done as u64)?;
+            let n = (m.len as usize).min(buf.len() - done);
+            if n == 0 {
+                return Err(Error::UnmappedLogical(logical + done as u64));
+            }
+            let dev = devices.get(&m.devid).ok_or_else(|| {
+                Error::UnsupportedFeature(format!(
+                    "the range at {} lives on device {}, which was not given",
+                    logical + done as u64,
+                    m.devid
+                ))
+            })?;
+            dev.read_at(m.physical, &mut buf[done..done + n])?;
+            done += n;
+        }
+        Ok(())
     }
 
     /// Read a logical range, refusing anything that lives on a device
@@ -436,6 +559,7 @@ impl Filesystem {
     pub(crate) fn reroot(&self, fs_tree_root: u64) -> Result<Self> {
         let mut fs = Filesystem {
             device: self.device.clone(),
+            devices: self.devices.clone(),
             writable: None,
             sb: self.sb.clone(),
             map: self.map.clone(),
@@ -477,7 +601,7 @@ impl Filesystem {
     /// filesystem is an error rather than an empty result.
     pub fn read_tree_block(&self, logical: u64) -> Result<crate::btree::TreeBlock> {
         let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical(&self.device, &self.map, logical, buf)
+            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
         };
         crate::btree::Tree::from_superblock(&self.sb, &read).read_block(logical)
     }
@@ -507,7 +631,7 @@ impl Filesystem {
     /// As the B-tree walk.
     pub fn root_tree_items(&self) -> Result<Vec<RootTreeItem>> {
         let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical(&self.device, &self.map, logical, buf)
+            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
         };
         let tree = Tree::from_superblock(&self.sb, &read);
         let mut out = Vec::new();
@@ -775,7 +899,13 @@ impl Filesystem {
                 Piece::Regular { logical, len } => {
                     let n = (len as usize).min(size - at);
                     if n > 0 {
-                        Self::read_logical(&self.device, &self.map, logical, &mut out[at..at + n])?;
+                        Self::read_logical_pool(
+                            &self.device,
+                            &self.devices,
+                            &self.map,
+                            logical,
+                            &mut out[at..at + n],
+                        )?;
                     }
                 }
                 Piece::Compressed {
@@ -787,7 +917,13 @@ impl Filesystem {
                     algo,
                 } => {
                     let mut packed = vec![0u8; disk_len as usize];
-                    Self::read_logical(&self.device, &self.map, logical, &mut packed)?;
+                    Self::read_logical_pool(
+                        &self.device,
+                        &self.devices,
+                        &self.map,
+                        logical,
+                        &mut packed,
+                    )?;
                     let decoded = compression::decompress(
                         algo,
                         &packed,

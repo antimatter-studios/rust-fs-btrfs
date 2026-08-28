@@ -300,7 +300,7 @@ impl Filesystem {
     /// one whose reachable part is worth knowing.
     fn for_each_tree_block(&self, root: u64, visit: BlockVisitor) -> Result<()> {
         let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical(&self.device, &self.map, logical, buf)
+            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
         };
         let tree = crate::btree::Tree::from_superblock(&self.sb, &read);
 

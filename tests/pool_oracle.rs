@@ -115,3 +115,124 @@ fn the_fixture_really_is_one_filesystem_on_two_devices() {
     assert_ne!(id_a, id_b, "both images claim to be the same device");
     eprintln!("one filesystem, devices {id_a} and {id_b}");
 }
+
+/// Both devices together: the pool reads, and holds what the kernel put
+/// in it.
+///
+/// This is the point of the whole exercise. `btrfs-pool.manifest` was
+/// written by the kernel while the filesystem was mounted, so it says
+/// what is really there — including a 4 MiB file, which is large enough
+/// to live in a data extent rather than inline in its item and so
+/// actually exercises the chunk mapping across two devices.
+#[test]
+fn a_pool_opened_with_every_device_reads_what_the_kernel_wrote() {
+    let (Some(a), Some(b)) = (
+        pool_member("btrfs-pool-a.img"),
+        pool_member("btrfs-pool-b.img"),
+    ) else {
+        eprintln!("no pool fixture; build it with ./scripts/vm-build-pool-fixtures.sh");
+        return;
+    };
+    let manifest = share().join("btrfs-pool.manifest");
+    let Ok(expected) = std::fs::read_to_string(&manifest) else {
+        eprintln!("no manifest — skipping");
+        return;
+    };
+
+    let devices: Vec<Arc<dyn fs_core::BlockRead>> = [a, b]
+        .iter()
+        .map(|p| {
+            Arc::new(FileDevice::open(p).expect("opening a pool member"))
+                as Arc<dyn fs_core::BlockRead>
+        })
+        .collect();
+
+    let fs = match Filesystem::mount_pool(devices) {
+        Ok(fs) => fs,
+        Err(e) => panic!("a pool given all its devices should open: {e}"),
+    };
+
+    let mut checked = 0usize;
+    for line in expected.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let (path, size, digest) = (parts[0], parts[1], parts[2]);
+
+        if size == "dir" {
+            fs.list_path(path)
+                .unwrap_or_else(|e| panic!("listing {path}: {e}"));
+            checked += 1;
+            continue;
+        }
+
+        let want: usize = size.parse().expect("a size");
+        let got = fs
+            .read_path(path)
+            .unwrap_or_else(|e| panic!("reading {path}: {e}"));
+        assert_eq!(
+            got.len(),
+            want,
+            "{path}: the kernel wrote {want} bytes and this read {}",
+            got.len()
+        );
+
+        // Content, not just length. On a MIRRORED pool both disks hold
+        // the same data at different offsets, so a read that went to
+        // the wrong device would come back the right length — and, for
+        // RAID1, even the right bytes. The digest is what makes this
+        // a check on the data rather than on the arithmetic.
+        assert_eq!(
+            sha256_hex(&got),
+            digest,
+            "{path}: {want} bytes read, but not the bytes the kernel wrote"
+        );
+        checked += 1;
+    }
+
+    assert!(checked > 0, "the manifest named nothing to check");
+    eprintln!("{checked} entries read back from a two-device pool");
+}
+
+/// A pool given devices from two different filesystems is refused.
+#[test]
+fn devices_from_different_filesystems_are_refused() {
+    let (Some(a), Some(other)) = (
+        pool_member("btrfs-pool-a.img"),
+        pool_member("btrfs-default.img"),
+    ) else {
+        eprintln!("no fixtures — skipping");
+        return;
+    };
+
+    let devices: Vec<Arc<dyn fs_core::BlockRead>> = [a, other]
+        .iter()
+        .map(|p| Arc::new(FileDevice::open(p).expect("opening")) as Arc<dyn fs_core::BlockRead>)
+        .collect();
+
+    match Filesystem::mount_pool(devices) {
+        Ok(_) => panic!(
+            "two unrelated filesystems were accepted as one pool. Their chunk maps do \
+             not describe each other, so every read that crossed would return the wrong \
+             disk's bytes."
+        ),
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("different filesystems"),
+                "the refusal should say what is wrong: {msg}"
+            );
+            eprintln!("mixed devices refused — {msg}");
+        }
+    }
+}
+
+/// SHA-256 of `data`, lower-case hex — matching `sha256sum` in the
+/// manifest.
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}

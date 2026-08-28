@@ -142,7 +142,7 @@ impl Filesystem {
     pub fn block_groups(&self) -> Result<Vec<BlockGroup>> {
         let root = self.tree_root(objectid::EXTENT_TREE)?;
         let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical(&self.device, &self.map, logical, buf)
+            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
         };
         let tree = Tree::from_superblock(&self.sb, &read);
 
@@ -249,7 +249,7 @@ impl Filesystem {
     fn allocated_by_group(&self, groups: &[BlockGroup]) -> Result<Vec<Vec<FreeExtent>>> {
         let root = self.tree_root(objectid::EXTENT_TREE)?;
         let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical(&self.device, &self.map, logical, buf)
+            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
         };
         let tree = Tree::from_superblock(&self.sb, &read);
         let nodesize = self.sb.nodesize as u64;
@@ -302,7 +302,7 @@ impl Filesystem {
             return Ok(None);
         };
         let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical(&self.device, &self.map, logical, buf)
+            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
         };
         let tree = Tree::from_superblock(&self.sb, &read);
         let sectorsize = self.sb.sectorsize as u64;
@@ -406,7 +406,7 @@ impl Filesystem {
     pub fn for_each_extent_item(&self, visit: &mut dyn FnMut(&DiskKey, &[u8])) -> Result<()> {
         let root = self.tree_root(objectid::EXTENT_TREE)?;
         let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical(&self.device, &self.map, logical, buf)
+            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
         };
         let tree = Tree::from_superblock(&self.sb, &read);
         tree.for_each(root, &mut |key: &DiskKey, data: &[u8]| {
@@ -440,7 +440,7 @@ impl Filesystem {
         visit: &mut dyn FnMut(&DiskKey, &[u8]),
     ) -> Result<()> {
         let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical(&self.device, &self.map, logical, buf)
+            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
         };
         let tree = Tree::from_superblock(&self.sb, &read);
         tree.for_each(root, &mut |key: &DiskKey, data: &[u8]| {
@@ -459,7 +459,7 @@ impl Filesystem {
     pub(crate) fn tree_root(&self, objectid: u64) -> Result<u64> {
         const ROOT_ITEM_KEY: u8 = 132;
         let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical(&self.device, &self.map, logical, buf)
+            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
         };
         let tree = Tree::from_superblock(&self.sb, &read);
         let mut root = None;
