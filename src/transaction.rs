@@ -563,16 +563,33 @@ impl Filesystem {
     /// The extent tree leaves that hold, or would hold, the records for
     /// `addresses`.
     ///
-    /// A leaf "would hold" an address when the address falls inside its
-    /// key range: that is where an insert lands, so it is the leaf an
-    /// insert dirties even though nothing is filed under that key yet.
+    /// "Would hold" is the important half. An insert dirties the leaf it
+    /// lands in even though nothing is filed under that key yet, and
+    /// which leaf that is follows the same rule a descent uses: the LAST
+    /// leaf whose first key is not greater than the one being inserted.
+    ///
+    /// A range test — is the address between this leaf's first and last
+    /// key — is not that rule, and gets the common case wrong. A newly
+    /// allocated address is usually PAST every key in the tree, so it
+    /// falls in no leaf's range, no leaf is dirtied, and the record is
+    /// never written. The block then has no back reference and `btrfs
+    /// check` says so: "tree extent[...] has no backref item in extent
+    /// tree". It only showed up on a fixture whose free space happened
+    /// to lie beyond the last record rather than among them.
     fn extent_leaves_for(&self, addresses: &[u64]) -> Result<BTreeSet<u64>> {
+        let root = self.tree_root(objectid::EXTENT_TREE)?;
+        self.leaves_holding(root, addresses)
+    }
+
+    /// The leaves of `root` that an insert of each address would land
+    /// in.
+    fn leaves_holding(&self, root: u64, addresses: &[u64]) -> Result<BTreeSet<u64>> {
         if addresses.is_empty() {
             return Ok(BTreeSet::new());
         }
-        let root = self.tree_root(objectid::EXTENT_TREE)?;
 
-        let mut out = BTreeSet::new();
+        // Every leaf, by its first key.
+        let mut leaves: Vec<(u64, u64)> = Vec::new();
         self.for_each_tree_block(root, &mut |at, block, level, _| {
             if level != 0 {
                 return;
@@ -582,13 +599,24 @@ impl Filesystem {
                 return;
             }
             let first = u64::from_le_bytes(block[HEADER_SIZE..HEADER_SIZE + 8].try_into().unwrap());
-            let last_at = HEADER_SIZE + (n as usize - 1) * 25;
-            let last = u64::from_le_bytes(block[last_at..last_at + 8].try_into().unwrap());
-
-            if addresses.iter().any(|a| *a >= first && *a <= last) {
-                out.insert(at);
-            }
+            leaves.push((first, at));
         })?;
+        if leaves.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        leaves.sort();
+
+        let mut out = BTreeSet::new();
+        for a in addresses {
+            // The last leaf that begins at or before this key, or the
+            // first leaf when the key precedes everything.
+            let idx = match leaves.binary_search_by(|(first, _)| first.cmp(a)) {
+                Ok(i) => i,
+                Err(0) => 0,
+                Err(i) => i - 1,
+            };
+            out.insert(leaves[idx].1);
+        }
         Ok(out)
     }
 }
@@ -693,25 +721,17 @@ impl Filesystem {
             return Ok(BTreeSet::new());
         }
 
-        let mut out = BTreeSet::new();
-        self.for_each_tree_block(root, &mut |at, block, level, _| {
-            if level != 0 {
-                return;
+        // Same rule as the extent tree: an insert lands in the last
+        // leaf that begins at or before its key, which is not the same
+        // as the leaf whose existing keys bracket it.
+        let mut keys: Vec<u64> = Vec::new();
+        for (start, end) in &spans {
+            keys.push(*start);
+            for a in addresses.iter().filter(|a| **a >= *start && **a < *end) {
+                keys.push(*a);
             }
-            let n = u32::from_le_bytes(block[o::NRITEMS..o::NRITEMS + 4].try_into().unwrap());
-            for i in 0..n as usize {
-                let it = HEADER_SIZE + i * 25;
-                if it + 25 > block.len() {
-                    break;
-                }
-                let oid = u64::from_le_bytes(block[it..it + 8].try_into().unwrap());
-                if spans.iter().any(|(s, e)| oid >= *s && oid < *e) {
-                    out.insert(at);
-                    return;
-                }
-            }
-        })?;
-        Ok(out)
+        }
+        self.leaves_holding(root, &keys)
     }
 
     /// Rewrite a free-space tree leaf so it describes what the plan
