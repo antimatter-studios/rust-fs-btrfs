@@ -203,6 +203,12 @@ jobs:
       - name: Re-encode every allocation record
         run: cargo test --test extent_write_oracle -- --nocapture
 
+      # The order a commit reaches the device in, which is the
+      # crash-consistency rather than a performance detail. Checked
+      # against the sequence blktrace recorded from a live commit.
+      - name: Commit ordering and barriers
+        run: cargo test --test commit_order -- --nocapture
+
       - name: Loop-mount with the in-kernel btrfs driver
         run: |
           set -euo pipefail
