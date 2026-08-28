@@ -443,7 +443,7 @@ impl Filesystem {
                     // correct and the extent tree describes a filesystem
                     // that no longer exists.
                     if rewrite.owner == objectid::EXTENT_TREE {
-                        owned = self.apply_records(owned, plan, generation)?;
+                        owned = self.apply_records(rewrite.old, owned, plan, generation)?;
                     }
 
                     // The free-space tree is the complement of the
@@ -639,6 +639,7 @@ impl Filesystem {
     /// would leave a block recorded as allocated for ever.
     fn apply_records(
         &self,
+        leaf: u64,
         items: Vec<crate::leaf_edit::OwnedItem>,
         plan: &Plan,
         generation: u64,
@@ -646,19 +647,21 @@ impl Filesystem {
         use crate::extent_write::{record_tree_block, TreeBlockAllocation};
         use crate::leaf_edit::{delete, insert, OwnedItem};
 
-        // The span this leaf is responsible for. An address outside it
-        // belongs to another leaf, which the plan also moves.
-        let Some(first) = items.first().map(|i| i.key.objectid) else {
-            return Ok(items);
-        };
-        let last = items.last().map(|i| i.key.objectid).unwrap_or(first);
+        // Which leaf each address belongs to, by the rule a descent
+        // uses — NOT by whether this leaf's existing keys bracket it. A
+        // newly allocated address is usually past every key in the tree,
+        // and a bracket test skips it: the record is never written and
+        // `btrfs check` reports the block as having no backref item.
+        let root = self.tree_root(objectid::EXTENT_TREE)?;
+        let mine =
+            |at: u64| -> Result<bool> { Ok(self.leaves_holding(root, &[at])?.contains(&leaf)) };
 
         let mut out = items;
 
         // Releases first, so the leaf is at its smallest before
         // anything is added to it.
         for rewrite in &plan.rewrites {
-            if rewrite.old < first || rewrite.old > last {
+            if !mine(rewrite.old)? {
                 continue;
             }
             let key = TreeBlockAllocation {
@@ -674,7 +677,7 @@ impl Filesystem {
         }
 
         for rewrite in &plan.rewrites {
-            if rewrite.new < first || rewrite.new > last {
+            if !mine(rewrite.new)? {
                 continue;
             }
             let alloc = TreeBlockAllocation {
