@@ -9,32 +9,45 @@
 //! [`crate::tree_write::build_leaf`] turns a list into bytes. This
 //! produces the list.
 //!
-//! # Splitting is not implemented, and that is a measurement away
+//! # Splitting, and where the boundary goes
 //!
-//! When an item will not fit, the kernel splits the leaf in two and
-//! pushes half the items into a new one. Where it puts the boundary is a
-//! policy — roughly half, but "roughly" is doing work there, and a
-//! writer that guesses produces leaves the kernel would not have
-//! produced.
+//! When an item will not fit, the leaf splits in two. Where the kernel
+//! puts the boundary is a policy, and it was measured rather than
+//! guessed — `scripts/build-split-fixtures.sh` catches one split either
+//! side of the event, and the two candidate rules were separated by a
+//! second fixture built with deliberately uneven item sizes:
 //!
-//! Everything else in this crate's write path is byte-identical to what
-//! the kernel writes because it was measured first. Guessing a split
-//! point here would be the first place that stopped being true, so
-//! instead an item that will not fit is refused, and the refusal names
-//! what is missing.
+//! ```text
+//! items 12 to 232 bytes, 32 items across the split
+//!   the kernel put              17 items / 1951 B on the left
+//!   len/2 + 1 puts              17                  <- matches
+//!   half the BYTES puts         14
+//! ```
 //!
-//! That was a judgement when it was written, and it is now a
-//! measurement. Across 9,026 leaves of the two deep fixtures the median
-//! is 91-98% FULL, with the dominant mode at 90-99% and only a
-//! secondary cluster near half — see `docs/cow-transaction.md`. A split
-//! down the middle would pile the distribution up at 50%, and it does
-//! not. So "half" would be wrong in the common case, and wrong in a way
-//! nothing here would catch: every other check in this crate compares
-//! against blocks the kernel already wrote, not against blocks it would
-//! write next.
+//! And on the pair built with items of one size, 42 items became 22 and
+//! 20 — again `len/2 + 1`. Note that this is one MORE than half, not
+//! half rounded up: `div_ceil` gives 21 and 16 and is wrong on both.
 //!
-//! The fixture that would settle it is a leaf filled to just under
-//! capacity and one more item added, captured either side.
+//! So the boundary is half the item count, not half the bytes. With
+//! items of equal size the two rules agree and a measurement of such a
+//! split says nothing, which is why the uneven fixture exists.
+//!
+//! A distribution had suggested otherwise and was wrong. Across 9,026
+//! leaves of a populated filesystem the median is 91-98% FULL, which
+//! looks like evidence against halving — but it is what halving
+//! produces once the resulting leaves are filled up again by later
+//! inserts. Reading a rule off a steady state was the mistake.
+//!
+//! # What is not claimed
+//!
+//! Both measured splits had an even item count, so `len/2 + 1` and
+//! `(len + 1)/2 + ...` cannot be told apart for odd counts from this
+//! evidence alone — the rule here is the one that fits, not the only
+//! one that could.
+//!
+//! The kernel also biases towards where the new item is going, so a
+//! split whose insertion point is far to one side may not match. The
+//! fixtures do not cover that, and it is not claimed.
 
 use crate::chunk::DiskKey;
 use crate::error::{Error, Result};
@@ -133,6 +146,79 @@ pub fn delete(items: &[OwnedItem], key: &DiskKey) -> Result<Vec<OwnedItem>> {
     out.extend_from_slice(&items[..at]);
     out.extend_from_slice(&items[at + 1..]);
     Ok(out)
+}
+
+/// Split a list of items in two.
+///
+/// Returns the left and right halves. The boundary is half the item
+/// count, rounding up so the left takes the odd one — see the module
+/// docs for how that was measured, and for what about it is still a
+/// choice.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] if there are fewer than two items:
+/// there is no boundary that leaves something on both sides, and a
+/// "split" producing an empty leaf is a leaf the tree has no use for.
+///
+/// It does NOT check that each half fits in a block. A split of a list
+/// that was one item too big always does, and a caller assembling
+/// something larger is doing something this does not model.
+pub fn split(items: &[OwnedItem]) -> Result<(Vec<OwnedItem>, Vec<OwnedItem>)> {
+    if items.len() < 2 {
+        return Err(Error::UnsupportedFeature(format!(
+            "a leaf of {} item(s) cannot be split into two that both hold something",
+            items.len()
+        )));
+    }
+    // Measured, not rounded to taste. Two captured splits, read from
+    // the LIVE tree either side:
+    //
+    //     42 items -> 22 | 20        32 items -> 17 | 15
+    //
+    // Both are len/2 + 1, which is one MORE than half rather than half
+    // rounded up. `div_ceil` would give 21 and 16 and be wrong on both.
+    let mid = items.len() / 2 + 1;
+    Ok((items[..mid].to_vec(), items[mid..].to_vec()))
+}
+
+/// Put `item` in, splitting if it will not fit.
+///
+/// Returns one list when it fitted and two when the leaf had to split.
+/// The caller writes one block or two accordingly, and — when there are
+/// two — must add the second to the parent, which is not done here
+/// because this does not know what the parent is.
+///
+/// # Errors
+///
+/// As [`insert`], except that not fitting is no longer one.
+pub fn insert_or_split(
+    nodesize: u32,
+    items: &[OwnedItem],
+    item: OwnedItem,
+) -> Result<Vec<Vec<OwnedItem>>> {
+    if fits(nodesize, items, &item) {
+        return Ok(vec![insert(nodesize, items, item)?]);
+    }
+    // Ordered first, then divided: the boundary is a position in the
+    // final list, not in the one before the insert.
+    let at = match items.binary_search_by(|existing| order(&existing.key, &item.key)) {
+        Ok(_) => {
+            return Err(Error::UnsupportedFeature(format!(
+                "the leaf already holds an item under {:?}; replacing it is a different \
+                 operation from inserting",
+                item.key
+            )))
+        }
+        Err(at) => at,
+    };
+    let mut all = Vec::with_capacity(items.len() + 1);
+    all.extend_from_slice(&items[..at]);
+    all.push(item);
+    all.extend_from_slice(&items[at..]);
+
+    let (left, right) = split(&all)?;
+    Ok(vec![left, right])
 }
 
 /// Whether `item` would fit alongside `items`.
