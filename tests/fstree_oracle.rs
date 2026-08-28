@@ -26,6 +26,8 @@ use fs_btrfs::chunk::{ChunkMap, DiskKey};
 use fs_btrfs::superblock::{Superblock, SUPER_INFO_OFFSET};
 use std::path::{Path, PathBuf};
 
+mod common;
+
 /// `BTRFS_FS_TREE_OBJECTID` — the subvolume holding the default
 /// filesystem namespace.
 const FS_TREE_OBJECTID: u64 = 5;
@@ -54,6 +56,11 @@ fn fixtures() -> Vec<(String, PathBuf)> {
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("img"))
+        // One member of a multi-device filesystem holds chunks that
+        // live on the other disk; reading them out of this image
+        // returns bytes that fail a checksum against a block they were
+        // never meant to be.
+        .filter(|p| !common::spans_several_devices(p))
         .map(|p| (p.file_stem().unwrap().to_string_lossy().into_owned(), p))
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));

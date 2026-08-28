@@ -283,6 +283,26 @@ impl Filesystem {
         device.read_at(SUPER_INFO_OFFSET, &mut sb_buf)?;
         let sb = Superblock::parse_at(&sb_buf, SUPER_INFO_OFFSET)?;
 
+        // One device open, and the filesystem says it has more.
+        //
+        // A chunk stripe names the device it lives on, and with only one
+        // device there is nothing to do about a stripe naming another —
+        // except refuse. Reading it from the device at hand returns
+        // whatever is at that offset on THIS disk: it parses, it fails
+        // its checksum against a block it was never meant to be, and on
+        // a RAID1 filesystem where the mirror happens to hold the same
+        // data it does not even fail. Silently reading one disk of a
+        // pool as though it were the whole pool is worse than not
+        // opening it.
+        if sb.num_devices > 1 {
+            return Err(Error::UnsupportedFeature(format!(
+                "this filesystem spans {} devices and only one was given; reading \
+                 several devices is not implemented, and reading one of them alone \
+                 would return the wrong data rather than fail",
+                sb.num_devices
+            )));
+        }
+
         if sb.log_root != 0 {
             return Err(Error::DirtyLog);
         }
@@ -358,9 +378,40 @@ impl Filesystem {
         logical: u64,
         buf: &mut [u8],
     ) -> Result<()> {
+        Self::read_logical_on(device, map, u64::MAX, logical, buf)
+    }
+
+    /// Read a logical range, refusing anything that lives on a device
+    /// other than `devid`.
+    ///
+    /// A [`Mapping`] names the device its physical offset is on, and
+    /// with one device open there is nothing to do about a mapping that
+    /// names another — except say so. Reading it from the device at hand
+    /// returns whatever happens to be at that offset, which parses,
+    /// checksums against the wrong block, and is silently the wrong
+    /// data.
+    ///
+    /// `u64::MAX` means "do not check", used where the caller has
+    /// already established there is only one device.
+    pub(crate) fn read_logical_on(
+        device: &Arc<dyn BlockRead>,
+        map: &ChunkMap,
+        devid: u64,
+        logical: u64,
+        buf: &mut [u8],
+    ) -> Result<()> {
         let mut done = 0usize;
         while done < buf.len() {
             let m = map.map(logical + done as u64)?;
+            if devid != u64::MAX && m.devid != devid {
+                return Err(Error::UnsupportedFeature(format!(
+                    "the range at {} lives on device {} and this filesystem was opened \
+                     with device {devid} alone; reading it from the wrong device would \
+                     return the wrong data rather than fail",
+                    logical + done as u64,
+                    m.devid
+                )));
+            }
             // A read may span two chunks, so never take more than the
             // mapping says is contiguous.
             let n = (m.len as usize).min(buf.len() - done);

@@ -260,6 +260,15 @@ jobs:
       # This is the gate that cannot be satisfied by agreeing with
       # ourselves. Everything else here compares against bytes the
       # kernel already wrote; this asks it to accept bytes we wrote.
+      # A filesystem spanning two devices, which is different in kind
+      # from every other fixture: reading one disk of it is not a partial
+      # read but a read of the wrong bytes.
+      - name: Build the two-device pool
+        run: sudo bash scripts/build-pool-fixtures.sh
+
+      - name: Refuse one device of a pool
+        run: cargo test --test pool_oracle -- --nocapture
+
       - name: Write a transaction and let the kernel judge it
         run: |
           set -euo pipefail
