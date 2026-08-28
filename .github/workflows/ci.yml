@@ -296,6 +296,18 @@ jobs:
           failed=()
           for img in .vm-share/btrfs-*.img; do
             name="$(basename "$img" .img)"
+
+            # A member of a multi-device filesystem cannot be loop-mounted
+            # on its own — the KERNEL refuses it for the same reason this
+            # driver does, since half the chunks live on the other disk.
+            # Mounting a pool needs both devices registered, which is a
+            # different test from this one.
+            devices=$(od -An -tu8 -j $((65536 + 0x88)) -N 8 "$img" | tr -d ' ')
+            if [ "${devices:-1}" -gt 1 ]; then
+              echo "skipping $name: $devices devices, not a single-device fixture"
+              continue
+            fi
+
             mnt="/mnt/$name"
             sudo mkdir -p "$mnt"
             echo "::group::mount $name"

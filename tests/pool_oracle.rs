@@ -13,6 +13,11 @@
 //! worse than not opening it: the caller gets data rather than an
 //! error.
 //!
+//! The kernel agrees, which is worth knowing: `mount -o loop` on one
+//! member fails too, for the same reason. Mounting a pool needs every
+//! device registered first, and that is a different thing from opening
+//! a filesystem.
+//!
 //! Fixtures are gitignored. Build them with
 //! `./scripts/vm-build-pool-fixtures.sh`.
 
