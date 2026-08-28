@@ -223,6 +223,11 @@ jobs:
       - name: Transaction invariants
         run: cargo test --test transaction_oracle -- --nocapture
 
+      # What a planned transaction contains, bounded above by what the
+      # kernel actually rewrote for the same change.
+      - name: Transaction plan
+        run: cargo test --test transaction_plan -- --nocapture
+
       - name: Loop-mount with the in-kernel btrfs driver
         run: |
           set -euo pipefail
