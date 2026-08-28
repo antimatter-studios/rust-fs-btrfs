@@ -99,6 +99,11 @@ impl BlockGroup {
         self.flags & flags::DATA != 0
     }
 
+    /// Whether `at` falls inside this group.
+    pub fn contains(&self, at: u64) -> bool {
+        at >= self.start && at < self.end()
+    }
+
     /// Bytes not allocated. Derived, and worth comparing against a
     /// free-extent walk: they should sum to this.
     pub fn free(&self) -> u64 {

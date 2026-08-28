@@ -443,7 +443,15 @@ impl Filesystem {
                     // correct and the extent tree describes a filesystem
                     // that no longer exists.
                     if rewrite.owner == objectid::EXTENT_TREE {
-                        owned = self.apply_records(owned, plan, generation)?;
+                        owned = self.apply_records(rewrite.old, owned, plan, generation)?;
+                    }
+
+                    // The free-space tree is the complement of the
+                    // extent tree, so a transaction changes both. A leaf
+                    // left saying where things used to be is what `btrfs
+                    // check` calls "cache appears valid but isn't".
+                    if rewrite.owner == objectid::FREE_SPACE_TREE {
+                        owned = self.apply_free_space(owned, plan)?;
                     }
 
                     // A root tree leaf names other trees' roots.
@@ -535,9 +543,11 @@ impl Filesystem {
             let mut touched: Vec<u64> = plan.released();
             touched.extend(plan.allocated());
 
-            let leaves = self.extent_leaves_for(&touched)?;
             let before = seed.len();
-            seed.extend(leaves);
+            seed.extend(self.extent_leaves_for(&touched)?);
+            // The free-space tree tracks the same moves from the other
+            // side, so its leaves for those addresses are dirty too.
+            seed.extend(self.free_space_leaves_for(&touched)?);
             if seed.len() == before {
                 return Ok(plan);
             }
@@ -553,16 +563,33 @@ impl Filesystem {
     /// The extent tree leaves that hold, or would hold, the records for
     /// `addresses`.
     ///
-    /// A leaf "would hold" an address when the address falls inside its
-    /// key range: that is where an insert lands, so it is the leaf an
-    /// insert dirties even though nothing is filed under that key yet.
+    /// "Would hold" is the important half. An insert dirties the leaf it
+    /// lands in even though nothing is filed under that key yet, and
+    /// which leaf that is follows the same rule a descent uses: the LAST
+    /// leaf whose first key is not greater than the one being inserted.
+    ///
+    /// A range test — is the address between this leaf's first and last
+    /// key — is not that rule, and gets the common case wrong. A newly
+    /// allocated address is usually PAST every key in the tree, so it
+    /// falls in no leaf's range, no leaf is dirtied, and the record is
+    /// never written. The block then has no back reference and `btrfs
+    /// check` says so: "tree extent[...] has no backref item in extent
+    /// tree". It only showed up on a fixture whose free space happened
+    /// to lie beyond the last record rather than among them.
     fn extent_leaves_for(&self, addresses: &[u64]) -> Result<BTreeSet<u64>> {
+        let root = self.tree_root(objectid::EXTENT_TREE)?;
+        self.leaves_holding(root, addresses)
+    }
+
+    /// The leaves of `root` that an insert of each address would land
+    /// in.
+    fn leaves_holding(&self, root: u64, addresses: &[u64]) -> Result<BTreeSet<u64>> {
         if addresses.is_empty() {
             return Ok(BTreeSet::new());
         }
-        let root = self.tree_root(objectid::EXTENT_TREE)?;
 
-        let mut out = BTreeSet::new();
+        // Every leaf, by its first key.
+        let mut leaves: Vec<(u64, u64)> = Vec::new();
         self.for_each_tree_block(root, &mut |at, block, level, _| {
             if level != 0 {
                 return;
@@ -572,13 +599,24 @@ impl Filesystem {
                 return;
             }
             let first = u64::from_le_bytes(block[HEADER_SIZE..HEADER_SIZE + 8].try_into().unwrap());
-            let last_at = HEADER_SIZE + (n as usize - 1) * 25;
-            let last = u64::from_le_bytes(block[last_at..last_at + 8].try_into().unwrap());
-
-            if addresses.iter().any(|a| *a >= first && *a <= last) {
-                out.insert(at);
-            }
+            leaves.push((first, at));
         })?;
+        if leaves.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        leaves.sort();
+
+        let mut out = BTreeSet::new();
+        for a in addresses {
+            // The last leaf that begins at or before this key, or the
+            // first leaf when the key precedes everything.
+            let idx = match leaves.binary_search_by(|(first, _)| first.cmp(a)) {
+                Ok(i) => i,
+                Err(0) => 0,
+                Err(i) => i - 1,
+            };
+            out.insert(leaves[idx].1);
+        }
         Ok(out)
     }
 }
@@ -601,6 +639,7 @@ impl Filesystem {
     /// would leave a block recorded as allocated for ever.
     fn apply_records(
         &self,
+        leaf: u64,
         items: Vec<crate::leaf_edit::OwnedItem>,
         plan: &Plan,
         generation: u64,
@@ -608,19 +647,21 @@ impl Filesystem {
         use crate::extent_write::{record_tree_block, TreeBlockAllocation};
         use crate::leaf_edit::{delete, insert, OwnedItem};
 
-        // The span this leaf is responsible for. An address outside it
-        // belongs to another leaf, which the plan also moves.
-        let Some(first) = items.first().map(|i| i.key.objectid) else {
-            return Ok(items);
-        };
-        let last = items.last().map(|i| i.key.objectid).unwrap_or(first);
+        // Which leaf each address belongs to, by the rule a descent
+        // uses — NOT by whether this leaf's existing keys bracket it. A
+        // newly allocated address is usually past every key in the tree,
+        // and a bracket test skips it: the record is never written and
+        // `btrfs check` reports the block as having no backref item.
+        let root = self.tree_root(objectid::EXTENT_TREE)?;
+        let mine =
+            |at: u64| -> Result<bool> { Ok(self.leaves_holding(root, &[at])?.contains(&leaf)) };
 
         let mut out = items;
 
         // Releases first, so the leaf is at its smallest before
         // anything is added to it.
         for rewrite in &plan.rewrites {
-            if rewrite.old < first || rewrite.old > last {
+            if !mine(rewrite.old)? {
                 continue;
             }
             let key = TreeBlockAllocation {
@@ -636,7 +677,7 @@ impl Filesystem {
         }
 
         for rewrite in &plan.rewrites {
-            if rewrite.new < first || rewrite.new > last {
+            if !mine(rewrite.new)? {
                 continue;
             }
             let alloc = TreeBlockAllocation {
@@ -660,4 +701,202 @@ impl Filesystem {
         }
         Ok(out)
     }
+}
+
+/// `BTRFS_FREE_SPACE_INFO_KEY` / `..._EXTENT_KEY` / `..._BITMAP_KEY`.
+const FREE_SPACE_INFO_KEY: u8 = 198;
+const FREE_SPACE_EXTENT_KEY: u8 = 199;
+const FREE_SPACE_BITMAP_KEY: u8 = 200;
+
+impl Filesystem {
+    /// The free-space tree leaves that describe any of `addresses`.
+    fn free_space_leaves_for(&self, addresses: &[u64]) -> Result<BTreeSet<u64>> {
+        let Ok(root) = self.tree_root(objectid::FREE_SPACE_TREE) else {
+            return Ok(BTreeSet::new());
+        };
+        let groups = self.block_groups()?;
+        let spans: Vec<(u64, u64)> = groups
+            .iter()
+            .filter(|g| addresses.iter().any(|a| g.contains(*a)))
+            .map(|g| (g.start, g.end()))
+            .collect();
+        if spans.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+
+        // Same rule as the extent tree: an insert lands in the last
+        // leaf that begins at or before its key, which is not the same
+        // as the leaf whose existing keys bracket it.
+        let mut keys: Vec<u64> = Vec::new();
+        for (start, end) in &spans {
+            keys.push(*start);
+            for a in addresses.iter().filter(|a| **a >= *start && **a < *end) {
+                keys.push(*a);
+            }
+        }
+        self.leaves_holding(root, &keys)
+    }
+
+    /// Rewrite a free-space tree leaf so it describes what the plan
+    /// leaves behind.
+    ///
+    /// The free-space tree is the complement of the extent tree, so a
+    /// transaction that moves blocks changes both. A leaf left saying
+    /// where things used to be is what `btrfs check` reports as "cache
+    /// appears valid but isn't".
+    ///
+    /// # The two things a first attempt got wrong
+    ///
+    /// **A leaf is not per-block-group.** Measured: the whole tree can
+    /// be one leaf holding a `FREE_SPACE_INFO` for each of several
+    /// groups, each followed by that group's `FREE_SPACE_EXTENT`s in
+    /// objectid order. So a leaf is rewritten group by group, and every
+    /// group in it must come out again.
+    ///
+    /// **An `INFO` may name a group that no longer exists.** The tree
+    /// outlives its block groups and `btrfs check` calls that correct —
+    /// see `docs/cow-transaction.md`. Those entries are carried through
+    /// untouched: there is no block group to derive a free set from, and
+    /// dropping them would delete something the kernel put there.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] for a leaf holding a
+    /// `FREE_SPACE_BITMAP`, which needs its bits rewritten rather than
+    /// its extents and is not implemented. Refusing beats writing
+    /// extents where the kernel will read bits.
+    fn apply_free_space(
+        &self,
+        items: Vec<crate::leaf_edit::OwnedItem>,
+        plan: &Plan,
+    ) -> Result<Vec<crate::leaf_edit::OwnedItem>> {
+        use crate::block_group::FreeExtent;
+        use crate::chunk::DiskKey;
+        use crate::leaf_edit::OwnedItem;
+
+        if items
+            .iter()
+            .any(|i| i.key.key_type == FREE_SPACE_BITMAP_KEY)
+        {
+            return Err(Error::UnsupportedFeature(
+                "this free-space tree records a block group as a bitmap, and rewriting \
+                 bits is not implemented"
+                    .to_string(),
+            ));
+        }
+
+        let groups = self.block_groups()?;
+        let released: Vec<u64> = plan.released();
+        let allocated: Vec<u64> = plan.allocated();
+        let nodesize = self.sb.nodesize as u64;
+
+        let mut out: Vec<OwnedItem> = Vec::with_capacity(items.len());
+        let mut i = 0usize;
+        while i < items.len() {
+            let item = &items[i];
+            if item.key.key_type != FREE_SPACE_INFO_KEY {
+                // An extent item with no info before it: carry it.
+                out.push(item.clone());
+                i += 1;
+                continue;
+            }
+
+            // This group's span, and the run of items belonging to it.
+            let start = item.key.objectid;
+            let end = start + item.key.offset;
+            let mut j = i + 1;
+            while j < items.len()
+                && items[j].key.key_type != FREE_SPACE_INFO_KEY
+                && items[j].key.objectid < end
+            {
+                j += 1;
+            }
+
+            let touched = released
+                .iter()
+                .chain(allocated.iter())
+                .any(|a| *a >= start && *a < end);
+            let group = groups.iter().find(|g| g.start == start);
+
+            match (touched, group) {
+                // Untouched, or a group that no longer exists: carry the
+                // whole run through exactly as it was.
+                (false, _) | (_, None) => out.extend_from_slice(&items[i..j]),
+                (true, Some(group)) => {
+                    // What is free now, plus what the plan releases,
+                    // minus what it takes.
+                    let mut free = self.free_extents(group)?;
+                    for at in released.iter().filter(|a| group.contains(**a)) {
+                        free.push(FreeExtent {
+                            start: *at,
+                            len: nodesize,
+                        });
+                    }
+                    free.sort();
+
+                    let mut merged: Vec<FreeExtent> = Vec::with_capacity(free.len());
+                    for run in free {
+                        match merged.last_mut() {
+                            Some(prev) if prev.end() == run.start => prev.len += run.len,
+                            _ => merged.push(run),
+                        }
+                    }
+
+                    let mut runs: Vec<FreeExtent> = merged;
+                    for at in allocated.iter().filter(|a| group.contains(**a)) {
+                        runs = runs
+                            .into_iter()
+                            .flat_map(|r| carve(r, *at, nodesize))
+                            .collect();
+                    }
+                    runs.retain(|r| r.len > 0);
+
+                    let mut info = item.clone();
+                    if info.data.len() >= 4 {
+                        info.data[0..4].copy_from_slice(&(runs.len() as u32).to_le_bytes());
+                    }
+                    out.push(info);
+                    for run in runs {
+                        out.push(OwnedItem {
+                            key: DiskKey {
+                                objectid: run.start,
+                                key_type: FREE_SPACE_EXTENT_KEY,
+                                offset: run.len,
+                            },
+                            data: Vec::new(),
+                        });
+                    }
+                }
+            }
+            i = j;
+        }
+        Ok(out)
+    }
+}
+
+/// `run` with `[at, at + len)` taken out of it.
+fn carve(
+    run: crate::block_group::FreeExtent,
+    at: u64,
+    len: u64,
+) -> Vec<crate::block_group::FreeExtent> {
+    use crate::block_group::FreeExtent;
+    let end = at + len;
+    if end <= run.start || at >= run.end() {
+        return vec![run];
+    }
+    let mut out = Vec::new();
+    if at > run.start {
+        out.push(FreeExtent {
+            start: run.start,
+            len: at - run.start,
+        });
+    }
+    if end < run.end() {
+        out.push(FreeExtent {
+            start: end,
+            len: run.end() - end,
+        });
+    }
+    out
 }

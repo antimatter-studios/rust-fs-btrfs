@@ -252,6 +252,32 @@ jobs:
       - name: Render a plan into blocks
         run: cargo test --test render_plan -- --nocapture
 
+      # The whole write path, judged by the kernel's own tools: perform a
+      # transaction on a copy of a filesystem, have btrfs check pass it,
+      # then have the kernel MOUNT it read-write, write a file, and
+      # unmount — and check it again afterwards.
+      #
+      # This is the gate that cannot be satisfied by agreeing with
+      # ourselves. Everything else here compares against bytes the
+      # kernel already wrote; this asks it to accept bytes we wrote.
+      - name: Write a transaction and let the kernel judge it
+        run: |
+          set -euo pipefail
+          cargo run --release --example write_transaction \
+              .vm-share/btrfs-cow-before.img /tmp/written.img
+          echo "::group::btrfs check"
+          sudo btrfs check --readonly /tmp/written.img
+          echo "::endgroup::"
+          m=$(mktemp -d)
+          sudo mount -o loop /tmp/written.img "$m"
+          echo "hello from the kernel" | sudo tee "$m/newfile" >/dev/null
+          sudo sync
+          sudo umount "$m"
+          rmdir "$m"
+          echo "::group::btrfs check after the kernel used it"
+          sudo btrfs check --readonly /tmp/written.img
+          echo "::endgroup::"
+
       - name: Loop-mount with the in-kernel btrfs driver
         run: |
           set -euo pipefail
