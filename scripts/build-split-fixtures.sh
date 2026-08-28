@@ -44,9 +44,10 @@ command -v mkfs.btrfs >/dev/null || { echo "mkfs.btrfs not found" >&2; exit 1; }
 
 mkdir -p "$OUT"
 work="$OUT/btrfs-split-work.img"
-before="$OUT/btrfs-split-before.img"
-after="$OUT/btrfs-split-after.img"
-rm -f "$work" "$before" "$after" "$OUT/btrfs-split.txt"
+SUFFIX="${BTRFS_SPLIT_SUFFIX:-}"
+before="$OUT/btrfs-split${SUFFIX}-before.img"
+after="$OUT/btrfs-split${SUFFIX}-after.img"
+rm -f "$work" "$before" "$after" "$OUT/btrfs-split${SUFFIX}.txt"
 
 truncate -s "$SIZE" "$work"
 # The smallest nodesize btrfs accepts, so a leaf fills quickly.
@@ -75,9 +76,19 @@ for i in $(seq 1 "$MAX"); do
     cp --sparse=always "$work" "$prev"
 
     $SUDO mount -o loop "$work" "$m"
-    # A long name so each file costs more of a leaf, and a little data
-    # so the inode is not the only thing added.
-    $SUDO tee "$m/file-with-a-deliberately-long-name-$i.txt" >/dev/null <<< "$i"
+    # BTRFS_SPLIT_VARY makes the items WILDLY different sizes, by
+    # alternating a near-maximum filename with a one-character one. That
+    # is the experiment that separates the two candidate rules: a split
+    # at half the ITEM COUNT does not care about sizes, and a split at
+    # half the BYTES lands somewhere else entirely once the items are
+    # uneven. With every item the same size the two agree and the
+    # measurement says nothing.
+    if [ "${BTRFS_SPLIT_VARY:-0}" = "1" ] && [ $((i % 2)) -eq 0 ]; then
+        name=$(printf 'x%.0s' $(seq 1 200))-$i
+    else
+        name="f$i"
+    fi
+    $SUDO tee "$m/$name" >/dev/null <<< "$i"
     $SUDO sync
     $SUDO umount "$m"
 
@@ -91,7 +102,7 @@ for i in $(seq 1 "$MAX"); do
             echo "leaves_before=$last"
             echo "leaves_after=$now"
             echo "nodesize=4096"
-        } > "$OUT/btrfs-split.txt"
+        } > "$OUT/btrfs-split${SUFFIX}.txt"
         echo "SPLIT  at file $i: $last leaves -> $now"
         break
     fi
@@ -106,4 +117,4 @@ if [ -z "$split_at" ]; then
     exit 1
 fi
 
-echo "BUILT  btrfs-split-before.img and btrfs-split-after.img"
+echo "BUILT  btrfs-split${SUFFIX}-before.img and btrfs-split${SUFFIX}-after.img"
