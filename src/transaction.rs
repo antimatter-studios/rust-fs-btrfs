@@ -329,11 +329,22 @@ impl Filesystem {
 /// has to update.
 mod root_item {
     /// The tree's root address.
+    ///
+    /// Measured against a real filesystem, not counted from the struct:
+    /// the ROOT_ITEM for the extent tree holds the address the
+    /// superblock's own walk reaches.
     pub const BYTENR: usize = 176;
-    /// The transaction that wrote it.
-    pub const GENERATION: usize = 16;
-    /// Its height.
-    pub const LEVEL: usize = 246;
+    /// The transaction that wrote that root.
+    ///
+    /// AT 160, after the embedded `btrfs_inode_item`. Offset 16 is
+    /// inside that inode and holds something else entirely — a
+    /// ROOT_ITEM whose generation was written there leaves the real
+    /// field stale, and the kernel refuses the tree it names with
+    /// "parent transid verify failed". Which is exactly what `btrfs
+    /// check` said before this was measured.
+    pub const GENERATION: usize = 160;
+    /// Its height, after `drop_progress` and `drop_level`.
+    pub const LEVEL: usize = 238;
 }
 
 /// `BTRFS_ROOT_ITEM_KEY`.
@@ -423,6 +434,17 @@ impl Filesystem {
                             })
                         })
                         .collect();
+
+                    // An extent tree leaf carries the record of what is
+                    // allocated, so a relocation changes its CONTENTS as
+                    // well as its address: every block the plan moves
+                    // loses the item naming where it was and gains one
+                    // naming where it went. Without this the tree is
+                    // correct and the extent tree describes a filesystem
+                    // that no longer exists.
+                    if rewrite.owner == objectid::EXTENT_TREE {
+                        owned = self.apply_records(owned, plan, generation)?;
+                    }
 
                     // A root tree leaf names other trees' roots.
                     if rewrite.owner == objectid::ROOT_TREE {
@@ -557,6 +579,85 @@ impl Filesystem {
                 out.insert(at);
             }
         })?;
+        Ok(out)
+    }
+}
+
+impl Filesystem {
+    /// Apply a plan's allocations and releases to one extent tree leaf.
+    ///
+    /// Each moved block loses the `METADATA_ITEM` naming its old address
+    /// and gains one naming the new. Only the items belonging in THIS
+    /// leaf are touched: which leaf an address belongs to is decided by
+    /// the key range, and every leaf that any of them falls into is in
+    /// the plan — that is what closing the plan over its own bookkeeping
+    /// guarantees.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a refusal from the leaf editor. An address whose
+    /// record is missing is an error rather than a skip: it means the
+    /// extent tree does not say what the plan believes, and carrying on
+    /// would leave a block recorded as allocated for ever.
+    fn apply_records(
+        &self,
+        items: Vec<crate::leaf_edit::OwnedItem>,
+        plan: &Plan,
+        generation: u64,
+    ) -> Result<Vec<crate::leaf_edit::OwnedItem>> {
+        use crate::extent_write::{record_tree_block, TreeBlockAllocation};
+        use crate::leaf_edit::{delete, insert, OwnedItem};
+
+        // The span this leaf is responsible for. An address outside it
+        // belongs to another leaf, which the plan also moves.
+        let Some(first) = items.first().map(|i| i.key.objectid) else {
+            return Ok(items);
+        };
+        let last = items.last().map(|i| i.key.objectid).unwrap_or(first);
+
+        let mut out = items;
+
+        // Releases first, so the leaf is at its smallest before
+        // anything is added to it.
+        for rewrite in &plan.rewrites {
+            if rewrite.old < first || rewrite.old > last {
+                continue;
+            }
+            let key = TreeBlockAllocation {
+                bytenr: rewrite.old,
+                level: rewrite.level,
+                generation,
+                owner: rewrite.owner,
+            }
+            .key();
+            if out.iter().any(|i| i.key == key) {
+                out = delete(&out, &key)?;
+            }
+        }
+
+        for rewrite in &plan.rewrites {
+            if rewrite.new < first || rewrite.new > last {
+                continue;
+            }
+            let alloc = TreeBlockAllocation {
+                bytenr: rewrite.new,
+                level: rewrite.level,
+                generation,
+                owner: rewrite.owner,
+            };
+            let (key, body) = record_tree_block(&self.sb, alloc)?;
+            if out.iter().any(|i| i.key == key) {
+                continue;
+            }
+            out = insert(
+                self.sb.nodesize,
+                &out,
+                OwnedItem {
+                    key,
+                    data: body.to_vec(),
+                },
+            )?;
+        }
         Ok(out)
     }
 }

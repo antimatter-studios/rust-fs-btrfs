@@ -88,6 +88,9 @@ fn each_commit_reproduces_the_superblock_the_kernel_wrote() {
             bytes_used: Some(le64(after, offsets::BYTES_USED)),
             chunk_root: Some(le64(after, offsets::CHUNK_ROOT)),
             chunk_root_generation: Some(le64(after, offsets::CHUNK_ROOT_GENERATION)),
+            // The kernel's own commits maintain the free-space tree, so
+            // reproducing them must not clear its validity bit.
+            invalidate_free_space_tree: false,
         };
 
         let mut ours = before.clone();

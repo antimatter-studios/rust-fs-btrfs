@@ -76,6 +76,9 @@ pub mod offsets {
     /// copied elsewhere. Verified on a real filesystem: the copy at
     /// 0x10000 holds 0x10000, the one at 0x4000000 holds 0x4000000.
     pub const BYTENR: usize = 0x30;
+    /// Read-only compatibility flags. Bit 0 says a free-space tree
+    /// exists; bit 1 says its contents can be trusted.
+    pub const COMPAT_RO_FLAGS: usize = 0xb4;
     /// The first of four `btrfs_root_backup` slots.
     pub const ROOT_BACKUPS: usize = 0xb2b;
 }
@@ -134,6 +137,20 @@ pub struct Commit {
     pub chunk_root: Option<u64>,
     /// Set alongside `chunk_root`.
     pub chunk_root_generation: Option<u64>,
+    /// Set to `true` when the transaction did NOT maintain the
+    /// free-space tree.
+    ///
+    /// The free-space tree is a cache of the complement of the extent
+    /// tree, and it has a validity bit precisely so it can be marked
+    /// untrustworthy: the kernel then rebuilds it on the next
+    /// read-write mount rather than believing it. A writer that moves
+    /// blocks without updating the cache MUST say so, or the filesystem
+    /// carries a cache describing where things used to be — which
+    /// `btrfs check` reports as "cache appears valid but isn't".
+    ///
+    /// Clearing the bit is not a workaround; it is the state the format
+    /// defines for exactly this.
+    pub invalidate_free_space_tree: bool,
 }
 
 /// Apply a commit to a superblock, in place, and re-checksum it.
@@ -186,6 +203,21 @@ pub fn apply(raw: &mut [u8], csum_type: ChecksumType, commit: &Commit) -> Result
     }
     if let Some(gen) = commit.chunk_root_generation {
         put64(raw, offsets::CHUNK_ROOT_GENERATION, gen);
+    }
+
+    if commit.invalidate_free_space_tree {
+        /// `BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID`.
+        const FREE_SPACE_TREE_VALID: u64 = 1 << 1;
+        let flags = u64::from_le_bytes(
+            raw[offsets::COMPAT_RO_FLAGS..offsets::COMPAT_RO_FLAGS + 8]
+                .try_into()
+                .expect("8 bytes"),
+        );
+        put64(
+            raw,
+            offsets::COMPAT_RO_FLAGS,
+            flags & !FREE_SPACE_TREE_VALID,
+        );
     }
 
     stamp_checksum(raw, csum_type);
