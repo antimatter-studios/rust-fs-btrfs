@@ -246,6 +246,12 @@ jobs:
       - name: Reproduce the kernel's leaf split
         run: cargo test --test split_oracle -- --nocapture
 
+      # A plan turned into blocks: same contents, new addresses, every
+      # pointer following what it names. The relocated tree must hold
+      # exactly what the original held.
+      - name: Render a plan into blocks
+        run: cargo test --test render_plan -- --nocapture
+
       - name: Loop-mount with the in-kernel btrfs driver
         run: |
           set -euo pipefail

@@ -324,3 +324,150 @@ impl Filesystem {
         Ok(())
     }
 }
+
+/// Byte offsets inside a `btrfs_root_item`, of the fields a relocation
+/// has to update.
+mod root_item {
+    /// The tree's root address.
+    pub const BYTENR: usize = 176;
+    /// The transaction that wrote it.
+    pub const GENERATION: usize = 16;
+    /// Its height.
+    pub const LEVEL: usize = 246;
+}
+
+/// `BTRFS_ROOT_ITEM_KEY`.
+const ROOT_ITEM_KEY: u8 = 132;
+
+impl Filesystem {
+    /// Turn a plan into the blocks it says to write.
+    ///
+    /// Every block keeps its contents and changes its address. What that
+    /// means depends on what the block is:
+    ///
+    /// - a **leaf** keeps its items exactly, and is re-stamped with its
+    ///   new address and the new generation;
+    /// - a **node** keeps its keys, but every child that also moved is
+    ///   pointed at its new address — a node still naming the old one is
+    ///   a tree that reads the version before the change;
+    /// - a **root tree leaf** additionally has its `ROOT_ITEM`s
+    ///   rewritten, because those name the roots of other trees, and a
+    ///   tree whose root moved has a stale `ROOT_ITEM` otherwise.
+    ///
+    /// The result goes straight to [`Filesystem::commit`].
+    ///
+    /// # What it does not do
+    ///
+    /// It does not add or remove anything. A relocation is the part of a
+    /// transaction that moves what is already there; the item changes
+    /// that record the moves in the extent tree are separate and are not
+    /// produced here. So a filesystem committed from this alone has a
+    /// correct tree and an extent tree that still describes the old
+    /// addresses.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a read failure, and [`Error::UnsupportedFeature`] if a
+    /// block cannot be re-encoded at its new size — which cannot happen
+    /// for a straight relocation and is reported rather than assumed
+    /// away.
+    pub fn render_plan(
+        &self,
+        plan: &Plan,
+        generation: u64,
+    ) -> Result<Vec<crate::commit::PlacedBlock>> {
+        use crate::commit::PlacedBlock;
+        use crate::leaf_edit::OwnedItem;
+        use crate::tree_write::{build_leaf, build_node, chunk_tree_uuid_of, BlockIdentity};
+
+        // Where each moved block is going.
+        let moved: BTreeMap<u64, u64> = plan.rewrites.iter().map(|r| (r.old, r.new)).collect();
+
+        let mut out = Vec::with_capacity(plan.rewrites.len());
+        for rewrite in &plan.rewrites {
+            let block = self.read_tree_block(rewrite.old)?;
+            let raw = block.bytes().to_vec();
+            let id = BlockIdentity {
+                bytenr: rewrite.new,
+                owner: rewrite.owner,
+                generation,
+                level: rewrite.level,
+                flags: crate::tree_write::flags_for_new_block(),
+                chunk_tree_uuid: chunk_tree_uuid_of(&raw),
+            };
+
+            let bytes = match block.body.key_ptrs() {
+                Some(ptrs) => {
+                    // A node: follow every child that moved.
+                    let updated: Vec<_> = ptrs
+                        .iter()
+                        .map(|p| {
+                            let mut p = *p;
+                            if let Some(&to) = moved.get(&p.blockptr) {
+                                p.blockptr = to;
+                                p.generation = generation;
+                            }
+                            p
+                        })
+                        .collect();
+                    build_node(&self.sb, id, &updated)?
+                }
+                None => {
+                    let items = block.body.items().unwrap_or(&[]);
+                    let mut owned: Vec<OwnedItem> = items
+                        .iter()
+                        .filter_map(|item| {
+                            block.item_data(item).map(|data| OwnedItem {
+                                key: item.key,
+                                data: data.to_vec(),
+                            })
+                        })
+                        .collect();
+
+                    // A root tree leaf names other trees' roots.
+                    if rewrite.owner == objectid::ROOT_TREE {
+                        for item in &mut owned {
+                            if item.key.key_type != ROOT_ITEM_KEY
+                                || item.data.len() < root_item::LEVEL + 1
+                            {
+                                continue;
+                            }
+                            let at = u64::from_le_bytes(
+                                item.data[root_item::BYTENR..root_item::BYTENR + 8]
+                                    .try_into()
+                                    .expect("8 bytes"),
+                            );
+                            if let Some(&to) = moved.get(&at) {
+                                item.data[root_item::BYTENR..root_item::BYTENR + 8]
+                                    .copy_from_slice(&to.to_le_bytes());
+                                item.data[root_item::GENERATION..root_item::GENERATION + 8]
+                                    .copy_from_slice(&generation.to_le_bytes());
+                            }
+                        }
+                    }
+
+                    let borrowed: Vec<_> = owned.iter().map(|i| i.as_leaf_item()).collect();
+                    build_leaf(&self.sb, id, &borrowed)?
+                }
+            };
+
+            out.push(PlacedBlock {
+                logical: rewrite.new,
+                bytes,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Where the root tree ends up, for a plan that moves it.
+    ///
+    /// The superblock names the root tree, so committing a plan needs
+    /// this. Returns `None` when the plan does not move the root tree,
+    /// which means the superblock's existing value still stands.
+    pub fn planned_root(&self, plan: &Plan) -> Option<u64> {
+        plan.rewrites
+            .iter()
+            .find(|r| r.old == self.sb.root)
+            .map(|r| r.new)
+    }
+}
