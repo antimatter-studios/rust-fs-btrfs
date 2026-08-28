@@ -160,3 +160,50 @@ scanning for the newest generation, which turns up leaves nothing points at any 
 paired two of those and compared a 43-item "split" that never happened. Walking the live
 tree from its root fixed it. Scanning is right for asking what is *on* a disk and wrong
 for asking what the filesystem *is*.
+
+## What the kernel's checker still says, and why
+
+The write path runs end to end — plan, close, render, record, commit — and
+`examples/write_transaction.rs` performs one transaction on a copy of a filesystem.
+`btrfs check` on the result:
+
+```text
+[1/7] checking root items          ok
+[2/7] checking extents             ok
+[3/7] checking free space tree     wanted bytes 81920, found 49152 for off 30556160
+                                   cache appears valid but isn't
+[4/7] checking fs roots            ok
+[5/7] checking only csums items    ok
+[6/7] checking root refs           ok
+```
+
+Everything about the trees and their allocation records passes. What remains is the
+free-space tree, which this transaction does not maintain.
+
+The superblock's `FREE_SPACE_TREE_VALID` bit is cleared when a commit says it did not
+maintain the cache — the state the format defines for exactly this, and it makes the
+kernel rebuild the cache on the next read-write mount. `btrfs check` verifies the cache's
+*contents* regardless of the bit, so it still reports the discrepancy.
+
+### An attempt that did not work, and what it cost
+
+The obvious fix is to recompute each affected block group's free set — derive it from the
+extent tree, add what the plan releases, remove what it takes — and rewrite the
+`FREE_SPACE_EXTENT` items from that. It is wrong, and the checker said so precisely:
+
+```text
+before the attempt:  wanted bytes    81920, found 49152
+after the attempt:   wanted bytes 28164096, found 49152
+```
+
+A 28 MB free run where 48 KB was expected means the rewrite replaced a leaf's items with
+a free set covering ground that leaf is not responsible for. The assumption underneath it
+— that a `FREE_SPACE_INFO` item and the `FREE_SPACE_EXTENT` items for its block group live
+together in one leaf, so a leaf can be rewritten from the group alone — is not something
+that was measured. It was assumed, and the layout does not oblige.
+
+So the attempt was reverted rather than shipped. What settles it is the same method that
+settled everything else here: measure how the kernel distributes `FREE_SPACE_INFO` and
+`FREE_SPACE_EXTENT` items across leaves, on a filesystem large enough for the tree to have
+more than one, and rewrite from that rather than from a guess. The bitmap form
+(`FREE_SPACE_BITMAP`) has not been measured at all.
