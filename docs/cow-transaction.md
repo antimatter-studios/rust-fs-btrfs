@@ -92,9 +92,17 @@ bytes_used(after) - bytes_used(before)
 Together with two others this is enough to check a transaction without knowing what it
 was for:
 
-1. every block the commit wrote has a `METADATA_ITEM` naming it in the after image;
-2. `bytes_used` equals the sum of every block group's `used`;
-3. the delta above.
+1. every block **reachable** from the superblock — through the root tree, through every
+   `ROOT_ITEM` it holds, down to the leaves — has a `METADATA_ITEM` naming it;
+2. every recorded block is physically on the disk and checksums;
+3. `bytes_used` equals the sum of every block group's `used`, and moves by the delta
+   above.
+
+Reachability rather than generation, and that distinction cost two CI runs. "Every block
+stamped with the current generation must be recorded" is the obvious cheap test and it is
+wrong: a block written by one transaction in a sequence is routinely superseded by the
+next, and is then still on the disk, still checksumming, and correctly unrecorded.
+Generation says when a block was written, not whether anything still points at it.
 
 `tests/transaction_oracle.rs` asserts all three against the kernel's own transactions.
 It is written now, before the transaction planner exists, precisely so the planner has

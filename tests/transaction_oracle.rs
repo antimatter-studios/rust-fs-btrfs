@@ -20,7 +20,7 @@
 //! Fixtures are gitignored. Build them with
 //! `./scripts/vm-build-cow-fixtures.sh`.
 
-use fs_btrfs::btree::header_offsets as o;
+use fs_btrfs::btree::{header_offsets as o, HEADER_SIZE};
 use fs_btrfs::chunk::{key_type, DiskKey};
 use fs_btrfs::fs::Filesystem;
 use fs_core::FileDevice;
@@ -124,72 +124,125 @@ fn pairs() -> Vec<(&'static str, PathBuf, PathBuf)> {
     out
 }
 
-/// Every block the LAST commit wrote is recorded as allocated.
+/// Every block the filesystem can reach is recorded as allocated.
 ///
-/// A block written and not recorded is one the allocator will hand out
-/// again — and the filesystem will still mount, read correctly, and
-/// corrupt itself on the next transaction. This is the invariant that
-/// makes allocation mean anything.
+/// A block that is reachable but unrecorded is one the allocator will
+/// hand out again. The filesystem will still mount, still read
+/// correctly, and corrupt itself on the next transaction — which makes
+/// this the invariant that gives allocation its meaning.
 ///
-/// It applies to the last commit's blocks, not to everything newer than
-/// the before image. A pair may span more than one transaction — a
-/// `touch` and a `sync` commit, then the unmount commits again — and a
-/// block written by the first of those is routinely rewritten and freed
-/// by the second. It is then still on the disk, still checksums, and is
-/// correctly not recorded. The first version of this test asserted over
-/// every block newer than the before image and failed on exactly that,
-/// which is the kind of wrong a check gets to be once, before it is
-/// pointed at a writer that cannot answer back.
+/// # Reachability, not generation
+///
+/// The obvious cheap test — every block stamped with the current
+/// generation must be recorded — is WRONG, and it took two CI runs to
+/// stop being wrong in a new way each time. A block written by a
+/// transaction can be superseded within the sequence a fixture pair
+/// spans, and is then still on the disk, still checksumming, and
+/// correctly unrecorded. Generation says when a block was written. It
+/// does not say whether anything still points at it.
+///
+/// So this descends: from the root tree, through every `ROOT_ITEM` it
+/// holds, through every node to every leaf. What that reaches is what
+/// the filesystem is. Anything else on the disk is debris.
+fn reachable(fs: &Filesystem, image: &[u8]) -> BTreeSet<u64> {
+    let sb = fs.superblock();
+    let nodesize = sb.nodesize as usize;
+
+    // Read one block by logical address, through the chunk map, from
+    // the image already in memory.
+    let read = |logical: u64| -> Option<Vec<u8>> {
+        let m = fs.chunk_map().map(logical).ok()?;
+        let at = m.physical as usize;
+        let end = at.checked_add(nodesize)?;
+        if end > image.len() {
+            return None;
+        }
+        let b = image[at..end].to_vec();
+        sb.csum_type.verify(&b[32..], &b[..32]).then_some(b)
+    };
+
+    /// `btrfs_root_item.bytenr` — the address of that tree's root.
+    const ROOT_ITEM_BYTENR: usize = 176;
+    const ROOT_ITEM_KEY: u8 = 132;
+
+    let mut seen = BTreeSet::new();
+    // The chunk tree is reachable from the superblock rather than from
+    // the root tree, being what makes reading the root tree possible.
+    let mut stack = vec![sb.root, sb.chunk_root];
+
+    while let Some(at) = stack.pop() {
+        if at == 0 || !seen.insert(at) {
+            continue;
+        }
+        let Some(b) = read(at) else { continue };
+        let nritems =
+            u32::from_le_bytes(b[o::NRITEMS..o::NRITEMS + 4].try_into().unwrap()) as usize;
+
+        if b[o::LEVEL] > 0 {
+            // A node: 33-byte key pointers, the address at offset 17.
+            for i in 0..nritems {
+                let p = HEADER_SIZE + i * 33;
+                if p + 25 <= b.len() {
+                    stack.push(le64(&b, p + 17));
+                }
+            }
+            continue;
+        }
+
+        // A leaf. Only ROOT_ITEMs lead anywhere: they name the roots of
+        // the other trees.
+        for i in 0..nritems {
+            let it = HEADER_SIZE + i * 25;
+            if it + 25 > b.len() || b[it + 8] != ROOT_ITEM_KEY {
+                continue;
+            }
+            let off =
+                HEADER_SIZE + u32::from_le_bytes(b[it + 17..it + 21].try_into().unwrap()) as usize;
+            if off + ROOT_ITEM_BYTENR + 8 <= b.len() {
+                stack.push(le64(&b, off + ROOT_ITEM_BYTENR));
+            }
+        }
+    }
+    seen
+}
+
+/// Nothing the filesystem points at is missing from the extent tree.
 #[test]
-fn every_block_the_last_commit_wrote_is_recorded_as_allocated() {
+fn every_reachable_block_is_recorded_as_allocated() {
     let pairs = pairs();
     if pairs.is_empty() {
         eprintln!("no fixtures; build them with ./scripts/vm-build-cow-fixtures.sh");
         return;
     }
 
-    let mut transactions = 0usize;
+    let mut checked = 0usize;
     for (what, before, after) in &pairs {
-        let fs_before = mount(before);
-        let fs_after = mount(after);
-        let old_gen = fs_before.superblock().generation;
-        let now = fs_after.superblock().generation;
-        if now == old_gen {
-            eprintln!("{what}: no commit happened on this run — nothing to check");
-            continue;
-        }
-        transactions += 1;
-        let recorded = recorded_blocks(&fs_after);
+        for (side, path) in [("before", before), ("after", after)] {
+            let fs = mount(path);
+            let image = std::fs::read(path).expect("reading a fixture");
+            let recorded = recorded_blocks(&fs);
+            let live = reachable(&fs, &image);
 
-        // Blocks stamped with the CURRENT generation: what the last
-        // transaction wrote, and all of which must still be live.
-        let written: Vec<(u64, u64, u64)> = present_blocks(&fs_after, after)
-            .into_iter()
-            .filter(|(_, gen, _)| *gen == now)
-            .collect();
-
-        assert!(
-            !written.is_empty(),
-            "{what}: no block carries generation {now}, so the superblock names a \
-             transaction that wrote nothing"
-        );
-
-        for (bytenr, gen, owner) in &written {
             assert!(
-                recorded.contains(bytenr),
-                "{what}: the block at {bytenr} (generation {gen}, tree {owner}) was \
-                 written but has no METADATA_ITEM. The allocator will hand that address \
-                 out again."
+                live.len() > 1,
+                "{what} ({side}): only {} block reachable, so the descent found nothing \
+                 and this test proves nothing",
+                live.len()
             );
-        }
-        eprintln!("{what}: {} blocks written, all recorded", written.len());
-    }
 
-    assert!(
-        transactions > 0,
-        "not one pair contained a transaction, so nothing was checked. The fixture \
-         builder is producing images that never commit."
-    );
+            for at in &live {
+                assert!(
+                    recorded.contains(at),
+                    "{what} ({side}): the block at {at} is reachable from the superblock \
+                     but has no METADATA_ITEM. The allocator will hand that address out \
+                     again, and the filesystem will still mount until it does."
+                );
+            }
+            checked += live.len();
+        }
+        eprintln!("{what}: reachable blocks all recorded, both sides");
+    }
+    eprintln!("{checked} reachable blocks checked");
 }
 
 /// The superblock's total is the sum of the block groups, after as
