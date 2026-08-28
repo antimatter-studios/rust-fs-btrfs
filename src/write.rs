@@ -39,7 +39,7 @@
 use crate::btree::Tree;
 use crate::chunk::DiskKey;
 use crate::error::{Error, Result};
-use crate::fs::Filesystem;
+use crate::fs::{Filesystem, ROOT_ITEM_KEY};
 
 /// `BTRFS_INODE_NODATASUM` — this file's blocks carry no checksums.
 pub const INODE_NODATASUM: u64 = 1 << 0;
@@ -50,8 +50,6 @@ pub const INODE_NODATACOW: u64 = 1 << 1;
 const EXTENT_TREE_OBJECTID: u64 = 2;
 /// `BTRFS_EXTENT_ITEM_KEY`.
 const EXTENT_ITEM_KEY: u8 = 168;
-/// `BTRFS_ROOT_ITEM_KEY`, as used to find a tree's root.
-const ROOT_ITEM_KEY: u8 = 132;
 
 /// Offsets within `btrfs_extent_item`.
 mod extent_item {

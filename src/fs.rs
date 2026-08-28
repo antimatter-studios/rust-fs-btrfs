@@ -64,13 +64,37 @@ pub const EXTENT_DATA_KEY: u8 = 108;
 ///
 /// The item opens with an embedded `btrfs_inode_item` of 160 bytes,
 /// followed by `generation` and `root_dirid` before the root address.
-/// Corroborated against real media: a wrong value here yields an address
-/// whose tree block fails its own identity check rather than producing
-/// plausible garbage.
-pub(crate) mod root_item {
+///
+/// THE one copy. There were three — here, in `subvol`, and in
+/// `transaction` — and only one of them carried the note below about
+/// offset 160, which is the field a writer gets wrong.
+pub mod root_item {
+    /// `u64`. The transaction this tree was last written in.
+    ///
+    /// AT 160, after the embedded `btrfs_inode_item`. Offset 16 is
+    /// inside that inode and holds something else entirely — a
+    /// `ROOT_ITEM` whose generation was written there leaves the real
+    /// field stale, and the kernel refuses the tree it names with
+    /// "parent transid verify failed". Which is exactly what `btrfs
+    /// check` said before this was measured.
+    pub const GENERATION: usize = 160;
+    /// `u64`. The tree's root block.
+    ///
+    /// Measured against a real filesystem, not counted from the struct:
+    /// the `ROOT_ITEM` for the extent tree holds the address the
+    /// superblock's own walk reaches. A wrong value here yields an
+    /// address whose tree block fails its own identity check rather
+    /// than producing plausible garbage.
     pub const BYTENR: usize = 176;
-    #[allow(dead_code)]
+    /// `u64`. The generation this subvolume was last snapshotted at, or
+    /// zero if it never was.
+    pub const LAST_SNAPSHOT: usize = 200;
+    /// `u64`. Bit 0 is `BTRFS_ROOT_SUBVOL_RDONLY`.
+    pub const FLAGS: usize = 208;
+    /// The height of the tree this item names.
     pub const LEVEL: usize = 238;
+    /// The smallest item any of these fields can be read out of.
+    pub const MIN_SIZE: usize = FLAGS + 8;
 }
 
 /// Byte offsets within `struct btrfs_file_extent_item`.

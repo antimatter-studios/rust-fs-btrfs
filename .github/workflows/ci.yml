@@ -269,6 +269,27 @@ jobs:
       - name: Refuse one device of a pool
         run: cargo test --test pool_oracle -- --nocapture
 
+      # The targets this gate did not name.
+      #
+      # It listed each suite individually and missed seven, while the
+      # other job runs everything with NO fixtures — so those seven
+      # found nothing, skipped, and reported success on every push.
+      # `compression_oracle` and `write_oracle` need fixtures only this
+      # job builds, which means they had never executed an assertion on
+      # a pull request at all.
+      #
+      # Run as one step rather than seven so the next suite added is
+      # covered by default instead of waiting to be remembered.
+      - name: The remaining fixture-backed suites
+        run: |
+          set -euo pipefail
+          for t in bootstrap_chain btree_oracle capi compression_oracle \
+                   fs_oracle fstree_oracle write_oracle; do
+            echo "::group::$t"
+            cargo test --test "$t" -- --nocapture
+            echo "::endgroup::"
+          done
+
       - name: Write a transaction and let the kernel judge it
         run: |
           set -euo pipefail

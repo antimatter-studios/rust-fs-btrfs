@@ -345,10 +345,23 @@ mod tests {
         assert!(format!("{err}").contains("past the end"), "got {err}");
     }
 
-    /// The framing must skip to the next sector when a header will not
-    /// fit in what is left of the current one. Built here with segments
-    /// sized so the gap is unavoidable; whether real encoders lay it out
-    /// this way is settled by the fixtures, not by this test.
+    /// The layout a straddling header produces, written down.
+    ///
+    /// # What this does NOT do
+    ///
+    /// It does not exercise the decoder. `lzo_frame` is the test
+    /// module's own implementation of the padding rule, so this builds a
+    /// frame with that rule and then asserts the rule was applied —
+    /// `decompress` is never called, and the production branch that
+    /// skips a straddling header can be deleted without this going red.
+    ///
+    /// It is kept because the layout is worth having written down
+    /// somewhere executable, and removed nothing: what actually covers
+    /// the decoder here is `tests/compression_oracle.rs`, against LZO
+    /// streams a real encoder produced. That suite needs fixtures, and
+    /// until now it was not named in the CI gate that builds them — so
+    /// it had never run an assertion on a pull request. It is named
+    /// there now.
     #[test]
     fn lzo_segment_headers_do_not_straddle_a_sector() {
         let sectorsize = 64;

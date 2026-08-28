@@ -37,7 +37,7 @@
 use crate::btree::Tree;
 use crate::chunk::{block_group as flags, key_type, objectid, DiskKey};
 use crate::error::{Error, Result};
-use crate::fs::Filesystem;
+use crate::fs::{Filesystem, ROOT_ITEM_KEY};
 
 /// Byte offsets within `struct btrfs_block_group_item`.
 mod block_group_item {
@@ -457,7 +457,6 @@ impl Filesystem {
     /// for `objectid` — for an optional tree, that is how a caller
     /// learns the tree is absent.
     pub(crate) fn tree_root(&self, objectid: u64) -> Result<u64> {
-        const ROOT_ITEM_KEY: u8 = 132;
         let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
             Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
         };
@@ -562,7 +561,7 @@ fn place_in_run(run: FreeExtent, nodesize: u64) -> Option<u64> {
 
 /// Join runs that touch, so two sources of the same free space compare
 /// equal regardless of how each happened to split it.
-fn merge_adjacent(runs: Vec<FreeExtent>) -> Vec<FreeExtent> {
+pub(crate) fn merge_adjacent(runs: Vec<FreeExtent>) -> Vec<FreeExtent> {
     let mut out: Vec<FreeExtent> = Vec::with_capacity(runs.len());
     for run in runs {
         match out.last_mut() {
