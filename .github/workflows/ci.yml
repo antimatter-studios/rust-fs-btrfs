@@ -228,6 +228,12 @@ jobs:
       - name: Transaction plan
         run: cargo test --test transaction_plan -- --nocapture
 
+      # Recording an allocation is an insert into the extent tree and
+      # releasing one is a delete. Both are checked by round-tripping
+      # every item of real leaves.
+      - name: Leaf editing
+        run: cargo test --test leaf_edit_oracle -- --nocapture
+
       - name: Loop-mount with the in-kernel btrfs driver
         run: |
           set -euo pipefail

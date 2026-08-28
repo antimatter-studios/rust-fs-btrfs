@@ -57,6 +57,7 @@ pub mod error;
 pub mod extent_write;
 pub mod fs;
 pub mod inode;
+pub mod leaf_edit;
 pub mod subvol;
 pub mod super_write;
 pub mod superblock;
