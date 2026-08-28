@@ -471,3 +471,92 @@ impl Filesystem {
             .map(|r| r.new)
     }
 }
+
+impl Filesystem {
+    /// Plan a transaction including the extent tree's own rewrite.
+    ///
+    /// [`Filesystem::plan_transaction`] computes the spine: the dirty
+    /// blocks, their ancestors, and the root tree leaf naming a tree
+    /// whose root moved. That is not a whole transaction, because moving
+    /// a block means recording the move — a `METADATA_ITEM` added for
+    /// the new address and the old one's removed — and those items live
+    /// in extent tree leaves, which are themselves blocks that must then
+    /// be rewritten.
+    ///
+    /// That is the recursion `docs/cow-transaction.md` measured, where a
+    /// commit changing NOTHING still rewrote four blocks. It terminates
+    /// because the extent tree ends up recording its own new blocks
+    /// rather than growing: each rewrite is an allocation and a release.
+    ///
+    /// This closes it by iterating. Each round works out which extent
+    /// tree leaves hold the records for the blocks moved so far, adds
+    /// them to the dirty set, and plans again. When a round adds nothing
+    /// the plan is closed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Filesystem::plan_transaction`], and
+    /// [`Error::UnsupportedFeature`] if the iteration does not settle
+    /// within `rounds`. That is reported rather than papered over: a
+    /// transaction whose own bookkeeping keeps producing more work is
+    /// one that needs the kernel's reservation machinery, not another
+    /// turn of the loop.
+    pub fn plan_transaction_closed(&self, dirty: &[u64], rounds: usize) -> Result<Plan> {
+        let mut seed: BTreeSet<u64> = dirty.iter().copied().collect();
+
+        for _ in 0..rounds {
+            let list: Vec<u64> = seed.iter().copied().collect();
+            let plan = self.plan_transaction(&list)?;
+
+            // Every address whose record changes: the old ones lose a
+            // METADATA_ITEM, the new ones gain one.
+            let mut touched: Vec<u64> = plan.released();
+            touched.extend(plan.allocated());
+
+            let leaves = self.extent_leaves_for(&touched)?;
+            let before = seed.len();
+            seed.extend(leaves);
+            if seed.len() == before {
+                return Ok(plan);
+            }
+        }
+
+        Err(Error::UnsupportedFeature(format!(
+            "the transaction did not settle in {rounds} rounds: recording each round's \
+             moves keeps dirtying extent tree leaves that were not already in it. \
+             Breaking that needs reservations rather than another iteration"
+        )))
+    }
+
+    /// The extent tree leaves that hold, or would hold, the records for
+    /// `addresses`.
+    ///
+    /// A leaf "would hold" an address when the address falls inside its
+    /// key range: that is where an insert lands, so it is the leaf an
+    /// insert dirties even though nothing is filed under that key yet.
+    fn extent_leaves_for(&self, addresses: &[u64]) -> Result<BTreeSet<u64>> {
+        if addresses.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let root = self.tree_root(objectid::EXTENT_TREE)?;
+
+        let mut out = BTreeSet::new();
+        self.for_each_tree_block(root, &mut |at, block, level, _| {
+            if level != 0 {
+                return;
+            }
+            let n = u32::from_le_bytes(block[o::NRITEMS..o::NRITEMS + 4].try_into().unwrap());
+            if n == 0 {
+                return;
+            }
+            let first = u64::from_le_bytes(block[HEADER_SIZE..HEADER_SIZE + 8].try_into().unwrap());
+            let last_at = HEADER_SIZE + (n as usize - 1) * 25;
+            let last = u64::from_le_bytes(block[last_at..last_at + 8].try_into().unwrap());
+
+            if addresses.iter().any(|a| *a >= first && *a <= last) {
+                out.insert(at);
+            }
+        })?;
+        Ok(out)
+    }
+}

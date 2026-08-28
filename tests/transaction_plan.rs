@@ -293,3 +293,113 @@ fn a_change_to_a_leaf_rewrites_the_nodes_above_it() {
         plan.rewrites.len()
     );
 }
+
+/// The recursion settles.
+///
+/// Moving a block means recording the move, and those records live in
+/// extent tree leaves that are then themselves blocks to move. That is
+/// the recursion `docs/cow-transaction.md` measured, where a commit
+/// changing nothing still rewrote four blocks. It terminates because
+/// each rewrite is an allocation AND a release, so the extent tree ends
+/// up recording its own new blocks rather than growing.
+///
+/// Whether it terminates *for this implementation* is not something the
+/// measurement settles — that is what this asks.
+#[test]
+fn closing_the_plan_over_its_own_bookkeeping_settles() {
+    let Some(fs) = fixture("btrfs-cow-before.img") else {
+        eprintln!("no fixtures; build them with ./scripts/vm-build-cow-fixtures.sh");
+        return;
+    };
+    let Some(fs_root) = fs_tree_root(&fs) else {
+        return;
+    };
+
+    let open = fs.plan_transaction(&[fs_root]).expect("the spine alone");
+    let closed = fs
+        .plan_transaction_closed(&[fs_root], 8)
+        .expect("the plan should settle: recording a move must not keep making more work");
+
+    assert!(
+        closed.rewrites.len() >= open.rewrites.len(),
+        "closing the plan lost blocks: {} became {}",
+        open.rewrites.len(),
+        closed.rewrites.len()
+    );
+
+    // The extent tree must be in it. That is the whole point: the spine
+    // alone does not record its own moves.
+    assert!(
+        closed.trees().contains(&objectid::EXTENT_TREE),
+        "a closed plan must rewrite the extent tree, because that is where the record of \
+         every move it makes lives. It touches {:?}",
+        closed.trees().iter().collect::<Vec<_>>()
+    );
+
+    // Still nothing the kernel left alone.
+    eprintln!(
+        "spine {} blocks {:?} -> closed {} blocks {:?}",
+        open.rewrites.len(),
+        open.trees().iter().collect::<Vec<_>>(),
+        closed.rewrites.len(),
+        closed.trees().iter().collect::<Vec<_>>()
+    );
+}
+
+/// A closed plan still places everything somewhere free and distinct.
+#[test]
+fn a_closed_plan_places_every_block_somewhere_free() {
+    let Some(fs) = fixture("btrfs-cow-before.img") else {
+        eprintln!("no fixtures — skipping");
+        return;
+    };
+    let Some(fs_root) = fs_tree_root(&fs) else {
+        return;
+    };
+    let nodesize = fs.superblock().nodesize as u64;
+    let Ok(plan) = fs.plan_transaction_closed(&[fs_root], 8) else {
+        return;
+    };
+
+    let news: BTreeSet<u64> = plan.allocated().into_iter().collect();
+    assert_eq!(
+        news.len(),
+        plan.rewrites.len(),
+        "a closed plan places {} blocks at {} distinct addresses",
+        plan.rewrites.len(),
+        news.len()
+    );
+
+    // Nothing is placed on a block the same plan is moving away from —
+    // legal in principle, since that address is freed, but only once the
+    // transaction commits, and writing there first destroys the source.
+    let olds: BTreeSet<u64> = plan.released().into_iter().collect();
+    for at in &news {
+        assert!(
+            !olds.contains(at),
+            "the plan puts a new block at {at}, which is where a block it is still \
+             reading from lives. That address is only free after the commit."
+        );
+    }
+
+    let groups: Vec<_> = fs
+        .block_groups()
+        .expect("block groups")
+        .into_iter()
+        .filter(|g| g.holds_metadata())
+        .collect();
+    let free = fs.free_extents_by_group(&groups).expect("free space");
+    for at in &news {
+        assert_eq!(at % nodesize, 0, "{at} is not tree-block aligned");
+        assert!(
+            free.iter()
+                .flatten()
+                .any(|r| *at >= r.start && at + nodesize <= r.end()),
+            "the plan puts a block at {at}, which the extent tree says is allocated"
+        );
+    }
+    eprintln!(
+        "{} blocks, all free, distinct, and none on top of a source",
+        news.len()
+    );
+}
