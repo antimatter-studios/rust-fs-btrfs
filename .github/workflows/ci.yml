@@ -209,6 +209,20 @@ jobs:
       - name: Commit ordering and barriers
         run: cargo test --test commit_order -- --nocapture
 
+      # A whole image before and after one change, so what a transaction
+      # actually does can be measured rather than reasoned about. The
+      # control pair — a mount cycle that changes nothing — is what makes
+      # the other one mean anything.
+      - name: Build the before/after transaction pair
+        run: sudo bash scripts/build-cow-fixtures.sh
+
+      # What must be true of a transaction whatever it was for. Asserted
+      # against the kernel's transactions, and written before the
+      # planner exists so the planner has something to satisfy that was
+      # not shaped around it.
+      - name: Transaction invariants
+        run: cargo test --test transaction_oracle -- --nocapture
+
       - name: Loop-mount with the in-kernel btrfs driver
         run: |
           set -euo pipefail

@@ -179,7 +179,7 @@ tasks:
     cmds: ['./scripts/vm.sh destroy']
 
   fixtures:
-    desc: 'Build test fixtures: chore fixtures [--set geometry|subvol|commit|all] [--only name,name]'
+    desc: 'Build test fixtures: chore fixtures [--set geometry|subvol|commit|cow|all] [--only name,name]'
     args:
       - name: set
         desc: which set to build; every set by default
@@ -226,15 +226,17 @@ tasks:
           geometry) run vm-build-fixtures.sh ;;
           subvol)   run vm-build-subvol-fixtures.sh ;;
           commit)   run vm-build-commit-fixtures.sh ;;
+          cow)      run vm-build-cow-fixtures.sh ;;
           all)
             # Geometry first: most suites read those. The other two are
             # independent of it and of each other.
             run vm-build-fixtures.sh
             run vm-build-subvol-fixtures.sh
             run vm-build-commit-fixtures.sh
+            run vm-build-cow-fixtures.sh
             ;;
           *)
-            echo "unknown set '{{.set}}' — one of: geometry subvol commit all" >&2
+            echo "unknown set '{{.set}}' — one of: geometry subvol commit cow all" >&2
             exit 2
             ;;
         esac
