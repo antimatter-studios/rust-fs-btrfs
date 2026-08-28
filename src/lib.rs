@@ -50,6 +50,7 @@ pub mod block_group;
 pub mod btree;
 pub mod capi;
 pub mod chunk;
+pub mod commit;
 pub mod compression;
 pub mod dir;
 pub mod error;

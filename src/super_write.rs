@@ -69,6 +69,13 @@ pub mod offsets {
     pub const CACHE_GENERATION: usize = 0x22b;
     /// Tracks generation even when the UUID tree is untouched.
     pub const UUID_TREE_GENERATION: usize = 0x233;
+    /// The offset this copy belongs at.
+    ///
+    /// Each copy records its own address, which is what lets a reader
+    /// tell a genuine superblock from a stale image of one that was
+    /// copied elsewhere. Verified on a real filesystem: the copy at
+    /// 0x10000 holds 0x10000, the one at 0x4000000 holds 0x4000000.
+    pub const BYTENR: usize = 0x30;
     /// The first of four `btrfs_root_backup` slots.
     pub const ROOT_BACKUPS: usize = 0xb2b;
 }
@@ -183,6 +190,18 @@ pub fn apply(raw: &mut [u8], csum_type: ChecksumType, commit: &Commit) -> Result
 
     stamp_checksum(raw, csum_type);
     Ok(())
+}
+
+/// Stamp the address this copy belongs at.
+///
+/// The copies are not identical images: each names its own offset, and
+/// [`crate::fs::Filesystem::verify`] rejects one found where it does not
+/// claim to be. So a commit cannot write one buffer to all three — it
+/// re-stamps and re-checksums per copy.
+///
+/// Call before [`stamp_checksum`], which covers this field.
+pub fn set_bytenr(raw: &mut [u8], offset: u64) {
+    put64(raw, offsets::BYTENR, offset);
 }
 
 /// Compute and store the superblock's checksum.

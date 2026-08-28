@@ -775,6 +775,20 @@ impl ChunkMap {
         self.chunk_for(logical).is_some()
     }
 
+    /// How many copies of `logical` exist.
+    ///
+    /// One for `Single`, two for `Dup` and `Raid1`, and so on. A WRITE
+    /// has to reach every one of them: leaving a mirror holding the
+    /// previous contents is not a lesser form of redundancy, it is a
+    /// filesystem whose two copies disagree, and which copy a later read
+    /// returns is not something the caller chooses.
+    pub fn mirrors_at(&self, logical: u64) -> Result<usize> {
+        Ok(self
+            .chunk_for(logical)
+            .ok_or(Error::UnmappedLogical(logical))?
+            .num_mirrors())
+    }
+
     /// Translate `logical` using the first copy.
     pub fn map(&self, logical: u64) -> Result<Mapping> {
         self.map_mirror(logical, 0)

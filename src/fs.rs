@@ -218,6 +218,47 @@ impl Filesystem {
     /// Write to a logical address, following the chunk map exactly as
     /// the read path does — a write that ignored a chunk boundary would
     /// run past the end of one device and into another.
+    /// Write to EVERY copy of a logical range.
+    ///
+    /// [`Filesystem::write_logical`] writes the first copy only, which is
+    /// right for reading and wrong for writing. On a `DUP` or `RAID1`
+    /// chunk it leaves the other copy holding what was there before, and
+    /// the two then disagree with no record of which is current — a
+    /// later read may return either.
+    ///
+    /// The commit trace confirms this is what the kernel does: both
+    /// mirrors of every tree block go out BEFORE the barrier, so a torn
+    /// write to one leaves the other and the barrier still orders both
+    /// against the superblock.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the first write failure. A partial result is possible
+    /// and is not cleaned up: some mirrors may hold the new contents and
+    /// some the old, which is the same state a power loss produces and
+    /// is what the commit ordering exists to survive.
+    pub(crate) fn write_logical_all_mirrors(
+        device: &Arc<dyn BlockDevice>,
+        map: &ChunkMap,
+        logical: u64,
+        buf: &[u8],
+    ) -> Result<()> {
+        let mirrors = map.mirrors_at(logical)?;
+        for mirror in 0..mirrors {
+            let mut done = 0usize;
+            while done < buf.len() {
+                let m = map.map_mirror(logical + done as u64, mirror)?;
+                let n = (m.len as usize).min(buf.len() - done);
+                if n == 0 {
+                    return Err(Error::UnmappedLogical(logical + done as u64));
+                }
+                device.write_at(m.physical, &buf[done..done + n])?;
+                done += n;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn write_logical(
         device: &Arc<dyn BlockDevice>,
         map: &ChunkMap,
@@ -372,6 +413,15 @@ impl Filesystem {
     }
 
     /// The parsed superblock.
+    /// The chunk map — how logical addresses become physical ones.
+    ///
+    /// Exposed because a WRITER has to reason about placement in a way a
+    /// reader does not: how many copies an address has, and where each
+    /// one lands.
+    pub fn chunk_map(&self) -> &ChunkMap {
+        &self.map
+    }
+
     pub fn superblock(&self) -> &Superblock {
         &self.sb
     }
