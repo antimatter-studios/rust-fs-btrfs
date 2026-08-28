@@ -170,15 +170,18 @@ The write path runs end to end — plan, close, render, record, commit — and
 ```text
 [1/7] checking root items          ok
 [2/7] checking extents             ok
-[3/7] checking free space tree     wanted bytes 81920, found 49152 for off 30556160
-                                   cache appears valid but isn't
+[3/7] checking free space tree     ok
 [4/7] checking fs roots            ok
 [5/7] checking only csums items    ok
 [6/7] checking root refs           ok
+
+found 147456 bytes used, no error found
 ```
 
-Everything about the trees and their allocation records passes. What remains is the
-free-space tree, which this transaction does not maintain.
+And the kernel then mounts it read-write, writes a file, unmounts cleanly, and `btrfs
+check` passes again afterwards. That is the gate that cannot be satisfied by agreeing
+with ourselves: every other check here compares against bytes the kernel already wrote,
+and this one asks it to accept bytes we wrote.
 
 The superblock's `FREE_SPACE_TREE_VALID` bit is cleared when a commit says it did not
 maintain the cache — the state the format defines for exactly this, and it makes the
@@ -237,3 +240,39 @@ something is not a guarantee that the something exists.** The checks in
 `tests/transaction_oracle.rs` are deliberately one-directional for the same reason —
 every reachable block must be recorded, and every recorded block must be present, but
 neither says the two sets are equal.
+
+### The free-space tree, second attempt
+
+The first attempt (above) was reverted. What it was missing, both measured rather than
+reasoned:
+
+**A leaf is not per-block-group.** The whole tree can be one leaf holding a
+`FREE_SPACE_INFO` for each of several groups, each followed by that group's
+`FREE_SPACE_EXTENT`s in objectid order:
+
+```text
+INFO    1048576   len 4194304      <- no block group
+  EXTENT 1048576  len 4194304
+INFO    5242880   len 8388608      <- no block group
+  EXTENT 5242880  len 8388608
+INFO   13631488   len 8388608
+  EXTENT 13631488 len 8388608
+INFO   22020096   len 8388608
+  EXTENT 22020096 len 16384
+  EXTENT 22052864 len 8355840
+INFO   30408704   len 33554432
+  EXTENT 30408704 len 16384
+  ... six runs
+```
+
+So a leaf is rewritten group by group, and every group in it has to come out again.
+
+**An `INFO` may name a group that no longer exists**, and that is correct. Those runs are
+carried through untouched: there is no block group to derive a free set from, and dropping
+them would delete something the kernel put there deliberately.
+
+The checker's arithmetic is worth following, because it confirms the model rather than
+just the result. Before the fix it wanted **81920** bytes free at 30556160 where the tree
+said **49152**. The run at 30556160 covers 30556160..30605312. The transaction frees the
+old root tree at 30605312 and the old extent tree at 30621696, both one node long, which
+extends that run to 30638080 — and 30638080 − 30556160 is exactly 81920.

@@ -446,6 +446,14 @@ impl Filesystem {
                         owned = self.apply_records(owned, plan, generation)?;
                     }
 
+                    // The free-space tree is the complement of the
+                    // extent tree, so a transaction changes both. A leaf
+                    // left saying where things used to be is what `btrfs
+                    // check` calls "cache appears valid but isn't".
+                    if rewrite.owner == objectid::FREE_SPACE_TREE {
+                        owned = self.apply_free_space(owned, plan)?;
+                    }
+
                     // A root tree leaf names other trees' roots.
                     if rewrite.owner == objectid::ROOT_TREE {
                         for item in &mut owned {
@@ -535,9 +543,11 @@ impl Filesystem {
             let mut touched: Vec<u64> = plan.released();
             touched.extend(plan.allocated());
 
-            let leaves = self.extent_leaves_for(&touched)?;
             let before = seed.len();
-            seed.extend(leaves);
+            seed.extend(self.extent_leaves_for(&touched)?);
+            // The free-space tree tracks the same moves from the other
+            // side, so its leaves for those addresses are dirty too.
+            seed.extend(self.free_space_leaves_for(&touched)?);
             if seed.len() == before {
                 return Ok(plan);
             }
@@ -660,4 +670,210 @@ impl Filesystem {
         }
         Ok(out)
     }
+}
+
+/// `BTRFS_FREE_SPACE_INFO_KEY` / `..._EXTENT_KEY` / `..._BITMAP_KEY`.
+const FREE_SPACE_INFO_KEY: u8 = 198;
+const FREE_SPACE_EXTENT_KEY: u8 = 199;
+const FREE_SPACE_BITMAP_KEY: u8 = 200;
+
+impl Filesystem {
+    /// The free-space tree leaves that describe any of `addresses`.
+    fn free_space_leaves_for(&self, addresses: &[u64]) -> Result<BTreeSet<u64>> {
+        let Ok(root) = self.tree_root(objectid::FREE_SPACE_TREE) else {
+            return Ok(BTreeSet::new());
+        };
+        let groups = self.block_groups()?;
+        let spans: Vec<(u64, u64)> = groups
+            .iter()
+            .filter(|g| addresses.iter().any(|a| g.contains(*a)))
+            .map(|g| (g.start, g.end()))
+            .collect();
+        if spans.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+
+        let mut out = BTreeSet::new();
+        self.for_each_tree_block(root, &mut |at, block, level, _| {
+            if level != 0 {
+                return;
+            }
+            let n = u32::from_le_bytes(block[o::NRITEMS..o::NRITEMS + 4].try_into().unwrap());
+            for i in 0..n as usize {
+                let it = HEADER_SIZE + i * 25;
+                if it + 25 > block.len() {
+                    break;
+                }
+                let oid = u64::from_le_bytes(block[it..it + 8].try_into().unwrap());
+                if spans.iter().any(|(s, e)| oid >= *s && oid < *e) {
+                    out.insert(at);
+                    return;
+                }
+            }
+        })?;
+        Ok(out)
+    }
+
+    /// Rewrite a free-space tree leaf so it describes what the plan
+    /// leaves behind.
+    ///
+    /// The free-space tree is the complement of the extent tree, so a
+    /// transaction that moves blocks changes both. A leaf left saying
+    /// where things used to be is what `btrfs check` reports as "cache
+    /// appears valid but isn't".
+    ///
+    /// # The two things a first attempt got wrong
+    ///
+    /// **A leaf is not per-block-group.** Measured: the whole tree can
+    /// be one leaf holding a `FREE_SPACE_INFO` for each of several
+    /// groups, each followed by that group's `FREE_SPACE_EXTENT`s in
+    /// objectid order. So a leaf is rewritten group by group, and every
+    /// group in it must come out again.
+    ///
+    /// **An `INFO` may name a group that no longer exists.** The tree
+    /// outlives its block groups and `btrfs check` calls that correct —
+    /// see `docs/cow-transaction.md`. Those entries are carried through
+    /// untouched: there is no block group to derive a free set from, and
+    /// dropping them would delete something the kernel put there.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] for a leaf holding a
+    /// `FREE_SPACE_BITMAP`, which needs its bits rewritten rather than
+    /// its extents and is not implemented. Refusing beats writing
+    /// extents where the kernel will read bits.
+    fn apply_free_space(
+        &self,
+        items: Vec<crate::leaf_edit::OwnedItem>,
+        plan: &Plan,
+    ) -> Result<Vec<crate::leaf_edit::OwnedItem>> {
+        use crate::block_group::FreeExtent;
+        use crate::chunk::DiskKey;
+        use crate::leaf_edit::OwnedItem;
+
+        if items
+            .iter()
+            .any(|i| i.key.key_type == FREE_SPACE_BITMAP_KEY)
+        {
+            return Err(Error::UnsupportedFeature(
+                "this free-space tree records a block group as a bitmap, and rewriting \
+                 bits is not implemented"
+                    .to_string(),
+            ));
+        }
+
+        let groups = self.block_groups()?;
+        let released: Vec<u64> = plan.released();
+        let allocated: Vec<u64> = plan.allocated();
+        let nodesize = self.sb.nodesize as u64;
+
+        let mut out: Vec<OwnedItem> = Vec::with_capacity(items.len());
+        let mut i = 0usize;
+        while i < items.len() {
+            let item = &items[i];
+            if item.key.key_type != FREE_SPACE_INFO_KEY {
+                // An extent item with no info before it: carry it.
+                out.push(item.clone());
+                i += 1;
+                continue;
+            }
+
+            // This group's span, and the run of items belonging to it.
+            let start = item.key.objectid;
+            let end = start + item.key.offset;
+            let mut j = i + 1;
+            while j < items.len()
+                && items[j].key.key_type != FREE_SPACE_INFO_KEY
+                && items[j].key.objectid < end
+            {
+                j += 1;
+            }
+
+            let touched = released
+                .iter()
+                .chain(allocated.iter())
+                .any(|a| *a >= start && *a < end);
+            let group = groups.iter().find(|g| g.start == start);
+
+            match (touched, group) {
+                // Untouched, or a group that no longer exists: carry the
+                // whole run through exactly as it was.
+                (false, _) | (_, None) => out.extend_from_slice(&items[i..j]),
+                (true, Some(group)) => {
+                    // What is free now, plus what the plan releases,
+                    // minus what it takes.
+                    let mut free = self.free_extents(group)?;
+                    for at in released.iter().filter(|a| group.contains(**a)) {
+                        free.push(FreeExtent {
+                            start: *at,
+                            len: nodesize,
+                        });
+                    }
+                    free.sort();
+
+                    let mut merged: Vec<FreeExtent> = Vec::with_capacity(free.len());
+                    for run in free {
+                        match merged.last_mut() {
+                            Some(prev) if prev.end() == run.start => prev.len += run.len,
+                            _ => merged.push(run),
+                        }
+                    }
+
+                    let mut runs: Vec<FreeExtent> = merged;
+                    for at in allocated.iter().filter(|a| group.contains(**a)) {
+                        runs = runs
+                            .into_iter()
+                            .flat_map(|r| carve(r, *at, nodesize))
+                            .collect();
+                    }
+                    runs.retain(|r| r.len > 0);
+
+                    let mut info = item.clone();
+                    if info.data.len() >= 4 {
+                        info.data[0..4].copy_from_slice(&(runs.len() as u32).to_le_bytes());
+                    }
+                    out.push(info);
+                    for run in runs {
+                        out.push(OwnedItem {
+                            key: DiskKey {
+                                objectid: run.start,
+                                key_type: FREE_SPACE_EXTENT_KEY,
+                                offset: run.len,
+                            },
+                            data: Vec::new(),
+                        });
+                    }
+                }
+            }
+            i = j;
+        }
+        Ok(out)
+    }
+}
+
+/// `run` with `[at, at + len)` taken out of it.
+fn carve(
+    run: crate::block_group::FreeExtent,
+    at: u64,
+    len: u64,
+) -> Vec<crate::block_group::FreeExtent> {
+    use crate::block_group::FreeExtent;
+    let end = at + len;
+    if end <= run.start || at >= run.end() {
+        return vec![run];
+    }
+    let mut out = Vec::new();
+    if at > run.start {
+        out.push(FreeExtent {
+            start: run.start,
+            len: at - run.start,
+        });
+    }
+    if end < run.end() {
+        out.push(FreeExtent {
+            start: end,
+            len: run.end() - end,
+        });
+    }
+    out
 }
