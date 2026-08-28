@@ -410,6 +410,40 @@ impl Filesystem {
         })
     }
 
+    /// Look up a tree's root address by its objectid — public form.
+    ///
+    /// The same lookup [`Filesystem::block_groups`] uses. Exposed so a
+    /// caller can ask about a tree this crate has no dedicated reader
+    /// for, such as the free-space tree.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadSuperblock`] when there is no `ROOT_ITEM` for it,
+    /// which is how an optional tree's absence is reported.
+    pub fn tree_root_public(&self, objectid: u64) -> Result<u64> {
+        self.tree_root(objectid)
+    }
+
+    /// Walk any tree, handing every item to `visit`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a tree read failure.
+    pub fn for_each_item_in(
+        &self,
+        root: u64,
+        visit: &mut dyn FnMut(&DiskKey, &[u8]),
+    ) -> Result<()> {
+        let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
+            Self::read_logical(&self.device, &self.map, logical, buf)
+        };
+        let tree = Tree::from_superblock(&self.sb, &read);
+        tree.for_each(root, &mut |key: &DiskKey, data: &[u8]| {
+            visit(key, data);
+            Ok(true)
+        })
+    }
+
     /// Look up a tree's root address by its objectid.
     ///
     /// # Errors

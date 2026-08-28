@@ -207,3 +207,33 @@ settled everything else here: measure how the kernel distributes `FREE_SPACE_INF
 `FREE_SPACE_EXTENT` items across leaves, on a filesystem large enough for the tree to have
 more than one, and rewrite from that rather than from a guess. The bitmap form
 (`FREE_SPACE_BITMAP`) has not been measured at all.
+
+### The free-space tree outlives its block groups
+
+Settled before attempting the rewrite again, because the failed attempt tripped over it.
+
+The free-space tree on the fixture names **five** block groups. The extent tree has
+**three**:
+
+```text
+extent tree      13631488  22020096  30408704
+free-space tree   1048576   5242880  13631488  22020096  30408704
+                  ^^^^^^^   ^^^^^^^  no BLOCK_GROUP_ITEM for either
+```
+
+This is not a reader bug, and it was checked against the reference tools rather than
+argued about: `btrfs inspect-internal dump-tree -t 2` counts three
+`BLOCK_GROUP_ITEM`s and `-t 10` lists five `FREE_SPACE_INFO`s, exactly as this driver
+reports. `btrfs check` on the same image says **"no error found"**.
+
+So a free-space tree may hold entries for block groups that have been removed, and the
+filesystem is correct. Anything rewriting that tree has to tolerate it. The reverted
+attempt did not: it looked each `FREE_SPACE_INFO` up by objectid, found no group for two
+of the five, and bailed out — which is part of how it came to write a free set covering
+ground it had no business describing.
+
+Worth stating as a rule, because it generalises past this tree: **an item naming
+something is not a guarantee that the something exists.** The checks in
+`tests/transaction_oracle.rs` are deliberately one-directional for the same reason —
+every reachable block must be recorded, and every recorded block must be present, but
+neither says the two sets are equal.
