@@ -175,13 +175,40 @@ impl Filesystem {
     pub fn free_extents(&self, group: &BlockGroup) -> Result<Vec<FreeExtent>> {
         let mut taken = self.allocated_extents(group)?;
         taken.sort_by_key(|e| e.start);
+        Self::gaps(group, &taken)
+    }
 
+    /// What is free in every group, from ONE walk of the extent tree.
+    ///
+    /// [`Filesystem::free_extents`] answers for a single group and walks
+    /// the whole extent tree to do it, because an allocated run for any
+    /// group can be filed anywhere in it. A caller asking about every
+    /// group therefore walked it once per group — on a filesystem with
+    /// a dozen groups that is a dozen full traversals for one answer,
+    /// and it made the allocation suite take five minutes.
+    ///
+    /// Returns one list per group, in the order given.
+    ///
+    /// # Errors
+    ///
+    /// As [`Filesystem::free_extents`].
+    pub fn free_extents_by_group(&self, groups: &[BlockGroup]) -> Result<Vec<Vec<FreeExtent>>> {
+        let mut taken = self.allocated_by_group(groups)?;
+        let mut out = Vec::with_capacity(groups.len());
+        for (group, runs) in groups.iter().zip(taken.iter_mut()) {
+            runs.sort_by_key(|e| e.start);
+            out.push(Self::gaps(group, runs)?);
+        }
+        Ok(out)
+    }
+
+    /// The runs of `group` not covered by anything in `taken`, which
+    /// must be sorted.
+    fn gaps(group: &BlockGroup, taken: &[FreeExtent]) -> Result<Vec<FreeExtent>> {
         let mut free = Vec::new();
         let mut pos = group.start;
-        for e in &taken {
+        for e in taken {
             if e.start < pos {
-                // Equal starts, or a run that reaches into the previous
-                // one. Either way two items claim the same byte.
                 return Err(Error::UnsupportedFeature(format!(
                     "the extent tree has an allocated run at {} that overlaps the one \
                      ending at {pos}, in the block group at {}",
@@ -207,6 +234,14 @@ impl Filesystem {
 
     /// The allocated runs inside `group`, from the extent tree.
     fn allocated_extents(&self, group: &BlockGroup) -> Result<Vec<FreeExtent>> {
+        Ok(self
+            .allocated_by_group(std::slice::from_ref(group))?
+            .pop()
+            .unwrap_or_default())
+    }
+
+    /// The allocated runs of every group, from one traversal.
+    fn allocated_by_group(&self, groups: &[BlockGroup]) -> Result<Vec<Vec<FreeExtent>>> {
         let root = self.tree_root(objectid::EXTENT_TREE)?;
         let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
             Self::read_logical(&self.device, &self.map, logical, buf)
@@ -214,7 +249,7 @@ impl Filesystem {
         let tree = Tree::from_superblock(&self.sb, &read);
         let nodesize = self.sb.nodesize as u64;
 
-        let mut out = Vec::new();
+        let mut out = vec![Vec::new(); groups.len()];
         tree.for_each(root, &mut |key: &DiskKey, _data: &[u8]| {
             // Reference items (TREE_BLOCK_REF and friends) are filed
             // under the same objectid as the extent they describe. They
@@ -228,8 +263,12 @@ impl Filesystem {
                 key_type::METADATA_ITEM => nodesize,
                 _ => return Ok(true),
             };
-            if key.objectid >= group.start && key.objectid < group.end() {
-                out.push(FreeExtent {
+            // Groups do not overlap, so at most one claims this run.
+            if let Some(i) = groups
+                .iter()
+                .position(|g| key.objectid >= g.start && key.objectid < g.end())
+            {
+                out[i].push(FreeExtent {
                     start: key.objectid,
                     len,
                 });
@@ -430,8 +469,15 @@ impl Filesystem {
         let nodesize = self.sb.nodesize as u64;
         let mut best_free = 0u64;
 
-        for group in self.block_groups()?.iter().filter(|g| g.holds_metadata()) {
-            for run in self.free_extents(group)? {
+        // One walk of the extent tree for every group, rather than one
+        // per group.
+        let groups: Vec<BlockGroup> = self
+            .block_groups()?
+            .into_iter()
+            .filter(|g| g.holds_metadata())
+            .collect();
+        for runs in self.free_extents_by_group(&groups)? {
+            for run in runs {
                 best_free = best_free.max(usable_in(run, nodesize));
                 if let Some(at) = place_in_run(run, nodesize) {
                     return Ok(at);

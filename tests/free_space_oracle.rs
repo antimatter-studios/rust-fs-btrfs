@@ -113,11 +113,11 @@ fn free_space_derived_from_the_extent_tree_matches_the_kernels_cache() {
         );
 
         let mut had_cache = false;
-        for group in &groups {
-            let ours = fs
-                .free_extents(group)
-                .unwrap_or_else(|e| panic!("{name}: deriving free space at {}: {e}", group.start));
-
+        // One traversal for every group, not one per group.
+        let derived = fs
+            .free_extents_by_group(&groups)
+            .unwrap_or_else(|e| panic!("{name}: deriving free space: {e}"));
+        for (group, ours) in groups.iter().zip(derived) {
             let theirs = match fs.cached_free_extents(group) {
                 Ok(Some(t)) => t,
                 // No free-space tree on this filesystem: nothing to
