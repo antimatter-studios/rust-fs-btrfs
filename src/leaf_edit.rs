@@ -21,8 +21,20 @@
 //! the kernel writes because it was measured first. Guessing a split
 //! point here would be the first place that stopped being true, so
 //! instead an item that will not fit is refused, and the refusal names
-//! what is missing. The fixture that would settle it is a filesystem
-//! with a leaf filled to just under capacity and one more item added.
+//! what is missing.
+//!
+//! That was a judgement when it was written, and it is now a
+//! measurement. Across 9,026 leaves of the two deep fixtures the median
+//! is 91-98% FULL, with the dominant mode at 90-99% and only a
+//! secondary cluster near half — see `docs/cow-transaction.md`. A split
+//! down the middle would pile the distribution up at 50%, and it does
+//! not. So "half" would be wrong in the common case, and wrong in a way
+//! nothing here would catch: every other check in this crate compares
+//! against blocks the kernel already wrote, not against blocks it would
+//! write next.
+//!
+//! The fixture that would settle it is a leaf filled to just under
+//! capacity and one more item added, captured either side.
 
 use crate::chunk::DiskKey;
 use crate::error::{Error, Result};

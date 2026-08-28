@@ -113,3 +113,43 @@ something to be measured against that was not written to fit it.
 A commit that makes a tree grow taller, and a data write — which adds a checksum-tree
 leaf and data extents, neither of which appears above. The document's earlier reasoning
 puts those before the tree blocks in write order; that part is still reasoned.
+
+## The split policy is not "half"
+
+`src/leaf_edit.rs` refuses an item that will not fit, rather than splitting the leaf,
+because where the kernel puts the boundary is a policy and guessing it would produce
+leaves the kernel would not have written. That was a judgement when it was written. It
+is now a measurement.
+
+How full every leaf is, across the two deep fixtures — 5,261 leaves at 4 KiB and 3,765
+at 16 KiB, built by creating 20,000 and 60,000 files:
+
+```text
+deep4k    median fill 98%        deep16k   median fill 91%
+   40-49%   260                     40-49%   280
+   50-59%   894   <- a mode         50-59%   406   <- a mode
+   60-69%   125                     60-69%   430
+   70-79%   118                     70-79%   248
+   80-89%   736                     80-89%   406
+   90-99%  2796   <- the mode       90-99%  1912   <- the mode
+```
+
+If splitting cut every full leaf down the middle, the distribution would pile up around
+50%. It does not: the dominant mode is 90–99% full, with a secondary cluster near half.
+So the kernel is filling leaves and splitting somewhere other than the middle — which is
+what `btrfs_split_leaf` does, pushing items to a sibling before splitting at all, and
+splitting near the insertion point rather than the centre for keys that arrive in order.
+Creating files in one directory is exactly that workload.
+
+A "split in half" implementation would therefore be wrong in the common case, and wrong
+in a way nothing in this crate would catch, because every other check compares against
+blocks the kernel already wrote rather than against blocks it would write next.
+
+**What would settle it**: a fixture that captures one split directly — a leaf filled to
+just under capacity, then one more item, with the images either side. That is a
+before/after pair like the ones in this document, and the same `cow_diff` reads it.
+
+(The fill figures are approximate: 32 of the 4 KiB blocks computed to over 100%, which
+means the crude item-array arithmetic used here misreads some blocks. They are excluded
+above. The shape of the distribution is not in doubt — the two modes are thousands of
+leaves apart.)
