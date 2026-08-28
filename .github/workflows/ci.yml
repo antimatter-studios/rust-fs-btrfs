@@ -234,6 +234,18 @@ jobs:
       - name: Leaf editing
         run: cargo test --test leaf_edit_oracle -- --nocapture
 
+      # A filesystem either side of one leaf splitting, plus a second
+      # pair with deliberately uneven item sizes — without which
+      # half-the-count and half-the-bytes cannot be told apart.
+      - name: Build the leaf-split pairs
+        run: |
+          set -euo pipefail
+          sudo bash scripts/build-split-fixtures.sh
+          sudo env BTRFS_SPLIT_VARY=1 BTRFS_SPLIT_SUFFIX=-vary bash scripts/build-split-fixtures.sh
+
+      - name: Reproduce the kernel's leaf split
+        run: cargo test --test split_oracle -- --nocapture
+
       - name: Loop-mount with the in-kernel btrfs driver
         run: |
           set -euo pipefail

@@ -114,42 +114,49 @@ A commit that makes a tree grow taller, and a data write — which adds a checks
 leaf and data extents, neither of which appears above. The document's earlier reasoning
 puts those before the tree blocks in write order; that part is still reasoned.
 
-## The split policy is not "half"
+## The split boundary, and why it is not copied
 
-`src/leaf_edit.rs` refuses an item that will not fit, rather than splitting the leaf,
-because where the kernel puts the boundary is a policy and guessing it would produce
-leaves the kernel would not have written. That was a judgement when it was written. It
-is now a measurement.
+An earlier version of this section read *"the split policy is not half"*, inferred from
+the fill distribution of a populated filesystem — the median leaf is 91-98% full, which
+looks like evidence against halving. **That was wrong.** Mostly-full leaves are what
+halving *produces*, once each resulting half is filled up again by later inserts. Reading
+a rule off a steady state was the mistake.
 
-How full every leaf is, across the two deep fixtures — 5,261 leaves at 4 KiB and 3,765
-at 16 KiB, built by creating 20,000 and 60,000 files:
+So the event was captured. `scripts/build-split-fixtures.sh` adds files one at a time,
+committing each, and watches the fs tree's leaf count in btrfs-progs' own dump; when it
+goes up, the previous image is the before and the current one the after. At the smallest
+nodesize the first split arrives at file 8. `BTRFS_SPLIT_VARY=1` builds a second pair
+whose items run from 12 to 232 bytes, because with items of equal size *half the count*
+and *half the bytes* give the same boundary and a measurement says nothing.
+
+Three real splits, read from the **live** tree either side:
 
 ```text
-deep4k    median fill 98%        deep16k   median fill 91%
-   40-49%   260                     40-49%   280
-   50-59%   894   <- a mode         50-59%   406   <- a mode
-   60-69%   125                     60-69%   430
-   70-79%   118                     70-79%   248
-   80-89%   736                     80-89%   406
-   90-99%  2796   <- the mode       90-99%  1912   <- the mode
+  42 items -> 22 | 20      half + 1
+  32 items -> 17 | 15      half + 1
+  52 items -> 26 | 26      half
 ```
 
-If splitting cut every full leaf down the middle, the distribution would pile up around
-50%. It does not: the dominant mode is 90–99% full, with a secondary cluster near half.
-So the kernel is filling leaves and splitting somewhere other than the middle — which is
-what `btrfs_split_leaf` does, pushing items to a sibling before splitting at all, and
-splitting near the insertion point rather than the centre for keys that arrive in order.
-Creating files in one directory is exactly that workload.
+They do not follow one rule. `__btrfs_split_leaf` picks its boundary partly from the slot
+the new item is going into, and can push items to a sibling instead of splitting at all;
+reproducing it needs the insertion slot and the sibling's state, which these fixtures
+underdetermine.
 
-A "split in half" implementation would therefore be wrong in the common case, and wrong
-in a way nothing in this crate would catch, because every other check compares against
-blocks the kernel already wrote rather than against blocks it would write next.
+**And it does not need reproducing.** The split point is not part of the on-disk format.
+A checksum over the wrong span is a filesystem the kernel rejects; an item offset measured
+from the wrong place is a leaf it misreads; a leaf divided in a different place is simply
+a different, equally valid tree. So `leaf_edit::split` halves the item count and says so,
+and `tests/split_oracle.rs` checks what actually has to hold — both halves non-empty, in
+key order across the boundary as well as within each, together exactly the input, and each
+fitting in a block — using the items of leaves the kernel really did split. The kernel's
+own boundary is recorded alongside rather than asserted.
 
-**What would settle it**: a fixture that captures one split directly — a leaf filled to
-just under capacity, then one more item, with the images either side. That is a
-before/after pair like the ones in this document, and the same `cow_diff` reads it.
+This is the one place in the write path where byte-identity with the kernel is the wrong
+bar, and noticing that took three measurements and a CI failure: the rule fitted two
+splits, and the third, on a different machine, broke it.
 
-(The fill figures are approximate: 32 of the 4 KiB blocks computed to over 100%, which
-means the crude item-array arithmetic used here misreads some blocks. They are excluded
-above. The shape of the distribution is not in doubt — the two modes are thousands of
-leaves apart.)
+One methodological note. The first version of the oracle found the split leaves by
+scanning for the newest generation, which turns up leaves nothing points at any more; it
+paired two of those and compared a 43-item "split" that never happened. Walking the live
+tree from its root fixed it. Scanning is right for asking what is *on* a disk and wrong
+for asking what the filesystem *is*.
