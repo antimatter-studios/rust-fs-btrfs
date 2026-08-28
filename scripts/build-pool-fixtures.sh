@@ -43,7 +43,36 @@ trap cleanup EXIT
 
 $SUDO mkfs.btrfs -f -d raid1 -m raid1 "$la" "$lb" >/dev/null
 
-echo "BUILT  a two-device RAID1 filesystem"
+# Content, so a reader has something to be right or wrong about. An
+# empty pool proves only that the superblock parses.
+m="$(mktemp -d)"
+$SUDO mount "$la" "$m"
+$SUDO mkdir -p "$m/dir"
+for i in 1 2 3; do
+    echo "pool file $i" | $SUDO tee "$m/dir/file-$i.txt" >/dev/null
+done
+# Big enough to need a data extent rather than living inline in its
+# item, so the chunk mapping is actually exercised on a read.
+$SUDO dd if=/dev/urandom of="$m/big.bin" bs=1M count=4 status=none
+$SUDO sync
+
+# What the kernel says is in there, written while it is still mounted,
+# for a reader to be checked against.
+# Size AND content. A size alone is a weak check on a mirrored pool:
+# reading four megabytes of the WRONG bytes has the right length.
+( cd "$m" && $SUDO find . -mindepth 1 | sort | while read -r p; do
+    if [ -f "$p" ]; then
+        printf '%s\t%s\t%s\n' "${p#.}" "$($SUDO stat -c%s "$p")" \
+            "$($SUDO sha256sum "$p" | cut -d' ' -f1)"
+    else
+        printf '%s\tdir\t-\n' "${p#.}"
+    fi
+  done ) > "$OUT/btrfs-pool.manifest"
+
+$SUDO umount "$m"
+rmdir "$m"
+
+echo "BUILT  a two-device RAID1 filesystem with content"
 for f in "$a" "$b"; do
     devs=$(od -An -tu8 -j $((65536 + 0x88)) -N 8 "$f" | tr -d ' ')
     echo "  $(basename "$f")  num_devices $devs"
