@@ -54,6 +54,8 @@ use fs_btrfs::superblock::{Superblock, SUPER_INFO_OFFSET};
 use fs_btrfs::{Error, Result};
 use std::path::{Path, PathBuf};
 
+mod common;
+
 /// `BTRFS_ROOT_ITEM_KEY`. `chunk::key_type` names only the two types the
 /// chunk bootstrap needs, so this one is spelled out here rather than
 /// added to a module this test is not allowed to touch.
@@ -66,13 +68,31 @@ fn fixtures() -> Vec<(String, PathBuf)> {
         return Vec::new();
     };
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     for e in entries.flatten() {
         let p = e.path();
         if p.extension().and_then(|s| s.to_str()) != Some("img") {
             continue;
         }
         let name = p.file_stem().unwrap().to_string_lossy().into_owned();
+
+        // Multi-device filesystems are not fixtures for this file.
+        // Everything here reads a logical address straight out of a
+        // flat image, which is only meaningful when every chunk lives
+        // on the device being read. One disk of a pool holds chunks
+        // belonging to the other, and the bytes at those offsets are
+        // something else entirely.
+        if common::spans_several_devices(&p) {
+            skipped.push(name);
+            continue;
+        }
         out.push((name, p));
+    }
+    if !skipped.is_empty() {
+        eprintln!(
+            "skipping {} multi-device image(s): {skipped:?}",
+            skipped.len()
+        );
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out

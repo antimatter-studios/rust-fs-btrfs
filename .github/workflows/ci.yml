@@ -260,6 +260,15 @@ jobs:
       # This is the gate that cannot be satisfied by agreeing with
       # ourselves. Everything else here compares against bytes the
       # kernel already wrote; this asks it to accept bytes we wrote.
+      # A filesystem spanning two devices, which is different in kind
+      # from every other fixture: reading one disk of it is not a partial
+      # read but a read of the wrong bytes.
+      - name: Build the two-device pool
+        run: sudo bash scripts/build-pool-fixtures.sh
+
+      - name: Refuse one device of a pool
+        run: cargo test --test pool_oracle -- --nocapture
+
       - name: Write a transaction and let the kernel judge it
         run: |
           set -euo pipefail
@@ -287,6 +296,18 @@ jobs:
           failed=()
           for img in .vm-share/btrfs-*.img; do
             name="$(basename "$img" .img)"
+
+            # A member of a multi-device filesystem cannot be loop-mounted
+            # on its own — the KERNEL refuses it for the same reason this
+            # driver does, since half the chunks live on the other disk.
+            # Mounting a pool needs both devices registered, which is a
+            # different test from this one.
+            devices=$(od -An -tu8 -j $((65536 + 0x88)) -N 8 "$img" | tr -d ' ')
+            if [ "${devices:-1}" -gt 1 ]; then
+              echo "skipping $name: $devices devices, not a single-device fixture"
+              continue
+            fi
+
             mnt="/mnt/$name"
             sudo mkdir -p "$mnt"
             echo "::group::mount $name"

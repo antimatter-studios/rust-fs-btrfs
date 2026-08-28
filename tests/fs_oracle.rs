@@ -20,6 +20,8 @@ use fs_core::FileDevice;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod common;
+
 fn fixtures() -> Vec<(String, PathBuf)> {
     let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
     let Ok(entries) = std::fs::read_dir(&share) else {
@@ -29,6 +31,13 @@ fn fixtures() -> Vec<(String, PathBuf)> {
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("img"))
+        // A pool member is not a fixture for this file. These tests
+        // require every image to MOUNT, and a filesystem spanning two
+        // devices opened with one is refused on purpose — reading it
+        // would return the wrong data rather than fail. Asserting that
+        // every image mounts would turn that correct refusal into a
+        // failure.
+        .filter(|p| !common::spans_several_devices(p))
         .map(|p| (p.file_stem().unwrap().to_string_lossy().into_owned(), p))
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
