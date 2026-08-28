@@ -17,6 +17,13 @@ something plausible and wrong. So it was measured.
 | `btrfs-cow-control.img` | mounted and unmounted again, **changing nothing** |
 | `btrfs-cow-after.img` | one `touch` and one `sync` |
 
+**A mount cycle that changes nothing does not always commit.** It did in the Debian
+oracle VM, where the numbers below were measured; the same script on the CI runner left
+the generation unmoved. Which is fair — there was nothing to write. So the control pair
+is a measurement when it commits and an empty pair when it does not, and
+`tests/transaction_oracle.rs` treats a pair with no transaction as nothing to check
+rather than as a failure, while requiring that *something* committed.
+
 The control is what makes the rest mean anything. Mounting read-write commits by
 itself, so a before/after pair around a `touch` contains the touch *and* whatever a bare
 mount cycle does. Without a pair that did nothing, all of it would be attributed to
