@@ -276,3 +276,30 @@ just the result. Before the fix it wanted **81920** bytes free at 30556160 where
 said **49152**. The run at 30556160 covers 30556160..30605312. The transaction frees the
 old root tree at 30605312 and the old extent tree at 30621696, both one node long, which
 extends that run to 30638080 — and 30638080 − 30556160 is exactly 81920.
+
+## The dev tree needs nothing, and that was measured rather than assumed
+
+The dev tree (objectid 4) holds `DEV_EXTENT` items mapping physical device ranges to the
+chunks on them — the reverse of the chunk tree's logical-to-physical map. An empty commit
+rewrites it, which made it look like a transaction has to maintain it.
+
+Rewriting a block is not the same as changing what it says.
+`examples/dev_tree_diff.rs` compares the items either side of both fixture pairs:
+
+```text
+before -> control (an empty commit)   6 items, added [] removed [] changed []
+before -> after   (one touch)         6 items, added [] removed [] changed []
+```
+
+Identical both times. The kernel rewrites the dev tree because a commit copies every tree
+it touches and it touches that one; the contents do not move because nothing about the
+device layout changed.
+
+A transaction that only relocates metadata within existing chunks therefore needs no dev
+tree work at all, and the end-to-end gate confirms it from the other direction: the
+filesystem this write path produces passes `btrfs check` and mounts read-write without the
+dev tree being touched.
+
+**What would change it** is allocating or freeing a CHUNK — that adds or removes a
+`DEV_EXTENT` and moves the chunk tree with it. No fixture does that yet, and the allocator
+refuses rather than growing the filesystem, so the case cannot arise today.
