@@ -9,45 +9,46 @@
 //! [`crate::tree_write::build_leaf`] turns a list into bytes. This
 //! produces the list.
 //!
-//! # Splitting, and where the boundary goes
+//! # Splitting, and why the boundary is not copied
 //!
-//! When an item will not fit, the leaf splits in two. Where the kernel
-//! puts the boundary is a policy, and it was measured rather than
-//! guessed — `scripts/build-split-fixtures.sh` catches one split either
-//! side of the event, and the two candidate rules were separated by a
-//! second fixture built with deliberately uneven item sizes:
+//! When an item will not fit, the leaf divides in two. Unlike almost
+//! everything else in this crate's write path, the boundary is NOT part
+//! of the on-disk contract: a checksum computed over the wrong span is
+//! a filesystem the kernel rejects, and an item offset measured from the
+//! wrong place is a leaf it misreads, but a leaf split at a different
+//! position is simply a different, equally valid tree. Any split that
+//! leaves both halves ordered, non-empty and inside a block reads back
+//! correctly.
+//!
+//! That distinction matters here because the kernel's own boundary was
+//! measured and does not follow a simple rule. Three real splits, read
+//! from the live tree either side of the event:
 //!
 //! ```text
-//! items 12 to 232 bytes, 32 items across the split
-//!   the kernel put              17 items / 1951 B on the left
-//!   len/2 + 1 puts              17                  <- matches
-//!   half the BYTES puts         14
+//!   42 items -> 22 | 20     len/2 + 1
+//!   32 items -> 17 | 15     len/2 + 1
+//!   52 items -> 26 | 26     len/2
 //! ```
 //!
-//! And on the pair built with items of one size, 42 items became 22 and
-//! 20 — again `len/2 + 1`. Note that this is one MORE than half, not
-//! half rounded up: `div_ceil` gives 21 and 16 and is wrong on both.
+//! `__btrfs_split_leaf` picks its boundary partly from the slot the new
+//! item is going into, and tries to leave room there; it can also push
+//! items to a sibling instead of splitting at all. Reproducing that
+//! needs the insertion slot and the sibling's state, and the fixtures
+//! underdetermine it — two of the three above agree on `len/2 + 1` and
+//! the third does not.
 //!
-//! So the boundary is half the item count, not half the bytes. With
-//! items of equal size the two rules agree and a measurement of such a
-//! split says nothing, which is why the uneven fixture exists.
+//! So this halves the item count and does not claim to be the kernel's
+//! choice. What IS claimed, and tested against the kernel's own splits
+//! in `tests/split_oracle.rs`, is that the result is a valid division:
+//! both halves non-empty, in key order, together holding exactly the
+//! input, and each fitting in a block.
 //!
-//! A distribution had suggested otherwise and was wrong. Across 9,026
-//! leaves of a populated filesystem the median is 91-98% FULL, which
-//! looks like evidence against halving — but it is what halving
-//! produces once the resulting leaves are filled up again by later
-//! inserts. Reading a rule off a steady state was the mistake.
-//!
-//! # What is not claimed
-//!
-//! Both measured splits had an even item count, so `len/2 + 1` and
-//! `(len + 1)/2 + ...` cannot be told apart for odd counts from this
-//! evidence alone — the rule here is the one that fits, not the only
-//! one that could.
-//!
-//! The kernel also biases towards where the new item is going, so a
-//! split whose insertion point is far to one side may not match. The
-//! fixtures do not cover that, and it is not claimed.
+//! An earlier version of this note said the policy "is not half",
+//! inferred from the fill distribution of a populated filesystem — the
+//! median leaf is 91-98% full. That inference was wrong: mostly-full
+//! leaves are what halving produces once each half is filled up again
+//! by later inserts. Reading a rule off a steady state is what the
+//! fixtures replaced.
 
 use crate::chunk::DiskKey;
 use crate::error::{Error, Result};
@@ -150,10 +151,12 @@ pub fn delete(items: &[OwnedItem], key: &DiskKey) -> Result<Vec<OwnedItem>> {
 
 /// Split a list of items in two.
 ///
-/// Returns the left and right halves. The boundary is half the item
-/// count, rounding up so the left takes the odd one — see the module
-/// docs for how that was measured, and for what about it is still a
-/// choice.
+/// Returns the left and right halves, divided at half the item count.
+///
+/// This is NOT the kernel's boundary, and does not try to be — see the
+/// module docs. The split point is not part of the on-disk format, so
+/// any division that leaves both halves ordered, non-empty and inside a
+/// block produces a filesystem that reads correctly.
 ///
 /// # Errors
 ///
@@ -171,14 +174,11 @@ pub fn split(items: &[OwnedItem]) -> Result<(Vec<OwnedItem>, Vec<OwnedItem>)> {
             items.len()
         )));
     }
-    // Measured, not rounded to taste. Two captured splits, read from
-    // the LIVE tree either side:
-    //
-    //     42 items -> 22 | 20        32 items -> 17 | 15
-    //
-    // Both are len/2 + 1, which is one MORE than half rather than half
-    // rounded up. `div_ceil` would give 21 and 16 and be wrong on both.
-    let mid = items.len() / 2 + 1;
+    // Half, rounded up so a two-item leaf gives one each rather than
+    // an empty half. The kernel's own boundary varies with the
+    // insertion slot — 42 items became 22|20 and 52 became 26|26 — and
+    // is deliberately not imitated.
+    let mid = items.len().div_ceil(2);
     Ok((items[..mid].to_vec(), items[mid..].to_vec()))
 }
 

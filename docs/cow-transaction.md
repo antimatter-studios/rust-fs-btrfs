@@ -114,54 +114,46 @@ A commit that makes a tree grow taller, and a data write — which adds a checks
 leaf and data extents, neither of which appears above. The document's earlier reasoning
 puts those before the tree blocks in write order; that part is still reasoned.
 
-## The split policy, measured — and a wrong inference corrected
+## The split boundary, and why it is not copied
 
 An earlier version of this section read *"the split policy is not half"*, inferred from
-the fill distribution below. **That was wrong**, and the way it was wrong is worth
-keeping.
-
-How full every leaf is, across the two deep fixtures — 5,261 leaves at 4 KiB and 3,765
-at 16 KiB, built by creating 20,000 and 60,000 files:
-
-```text
-deep4k    median fill 98%        deep16k   median fill 91%
-   40-49%   260                     40-49%   280
-   50-59%   894                     50-59%   406
-   80-89%   736                     80-89%   406
-   90-99%  2796   <- the mode       90-99%  1912   <- the mode
-```
-
-Mostly-full leaves look like evidence against halving. They are not: they are what
+the fill distribution of a populated filesystem — the median leaf is 91-98% full, which
+looks like evidence against halving. **That was wrong.** Mostly-full leaves are what
 halving *produces*, once each resulting half is filled up again by later inserts. Reading
-a rule off a steady state was the mistake, and the fix was to stop inferring and capture
-the event.
+a rule off a steady state was the mistake.
 
-`scripts/build-split-fixtures.sh` adds files one at a time, committing each, and watches
-the fs tree's leaf count in the reference tool's own dump. When it goes up, the previous
-image is the before and the current one is the after. With the smallest nodesize btrfs
-accepts, the first split arrives at file 8.
+So the event was captured. `scripts/build-split-fixtures.sh` adds files one at a time,
+committing each, and watches the fs tree's leaf count in btrfs-progs' own dump; when it
+goes up, the previous image is the before and the current one the after. At the smallest
+nodesize the first split arrives at file 8. `BTRFS_SPLIT_VARY=1` builds a second pair
+whose items run from 12 to 232 bytes, because with items of equal size *half the count*
+and *half the bytes* give the same boundary and a measurement says nothing.
 
-One split does not identify the rule, because with items of equal size *half the item
-count* and *half the bytes* give the same boundary. So `BTRFS_SPLIT_VARY=1` alternates a
-near-maximum filename with a one-character one, giving items from 12 to 232 bytes, and
-the two rules then disagree:
+Three real splits, read from the **live** tree either side:
 
 ```text
-32 items across the split
-  the kernel put        17 items / 1951 B on the left
-  len/2 + 1 puts        17                              <- matches
-  half the bytes puts   14
+  42 items -> 22 | 20      half + 1
+  32 items -> 17 | 15      half + 1
+  52 items -> 26 | 26      half
 ```
 
-The pair with even item sizes agrees: 42 items became **22 and 20**.
+They do not follow one rule. `__btrfs_split_leaf` picks its boundary partly from the slot
+the new item is going into, and can push items to a sibling instead of splitting at all;
+reproducing it needs the insertion slot and the sibling's state, which these fixtures
+underdetermine.
 
-So the boundary is **`len/2 + 1`** — one more than half, not half rounded up. `div_ceil`
-gives 21 and 16 and is wrong on both. `tests/split_oracle.rs` reproduces both splits
-item for item.
+**And it does not need reproducing.** The split point is not part of the on-disk format.
+A checksum over the wrong span is a filesystem the kernel rejects; an item offset measured
+from the wrong place is a leaf it misreads; a leaf divided in a different place is simply
+a different, equally valid tree. So `leaf_edit::split` halves the item count and says so,
+and `tests/split_oracle.rs` checks what actually has to hold — both halves non-empty, in
+key order across the boundary as well as within each, together exactly the input, and each
+fitting in a block — using the items of leaves the kernel really did split. The kernel's
+own boundary is recorded alongside rather than asserted.
 
-Two cautions, both in the code: every measured split had an even item count, so odd
-counts are not pinned by this evidence; and the kernel biases towards where the new item
-is going, which these fixtures do not exercise.
+This is the one place in the write path where byte-identity with the kernel is the wrong
+bar, and noticing that took three measurements and a CI failure: the rule fitted two
+splits, and the third, on a different machine, broke it.
 
 One methodological note. The first version of the oracle found the split leaves by
 scanning for the newest generation, which turns up leaves nothing points at any more; it
