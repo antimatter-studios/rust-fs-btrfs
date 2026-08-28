@@ -210,8 +210,6 @@ impl Filesystem {
 
     /// The root tree leaf holding the `ROOT_ITEM` for `objectid`.
     fn root_item_leaf(&self, objectid: u64) -> Result<Option<u64>> {
-        /// `BTRFS_ROOT_ITEM_KEY`.
-        const ROOT_ITEM_KEY: u8 = 132;
         let mut found = None;
         self.for_each_tree_block(self.sb.root, &mut |at, block, level, _| {
             if level != 0 || found.is_some() {
@@ -235,11 +233,6 @@ impl Filesystem {
 
     /// Where every reachable block sits: its parent, tree and level.
     fn placements(&self) -> Result<BTreeMap<u64, Placement>> {
-        /// `BTRFS_ROOT_ITEM_KEY`.
-        const ROOT_ITEM_KEY: u8 = 132;
-        /// `btrfs_root_item.bytenr`.
-        const ROOT_ITEM_BYTENR: usize = 176;
-
         let mut out = BTreeMap::new();
         let mut roots = vec![self.sb.root];
 
@@ -271,9 +264,9 @@ impl Filesystem {
                     }
                     let off = HEADER_SIZE
                         + u32::from_le_bytes(block[it + 17..it + 21].try_into().unwrap()) as usize;
-                    if off + ROOT_ITEM_BYTENR + 8 <= block.len() {
+                    if off + root_item::BYTENR + 8 <= block.len() {
                         let b = u64::from_le_bytes(
-                            block[off + ROOT_ITEM_BYTENR..off + ROOT_ITEM_BYTENR + 8]
+                            block[off + root_item::BYTENR..off + root_item::BYTENR + 8]
                                 .try_into()
                                 .unwrap(),
                         );
@@ -325,30 +318,7 @@ impl Filesystem {
     }
 }
 
-/// Byte offsets inside a `btrfs_root_item`, of the fields a relocation
-/// has to update.
-mod root_item {
-    /// The tree's root address.
-    ///
-    /// Measured against a real filesystem, not counted from the struct:
-    /// the ROOT_ITEM for the extent tree holds the address the
-    /// superblock's own walk reaches.
-    pub const BYTENR: usize = 176;
-    /// The transaction that wrote that root.
-    ///
-    /// AT 160, after the embedded `btrfs_inode_item`. Offset 16 is
-    /// inside that inode and holds something else entirely — a
-    /// ROOT_ITEM whose generation was written there leaves the real
-    /// field stale, and the kernel refuses the tree it names with
-    /// "parent transid verify failed". Which is exactly what `btrfs
-    /// check` said before this was measured.
-    pub const GENERATION: usize = 160;
-    /// Its height, after `drop_progress` and `drop_level`.
-    pub const LEVEL: usize = 238;
-}
-
-/// `BTRFS_ROOT_ITEM_KEY`.
-const ROOT_ITEM_KEY: u8 = 132;
+use crate::fs::{root_item, ROOT_ITEM_KEY};
 
 impl Filesystem {
     /// Turn a plan into the blocks it says to write.
@@ -367,14 +337,22 @@ impl Filesystem {
     ///
     /// The result goes straight to [`Filesystem::commit`].
     ///
-    /// # What it does not do
+    /// # What it also does
     ///
-    /// It does not add or remove anything. A relocation is the part of a
-    /// transaction that moves what is already there; the item changes
-    /// that record the moves in the extent tree are separate and are not
-    /// produced here. So a filesystem committed from this alone has a
-    /// correct tree and an extent tree that still describes the old
-    /// addresses.
+    /// Two of the blocks it renders have their CONTENTS changed as well
+    /// as their address, because they are the record of the move:
+    ///
+    /// - an **extent tree** leaf loses the `METADATA_ITEM` naming each
+    ///   block's old address and gains one naming the new;
+    /// - a **free-space tree** leaf has the affected block groups' free
+    ///   runs recomputed, since that tree is the complement of the
+    ///   extent tree.
+    ///
+    /// This section previously said the opposite — that a relocation
+    /// moves what is already there and records nothing — which was true
+    /// when it was written and stopped being true seventy lines below,
+    /// where `apply_records` was added. Left uncorrected it pointed a
+    /// reader at exactly the bug the code exists to prevent.
     ///
     /// # Errors
     ///
@@ -834,15 +812,11 @@ impl Filesystem {
                     }
                     free.sort();
 
-                    let mut merged: Vec<FreeExtent> = Vec::with_capacity(free.len());
-                    for run in free {
-                        match merged.last_mut() {
-                            Some(prev) if prev.end() == run.start => prev.len += run.len,
-                            _ => merged.push(run),
-                        }
-                    }
-
-                    let mut runs: Vec<FreeExtent> = merged;
+                    // The same join the free-space reader does, and the
+                    // same function: two copies of "runs that touch
+                    // become one" is two places for it to stop being
+                    // true.
+                    let mut runs: Vec<FreeExtent> = crate::block_group::merge_adjacent(free);
                     for at in allocated.iter().filter(|a| group.contains(**a)) {
                         runs = runs
                             .into_iter()

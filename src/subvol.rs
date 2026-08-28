@@ -47,8 +47,7 @@
 use crate::error::Result;
 use crate::fs::Filesystem;
 
-/// `BTRFS_ROOT_ITEM_KEY`.
-const ROOT_ITEM_KEY: u8 = 132;
+use crate::fs::ROOT_ITEM_KEY;
 
 /// `BTRFS_ROOT_BACKREF_KEY` — a subvolume's own record of its parent and
 /// its name.
@@ -75,19 +74,7 @@ pub const LAST_FREE_OBJECTID: u64 = u64::MAX - 255;
 ///
 /// The item opens with an embedded 160-byte `btrfs_inode_item`, then a
 /// generation and a `root_dirid` before the address of the root block.
-mod root_item {
-    /// `u64`. The transaction this tree was last written in.
-    pub const GENERATION: usize = 160;
-    /// `u64`. The tree's root block.
-    pub const BYTENR: usize = 176;
-    /// `u64`. The generation this subvolume was last snapshotted at, or
-    /// zero if it never was.
-    pub const LAST_SNAPSHOT: usize = 200;
-    /// `u64`. Bit 0 is `BTRFS_ROOT_SUBVOL_RDONLY`.
-    pub const FLAGS: usize = 208;
-    /// The smallest item this reads a field out of.
-    pub const MIN_SIZE: usize = FLAGS + 8;
-}
+use crate::fs::root_item;
 
 /// Byte offsets within `struct btrfs_root_ref`, which both the reference
 /// and the back-reference use.
