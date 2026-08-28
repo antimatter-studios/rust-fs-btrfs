@@ -137,10 +137,10 @@ tasks:
       - cargo test
 
   lint:
-    desc: Formatting and clippy, as CI runs them
+    desc: Formatting and clippy, exactly as CI runs them
     cmds:
       - cargo fmt --check
-      - cargo clippy --all-targets -- -D warnings
+      - cargo clippy --locked --all-targets -- -D warnings
 
   vm:up:
     desc: Boot the oracle VM and keep it up until `chore vm:down`
