@@ -492,42 +492,44 @@ impl Chunk {
                 ));
             }
         }
-        match profile {
-            ChunkProfile::Raid0 => {
-                if n < 2 {
-                    return bad(format!("raid0 chunk has {n} stripes, expected at least 2"));
-                }
+        // Same shape as `expect_exact` above, and deliberately so: these
+        // profiles constrain the stripe count from below rather than
+        // pinning it. Written as a table because the alternative clippy
+        // suggests — a `ChunkProfile::Raid0 if n < 2 =>` match guard —
+        // makes the arm match only the *failing* case, leaving a valid
+        // raid0 to fall through to the catch-all. That reads as though
+        // raid0 were unvalidated.
+        let expect_at_least = match profile {
+            ChunkProfile::Raid0 | ChunkProfile::Raid5 => Some(2),
+            ChunkProfile::Raid6 => Some(3),
+            _ => None,
+        };
+        if let Some(least) = expect_at_least {
+            if n < least {
+                return bad(format!(
+                    "{} chunk has {n} stripes, expected at least {least}",
+                    profile.name()
+                ));
             }
-            ChunkProfile::Raid10 => {
-                // Modern mkfs always writes sub_stripes = 2 for RAID10,
-                // and the kernel's own validator rejects anything else.
-                // Flagged for cross-validation: if a real image ever
-                // shows a different value, relax this to "non-zero and
-                // divides num_stripes".
-                if self.sub_stripes != 2 {
-                    return bad(format!(
-                        "raid10 chunk has sub_stripes {}, expected 2",
-                        self.sub_stripes
-                    ));
-                }
-                if n < 2 || !n.is_multiple_of(self.sub_stripes) {
-                    return bad(format!(
-                        "raid10 chunk has {n} stripes, which is not a positive multiple of sub_stripes {}",
-                        self.sub_stripes
-                    ));
-                }
+        }
+        if profile == ChunkProfile::Raid10 {
+            // Modern mkfs always writes sub_stripes = 2 for RAID10,
+            // and the kernel's own validator rejects anything else.
+            // Flagged for cross-validation: if a real image ever
+            // shows a different value, relax this to "non-zero and
+            // divides num_stripes".
+            if self.sub_stripes != 2 {
+                return bad(format!(
+                    "raid10 chunk has sub_stripes {}, expected 2",
+                    self.sub_stripes
+                ));
             }
-            ChunkProfile::Raid5 => {
-                if n < 2 {
-                    return bad(format!("raid5 chunk has {n} stripes, expected at least 2"));
-                }
+            if n < 2 || !n.is_multiple_of(self.sub_stripes) {
+                return bad(format!(
+                    "raid10 chunk has {n} stripes, which is not a positive multiple of sub_stripes {}",
+                    self.sub_stripes
+                ));
             }
-            ChunkProfile::Raid6 => {
-                if n < 3 {
-                    return bad(format!("raid6 chunk has {n} stripes, expected at least 3"));
-                }
-            }
-            _ => {}
         }
         Ok(())
     }
@@ -1491,5 +1493,84 @@ mod tests {
                 want
             );
         }
+    }
+
+    /// A profile whose stripe count only has a *floor* must reject a
+    /// count under it, and accept the floor itself.
+    ///
+    /// The three profiles share one table, so a bug in the table shows
+    /// up as the wrong floor for one of them rather than as no check at
+    /// all — which is why each is asserted with its own boundary and its
+    /// own message, rather than by looping over "is an error".
+    #[test]
+    fn a_profile_with_a_minimum_stripe_count_enforces_it() {
+        let cases = [
+            (block_group::RAID0, 2usize, "raid0"),
+            (block_group::RAID5, 2, "raid5"),
+            (block_group::RAID6, 3, "raid6"),
+        ];
+        for (bits, floor, name) in cases {
+            let stripes: Vec<(u64, u64)> =
+                (0..floor - 1).map(|i| (i as u64 + 1, 0x10_0000)).collect();
+            let err = Chunk::parse(
+                0,
+                &chunk_bytes(4 * K64, K64, block_group::DATA | bits, 0, &stripes),
+            )
+            .expect_err(&format!(
+                "{name} with {} stripes is below its floor of {floor} and must be refused",
+                stripes.len()
+            ));
+            let want = format!(
+                "{name} chunk has {} stripes, expected at least {floor}",
+                stripes.len()
+            );
+            assert!(
+                err.to_string().contains(&want),
+                "{name}: expected a message containing {want:?}, got {err}"
+            );
+
+            // And the floor itself is accepted, so the check is a floor
+            // and not an off-by-one that refuses valid chunks too.
+            let ok: Vec<(u64, u64)> = (0..floor).map(|i| (i as u64 + 1, 0x10_0000)).collect();
+            let parsed = Chunk::parse(
+                0,
+                &chunk_bytes(4 * K64, K64, block_group::DATA | bits, 0, &ok),
+            );
+            assert!(
+                parsed.is_ok(),
+                "{name} with exactly {floor} stripes is valid, but parse said {:?}",
+                parsed.err()
+            );
+        }
+    }
+
+    /// RAID10 keeps its own arm because it constrains `sub_stripes` as
+    /// well as the count, and both rejections must survive.
+    #[test]
+    fn raid10_checks_sub_stripes_and_the_multiple() {
+        let four = [
+            (DEV_A, 0x10_0000),
+            (DEV_B, 0x20_0000),
+            (3, 0x30_0000),
+            (4, 0x40_0000),
+        ];
+        let bits = block_group::DATA | block_group::RAID10;
+
+        let err = Chunk::parse(0, &chunk_bytes(4 * K64, K64, bits, 3, &four))
+            .expect_err("sub_stripes 3 is not what mkfs writes and must be refused");
+        assert!(
+            err.to_string().contains("sub_stripes 3, expected 2"),
+            "got {err}"
+        );
+
+        let three = &four[..3];
+        let err = Chunk::parse(0, &chunk_bytes(4 * K64, K64, bits, 2, three))
+            .expect_err("3 stripes is not a multiple of sub_stripes 2");
+        assert!(
+            err.to_string().contains("not a positive multiple"),
+            "got {err}"
+        );
+
+        assert!(Chunk::parse(0, &chunk_bytes(4 * K64, K64, bits, 2, &four)).is_ok());
     }
 }
