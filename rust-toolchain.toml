@@ -3,5 +3,5 @@
 # `-D warnings` turns it into a hard CI error even though Cargo.lock hasn't moved.
 # Bump this intentionally when we're ready to audit the new lint set. Matches the
 # pin used by the sister fs-* crates so a downstream vendor build is uniform.
-channel = "1.94.1"
+channel = "1.95.0"
 components = ["rustfmt", "clippy"]
