@@ -74,12 +74,16 @@ function: its doc says splitting is "the caller's decision, not this function's"
 (correct) while its error said it "is not implemented". That one now names both
 `leaf_edit::split` and `insert_or_split`.
 
-**The two tests that pinned the false sentence now assert the condition instead.**
-That is the part worth keeping: `src/leaf_edit.rs:286` and
-`tests/leaf_edit_oracle.rs:254` both matched on the exact wording, so the claim had
-two tests holding it in place. They check that the refusal names what went wrong
-and names the function that handles it — properties a correct message keeps and a
-rewording cannot break.
+**Three tests pinned the false sentence; all three now assert the condition
+instead.** That is the part worth keeping. `src/leaf_edit.rs:286`,
+`tests/leaf_edit_oracle.rs:254` and `tests/tree_write_oracle.rs:458` all matched on
+the exact wording, so the claim had three tests holding it in place. They check
+that the refusal names what went wrong and names the function that handles it —
+properties a correct message keeps and a rewording cannot break.
+
+The third was found by CI rather than by grep: it only runs under the kernel-
+validation job, so a local `cargo test` never reached it. Fitting, in that the
+last test still asserting splitting was unimplemented was the one hardest to run.
 
 ### H3, H4 — hand-rolled leaf parsing and a duplicated free-run merge — **fixable, not yet done**
 
