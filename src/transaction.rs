@@ -825,10 +825,29 @@ impl Filesystem {
                     }
                     runs.retain(|r| r.len > 0);
 
+                    // A FREE_SPACE_INFO item that cannot hold its own
+                    // extent count is refused rather than passed through
+                    // with the old one. The `if` that used to guard this
+                    // wrote the count when the item was long enough and
+                    // said nothing when it was not — so a short item kept
+                    // a STALE count while its runs were rewritten
+                    // underneath it, and the free-space tree then
+                    // disagreed with itself with no signal that anything
+                    // had gone wrong.
+                    //
+                    // The offsets come from block_group::free_space_info,
+                    // which is where the reader already gets them; this
+                    // side was spelling them out by hand.
                     let mut info = item.clone();
-                    if info.data.len() >= 4 {
-                        info.data[0..4].copy_from_slice(&(runs.len() as u32).to_le_bytes());
+                    if info.data.len() < crate::block_group::free_space_info::SIZE {
+                        return Err(Error::UnsupportedFeature(
+                            "FREE_SPACE_INFO item is shorter than the structure it declares"
+                                .to_string(),
+                        ));
                     }
+                    let count_at = crate::block_group::free_space_info::EXTENT_COUNT;
+                    info.data[count_at..count_at + 4]
+                        .copy_from_slice(&(runs.len() as u32).to_le_bytes());
                     out.push(info);
                     for run in runs {
                         out.push(OwnedItem {

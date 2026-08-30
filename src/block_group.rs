@@ -55,7 +55,7 @@ mod block_group_item {
 }
 
 /// Byte offsets within `struct btrfs_free_space_info`.
-mod free_space_info {
+pub(crate) mod free_space_info {
     /// How many free-space items this group has.
     pub const EXTENT_COUNT: usize = 0;
     /// Bit 0 says the group's free space is recorded as bitmaps rather
