@@ -562,6 +562,26 @@ pub struct Superblock {
     pub sys_chunk_array: Vec<u8>,
 }
 
+/// Reading fixed-width little-endian fields out of a byte slice.
+///
+/// Btrfs is little-endian throughout. There is deliberately no
+/// big-endian half: a big-endian read in this crate would be a bug, and
+/// a helper for it would make the bug spellable.
+///
+/// These live here rather than in an `endian` module of their own
+/// because the superblock is the first thing anything parses, and every
+/// other module already imports from it. `block_group` and `fs` each
+/// used to declare their own copies — three definitions of `le64` in
+/// one crate, byte-identical.
+///
+/// # Panics
+///
+/// If the slice is too short. Every caller has already length-checked
+/// its buffer against the structure it is parsing; that check belongs
+/// where the structure's size is known, not repeated per field. A panic
+/// here means a caller skipped it, which is a bug in this crate rather
+/// than bad input.
+///
 /// Read a little-endian `u16` at `off`.
 #[inline]
 pub(crate) fn le16(b: &[u8], off: usize) -> u16 {
@@ -1603,5 +1623,40 @@ mod tests {
         let d = ChecksumType::Crc32c.digest(b"btrfs");
         assert_eq!(&d[..4], &raw.to_le_bytes());
         assert_ne!(&d[..4], &raw.to_be_bytes());
+    }
+}
+
+#[cfg(test)]
+mod endian_tests {
+    use super::{le16, le32, le64};
+
+    /// Byte order, against literal bytes.
+    ///
+    /// Asserting it against `from_le_bytes` would restate the
+    /// implementation. These are the numbers a hex dump shows — and the
+    /// property that matters, since a byte-order slip is invisible to a
+    /// round trip through this crate: reader and writer would agree
+    /// with each other and disagree with the kernel.
+    #[test]
+    fn the_low_byte_comes_first() {
+        let b = [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        assert_eq!(le16(&b, 0), 0x0201);
+        assert_eq!(le32(&b, 0), 0x0403_0201);
+        assert_eq!(le64(&b, 0), 0x0807_0605_0403_0201);
+    }
+
+    /// The offset counts bytes, not units of the width being read.
+    #[test]
+    fn the_offset_counts_bytes() {
+        let b = [0x00u8, 0xAA, 0xBB, 0x00];
+        assert_eq!(le16(&b, 1), 0xBBAA);
+    }
+
+    #[test]
+    fn the_widest_values_survive() {
+        let b = [0xFFu8; 8];
+        assert_eq!(le16(&b, 0), u16::MAX);
+        assert_eq!(le32(&b, 0), u32::MAX);
+        assert_eq!(le64(&b, 0), u64::MAX);
     }
 }
