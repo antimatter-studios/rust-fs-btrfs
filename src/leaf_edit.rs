@@ -92,7 +92,11 @@ fn order(a: &DiskKey, b: &DiskKey) -> std::cmp::Ordering {
 /// [`Error::UnsupportedFeature`] if an item with the same key is already
 /// there — two items under one key is not a leaf a search can resolve,
 /// and silently replacing one would lose whatever it held — or if the
-/// result will not fit in a block, which is where splitting would go.
+/// result will not fit in a block.
+///
+/// Not fitting is this function's boundary, not the crate's:
+/// [`insert_or_split`] handles it. `insert` refuses so a caller who
+/// meant to write exactly one block finds out rather than getting two.
 pub fn insert(nodesize: u32, items: &[OwnedItem], item: OwnedItem) -> Result<Vec<OwnedItem>> {
     let at = match items.binary_search_by(|existing| order(&existing.key, &item.key)) {
         Ok(_) => {
@@ -116,8 +120,9 @@ pub fn insert(nodesize: u32, items: &[OwnedItem], item: OwnedItem) -> Result<Vec
     if needed > capacity {
         return Err(Error::UnsupportedFeature(format!(
             "the item does not fit: {} items need {needed} bytes and a leaf holds \
-             {capacity}. Splitting a leaf is not implemented — where the kernel puts the \
-             boundary is a policy this has not measured.",
+             {capacity}. `insert` produces one leaf by definition — use \
+             `insert_or_split`, which returns two when the contents no longer fit \
+             in one, and add the second to the parent.",
             out.len()
         )));
     }
@@ -281,10 +286,17 @@ mod tests {
     fn an_item_that_does_not_fit_is_refused_and_says_why() {
         let items = vec![item(1, 3000)];
         let err = insert(4096, &items, item(2, 3000)).expect_err("two 3000-byte items");
+        // Assert the CONDITION, not the sentence. Pinning the wording
+        // is what let the message go on claiming splitting was
+        // unimplemented for as long as it did: `split` sits fifty lines
+        // below, and two tests were holding the claim in place.
         assert!(
-            err.to_string()
-                .contains("Splitting a leaf is not implemented"),
-            "the refusal should name what is missing: {err}"
+            err.to_string().contains("does not fit"),
+            "the refusal should name what went wrong: {err}"
+        );
+        assert!(
+            err.to_string().contains("insert_or_split"),
+            "the refusal should name the function that handles it: {err}"
         );
         assert!(!fits(4096, &items, &item(2, 3000)));
         assert!(fits(4096, &items, &item(2, 8)));

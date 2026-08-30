@@ -249,9 +249,14 @@ fn an_item_that_needs_a_split_is_refused() {
     };
     assert!(!fits(sb.nodesize, &items, &huge));
     let err = insert(sb.nodesize, &items, huge).expect_err("a block-sized item cannot fit");
+    // The condition, not the wording — see the unit test of the same
+    // shape in `leaf_edit.rs` for why.
     assert!(
-        err.to_string()
-            .contains("Splitting a leaf is not implemented"),
-        "the refusal should name what is missing: {err}"
+        err.to_string().contains("does not fit"),
+        "the refusal should name what went wrong: {err}"
+    );
+    assert!(
+        err.to_string().contains("insert_or_split"),
+        "the refusal should name the function that handles it: {err}"
     );
 }

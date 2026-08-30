@@ -161,8 +161,10 @@ pub fn build_leaf(sb: &Superblock, id: BlockIdentity, items: &[LeafItem]) -> Res
     let needed = space_needed(items);
     if needed > nodesize {
         return Err(Error::UnsupportedFeature(format!(
-            "{} items need {needed} bytes and a tree block holds {nodesize}; splitting a \
-             leaf is not implemented",
+            "{} items need {needed} bytes and a tree block holds {nodesize}; this \
+             builds one block, so splitting the items is the caller's decision — \
+             `leaf_edit::split` divides a list and `leaf_edit::insert_or_split` \
+             does it as part of an insert",
             items.len()
         )));
     }

@@ -50,12 +50,41 @@ Refused now. The offsets also come from `block_group::free_space_info`, which is
 where the *reader* already gets them; this side was spelling them out by hand,
 so the two could drift.
 
-### H3, H4, H5 — hand-rolled leaf parsing, a duplicated free-run merge, contradictory refusal messages — **fixable, not yet done**
+### H5 — a refusal that told callers to give up on something the crate does — **fixed**
 
-All three concern the write path duplicating what `btree.rs` and
-`merge_adjacent` already do. H5 is the one to do first: `insert`'s refusal
-message contradicts the `split` function fifty lines below it, so one of the two
-is wrong about when a split happens.
+`insert` refused an over-large item with:
+
+> Splitting a leaf is not implemented — where the kernel puts the boundary is a
+> policy this has not measured.
+
+Both halves false. `leaf_edit::split` is **fifty lines below**, with
+`tests/split_oracle.rs` checking it against leaves the kernel really split, and
+`insert_or_split` does exactly what the message says cannot be done. The module
+doc directly above prints three *measured* splits, and `docs/cow-transaction.md`
+has a section on the measurement and on why the boundary is deliberately not
+copied.
+
+The house style is what made this expensive: the message is long and specific
+precisely so a caller knows what to do next, and what it told them to do was give
+up. It now names `insert_or_split` and says why `insert` itself refuses — a caller
+who meant to write exactly one block should find out rather than get two.
+
+`tree_write::build_leaf` had the milder version of the same disagreement inside one
+function: its doc says splitting is "the caller's decision, not this function's"
+(correct) while its error said it "is not implemented". That one now names both
+`leaf_edit::split` and `insert_or_split`.
+
+**The two tests that pinned the false sentence now assert the condition instead.**
+That is the part worth keeping: `src/leaf_edit.rs:286` and
+`tests/leaf_edit_oracle.rs:254` both matched on the exact wording, so the claim had
+two tests holding it in place. They check that the refusal names what went wrong
+and names the function that handles it — properties a correct message keeps and a
+rewording cannot break.
+
+### H3, H4 — hand-rolled leaf parsing and a duplicated free-run merge — **fixable, not yet done**
+
+Both concern the write path duplicating what `btree.rs` and `merge_adjacent`
+already do.
 
 ---
 
