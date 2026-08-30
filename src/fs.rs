@@ -23,9 +23,11 @@
 //! Returning plausible-but-wrong file contents is the one failure a
 //! caller cannot detect, so these are errors rather than best efforts:
 //!
-//! - **Compressed extents.** Decompression is not implemented. Returning
-//!   the raw compressed bytes would look like a successful read of
-//!   corrupt data.
+//! Compressed extents are NOT in that list. All three btrfs codecs —
+//! zlib, LZO and zstd — are decoded, in [`crate::compression`]. This
+//! module used to say decompression was unimplemented, which was true
+//! when it was written and has not been for some time.
+//!
 //! - **Encoded extents** — encrypted or otherwise transformed.
 //! - **A dirty log.** `log_root` being set means the tree on disk is not
 //!   the whole story.
