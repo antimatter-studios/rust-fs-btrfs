@@ -38,6 +38,7 @@ use crate::btree::Tree;
 use crate::chunk::{block_group as flags, key_type, objectid, DiskKey};
 use crate::error::{Error, Result};
 use crate::fs::{Filesystem, ROOT_ITEM_KEY};
+use crate::superblock::{le32, le64};
 
 /// Byte offsets within `struct btrfs_block_group_item`.
 mod block_group_item {
@@ -122,13 +123,6 @@ impl FreeExtent {
     pub fn end(&self) -> u64 {
         self.start + self.len
     }
-}
-
-fn le32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(b[at..at + 4].try_into().expect("4 bytes"))
-}
-fn le64(b: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes"))
 }
 
 impl Filesystem {

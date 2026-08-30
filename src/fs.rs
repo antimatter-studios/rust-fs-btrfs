@@ -40,7 +40,7 @@ use crate::compression::{self, Compression};
 use crate::dir::{self, DirEntry, DIR_INDEX_KEY};
 use crate::error::{Error, Result};
 use crate::inode::{Inode, FIRST_FREE_OBJECTID, INODE_ITEM_KEY};
-use crate::superblock::{Superblock, SUPER_INFO_OFFSET};
+use crate::superblock::{le64, Superblock, SUPER_INFO_OFFSET};
 use fs_core::{BlockDevice, BlockRead};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -137,11 +137,6 @@ mod file_extent {
 const EXTENT_INLINE: u8 = 0;
 const EXTENT_REGULAR: u8 = 1;
 const EXTENT_PREALLOC: u8 = 2;
-
-#[inline]
-fn le64(b: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(b[off..off + 8].try_into().expect("8 bytes"))
-}
 
 /// One resolved piece of a file's contents.
 enum Piece<'a> {

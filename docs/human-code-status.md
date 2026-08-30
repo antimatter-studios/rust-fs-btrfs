@@ -127,6 +127,31 @@ the example is teaching a habit that is no longer necessary.
 
 They already share `tests/common`; the copies predate it.
 
+### The endian readers, declared three times — **fixed**
+
+`le64` was defined in `superblock`, `block_group` **and** `fs` — byte-identical
+bodies — with `le32` twice. 100 call sites across the crate depend on them.
+
+Nothing was wrong with any copy, and that is the point: a helper this small is
+not duplicated because somebody misunderstood it, but because declaring it again
+is cheaper in the moment than importing it. The cost lands on a reader checking
+that the third copy still says `from_le_bytes`.
+
+They stay in `superblock` rather than moving to an `endian` module, because the
+superblock is the first thing anything parses and every other module already
+imports from it. The doc now says btrfs is little-endian throughout and that
+there is deliberately no big-endian half — a big-endian read here would be a bug,
+and a helper for it would make the bug spellable.
+
+**Both duplicates were covered, which is what made removing them safe.** Flipping
+each to `from_be_bytes` in turn: `block_group` 4 tests, `fs` 20. After, flipping
+the single definition fails **72**.
+
+Three tests assert the byte order against literal bytes rather than against
+`from_le_bytes`. That is the property worth pinning: a byte-order slip is
+invisible to a round trip through this crate, because reader and writer would
+agree with each other while disagreeing with the kernel.
+
 ---
 
 ## Verification
