@@ -454,8 +454,17 @@ fn an_overfull_leaf_is_refused() {
         &items,
     )
     .expect_err("an item the size of the whole block cannot fit alongside a header");
+    // The condition and the way out, not the wording. A third
+    // assertion on the exact sentence is how the old message went on
+    // saying splitting was unimplemented while `leaf_edit::split` sat
+    // beside it — and this one only runs under the kernel-validation
+    // job, so it was the last to say so.
     assert!(
-        err.to_string().contains("splitting a leaf"),
+        err.to_string().contains("a tree block holds"),
+        "the refusal should name what went wrong: {err}"
+    );
+    assert!(
+        err.to_string().contains("leaf_edit::split"),
         "the refusal should name what the answer would be: {err}"
     );
 }
