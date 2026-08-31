@@ -34,10 +34,9 @@
 //! a length, it yields extents of length 0, 1 and 2, and every tree
 //! block on the filesystem reads as free.
 
-use crate::btree::Tree;
 use crate::chunk::{block_group as flags, key_type, objectid, DiskKey};
 use crate::error::{Error, Result};
-use crate::fs::{Filesystem, ROOT_ITEM_KEY};
+use crate::fs::Filesystem;
 use crate::superblock::{le32, le64};
 
 /// Byte offsets within `struct btrfs_block_group_item`.
@@ -135,10 +134,8 @@ impl Filesystem {
     /// group has nowhere for its own root tree to live.
     pub fn block_groups(&self) -> Result<Vec<BlockGroup>> {
         let root = self.tree_root(objectid::EXTENT_TREE)?;
-        let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
-        };
-        let tree = Tree::from_superblock(&self.sb, &read);
+        let reader = self.pool_reader();
+        let tree = reader.tree();
 
         let mut out = Vec::new();
         tree.for_each(root, &mut |key: &DiskKey, data: &[u8]| {
@@ -242,10 +239,8 @@ impl Filesystem {
     /// The allocated runs of every group, from one traversal.
     fn allocated_by_group(&self, groups: &[BlockGroup]) -> Result<Vec<Vec<FreeExtent>>> {
         let root = self.tree_root(objectid::EXTENT_TREE)?;
-        let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
-        };
-        let tree = Tree::from_superblock(&self.sb, &read);
+        let reader = self.pool_reader();
+        let tree = reader.tree();
         let nodesize = self.sb.nodesize as u64;
 
         let mut out = vec![Vec::new(); groups.len()];
@@ -295,10 +290,8 @@ impl Filesystem {
         let Ok(root) = self.tree_root(objectid::FREE_SPACE_TREE) else {
             return Ok(None);
         };
-        let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
-        };
-        let tree = Tree::from_superblock(&self.sb, &read);
+        let reader = self.pool_reader();
+        let tree = reader.tree();
         let sectorsize = self.sb.sectorsize as u64;
 
         let mut info = None;
@@ -399,10 +392,8 @@ impl Filesystem {
     /// Propagates a tree read failure.
     pub fn for_each_extent_item(&self, visit: &mut dyn FnMut(&DiskKey, &[u8])) -> Result<()> {
         let root = self.tree_root(objectid::EXTENT_TREE)?;
-        let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
-        };
-        let tree = Tree::from_superblock(&self.sb, &read);
+        let reader = self.pool_reader();
+        let tree = reader.tree();
         tree.for_each(root, &mut |key: &DiskKey, data: &[u8]| {
             visit(key, data);
             Ok(true)
@@ -433,10 +424,8 @@ impl Filesystem {
         root: u64,
         visit: &mut dyn FnMut(&DiskKey, &[u8]),
     ) -> Result<()> {
-        let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
-        };
-        let tree = Tree::from_superblock(&self.sb, &read);
+        let reader = self.pool_reader();
+        let tree = reader.tree();
         tree.for_each(root, &mut |key: &DiskKey, data: &[u8]| {
             visit(key, data);
             Ok(true)
@@ -451,26 +440,9 @@ impl Filesystem {
     /// for `objectid` — for an optional tree, that is how a caller
     /// learns the tree is absent.
     pub(crate) fn tree_root(&self, objectid: u64) -> Result<u64> {
-        let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
-        };
-        let tree = Tree::from_superblock(&self.sb, &read);
-        let mut root = None;
-        tree.for_each(self.sb.root, &mut |key: &DiskKey, data: &[u8]| {
-            if key.objectid == objectid
-                && key.key_type == ROOT_ITEM_KEY
-                && data.len() > crate::fs::root_item::BYTENR + 8
-            {
-                root = Some(le64(data, crate::fs::root_item::BYTENR));
-                return Ok(false);
-            }
-            Ok(true)
-        })?;
-        root.ok_or_else(|| {
-            Error::BadSuperblock(format!(
-                "the root tree holds no ROOT_ITEM for tree {objectid}"
-            ))
-        })
+        let reader = self.pool_reader();
+        let tree = reader.tree();
+        crate::fs::root_item_target(&tree, self.sb.root, objectid)
     }
 
     /// Find somewhere to put one new tree block.

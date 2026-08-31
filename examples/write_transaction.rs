@@ -56,8 +56,28 @@ fn main() {
             bytes_used: None,
             chunk_root: None,
             chunk_root_generation: None,
-            // This transaction moves blocks and does not maintain the
-            // free-space tree, so the cache must be marked untrusted.
+            // Kept `true` deliberately, and NOT for the reason this
+            // comment used to give.
+            //
+            // The old reason — "this transaction does not maintain the
+            // free-space tree" — stopped being true when
+            // `apply_free_space` landed: `render_plan` rewrites the
+            // free-space tree's extents alongside the extent tree's,
+            // and refuses outright (rather than silently skipping) a
+            // block group recorded as a bitmap.
+            //
+            // The reason now is that this example does not *verify*
+            // what it wrote. Clearing the validity bit tells the kernel
+            // to rebuild the cache on the next read-write mount, which
+            // is the format's own way of saying "believe the extent
+            // tree, not this". For an example whose point is the
+            // transaction shape, that is the honest setting.
+            //
+            // A caller that runs the oracle suite — which checks the
+            // result with `btrfs check` inside a VM — can set this to
+            // `false` and keep the cache. Setting it to `false` here,
+            // in an example nothing checks, would be asserting a
+            // property this file does not test.
             invalidate_free_space_tree: true,
         },
     )

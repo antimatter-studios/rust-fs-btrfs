@@ -24,15 +24,11 @@ use fs_core::FileDevice;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod common;
+use common::{le32, le64};
+
 fn share() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
-
-fn le32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
-}
-fn le64(b: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
 fn items_of(block: &[u8]) -> Vec<OwnedItem> {

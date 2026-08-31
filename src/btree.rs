@@ -901,6 +901,89 @@ impl<'a> Tree<'a> {
     }
 }
 
+/// Synthetic tree blocks, for tests in this crate.
+///
+/// These live outside `mod tests` so `fs.rs` can build a root tree to
+/// exercise `root_item_target` without a fourth hand-rolled leaf
+/// builder — the crate already had three.
+#[cfg(test)]
+pub(crate) mod test_blocks {
+    use super::*;
+
+    pub const NODESIZE: u32 = 4096;
+    pub const FSID: [u8; UUID_SIZE] = [0x5A; UUID_SIZE];
+    pub const CSUM: ChecksumType = ChecksumType::Crc32c;
+
+    pub const LEAF_A: u64 = 0x1000;
+    pub const LEAF_B: u64 = 0x2000;
+    pub const ROOT: u64 = 0x3000;
+
+    pub fn geom() -> TreeGeometry {
+        TreeGeometry {
+            nodesize: NODESIZE,
+            csum_type: CSUM,
+            fsid: FSID,
+        }
+    }
+
+    pub fn key(objectid: u64, key_type: u8, offset: u64) -> DiskKey {
+        DiskKey {
+            objectid,
+            key_type,
+            offset,
+        }
+    }
+
+    pub fn put_key(b: &mut [u8], at: usize, k: &DiskKey) {
+        b[at..at + 8].copy_from_slice(&k.objectid.to_le_bytes());
+        b[at + 8] = k.key_type;
+        b[at + 9..at + 17].copy_from_slice(&k.offset.to_le_bytes());
+    }
+
+    /// Write a header. Leaves the checksum for [`seal`].
+    pub fn put_header(b: &mut [u8], bytenr: u64, owner: u64, nritems: u32, level: u8) {
+        use header_offsets as o;
+        b[o::FSID..o::FSID + UUID_SIZE].copy_from_slice(&FSID);
+        b[o::BYTENR..o::BYTENR + 8].copy_from_slice(&bytenr.to_le_bytes());
+        let flags = (u64::from(header_flags::MIXED_BACKREF_REV) << header_flags::BACKREF_REV_SHIFT)
+            | header_flags::WRITTEN;
+        b[o::FLAGS..o::FLAGS + 8].copy_from_slice(&flags.to_le_bytes());
+        b[o::CHUNK_TREE_UUID..o::CHUNK_TREE_UUID + UUID_SIZE].copy_from_slice(&[0xC4; UUID_SIZE]);
+        b[o::GENERATION..o::GENERATION + 8].copy_from_slice(&9u64.to_le_bytes());
+        b[o::OWNER..o::OWNER + 8].copy_from_slice(&owner.to_le_bytes());
+        b[o::NRITEMS..o::NRITEMS + 4].copy_from_slice(&nritems.to_le_bytes());
+        b[o::LEVEL] = level;
+    }
+
+    /// Recompute the block checksum after building or mutating a block.
+    pub fn seal(b: &mut [u8]) {
+        let digest = CSUM.digest(&b[CSUM_SIZE..]);
+        b[..CSUM_SIZE].copy_from_slice(&digest);
+    }
+
+    /// Build a leaf holding `entries`, packed the way Btrfs packs them:
+    /// item array forwards from the header, data backwards from the end.
+    pub fn leaf(bytenr: u64, owner: u64, entries: &[(DiskKey, Vec<u8>)]) -> Vec<u8> {
+        let mut b = vec![0u8; NODESIZE as usize];
+        put_header(&mut b, bytenr, owner, entries.len() as u32, 0);
+        let mut end = NODESIZE as usize - LEAF_DATA_OFFSET;
+        for (i, (k, data)) in entries.iter().enumerate() {
+            let offset = end - data.len();
+            let at = LEAF_DATA_OFFSET + i * ITEM_SIZE;
+            put_key(&mut b, at, k);
+            b[at + DISK_KEY_SIZE..at + DISK_KEY_SIZE + 4]
+                .copy_from_slice(&(offset as u32).to_le_bytes());
+            b[at + DISK_KEY_SIZE + 4..at + DISK_KEY_SIZE + 8]
+                .copy_from_slice(&(data.len() as u32).to_le_bytes());
+            let start = LEAF_DATA_OFFSET + offset;
+            b[start..start + data.len()].copy_from_slice(data);
+            end = offset;
+        }
+        seal(&mut b);
+        b
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Unit tests over hand-built tree blocks.
@@ -920,78 +1003,7 @@ mod tests {
     use crate::chunk::objectid;
     use std::collections::HashMap;
 
-    const NODESIZE: u32 = 4096;
-    const FSID: [u8; UUID_SIZE] = [0x5A; UUID_SIZE];
-    const CSUM: ChecksumType = ChecksumType::Crc32c;
-
-    const LEAF_A: u64 = 0x1000;
-    const LEAF_B: u64 = 0x2000;
-    const ROOT: u64 = 0x3000;
-
-    fn geom() -> TreeGeometry {
-        TreeGeometry {
-            nodesize: NODESIZE,
-            csum_type: CSUM,
-            fsid: FSID,
-        }
-    }
-
-    fn key(objectid: u64, key_type: u8, offset: u64) -> DiskKey {
-        DiskKey {
-            objectid,
-            key_type,
-            offset,
-        }
-    }
-
-    fn put_key(b: &mut [u8], at: usize, k: &DiskKey) {
-        b[at..at + 8].copy_from_slice(&k.objectid.to_le_bytes());
-        b[at + 8] = k.key_type;
-        b[at + 9..at + 17].copy_from_slice(&k.offset.to_le_bytes());
-    }
-
-    /// Write a header. Leaves the checksum for [`seal`].
-    fn put_header(b: &mut [u8], bytenr: u64, owner: u64, nritems: u32, level: u8) {
-        use header_offsets as o;
-        b[o::FSID..o::FSID + UUID_SIZE].copy_from_slice(&FSID);
-        b[o::BYTENR..o::BYTENR + 8].copy_from_slice(&bytenr.to_le_bytes());
-        let flags = (u64::from(header_flags::MIXED_BACKREF_REV) << header_flags::BACKREF_REV_SHIFT)
-            | header_flags::WRITTEN;
-        b[o::FLAGS..o::FLAGS + 8].copy_from_slice(&flags.to_le_bytes());
-        b[o::CHUNK_TREE_UUID..o::CHUNK_TREE_UUID + UUID_SIZE].copy_from_slice(&[0xC4; UUID_SIZE]);
-        b[o::GENERATION..o::GENERATION + 8].copy_from_slice(&9u64.to_le_bytes());
-        b[o::OWNER..o::OWNER + 8].copy_from_slice(&owner.to_le_bytes());
-        b[o::NRITEMS..o::NRITEMS + 4].copy_from_slice(&nritems.to_le_bytes());
-        b[o::LEVEL] = level;
-    }
-
-    /// Recompute the block checksum after building or mutating a block.
-    fn seal(b: &mut [u8]) {
-        let digest = CSUM.digest(&b[CSUM_SIZE..]);
-        b[..CSUM_SIZE].copy_from_slice(&digest);
-    }
-
-    /// Build a leaf holding `entries`, packed the way Btrfs packs them:
-    /// item array forwards from the header, data backwards from the end.
-    fn leaf(bytenr: u64, owner: u64, entries: &[(DiskKey, Vec<u8>)]) -> Vec<u8> {
-        let mut b = vec![0u8; NODESIZE as usize];
-        put_header(&mut b, bytenr, owner, entries.len() as u32, 0);
-        let mut end = NODESIZE as usize - LEAF_DATA_OFFSET;
-        for (i, (k, data)) in entries.iter().enumerate() {
-            let offset = end - data.len();
-            let at = LEAF_DATA_OFFSET + i * ITEM_SIZE;
-            put_key(&mut b, at, k);
-            b[at + DISK_KEY_SIZE..at + DISK_KEY_SIZE + 4]
-                .copy_from_slice(&(offset as u32).to_le_bytes());
-            b[at + DISK_KEY_SIZE + 4..at + DISK_KEY_SIZE + 8]
-                .copy_from_slice(&(data.len() as u32).to_le_bytes());
-            let start = LEAF_DATA_OFFSET + offset;
-            b[start..start + data.len()].copy_from_slice(data);
-            end = offset;
-        }
-        seal(&mut b);
-        b
-    }
+    use super::test_blocks::*;
 
     /// Build an internal node pointing at `children`.
     fn node(bytenr: u64, owner: u64, level: u8, children: &[(DiskKey, u64)]) -> Vec<u8> {

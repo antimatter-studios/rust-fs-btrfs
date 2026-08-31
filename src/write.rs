@@ -36,10 +36,9 @@
 //! extent item. This reads it, and refuses anything above one. That
 //! lookup is the reason this module is more than a byte copy.
 
-use crate::btree::Tree;
 use crate::chunk::DiskKey;
 use crate::error::{Error, Result};
-use crate::fs::{Filesystem, ROOT_ITEM_KEY};
+use crate::fs::Filesystem;
 
 /// `BTRFS_INODE_NODATASUM` — this file's blocks carry no checksums.
 pub const INODE_NODATASUM: u64 = 1 << 0;
@@ -212,10 +211,8 @@ impl Filesystem {
     /// place would change what that other reader sees.
     fn extent_refs(&self, bytenr: u64) -> Result<u64> {
         let root = self.extent_tree_root()?;
-        let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
-        };
-        let tree = Tree::from_superblock(&self.sb, &read);
+        let reader = self.pool_reader();
+        let tree = reader.tree();
 
         let mut refs = None;
         tree.for_each(root, &mut |key: &DiskKey, data: &[u8]| {
@@ -245,28 +242,12 @@ impl Filesystem {
     }
 
     /// The extent tree's root, named by the root tree.
+    ///
+    /// A thin alias now: this used to be `tree_root(EXTENT_TREE)`
+    /// written out again with its own bound and its own objectid
+    /// constant, and its bound disagreed with the general one. See
+    /// [`crate::fs::root_item_target`].
     fn extent_tree_root(&self) -> Result<u64> {
-        let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
-        };
-        let tree = Tree::from_superblock(&self.sb, &read);
-        let mut root = None;
-        tree.for_each(self.sb.root, &mut |key: &DiskKey, data: &[u8]| {
-            if key.objectid == EXTENT_TREE_OBJECTID
-                && key.key_type == ROOT_ITEM_KEY
-                && data.len() > crate::fs::root_item::LEVEL
-            {
-                root = Some(u64::from_le_bytes(
-                    data[crate::fs::root_item::BYTENR..crate::fs::root_item::BYTENR + 8]
-                        .try_into()
-                        .expect("8 bytes"),
-                ));
-                return Ok(false);
-            }
-            Ok(true)
-        })?;
-        root.ok_or_else(|| {
-            Error::BadSuperblock("the root tree holds no ROOT_ITEM for the extent tree".into())
-        })
+        self.tree_root(EXTENT_TREE_OBJECTID)
     }
 }

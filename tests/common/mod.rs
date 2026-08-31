@@ -2,6 +2,12 @@
 //!
 //! Rust builds each file in `tests/` as its own binary, so anything two
 //! of them need has to live here and be pulled in with `mod common;`.
+//!
+//! That also means this module is compiled once *per* binary, and each
+//! one uses only the part it needs — so an unused helper here is the
+//! normal case, not a leftover.
+
+#![allow(dead_code)]
 
 use std::path::Path;
 
@@ -29,4 +35,35 @@ pub fn spans_several_devices(image: &Path) -> bool {
         .filter(|b| b.len() >= NUM_DEVICES + 8)
         .map(|b| u64::from_le_bytes(b[NUM_DEVICES..NUM_DEVICES + 8].try_into().unwrap()))
         .is_some_and(|devices| devices > 1)
+}
+
+/// Little-endian `u32` at `at`.
+///
+/// Hand-rolled here, and **deliberately not** `src/`'s reader. These
+/// oracles decode leaves by hand on purpose: one that read a leaf
+/// through `btree::TreeBlock` would be checking the writer against the
+/// reader rather than against the disk, and the two agreeing is exactly
+/// what an oracle must not assume.
+///
+/// So this moves the decoder *sideways* — out of eight test binaries
+/// and into the module they already share — without moving it into the
+/// crate under test. That keeps the independence and removes seven
+/// copies.
+///
+/// # Panics
+///
+/// If `at + 4` is past the end. A fixture that is too short is a broken
+/// test, not a case to handle.
+pub fn le32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(b[at..at + 4].try_into().expect("4 bytes in range"))
+}
+
+/// Little-endian `u64` at `at`. See [`le32`] on why this is not the
+/// crate's own reader.
+///
+/// # Panics
+///
+/// If `at + 8` is past the end.
+pub fn le64(b: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes in range"))
 }

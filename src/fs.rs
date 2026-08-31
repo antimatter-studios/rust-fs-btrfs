@@ -99,6 +99,62 @@ pub mod root_item {
     pub const MIN_SIZE: usize = FLAGS + 8;
 }
 
+/// The root block address the root tree records for `objectid`.
+///
+/// This existed three times — `block_group::tree_root`,
+/// `write::extent_tree_root`, and inline in `fs::open_pool` for the FS
+/// tree — and **the three did not agree**, in two ways that no test
+/// distinguishes because a real `ROOT_ITEM` is 439 bytes and none of
+/// the disagreements can trigger on one:
+///
+/// * two required `data.len() > root_item::LEVEL` (238) and one
+///   required `data.len() > root_item::BYTENR + 8` (184), so a
+///   truncated item of 185..=238 bytes was accepted by one and rejected
+///   by the others;
+/// * two stopped at the first matching `ROOT_ITEM` and one kept
+///   scanning and took the **last**, so a root tree holding two items
+///   for the same objectid would have been read differently depending
+///   on which caller asked.
+///
+/// This settles both. The bound is `BYTENR + 8` — the bytes actually
+/// read — because a bound of `LEVEL` refuses items this function could
+/// answer from. And it takes the **first** match and stops, which is
+/// what a tree with one `ROOT_ITEM` per objectid means; if there are
+/// two, the tree is already malformed and reading further does not make
+/// the answer better.
+///
+/// `tree` walks the root tree, so callers differ only in which read
+/// closure they built it from — which is the only thing that ever
+/// genuinely differed between the three copies.
+///
+/// # Errors
+///
+/// [`Error::BadSuperblock`] when there is no `ROOT_ITEM` for
+/// `objectid`. For an optional tree, that is how a caller learns the
+/// tree is absent.
+pub(crate) fn root_item_target(
+    tree: &crate::btree::Tree,
+    root_tree: u64,
+    objectid: u64,
+) -> Result<u64> {
+    let mut root = None;
+    tree.for_each(root_tree, &mut |key: &DiskKey, data: &[u8]| {
+        if key.objectid == objectid
+            && key.key_type == ROOT_ITEM_KEY
+            && data.len() >= root_item::BYTENR + 8
+        {
+            root = Some(le64(data, root_item::BYTENR));
+            return Ok(false);
+        }
+        Ok(true)
+    })?;
+    root.ok_or_else(|| {
+        Error::BadSuperblock(format!(
+            "the root tree holds no ROOT_ITEM for tree {objectid}"
+        ))
+    })
+}
+
 /// Byte offsets within `struct btrfs_file_extent_item`.
 ///
 /// The full field list is kept even where a read-only driver does not
@@ -445,19 +501,7 @@ impl Filesystem {
                 Self::read_logical(&device, &map, logical, buf)
             };
             let tree = Tree::from_superblock(&sb, &read);
-            let mut root = None;
-            tree.for_each(sb.root, &mut |key: &DiskKey, data: &[u8]| {
-                if key.objectid == FS_TREE_OBJECTID
-                    && key.key_type == ROOT_ITEM_KEY
-                    && data.len() > root_item::LEVEL
-                {
-                    root = Some(le64(data, root_item::BYTENR));
-                }
-                Ok(true)
-            })?;
-            root.ok_or_else(|| {
-                Error::BadSuperblock("the root tree holds no ROOT_ITEM for the fs tree".into())
-            })?
+            root_item_target(&tree, sb.root, FS_TREE_OBJECTID)?
         };
 
         let mut fs = Filesystem {
@@ -495,6 +539,39 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] when a mapping names a device that
     /// was not given. That is not recoverable by trying another: the
     /// bytes are somewhere this filesystem cannot see.
+    /// A tree walker over this filesystem's pool.
+    ///
+    /// The four lines this replaces —
+    ///
+    /// ```ignore
+    /// let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
+    ///     Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
+    /// };
+    /// let tree = Tree::from_superblock(&self.sb, &read);
+    /// ```
+    ///
+    /// appeared eleven times, character-identical in ten of them. The
+    /// borrow checker is why they were never factored: the closure
+    /// borrows three fields and the `Tree` borrows the closure, so a
+    /// `fn tree(&self) -> Tree<'_>` cannot return both. Returning the
+    /// *reader* instead, and taking the `Tree` from it, splits the two
+    /// borrows across two statements, which is all that was needed.
+    ///
+    /// Callers write:
+    ///
+    /// ```ignore
+    /// let reader = self.pool_reader();
+    /// let tree = reader.tree();
+    /// ```
+    pub(crate) fn pool_reader(&self) -> PoolReader<'_> {
+        PoolReader {
+            geom: crate::btree::TreeGeometry::from_superblock(&self.sb),
+            read: Box::new(move |logical, buf| {
+                Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
+            }),
+        }
+    }
+
     pub(crate) fn read_logical_pool(
         device: &Arc<dyn BlockRead>,
         devices: &BTreeMap<u64, Arc<dyn BlockRead>>,
@@ -621,10 +698,8 @@ impl Filesystem {
     /// address holding something that is not a tree block of this
     /// filesystem is an error rather than an empty result.
     pub fn read_tree_block(&self, logical: u64) -> Result<crate::btree::TreeBlock> {
-        let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
-        };
-        crate::btree::Tree::from_superblock(&self.sb, &read).read_block(logical)
+        let reader = self.pool_reader();
+        reader.tree().read_block(logical)
     }
 
     /// The chunk map — how logical addresses become physical ones.
@@ -651,10 +726,8 @@ impl Filesystem {
     ///
     /// As the B-tree walk.
     pub fn root_tree_items(&self) -> Result<Vec<RootTreeItem>> {
-        let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
-        };
-        let tree = Tree::from_superblock(&self.sb, &read);
+        let reader = self.pool_reader();
+        let tree = reader.tree();
         let mut out = Vec::new();
         tree.for_each(self.sb.root, &mut |key: &DiskKey, data: &[u8]| {
             out.push((key.objectid, key.key_type, key.offset, data.to_vec()));
@@ -996,5 +1069,125 @@ impl Filesystem {
     pub fn read_path(&self, path: &str) -> Result<Vec<u8>> {
         let inode = self.lookup_path(path)?;
         self.read_file(inode.ino)
+    }
+}
+
+/// A tree walker bound to one filesystem's pool.
+///
+/// Holds the read closure so a [`crate::btree::Tree`] can borrow it —
+/// see [`Filesystem::pool_reader`] for why the two cannot be one value.
+pub(crate) struct PoolReader<'a> {
+    geom: crate::btree::TreeGeometry,
+    read: OwnedReadBlock<'a>,
+}
+
+/// An owned block reader, the counterpart to
+/// [`crate::btree::ReadBlock`]'s borrowed one.
+///
+/// The `Tree` borrows a reader; something has to own it, and that
+/// something is [`PoolReader`].
+type OwnedReadBlock<'a> = Box<dyn Fn(u64, &mut [u8]) -> Result<()> + 'a>;
+
+impl PoolReader<'_> {
+    /// A walker over any tree in this pool. The root address is a
+    /// per-call argument, so one reader serves every tree.
+    pub(crate) fn tree(&self) -> crate::btree::Tree<'_> {
+        crate::btree::Tree::new(self.geom, &*self.read)
+    }
+}
+
+#[cfg(test)]
+mod root_item_target_tests {
+    use super::*;
+    use crate::btree::test_blocks::{geom, key, leaf, LEAF_A, NODESIZE};
+    use crate::btree::Tree;
+
+    /// A `ROOT_ITEM` body of exactly the bytes this function reads.
+    ///
+    /// A real one is 439 bytes; this is the shortest body from which the
+    /// answer is still derivable. Two of the three copies this replaced
+    /// required `len > root_item::LEVEL` (238) and would have refused
+    /// it — which is the disagreement the consolidation had to settle,
+    /// and settling it silently is what this test prevents.
+    fn minimal_root_item(bytenr: u64) -> Vec<u8> {
+        let mut body = vec![0u8; root_item::BYTENR + 8];
+        body[root_item::BYTENR..root_item::BYTENR + 8].copy_from_slice(&bytenr.to_le_bytes());
+        body
+    }
+
+    fn tree_over(block: Vec<u8>) -> (Vec<u8>, u64) {
+        (block, LEAF_A)
+    }
+
+    fn lookup(entries: &[(DiskKey, Vec<u8>)], objectid: u64) -> Result<u64> {
+        let (block, at) = tree_over(leaf(LEAF_A, crate::chunk::objectid::ROOT_TREE, entries));
+        let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
+            assert_eq!(logical, at, "the walk asked for a block that is not there");
+            buf.copy_from_slice(&block[..buf.len()]);
+            Ok(())
+        };
+        let tree = Tree::new(geom(), &read);
+        root_item_target(&tree, at, objectid)
+    }
+
+    /// The bound is what the function reads, not the whole structure.
+    #[test]
+    fn a_root_item_long_enough_to_answer_from_is_accepted() {
+        let entries = vec![(key(7, ROOT_ITEM_KEY, 0), minimal_root_item(0xABCD_0000))];
+        assert_eq!(lookup(&entries, 7).unwrap(), 0xABCD_0000);
+    }
+
+    /// One byte short and it is refused, rather than read past.
+    #[test]
+    fn a_root_item_one_byte_too_short_is_not_used() {
+        let mut short = minimal_root_item(0xABCD_0000);
+        short.pop();
+        let entries = vec![(key(7, ROOT_ITEM_KEY, 0), short)];
+        assert!(
+            lookup(&entries, 7).is_err(),
+            "a body that cannot hold the field must not be read from"
+        );
+    }
+
+    /// Two `ROOT_ITEM`s for one objectid: the first wins.
+    ///
+    /// One of the three copies kept scanning and took the last. A tree
+    /// with two items for the same objectid is already malformed, so
+    /// neither answer is more correct — but they must not differ by
+    /// which caller asked, and before this they did.
+    #[test]
+    fn the_first_matching_root_item_is_the_answer() {
+        let entries = vec![
+            (key(7, ROOT_ITEM_KEY, 0), minimal_root_item(0x1111_0000)),
+            (key(7, ROOT_ITEM_KEY, 1), minimal_root_item(0x2222_0000)),
+        ];
+        assert_eq!(lookup(&entries, 7).unwrap(), 0x1111_0000);
+    }
+
+    /// An absent tree is an error, which is how an optional tree's
+    /// caller learns it is not there.
+    #[test]
+    fn a_missing_root_item_is_an_error_naming_the_tree() {
+        let entries = vec![(key(7, ROOT_ITEM_KEY, 0), minimal_root_item(1))];
+        let err = lookup(&entries, 9).unwrap_err();
+        assert!(
+            err.to_string().contains('9'),
+            "the error should name the tree that is missing, got: {err}"
+        );
+    }
+
+    /// An item of the right objectid but the wrong type is not a match.
+    #[test]
+    fn only_root_items_are_considered() {
+        let entries = vec![(key(7, ROOT_ITEM_KEY + 1, 0), minimal_root_item(0x3333_0000))];
+        assert!(lookup(&entries, 7).is_err());
+    }
+
+    /// The block builder's own assumption, so a change to `NODESIZE`
+    /// that makes these fixtures impossible fails here rather than
+    /// somewhere confusing.
+    #[test]
+    fn the_fixture_leaf_has_room_for_two_root_items() {
+        assert!(NODESIZE as usize > 2 * (root_item::BYTENR + 8) + 128);
     }
 }

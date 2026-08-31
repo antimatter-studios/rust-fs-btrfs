@@ -38,6 +38,9 @@ use fs_btrfs::super_write::{
 use fs_btrfs::superblock::ChecksumType;
 use std::path::{Path, PathBuf};
 
+mod common;
+use common::le64;
+
 fn share() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
 }
@@ -56,10 +59,6 @@ fn captured() -> Vec<Vec<u8>> {
         }
     }
     out
-}
-
-fn le64(b: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
 /// Given a superblock and the next one's decisions, produce the next one.
