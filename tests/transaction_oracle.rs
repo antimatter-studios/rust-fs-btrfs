@@ -28,6 +28,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod common;
+use common::le64;
+
 fn share() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
 }
@@ -40,10 +43,6 @@ fn image(name: &str) -> Option<PathBuf> {
 fn mount(p: &Path) -> Filesystem {
     let dev = Arc::new(FileDevice::open(p).expect("opening a fixture"));
     Filesystem::mount(dev).expect("mounting a fixture")
-}
-
-fn le64(b: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
 /// The addresses named by a `METADATA_ITEM`, i.e. the tree blocks the

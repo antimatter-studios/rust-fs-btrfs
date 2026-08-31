@@ -26,6 +26,9 @@ use fs_core::FileDevice;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod common;
+use common::le64;
+
 fn share() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
 }
@@ -50,10 +53,6 @@ fn images() -> Vec<PathBuf> {
 fn open(img: &Path) -> Option<Filesystem> {
     let dev = Arc::new(FileDevice::open(img).ok()?);
     Filesystem::mount(dev).ok()
-}
-
-fn le64(b: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
 /// Rebuilding an allocation record gives back what the kernel wrote.

@@ -39,7 +39,6 @@
 //! checkable before it is complete is worth more than being complete and
 //! unverified.
 
-use crate::btree::{header_offsets as o, HEADER_SIZE};
 use crate::chunk::objectid;
 use crate::error::{Error, Result};
 use crate::fs::Filesystem;
@@ -97,7 +96,17 @@ impl Plan {
 
 /// What a tree walk hands to its visitor: a block's address, its bytes,
 /// its level, and the node that points at it — `None` for a root.
-type BlockVisitor<'a> = &'a mut dyn FnMut(u64, &[u8], u8, Option<u64>);
+/// What [`Filesystem::for_each_tree_block`] hands a visitor: the
+/// block's address, the **parsed** block, and the address of the node
+/// pointing at it (`None` for a root).
+///
+/// It used to pass `&[u8]`. The walk parses every block anyway, so
+/// handing over the bytes meant each of the three visitors re-parsed
+/// the leaf by hand — `25` as a bare literal in four places, the item
+/// key at `+0..17`, the data offset at `+17..21` — all of which
+/// `btree::Item` and `TreeBlock::item_data` already own, in the module
+/// this file already imports from.
+type BlockVisitor<'a> = &'a mut dyn FnMut(u64, &crate::btree::TreeBlock, Option<u64>);
 
 /// A block's place in the tree it belongs to.
 #[derive(Debug, Clone, Copy)]
@@ -208,24 +217,39 @@ impl Filesystem {
         )))
     }
 
+    /// The root block a `ROOT_ITEM` names, or `None` if its body does
+    /// not reach that far.
+    ///
+    /// `None` is a *refusal to guess*, not a "no root": the item claims
+    /// a body that the block does not contain, which means the leaf is
+    /// malformed. The caller skips it, and the tree it would have named
+    /// goes undiscovered — which surfaces later as "not reachable from
+    /// any tree" rather than as a parse error. That indirection is
+    /// pre-existing; what is new is that the bounds decision is made in
+    /// one place, by `TreeBlock::item_data`, instead of by an inline
+    /// `if off + BYTENR + 8 <= block.len()` the reader has to
+    /// reconstruct.
+    fn root_item_bytenr(block: &crate::btree::TreeBlock, item: &crate::btree::Item) -> Option<u64> {
+        let data = block.item_data(item)?;
+        let field = data.get(root_item::BYTENR..root_item::BYTENR + 8)?;
+        Some(u64::from_le_bytes(field.try_into().ok()?))
+    }
+
     /// The root tree leaf holding the `ROOT_ITEM` for `objectid`.
     fn root_item_leaf(&self, objectid: u64) -> Result<Option<u64>> {
         let mut found = None;
-        self.for_each_tree_block(self.sb.root, &mut |at, block, level, _| {
-            if level != 0 || found.is_some() {
+        self.for_each_tree_block(self.sb.root, &mut |at, block, _| {
+            if found.is_some() {
                 return;
             }
-            let n = u32::from_le_bytes(block[o::NRITEMS..o::NRITEMS + 4].try_into().unwrap());
-            for i in 0..n as usize {
-                let it = HEADER_SIZE + i * 25;
-                if it + 25 > block.len() {
-                    break;
-                }
-                let oid = u64::from_le_bytes(block[it..it + 8].try_into().unwrap());
-                if oid == objectid && block[it + 8] == ROOT_ITEM_KEY {
-                    found = Some(at);
-                    return;
-                }
+            let Some(items) = block.body.items() else {
+                return;
+            };
+            if items
+                .iter()
+                .any(|it| it.key.objectid == objectid && it.key.key_type == ROOT_ITEM_KEY)
+            {
+                found = Some(at);
             }
         })?;
         Ok(found)
@@ -241,8 +265,9 @@ impl Filesystem {
                 continue;
             }
             let mut found_roots = Vec::new();
-            self.for_each_tree_block(root, &mut |at, block, level, parent| {
-                let owner = u64::from_le_bytes(block[o::OWNER..o::OWNER + 8].try_into().unwrap());
+            self.for_each_tree_block(root, &mut |at, block, parent| {
+                let owner = block.header.owner;
+                let level = block.header.level;
                 out.insert(
                     at,
                     Placement {
@@ -252,27 +277,22 @@ impl Filesystem {
                     },
                 );
 
-                if level != 0 || owner != objectid::ROOT_TREE {
+                if owner != objectid::ROOT_TREE {
                     return;
                 }
                 // A root tree leaf: each ROOT_ITEM names another tree.
-                let n = u32::from_le_bytes(block[o::NRITEMS..o::NRITEMS + 4].try_into().unwrap());
-                for i in 0..n as usize {
-                    let it = HEADER_SIZE + i * 25;
-                    if it + 25 > block.len() || block[it + 8] != ROOT_ITEM_KEY {
+                let Some(items) = block.body.items() else {
+                    return;
+                };
+                for item in items {
+                    if item.key.key_type != ROOT_ITEM_KEY {
                         continue;
                     }
-                    let off = HEADER_SIZE
-                        + u32::from_le_bytes(block[it + 17..it + 21].try_into().unwrap()) as usize;
-                    if off + root_item::BYTENR + 8 <= block.len() {
-                        let b = u64::from_le_bytes(
-                            block[off + root_item::BYTENR..off + root_item::BYTENR + 8]
-                                .try_into()
-                                .unwrap(),
-                        );
-                        if b != 0 && !out.contains_key(&b) {
-                            found_roots.push(b);
-                        }
+                    let Some(b) = Self::root_item_bytenr(block, item) else {
+                        continue;
+                    };
+                    if b != 0 && !out.contains_key(&b) {
+                        found_roots.push(b);
                     }
                 }
             })?;
@@ -283,8 +303,11 @@ impl Filesystem {
 
     /// Walk a tree, handing each block to `visit` with its parent.
     ///
-    /// `visit` receives the block's address, its bytes, its level, and
-    /// the address of the node that points at it — `None` for a root.
+    /// `visit` receives the block's address, the parsed block, and the
+    /// address of the node that points at it — `None` for a root. The
+    /// walk has already parsed it to find the child pointers, so
+    /// handing over the parse costs nothing and saves every visitor
+    /// from redoing it by hand.
     ///
     /// # Errors
     ///
@@ -292,10 +315,8 @@ impl Filesystem {
     /// rather than fatal: a tree this driver cannot fully walk is still
     /// one whose reachable part is worth knowing.
     fn for_each_tree_block(&self, root: u64, visit: BlockVisitor) -> Result<()> {
-        let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
-        };
-        let tree = crate::btree::Tree::from_superblock(&self.sb, &read);
+        let reader = self.pool_reader();
+        let tree = reader.tree();
 
         let mut stack = vec![(root, None)];
         let mut seen = BTreeSet::new();
@@ -306,8 +327,7 @@ impl Filesystem {
             let Ok(block) = tree.read_block(at) else {
                 continue;
             };
-            let level = block.header.level;
-            visit(at, block.bytes(), level, parent);
+            visit(at, &block, parent);
             if let Some(ptrs) = block.body.key_ptrs() {
                 for p in ptrs {
                     stack.push((p.blockptr, Some(at)));
@@ -568,16 +588,13 @@ impl Filesystem {
 
         // Every leaf, by its first key.
         let mut leaves: Vec<(u64, u64)> = Vec::new();
-        self.for_each_tree_block(root, &mut |at, block, level, _| {
-            if level != 0 {
+        self.for_each_tree_block(root, &mut |at, block, _| {
+            let Some(items) = block.body.items() else {
                 return;
+            };
+            if let Some(first) = items.first() {
+                leaves.push((first.key.objectid, at));
             }
-            let n = u32::from_le_bytes(block[o::NRITEMS..o::NRITEMS + 4].try_into().unwrap());
-            if n == 0 {
-                return;
-            }
-            let first = u64::from_le_bytes(block[HEADER_SIZE..HEADER_SIZE + 8].try_into().unwrap());
-            leaves.push((first, at));
         })?;
         if leaves.is_empty() {
             return Ok(BTreeSet::new());

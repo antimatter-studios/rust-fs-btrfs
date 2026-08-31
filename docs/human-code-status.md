@@ -2,16 +2,20 @@
 
 Tracks every **High** and **Medium** finding from
 [`human-code-report-2026-08-28.md`](human-code-report-2026-08-28.md). The report
-predates the work; this is the current position. Updated 2026-08-30.
+predates the work; this is the current position. Updated 2026-08-31.
 
 **27 findings** — 6 High, 10 Medium, 5 Low, plus 7 tests-that-cannot-fail. This
 covers the 16 High and Medium.
 
 | | High | Medium |
 |---|---|---|
-| Fixed | 3 | 2 |
+| Fixed | 6 | 6 |
 | Left for a human decision | 0 | 4 |
-| Fixable, not yet done | 3 | 4 |
+| Fixable, not yet done | 0 | 0 |
+
+The four Medium items left for a human decision are M8/M9 (two transaction-path
+god functions), M12 (a rename whose right answer depends on what the caller
+should understand the call to cost), and the `items_of` half of M16.
 
 ---
 
@@ -85,10 +89,23 @@ The third was found by CI rather than by grep: it only runs under the kernel-
 validation job, so a local `cargo test` never reached it. Fitting, in that the
 last test still asserting splitting was unimplemented was the one hardest to run.
 
-### H3, H4 — hand-rolled leaf parsing and a duplicated free-run merge — **fixable, not yet done**
+### H3 — the write path hand-rolls leaf parsing `btree.rs` already does — **fixed**
 
-Both concern the write path duplicating what `btree.rs` and `merge_adjacent`
-already do.
+The root cause was one line: `for_each_tree_block` had a fully parsed `TreeBlock`
+in hand and passed the visitor `block.bytes()`, so all three visitors re-parsed
+the leaf themselves — `25` as a bare literal in four places, the key at `+0..17`,
+the data offset at `+17..21`.
+
+`BlockVisitor` now carries `&TreeBlock`. All three hand-rolled loops are gone,
+along with the `HEADER_SIZE` / `header_offsets` imports they needed. The bounds
+decision the two loops made inline — `if off + BYTENR + 8 <= block.len()` — is
+now `TreeBlock::item_data`'s `Option`, in `root_item_bytenr`, where a reader can
+see it being made.
+
+### H4 — the free-run merge in `apply_free_space` duplicates `merge_adjacent` — **fixed earlier**
+
+This entry was stale. `block_group::merge_adjacent` is `pub(crate)` and
+`transaction.rs:838` calls it; there is no second copy.
 
 ---
 
@@ -114,18 +131,71 @@ readability gain for a risk in the part of the crate that writes to disk.
 A rename is the fix and the right name depends on what the caller should
 understand it to cost.
 
-### M11, M13 — four implementations of "find a tree's root"; the read-closure boilerplate eleven times — **fixable, not yet done**
+### M11 — four implementations of "find a tree's root" — **fixed, and the three plain copies did not agree**
 
-Both genuine, both mechanical, both wanting the oracle suites as the contract.
+One `fs::root_item_target(tree, root_tree, objectid)`. The copies differed in two
+ways, neither of which any test could distinguish because a real `ROOT_ITEM` is
+439 bytes and neither disagreement can trigger on one:
 
-### M15 — the example invalidates the free-space tree for a reason that no longer holds — **fixable, not yet done**
+- two required `data.len() > root_item::LEVEL` (238) and one required
+  `data.len() > root_item::BYTENR + 8` (184), so a truncated item of 185..=238
+  bytes was **accepted by one and rejected by the others**;
+- two stopped at the first match and one kept scanning and took the **last**, so
+  a root tree with two items for the same objectid would have read differently
+  depending on which caller asked.
 
-The reason was that the transaction did not maintain the tree. It does now, so
-the example is teaching a habit that is no longer necessary.
+Both are settled, with the reasoning in the doc: the bound is the bytes actually
+read (a bound of `LEVEL` refuses items the function could answer from), and the
+first match wins (a tree with two is already malformed, and reading on does not
+make the answer better). Five tests pin exactly those decisions — including the
+minimal-length item that two of the three old copies would have refused.
 
-### M16 — `le32`/`le64`/`items_of` copied across eight test binaries that share a helper module — **fixable, not yet done**
+`transaction::root_item_leaf` stays separate, because it answers a different
+question (*which leaf holds* the item, not what it points at), but it is now
+three lines because H3 gave it `block.body.items()`.
 
-They already share `tests/common`; the copies predate it.
+### M13 — the read-closure + `Tree` boilerplate eleven times — **fixed**
+
+`Filesystem::pool_reader()` returns a `PoolReader` that owns the closure;
+`reader.tree()` borrows it. Ten of the eleven sites are now two lines.
+
+The borrow checker is why this had not been factored, and the fix is worth
+recording: the closure borrows three fields and the `Tree` borrows the closure,
+so one function cannot return both. Returning the *reader* and taking the tree
+from it splits the two borrows across two statements, which is all that was
+needed.
+
+### M15 — the example invalidates the free-space tree for a reason that no longer holds — **fixed (the reason, not the flag)**
+
+The flag stays `true`, and the comment now gives the reason that is actually
+true. The old one — "this transaction does not maintain the free-space tree" —
+stopped being true when `apply_free_space` landed: `render_plan` rewrites the
+free-space tree's extents alongside the extent tree's, and *refuses* a block
+group recorded as a bitmap rather than skipping it.
+
+The reason now is that the example does not verify what it wrote. Clearing the
+validity bit is the format's own way of saying "believe the extent tree, not this
+cache", which is the honest setting for a file whose point is the transaction
+shape. Setting it to `false` here — in an example nothing checks — would assert a
+property this file does not test; the oracle suite, which runs `btrfs check`
+inside a VM, is where that assertion belongs.
+
+### M16 — `le32`/`le64`/`items_of` copied across eight test binaries — **`le32`/`le64` fixed; `items_of` left**
+
+`le32` and `le64` are in `tests/common/mod.rs` now, and eight binaries import
+them instead of declaring their own.
+
+They are still **hand-rolled there, not imported from `src/`**, and the doc says
+why: these oracles decode leaves by hand on purpose. One that read a leaf through
+`btree::TreeBlock` would be checking the writer against the reader instead of
+against the disk, and the two agreeing is the one thing an oracle must not
+assume. The decoder moved sideways, into the module the tests already share —
+not inward, into the crate under test.
+
+`items_of` is left. Its four copies return four different types (`Vec<OwnedItem>`,
+`Option<Vec<OwnedItem>>`, `Vec<(DiskKey, Vec<u8>)>`, `Vec<(DiskKey, Range<usize>)>`),
+so a shared version is a design job about what an oracle should be handed, not a
+copy-paste removal.
 
 ### The endian readers, declared three times — **fixed**
 
