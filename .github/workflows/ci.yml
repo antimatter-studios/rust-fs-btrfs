@@ -13,7 +13,7 @@ env:
   # (`am-fs-core = { path = "../rust-fs-core", version = "0.2" }`). Must match
   # the `am-fs-core` version recorded in Cargo.lock, or `--locked` will refuse
   # to build. Bump in lockstep with the constraint in Cargo.toml.
-  FS_CORE_REF: v0.2.3
+  FS_CORE_REF: v0.2.4
 
 jobs:
   test:
