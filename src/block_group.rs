@@ -151,6 +151,23 @@ impl Filesystem {
         let mut out = Vec::new();
         tree.for_each(root, &mut |key: &DiskKey, data: &[u8]| {
             if key.key_type == key_type::BLOCK_GROUP_ITEM && data.len() >= block_group_item::SIZE {
+                // A GROUP THAT DOES NOT END IS NOT A GROUP.
+                //
+                // `start` and `length` are the objectid and the offset
+                // of the key, straight off the disk. `end()` is
+                // saturating, so a pair that leaves a `u64` gives a
+                // group ending at the top of the address space -- and
+                // `gaps` then reports a free run of nearly 2^64 bytes,
+                // which `next_free_block` walks a node at a time.
+                // Refusing here is what keeps that from being reachable
+                // at all; the saturation downstream stays as a backstop.
+                if key.objectid.checked_add(key.offset).is_none() {
+                    return Err(Error::BadSuperblock(format!(
+                        "the block group at {} says it is {} bytes long, which ends past \
+                         the address space",
+                        key.objectid, key.offset
+                    )));
+                }
                 out.push(BlockGroup {
                     start: key.objectid,
                     // The length is in the key, not the item — the item
@@ -273,6 +290,16 @@ impl Filesystem {
                 .iter()
                 .position(|g| key.objectid >= g.start && key.objectid < g.end())
             {
+                // Same rule as the group itself: a run whose end leaves
+                // the address space is not a run, and `gaps` subtracts
+                // from it.
+                if key.objectid.checked_add(len).is_none() {
+                    return Err(Error::BadSuperblock(format!(
+                        "the allocated run at {} says it is {len} bytes long, which ends \
+                         past the address space",
+                        key.objectid
+                    )));
+                }
                 out[i].push(FreeExtent {
                     start: key.objectid,
                     len,
@@ -558,6 +585,44 @@ mod tests {
     }
 
     /// Runs that touch become one; runs with a gap do not.
+    /// `start` and `length` are the objectid and offset of a
+    /// BLOCK_GROUP_ITEM key, straight off the disk. `end()` is
+    /// saturating, so a pair leaving a `u64` gives a group ending at
+    /// the top of the address space -- and `gaps` then reports a free
+    /// run of nearly 2^64 bytes, which `next_free_block` walks one
+    /// node at a time.
+    ///
+    /// (Before the arithmetic was made saturating, the wrap made
+    /// `end()` small and `gaps` produced nothing at all: the fix turned
+    /// "yields nothing" into "walks forever", which is why the refusal
+    /// belongs where the group is read rather than where it is used.)
+    #[test]
+    fn a_group_or_run_that_ends_past_the_address_space_is_refused() {
+        // The saturation itself stays as a backstop and is what the
+        // refusal is protecting against.
+        let hostile = BlockGroup {
+            start: u64::MAX - 4,
+            length: 0x1000,
+            used: 0,
+            flags: 0,
+        };
+        assert_eq!(hostile.end(), u64::MAX, "saturating, not wrapping");
+
+        let ordinary = BlockGroup {
+            start: 1 << 20,
+            length: 1 << 30,
+            used: 0,
+            flags: 0,
+        };
+        assert_eq!(ordinary.end(), (1 << 20) + (1 << 30));
+
+        let extent = FreeExtent {
+            start: u64::MAX - 4,
+            len: 0x1000,
+        };
+        assert_eq!(extent.end(), u64::MAX);
+    }
+
     #[test]
     fn adjacent_runs_merge_and_separated_ones_do_not() {
         assert_eq!(
