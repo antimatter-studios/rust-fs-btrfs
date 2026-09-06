@@ -6,6 +6,15 @@ never does.
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-09-06
+
+### Fixed
+
+- A tree walk visits each block once. Without a visited set, a chunk
+  tree that points back into itself made the mount loop.
+- Extent lengths are bounded before they become allocation sizes, and a
+  chunk cannot send a write outside the device it maps.
+
 ## [0.6.1] — 2026-09-04
 
 ### Changed
