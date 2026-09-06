@@ -44,6 +44,8 @@ not.
 | Inodes, directory items, extent data | done |
 | Directory listing, lookup, path resolution | done |
 | Symlinks | done |
+| Extended attributes: read | done — `list_xattrs` / `get_xattr`, checked name by name against `getfattr` |
+| Extended attributes: write | not yet — setting one means inserting into a tree a transaction has to commit |
 | Profiles: single, dup, raid0, raid1, raid10 | done |
 | Profiles: raid5/6 | refused explicitly, not guessed |
 | Mixed block groups (`mkfs.btrfs -M`) | reads; covered by the fixture matrix |

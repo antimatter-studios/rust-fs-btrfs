@@ -158,6 +158,48 @@ int64_t fs_btrfs_read_file(fs_btrfs_fs_t *fs, const char *path,
 int fs_btrfs_readlink(fs_btrfs_fs_t *fs, const char *path,
                       char *buf, size_t bufsize);
 
+/* ---- extended attributes (read only) ---- */
+
+/*
+ * List extended attribute names for a path.
+ *
+ * Writes NUL-separated fully-qualified names ("user.colour\0user.tag\0")
+ * into buf. If buf is NULL or bufsize is 0, no bytes are written but the
+ * return value still reports the required total size -- use this to probe.
+ *
+ * Btrfs stores the namespace prefix as part of the name, so what comes
+ * back is exactly what setfattr was given. There is no prefix table to
+ * expand, unlike ext4 and EROFS.
+ *
+ * Returns: total bytes of output (names + NUL terminators) on success,
+ *          -1 on error. If bufsize is less than the required size, writes
+ *          as many WHOLE names as fit and still returns the required size.
+ *
+ * Signature and semantics match fs_ext4_listxattr, so a layer above can
+ * treat the drivers alike.
+ */
+int64_t fs_btrfs_listxattr(fs_btrfs_fs_t *fs, const char *path,
+                           char *buf, size_t bufsize);
+
+/*
+ * Get one extended attribute value by fully-qualified name
+ * (e.g. "user.colour").
+ *
+ * Writes raw value bytes (no NUL terminator) into buf. If buf is NULL or
+ * bufsize is 0, returns the value size without writing -- use this to probe.
+ *
+ * A zero-length value is a real value and returns 0, which is NOT an
+ * error; an absent attribute returns -1 with ENOENT. Check the return
+ * against -1, not against 0.
+ *
+ * Returns: value size in bytes on success,
+ *          -1 if the name is not present or on error. If bufsize is less
+ *          than the value size, writes as much as fits and still returns
+ *          the value size.
+ */
+int64_t fs_btrfs_getxattr(fs_btrfs_fs_t *fs, const char *path,
+                          const char *name, void *buf, size_t bufsize);
+
 /* ---- writing ---- */
 
 /*

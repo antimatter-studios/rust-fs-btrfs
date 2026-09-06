@@ -884,3 +884,232 @@ fn writing_past_the_end_is_enotsup() {
     assert_eq!(fs_btrfs_last_errno(), ENOTSUP_ERRNO, "{}", last_error());
     unsafe { fs_btrfs_umount(fs) };
 }
+
+// ---------------------------------------------------------------------
+// Extended attributes
+//
+// A different fixture from the one above: `btrfs-xattr`, built by
+// scripts/build-xattr-fixtures.sh, because `rich` carries no attributes
+// and adding some to it would change a filesystem several other tests
+// already assert against.
+// ---------------------------------------------------------------------
+
+fn xattr_fixture() -> Option<*mut fs_btrfs_fs> {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".vm-share")
+        .join("btrfs-xattr.img");
+    if !p.exists() {
+        return None;
+    }
+    let c = cstr(p.to_str().unwrap());
+    let fs = unsafe { fs_btrfs_mount(c.as_ptr()) };
+    assert!(!fs.is_null(), "mounting failed: {}", last_error());
+    Some(fs)
+}
+
+/// Names come back NUL-separated, and the probe form (NULL buffer)
+/// reports the same size the real call needs. A caller allocates on the
+/// strength of that number, so the two must agree exactly.
+#[test]
+fn listxattr_names_are_nul_separated_and_the_probe_agrees() {
+    let Some(fs) = xattr_fixture() else {
+        eprintln!("no xattr fixture — skipping");
+        return;
+    };
+    let path = cstr("/plain.txt");
+    let needed = unsafe { fs_btrfs_listxattr(fs, path.as_ptr(), std::ptr::null_mut(), 0) };
+    assert!(needed > 0, "{}", last_error());
+
+    let mut buf = vec![0u8; needed as usize];
+    let wrote = unsafe {
+        fs_btrfs_listxattr(
+            fs,
+            path.as_ptr(),
+            buf.as_mut_ptr().cast::<c_char>(),
+            buf.len(),
+        )
+    };
+    assert_eq!(wrote, needed, "the probe and the real call disagree");
+
+    let mut names: Vec<&[u8]> = buf.split(|&b| b == 0).collect();
+    // The buffer ends with a terminator, so the split leaves an empty
+    // tail; a name is never empty, so this is unambiguous.
+    assert_eq!(names.pop(), Some(&b""[..]));
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec![
+            &b"user.binary"[..],
+            &b"user.colour"[..],
+            &b"user.empty"[..],
+            &b"user.long"[..],
+        ]
+    );
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+/// A buffer too small takes as many WHOLE names as fit and still reports
+/// the full size. A half-written name is not a name, and a caller that
+/// parsed one would act on a name that does not exist.
+#[test]
+fn listxattr_into_a_short_buffer_writes_whole_names_only() {
+    let Some(fs) = xattr_fixture() else {
+        eprintln!("no xattr fixture — skipping");
+        return;
+    };
+    let path = cstr("/plain.txt");
+    let needed = unsafe { fs_btrfs_listxattr(fs, path.as_ptr(), std::ptr::null_mut(), 0) };
+    let mut buf = vec![0xAAu8; 16];
+    let got = unsafe {
+        fs_btrfs_listxattr(
+            fs,
+            path.as_ptr(),
+            buf.as_mut_ptr().cast::<c_char>(),
+            buf.len(),
+        )
+    };
+    assert_eq!(got, needed, "a short write must still report the full size");
+    let written = &buf[..buf.iter().position(|&b| b == 0xAA).unwrap_or(buf.len())];
+    // Whatever was written is a whole number of NUL-terminated names.
+    assert!(written.is_empty() || written.last() == Some(&0));
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+/// The value comes back byte for byte, including NULs, and the probe
+/// form reports its length without writing.
+#[test]
+fn getxattr_returns_the_value_and_its_length() {
+    let Some(fs) = xattr_fixture() else {
+        eprintln!("no xattr fixture — skipping");
+        return;
+    };
+    let path = cstr("/plain.txt");
+    let name = cstr("user.binary");
+    let want = [0x00u8, 0x01, 0x02, 0xff, 0x7f, 0x0a, 0x00];
+
+    let size =
+        unsafe { fs_btrfs_getxattr(fs, path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+    assert_eq!(size, want.len() as i64, "{}", last_error());
+
+    let mut buf = vec![0u8; want.len()];
+    let n = unsafe {
+        fs_btrfs_getxattr(
+            fs,
+            path.as_ptr(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast::<c_void>(),
+            buf.len(),
+        )
+    };
+    assert_eq!(n, want.len() as i64);
+    assert_eq!(buf, want, "a value with NUL bytes was truncated");
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+/// Zero and -1 mean different things here and the header says so: an
+/// attribute set to nothing returns 0, an attribute that is not there
+/// returns -1 with ENOENT. A caller testing `<= 0` would merge them.
+#[test]
+fn getxattr_distinguishes_an_empty_value_from_a_missing_one() {
+    let Some(fs) = xattr_fixture() else {
+        eprintln!("no xattr fixture — skipping");
+        return;
+    };
+    let path = cstr("/plain.txt");
+    let mut buf = [0u8; 8];
+
+    let empty = unsafe {
+        fs_btrfs_getxattr(
+            fs,
+            path.as_ptr(),
+            cstr("user.empty").as_ptr(),
+            buf.as_mut_ptr().cast::<c_void>(),
+            buf.len(),
+        )
+    };
+    assert_eq!(empty, 0, "an empty value must not look like an error");
+
+    let missing = unsafe {
+        fs_btrfs_getxattr(
+            fs,
+            path.as_ptr(),
+            cstr("user.never-set").as_ptr(),
+            buf.as_mut_ptr().cast::<c_void>(),
+            buf.len(),
+        )
+    };
+    assert_eq!(missing, -1);
+    assert_eq!(fs_btrfs_last_errno(), ENOENT, "{}", last_error());
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+/// A file with no attributes lists nothing, and that is a successful
+/// zero rather than a failure.
+#[test]
+fn listxattr_on_a_file_without_attributes_is_zero_not_an_error() {
+    let Some(fs) = xattr_fixture() else {
+        eprintln!("no xattr fixture — skipping");
+        return;
+    };
+    let n = unsafe { fs_btrfs_listxattr(fs, cstr("/bare.txt").as_ptr(), std::ptr::null_mut(), 0) };
+    assert_eq!(n, 0, "{}", last_error());
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+/// NULL tolerance, which is the whole reason this file exists.
+#[test]
+fn the_xattr_entry_points_tolerate_nulls() {
+    let mut buf = [0u8; 8];
+    assert_eq!(
+        unsafe {
+            fs_btrfs_listxattr(
+                std::ptr::null_mut(),
+                cstr("/x").as_ptr(),
+                std::ptr::null_mut(),
+                0,
+            )
+        },
+        -1
+    );
+    assert_eq!(
+        unsafe {
+            fs_btrfs_getxattr(
+                std::ptr::null_mut(),
+                cstr("/x").as_ptr(),
+                cstr("user.x").as_ptr(),
+                buf.as_mut_ptr().cast::<c_void>(),
+                buf.len(),
+            )
+        },
+        -1
+    );
+
+    let Some(fs) = xattr_fixture() else {
+        eprintln!("no xattr fixture — skipping the rest");
+        return;
+    };
+    assert_eq!(
+        unsafe { fs_btrfs_listxattr(fs, std::ptr::null(), std::ptr::null_mut(), 0) },
+        -1
+    );
+    assert_eq!(
+        unsafe {
+            fs_btrfs_getxattr(
+                fs,
+                cstr("/plain.txt").as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            )
+        },
+        -1
+    );
+    // A path that is not there fails as ENOENT rather than as EIO, so a
+    // user is not sent looking for a hardware fault.
+    assert_eq!(
+        unsafe { fs_btrfs_listxattr(fs, cstr("/nope.txt").as_ptr(), std::ptr::null_mut(), 0) },
+        -1
+    );
+    assert_eq!(fs_btrfs_last_errno(), ENOENT, "{}", last_error());
+    unsafe { fs_btrfs_umount(fs) };
+}

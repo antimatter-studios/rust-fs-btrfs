@@ -37,10 +37,11 @@
 use crate::btree::{Tree, TreeGeometry};
 use crate::chunk::{Chunk, ChunkMap, DiskKey};
 use crate::compression::{self, Compression};
-use crate::dir::{self, DirEntry, DIR_INDEX_KEY};
+use crate::dir::{self, DirEntry, DIR_INDEX_KEY, XATTR_ITEM_KEY};
 use crate::error::{Error, Result};
 use crate::inode::{Inode, FIRST_FREE_OBJECTID, INODE_ITEM_KEY};
 use crate::superblock::{le64, Superblock, SUPER_INFO_OFFSET};
+use crate::xattr::{self, XattrEntry};
 use fs_core::{BlockDevice, BlockRead};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -912,6 +913,69 @@ impl Filesystem {
             )));
         }
         self.read_inode(hit.ino)
+    }
+
+    /// Every extended attribute on an inode, in the order the tree
+    /// holds them.
+    ///
+    /// That order is by name hash, not alphabetical and not the order
+    /// the attributes were set — Btrfs files an attribute under
+    /// `(ino, 24, name_hash(name))`, so the sequence is whatever the
+    /// hash function produced. A caller wanting a stable presentation
+    /// order should sort; this reports what is there.
+    ///
+    /// Several names can share one key, and then their records are
+    /// packed into a single item. Every record in every item is
+    /// returned, which is the whole reason this is not a lookup.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if the inode does not exist, or
+    /// [`Error::BadSuperblock`] if an item is malformed.
+    pub fn list_xattrs(&self, ino: u64) -> Result<Vec<XattrEntry>> {
+        // Confirms the inode exists, so an attribute list for a number
+        // that names nothing is a refusal rather than an empty list —
+        // which a caller could not tell from a file with no attributes.
+        self.read_inode(ino)?;
+        let mut out = Vec::new();
+        for ((objectid, key_type, _), data) in self
+            .items
+            .range((ino, XATTR_ITEM_KEY, 0)..=(ino, XATTR_ITEM_KEY, u64::MAX))
+        {
+            if *objectid != ino || *key_type != XATTR_ITEM_KEY {
+                break;
+            }
+            out.extend(xattr::parse_xattr_items(data)?);
+        }
+        Ok(out)
+    }
+
+    /// One extended attribute's value, by fully-qualified name
+    /// (`user.colour`, not `colour`).
+    ///
+    /// `Ok(None)` means the attribute is not set. That is distinct from
+    /// `Ok(Some(vec![]))`, which means it is set to a zero-length value
+    /// — a real thing to store, and something a caller may act on.
+    ///
+    /// # Why this is not `list_xattrs().find(..)`
+    ///
+    /// The name's hash *is* the key, so the item holding it can be
+    /// fetched directly instead of walking every attribute on the
+    /// inode. The scan that remains is over the handful of records
+    /// inside that one item, which is where a colliding name would be.
+    ///
+    /// # Errors
+    ///
+    /// As [`list_xattrs`](Self::list_xattrs).
+    pub fn get_xattr(&self, ino: u64, name: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.read_inode(ino)?;
+        let Some(data) = self.items.get(&(ino, XATTR_ITEM_KEY, dir::name_hash(name))) else {
+            return Ok(None);
+        };
+        Ok(xattr::parse_xattr_items(data)?
+            .into_iter()
+            .find(|e| e.name == name)
+            .map(|e| e.value))
     }
 
     /// Resolve an absolute path to its inode.
