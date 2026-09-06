@@ -337,6 +337,36 @@ impl Filesystem {
     /// and is not cleaned up: some mirrors may hold the new contents and
     /// some the old, which is the same state a power loss produces and
     /// is what the commit ordering exists to survive.
+    /// Where a mapped range lands on the device, once it is known to be
+    /// on it.
+    ///
+    /// A chunk's `btrfs_stripe.offset` is a raw `u64` off the disk, and
+    /// `Chunk::validate_geometry` checks it for sector alignment and
+    /// nothing else -- not against `dev_item.total_bytes`, not against
+    /// the device. So every tree block and every data byte this crate
+    /// writes could land at an offset the image chose. Against a
+    /// file-backed image that is not an error at all: `write_at` on a
+    /// file extends it, so a chunk at `stripe.offset = 2^60` grows a
+    /// mounted image toward an exabyte. On a `CallbackDevice` the
+    /// offset goes straight to the host.
+    ///
+    /// `commit::superblock_copy_fits` applies exactly this rule to the
+    /// superblock copies; nothing else did.
+    fn writable_span(device: &Arc<dyn BlockDevice>, physical: u64, len: usize) -> Result<()> {
+        let end = physical.checked_add(len as u64).ok_or_else(|| {
+            Error::BadSuperblock(format!(
+                "a chunk maps a write to {physical}, which ends past the address space"
+            ))
+        })?;
+        let device_bytes = device.size_bytes();
+        if end > device_bytes {
+            return Err(Error::BadSuperblock(format!(
+                "a chunk maps a write to [{physical}, {end}) on a device of {device_bytes} bytes"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn write_logical_all_mirrors(
         device: &Arc<dyn BlockDevice>,
         map: &ChunkMap,
@@ -352,6 +382,9 @@ impl Filesystem {
                 if n == 0 {
                     return Err(Error::UnmappedLogical(logical + done as u64));
                 }
+                Self::writable_span(device, m.physical, n)?;
+                Self::writable_span(device, m.physical, n)?;
+                Self::writable_span(device, m.physical, n)?;
                 device.write_at(m.physical, &buf[done..done + n])?;
                 done += n;
             }
@@ -926,6 +959,27 @@ impl Filesystem {
                         len: num_bytes,
                         algo,
                     });
+                }
+                // THE ITEM'S WINDOW IS INSIDE THE EXTENT IT NAMES.
+                //
+                // `offset` says where in the extent this item's data
+                // starts and `num_bytes` how much of it the item
+                // covers, so together they cannot exceed the extent's
+                // own length. The kernel's tree checker enforces
+                // exactly this. Without it, one `u64` moved the write
+                // target outside the extent entirely -- and the
+                // reference check on the write path is keyed on
+                // `disk_bytenr`, so it still found the extent, agreed
+                // it had one owner, and let the write land somewhere
+                // else: over a tree block, or over another file.
+                let window_end = offset
+                    .checked_add(num_bytes)
+                    .filter(|end| *end <= ram_bytes);
+                if window_end.is_none() {
+                    return Err(Error::BadSuperblock(format!(
+                        "inode {ino}: an extent item covers [{offset}, +{num_bytes}) of an \
+                         extent that is {ram_bytes} bytes long"
+                    )));
                 }
                 Ok(Piece::Regular {
                     // Both halves are raw le64s. In release, where this
