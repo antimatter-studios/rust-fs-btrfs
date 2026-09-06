@@ -287,9 +287,69 @@ fn short_extent(ino: u64, kind: &str) -> Error {
     ))
 }
 
+/// How many blocks a mount caches by default: **none**.
+///
+/// Not an oversight, and not a placeholder. Measured — see
+/// `docs/read-path-cost.md` — a block cache buys this driver nothing
+/// and costs it something:
+///
+/// - Every item of the fs tree is loaded at mount, so a walk, a stat
+///   and a read make **zero** calls to the device afterwards. There are
+///   no repeat metadata reads left for a cache to serve.
+/// - Metadata is read a node at a time, and a node is `nodesize` —
+///   typically four sectors. Caching by sector turns one call into
+///   four, so on the `rich` fixture the cached mount asked the device
+///   for 14 reads where the uncached one asked for 4.
+///
+/// [`Filesystem::mount_with_cache`] still exists so the measurement can
+/// take both passes, and so the decision can be re-taken against a
+/// number if the eager load is ever replaced by lazy descent — at which
+/// point a cache becomes worth having and this constant should change
+/// with it.
+pub const DEFAULT_CACHE_BLOCKS: usize = 0;
+
 impl Filesystem {
     /// Open `device` as a Btrfs filesystem.
     pub fn mount(device: Arc<dyn BlockRead>) -> Result<Self> {
+        Self::mount_with_cache(device, DEFAULT_CACHE_BLOCKS)
+    }
+
+    /// Open `device` for reading, caching `blocks` metadata blocks.
+    ///
+    /// # Why the cache is built here and not by the caller
+    ///
+    /// It is sized in blocks, and the block size is the filesystem's.
+    /// A caller wanting to wrap the device itself would have to parse a
+    /// superblock first to know what to wrap it with — which is what
+    /// this does, once, before wrapping.
+    ///
+    /// # What it is for
+    ///
+    /// Every lookup descends from the root of the filesystem tree, so
+    /// the nodes near that root are read again for each path, and the
+    /// chunk map is consulted for every logical address translated.
+    /// None of those bytes change during a mount.
+    ///
+    /// `blocks` of zero disables it, which is what the measurement in
+    /// `tests/read_path_cost.rs` uses to take its baseline.
+    pub fn mount_with_cache(device: Arc<dyn BlockRead>, blocks: usize) -> Result<Self> {
+        if blocks == 0 {
+            return Self::open(device, None);
+        }
+        // The sector size is not known until a superblock has been
+        // parsed, and the superblock is at a fixed offset, so this one
+        // read goes to the device directly.
+        let mut sb_buf = vec![0u8; 4096];
+        device.read_at(SUPER_INFO_OFFSET, &mut sb_buf)?;
+        let sb = Superblock::parse_at(&sb_buf, SUPER_INFO_OFFSET)?;
+
+        // CACHED BY SECTOR RATHER THAN BY NODE. A node is `nodesize`,
+        // typically 16 KiB, and caching whole nodes would make the unit
+        // four times larger than the smallest useful read. Sectors are
+        // the finer unit and a node is then four cached blocks, stitched
+        // by the cache itself.
+        let device: Arc<dyn BlockRead> =
+            fs_core::CachingDevice::read_only(device, u64::from(sb.sectorsize), blocks);
         Self::open(device, None)
     }
 
