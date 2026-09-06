@@ -30,8 +30,11 @@
 //! the kind of quietly-wrong answer this driver is meant not to give.
 //!
 //! `XATTR_ITEM` uses the same struct with its `data` field holding the
-//! attribute value; this module parses the shape but skips that value,
-//! since extended attributes are not implemented.
+//! attribute value, and collides in the same way — several attribute
+//! names hashing to one key share an item. So the record walk is shared:
+//! [`parse_items`] does the bounds arithmetic once, and
+//! [`parse_dir_items`] and [`crate::xattr::parse_xattr_items`] each read
+//! the fields they care about out of the result.
 //!
 //! # Layout
 //!
@@ -79,8 +82,8 @@ pub const DIR_ITEM_KEY: u8 = 84;
 pub const DIR_INDEX_KEY: u8 = 96;
 
 /// `BTRFS_XATTR_ITEM_KEY` — extended attributes, which reuse this
-/// struct. Named so a walk over a file tree can account for it; the
-/// values themselves are not implemented.
+/// struct with the attribute's value in the trailing `data` field. Read
+/// by [`crate::xattr`].
 pub const XATTR_ITEM_KEY: u8 = 24;
 
 /// Size of the fixed part of a `struct btrfs_dir_item`, before its name.
@@ -230,25 +233,52 @@ impl DirEntry {
     }
 }
 
-/// Parse the sequence of dir items packed into one item's data.
+/// One record inside a packed `btrfs_dir_item` sequence, before anything
+/// has decided what it means.
+///
+/// Directory entries and extended attributes are the same bytes read two
+/// ways: an entry cares about the location key and the type byte and has
+/// no value; an attribute cares about the name and the value and has no
+/// meaningful location. Splitting the walk from the interpretation keeps
+/// one copy of the bounds arithmetic, which is the part that has to be
+/// right — a `name_len` or `data_len` mishandled by one byte
+/// desynchronises everything after it in the item.
+pub(crate) struct RawItem<'a> {
+    /// The `location` key. Names an inode or a subvolume root for a
+    /// directory entry; unused, and zero in practice, for an attribute.
+    pub(crate) location: DiskKey,
+    /// Transaction that created the record.
+    pub(crate) transid: u64,
+    /// The raw `type` byte, undecoded.
+    pub(crate) ftype: u8,
+    /// The name, exactly as stored.
+    pub(crate) name: &'a [u8],
+    /// The trailing value. Empty for a directory entry.
+    pub(crate) value: &'a [u8],
+}
+
+/// Walk the sequence of records packed into one item's data.
+///
+/// `what` names the caller in every error message, so a malformed
+/// extended attribute does not report itself as a malformed directory.
 ///
 /// # Errors
 ///
 /// [`Error::BadSuperblock`] if a header is truncated, a name runs past
 /// the end of the data, a name is empty or longer than
-/// [`MAX_NAME_LEN`], or the entries do not consume the item exactly. The
+/// [`MAX_NAME_LEN`], or the records do not consume the item exactly. The
 /// last of those is the load-bearing one: a leftover byte means the
 /// stride is wrong, and it is the cheapest available detector for a
 /// misread `name_len` or `data_len`.
-pub fn parse_dir_items(data: &[u8]) -> Result<Vec<DirEntry>> {
+pub(crate) fn parse_items<'a>(data: &'a [u8], what: &str) -> Result<Vec<RawItem<'a>>> {
     use offsets as o;
-    let mut out = Vec::new();
+    let mut out: Vec<RawItem<'a>> = Vec::new();
     let mut pos = 0usize;
     while pos < data.len() {
         let rest = &data[pos..];
         if rest.len() < DIR_ITEM_HEADER_SIZE {
             return Err(Error::BadSuperblock(format!(
-                "directory item {} is truncated: {} bytes left, need {DIR_ITEM_HEADER_SIZE} \
+                "{what} {} is truncated: {} bytes left, need {DIR_ITEM_HEADER_SIZE} \
                  for a header",
                 out.len(),
                 rest.len()
@@ -259,48 +289,64 @@ pub fn parse_dir_items(data: &[u8]) -> Result<Vec<DirEntry>> {
         let name_len = usize::from(le16(rest, o::NAME_LEN));
         if name_len == 0 {
             return Err(Error::BadSuperblock(format!(
-                "directory item {} has an empty name",
+                "{what} {} has an empty name",
                 out.len()
             )));
         }
         if name_len > MAX_NAME_LEN {
             return Err(Error::BadSuperblock(format!(
-                "directory item {} has a {name_len}-byte name, past the {MAX_NAME_LEN}-byte limit",
+                "{what} {} has a {name_len}-byte name, past the {MAX_NAME_LEN}-byte limit",
                 out.len()
             )));
         }
-        let end = o::NAME
-            .checked_add(name_len)
-            .and_then(|e| e.checked_add(data_len))
-            .ok_or_else(|| {
-                Error::BadSuperblock(format!(
-                    "directory item {} has lengths that overflow",
-                    out.len()
-                ))
-            })?;
+        let name_end = o::NAME + name_len;
+        let end = name_end.checked_add(data_len).ok_or_else(|| {
+            Error::BadSuperblock(format!("{what} {} has lengths that overflow", out.len()))
+        })?;
         if end > rest.len() {
             return Err(Error::BadSuperblock(format!(
-                "directory item {} needs {end} bytes but only {} remain",
+                "{what} {} needs {end} bytes but only {} remain",
                 out.len(),
                 rest.len()
             )));
         }
-        out.push(DirEntry {
-            name: rest[o::NAME..o::NAME + name_len].to_vec(),
-            ino: location.objectid,
-            ftype: ftype_from_raw(rest[o::TYPE])?,
-            location_type: location.key_type,
+        out.push(RawItem {
+            location,
             transid: le64(rest, o::TRANSID),
+            ftype: rest[o::TYPE],
+            name: &rest[o::NAME..name_end],
+            value: &rest[name_end..end],
         });
         pos += end;
     }
     if pos != data.len() {
         return Err(Error::BadSuperblock(format!(
-            "directory items consumed {pos} of {} bytes — the item stride is wrong",
+            "{what}s consumed {pos} of {} bytes — the item stride is wrong",
             data.len()
         )));
     }
     Ok(out)
+}
+
+/// Parse the sequence of dir items packed into one item's data.
+///
+/// # Errors
+///
+/// As [`parse_items`], plus [`Error::BadSuperblock`] for a `type` byte
+/// that is not a defined value.
+pub fn parse_dir_items(data: &[u8]) -> Result<Vec<DirEntry>> {
+    parse_items(data, "directory item")?
+        .into_iter()
+        .map(|r| {
+            Ok(DirEntry {
+                name: r.name.to_vec(),
+                ino: r.location.objectid,
+                ftype: ftype_from_raw(r.ftype)?,
+                location_type: r.location.key_type,
+                transid: r.transid,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
