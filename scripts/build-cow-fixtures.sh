@@ -39,6 +39,13 @@ set -euo pipefail
 
 OUT="${BTRFS_FIXTURE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.vm-share}"
 SIZE="${BTRFS_FIXTURE_SIZE:-512M}"
+CSUM="${BTRFS_CSUM:-crc32c}"
+GEOMETRY_ARGS="${BTRFS_GEOMETRY_ARGS:-}"
+
+mkfs_args=()
+if [[ -n "$GEOMETRY_ARGS" ]]; then
+    read -r -a mkfs_args <<< "$GEOMETRY_ARGS"
+fi
 
 SUDO=""
 [ "$(id -u)" -eq 0 ] || SUDO="sudo"
@@ -51,7 +58,7 @@ after="$OUT/btrfs-cow-after.img"
 rm -f "$before" "$after"
 
 truncate -s "$SIZE" "$before"
-mkfs.btrfs -f "$before" >/dev/null
+mkfs.btrfs "${mkfs_args[@]}" --csum "$CSUM" -f "$before" >/dev/null
 
 m="$(mktemp -d)"
 
@@ -78,7 +85,7 @@ $SUDO umount "$m"
 
 rmdir "$m"
 
-echo "BUILT  before, control (no change) and after (one touch)"
+echo "BUILT  before, control (no change) and after (one touch) (csum=$CSUM${GEOMETRY_ARGS:+, geometry=$GEOMETRY_ARGS})"
 for f in "$before" "$control" "$after"; do
     gen=$(od -An -tu8 -j $((65536 + 72)) -N 8 "$f" | tr -d ' ')
     root=$(od -An -tu8 -j $((65536 + 80)) -N 8 "$f" | tr -d ' ')

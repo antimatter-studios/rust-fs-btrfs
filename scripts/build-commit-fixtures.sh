@@ -34,6 +34,16 @@ set -euo pipefail
 OUT="${BTRFS_FIXTURE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.vm-share}"
 SIZE="${BTRFS_FIXTURE_SIZE:-512M}"
 COMMITS="${BTRFS_COMMITS:-6}"
+CSUM="${BTRFS_CSUM:-crc32c}"
+GEOMETRY_ARGS="${BTRFS_GEOMETRY_ARGS:-}"
+
+# Keep the fixture names stable so the oracle can be rerun against more than
+# one geometry in the same CI job. The builder is invoked once per geometry;
+# each invocation replaces the previous capture before its tests run.
+mkfs_args=()
+if [[ -n "$GEOMETRY_ARGS" ]]; then
+    read -r -a mkfs_args <<< "$GEOMETRY_ARGS"
+fi
 
 SUDO=""
 [ "$(id -u)" -eq 0 ] || SUDO="sudo"
@@ -45,7 +55,7 @@ img="$OUT/btrfs-commit.img"
 rm -f "$img" "$OUT"/btrfs-commit-*.super
 
 truncate -s "$SIZE" "$img"
-mkfs.btrfs -f "$img" >/dev/null
+mkfs.btrfs "${mkfs_args[@]}" --csum "$CSUM" -f "$img" >/dev/null
 
 # The superblock as mkfs left it: the "before" of the first commit.
 #
@@ -70,7 +80,7 @@ for n in $(seq 1 "$COMMITS"); do
 done
 rmdir "$m"
 
-echo "BUILT  $((COMMITS + 1)) superblocks, $COMMITS commits apart"
+echo "BUILT  $((COMMITS + 1)) superblocks, $COMMITS commits apart (csum=$CSUM${GEOMETRY_ARGS:+, geometry=$GEOMETRY_ARGS})"
 for n in $(seq 0 "$COMMITS"); do
     f="$OUT/btrfs-commit-$n.super"
     # generation is at 0x048, little-endian.

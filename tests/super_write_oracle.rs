@@ -35,11 +35,11 @@ use fs_btrfs::super_write::{
     apply, backup_slot, offsets, stamp_checksum, Commit, ROOT_BACKUPS_END, ROOT_BACKUP_SIZE,
     SUPERBLOCK_SIZE,
 };
-use fs_btrfs::superblock::ChecksumType;
+use fs_btrfs::superblock::{offsets as sb_offsets, ChecksumType};
 use std::path::{Path, PathBuf};
 
 mod common;
-use common::le64;
+use common::{le16, le64};
 
 fn share() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
@@ -108,7 +108,9 @@ fn each_commit_reproduces_the_superblock_the_kernel_wrote() {
         ours[INCOMPAT_FLAGS..INCOMPAT_FLAGS + 8]
             .copy_from_slice(&after[INCOMPAT_FLAGS..INCOMPAT_FLAGS + 8]);
 
-        apply(&mut ours, ChecksumType::Crc32c, &commit).expect("apply the commit");
+        let csum_type = ChecksumType::from_raw(le16(before, sb_offsets::CSUM_TYPE))
+            .expect("captured superblock names a supported checksum");
+        apply(&mut ours, csum_type, &commit).expect("apply the commit");
 
         let differing: Vec<usize> = (0..SUPERBLOCK_SIZE)
             .filter(|&i| ours[i] != after[i])
@@ -160,7 +162,9 @@ fn the_checksum_matches_every_captured_superblock() {
         // Blank it first, so a matching result cannot come from having
         // left the kernel's own answer in place.
         ours[..32].fill(0);
-        stamp_checksum(&mut ours, ChecksumType::Crc32c);
+        let csum_type = ChecksumType::from_raw(le16(sb, sb_offsets::CSUM_TYPE))
+            .expect("captured superblock names a supported checksum");
+        stamp_checksum(&mut ours, csum_type);
         assert_eq!(
             ours[..32],
             sb[..32],
