@@ -273,6 +273,20 @@ pub struct Filesystem {
     items: BTreeMap<(u64, u8, u64), Vec<u8>>,
 }
 
+/// The longest a symbolic link's target can be.
+///
+/// `PATH_MAX`. A link's target is a path and the operating system will
+/// not take a longer one, while the inode's declared size is a raw
+/// `le64`.
+pub const MAX_SYMLINK_TARGET: u64 = 4096;
+
+/// An extent that does not hold the bytes it claims to cover.
+fn short_extent(ino: u64, kind: &str) -> Error {
+    Error::BadSuperblock(format!(
+        "inode {ino}: a {kind} extent is shorter than the range it covers"
+    ))
+}
+
 impl Filesystem {
     /// Open `device` as a Btrfs filesystem.
     pub fn mount(device: Arc<dyn BlockRead>) -> Result<Self> {
@@ -892,9 +906,21 @@ impl Filesystem {
                     return Ok(Piece::Zeros);
                 }
                 if algo.is_compressed() {
+                    // `disk_len` is the buffer the compressed bytes are
+                    // read into, and it is a raw le64. Btrfs never
+                    // writes a compressed extent larger than the unit it
+                    // compresses in -- see `compression::MAX_COMPRESSED`.
+                    let disk_len = le64(data, file_extent::DISK_NUM_BYTES);
+                    if disk_len > compression::MAX_COMPRESSED {
+                        return Err(Error::BadSuperblock(format!(
+                            "inode {ino}: compressed extent occupies {disk_len} bytes on \
+                             disk, more than the {} a compressed extent can",
+                            compression::MAX_COMPRESSED
+                        )));
+                    }
                     return Ok(Piece::Compressed {
                         logical: disk_bytenr,
-                        disk_len: le64(data, file_extent::DISK_NUM_BYTES),
+                        disk_len,
                         ram_len: ram_bytes,
                         offset,
                         len: num_bytes,
@@ -902,7 +928,18 @@ impl Filesystem {
                     });
                 }
                 Ok(Piece::Regular {
-                    logical: disk_bytenr + offset,
+                    // Both halves are raw le64s. In release, where this
+                    // crate ships with overflow-checks off, the sum
+                    // wrapped to a small logical address that then
+                    // mapped into an unrelated chunk -- a silent
+                    // mistranslation, which is the failure this driver
+                    // exists to avoid.
+                    logical: disk_bytenr.checked_add(offset).ok_or_else(|| {
+                        Error::BadSuperblock(format!(
+                            "inode {ino}: extent at {disk_bytenr} plus offset {offset} \
+                             leaves the address space"
+                        ))
+                    })?,
                     len: num_bytes,
                 })
             }
@@ -963,15 +1000,45 @@ impl Filesystem {
     }
 
     /// Read a whole file.
+    ///
+    /// Materialises the file in memory, so it is bounded by the size of
+    /// the filesystem: a whole-file read cannot need more memory than
+    /// the filesystem has bytes, and `inode.size` is a raw `le64` that
+    /// said otherwise. Reading part of a larger file is what
+    /// [`Filesystem::read_at`] is for.
     pub fn read_file(&self, ino: u64) -> Result<Vec<u8>> {
         let inode = self.read_inode(ino)?;
         if !inode.is_regular_file() && !inode.is_symlink() {
             return Err(Error::NotAFile);
         }
-        let size = inode.size as usize;
-        // Start from zeros so holes and preallocated extents need no
-        // special case on the copy path.
-        let mut out = vec![0u8; size];
+        if inode.size > self.sb.total_bytes {
+            return Err(Error::BadSuperblock(format!(
+                "inode {ino} says it is {} bytes, more than the {} the filesystem holds",
+                inode.size, self.sb.total_bytes
+            )));
+        }
+        let mut out = vec![0u8; inode.size as usize];
+        self.read_range(&inode, 0, &mut out)?;
+        Ok(out)
+    }
+
+    /// Fill `buf` with the file's bytes from `from` onwards.
+    ///
+    /// `buf` is zeroed first, so a hole and a preallocated extent need
+    /// no special case: they are the absence of a copy.
+    ///
+    /// Only the extents that overlap the window are read. `read_at`
+    /// used to call `read_file` and slice the result, which meant
+    /// serving a 4 KiB read of a large file by materialising the whole
+    /// of it -- and `inode.size` is a raw `le64`, so "the whole of it"
+    /// was whatever the image claimed.
+    fn read_range(&self, inode: &Inode, from: u64, buf: &mut [u8]) -> Result<()> {
+        buf.fill(0);
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let ino = inode.ino;
+        let want_end = from.saturating_add(buf.len() as u64).min(inode.size);
 
         for ((objectid, key_type, offset), data) in self
             .items
@@ -980,35 +1047,53 @@ impl Filesystem {
             if *objectid != ino || *key_type != EXTENT_DATA_KEY {
                 break;
             }
-            let at = *offset as usize;
-            if at >= size {
+            let at = *offset;
+            if at >= want_end {
+                break;
+            }
+            let piece = self.decode_extent(data, ino)?;
+            let extent_len = match &piece {
+                Piece::Inline(bytes) => bytes.len() as u64,
+                Piece::Zeros => continue,
+                Piece::Regular { len, .. } | Piece::Compressed { len, .. } => *len,
+            };
+            // Where this extent and the window overlap, in file offsets.
+            let start = at.max(from);
+            let end = at.saturating_add(extent_len).min(want_end);
+            if end <= start {
                 continue;
             }
-            match self.decode_extent(data, ino)? {
+            let take = (end - start) as usize;
+            let skip = (start - at) as usize;
+            let dst = &mut buf[(start - from) as usize..(end - from) as usize];
+
+            match piece {
                 Piece::Inline(bytes) => {
-                    let n = bytes.len().min(size - at);
-                    out[at..at + n].copy_from_slice(&bytes[..n]);
+                    let src = bytes
+                        .get(skip..skip + take)
+                        .ok_or_else(|| short_extent(ino, "inline"))?;
+                    dst.copy_from_slice(src);
                 }
-                Piece::Zeros => {}
-                Piece::Regular { logical, len } => {
-                    let n = (len as usize).min(size - at);
-                    if n > 0 {
-                        Self::read_logical_pool(
-                            &self.device,
-                            &self.devices,
-                            &self.map,
-                            logical,
-                            &mut out[at..at + n],
-                        )?;
-                    }
+                Piece::Zeros => unreachable!("handled above"),
+                Piece::Regular { logical, .. } => {
+                    let at_logical = logical
+                        .checked_add(skip as u64)
+                        .ok_or_else(|| short_extent(ino, "regular"))?;
+                    Self::read_logical_pool(
+                        &self.device,
+                        &self.devices,
+                        &self.map,
+                        at_logical,
+                        dst,
+                    )?;
                 }
                 Piece::Compressed {
                     logical,
                     disk_len,
                     ram_len,
                     offset: within,
-                    len,
                     algo,
+                    ..
                 } => {
                     let mut packed = vec![0u8; disk_len as usize];
                     Self::read_logical_pool(
@@ -1026,13 +1111,15 @@ impl Filesystem {
                     )?;
                     // `within` indexes the decoded bytes, which is the
                     // whole reason this is not a Regular read.
-                    let from = (within as usize).min(decoded.len());
-                    let take = (len as usize).min(decoded.len() - from).min(size - at);
-                    out[at..at + take].copy_from_slice(&decoded[from..from + take]);
+                    let src_at = (within as usize).saturating_add(skip);
+                    let src = decoded
+                        .get(src_at..src_at + take)
+                        .ok_or_else(|| short_extent(ino, "compressed"))?;
+                    dst.copy_from_slice(src);
                 }
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Read part of a file.
@@ -1040,13 +1127,16 @@ impl Filesystem {
     /// Returns the number of bytes read, short only at end of file.
     pub fn read_at(&self, ino: u64, offset: u64, buf: &mut [u8]) -> Result<usize> {
         let inode = self.read_inode(ino)?;
+        // Kept from when this went through `read_file`: reading a
+        // directory is EISDIR, not a short read of nothing.
+        if !inode.is_regular_file() && !inode.is_symlink() {
+            return Err(Error::NotAFile);
+        }
         if offset >= inode.size {
             return Ok(0);
         }
-        let whole = self.read_file(ino)?;
-        let start = offset as usize;
-        let n = buf.len().min(whole.len().saturating_sub(start));
-        buf[..n].copy_from_slice(&whole[start..start + n]);
+        let n = buf.len().min((inode.size - offset) as usize);
+        self.read_range(&inode, offset, &mut buf[..n])?;
         Ok(n)
     }
 
@@ -1055,6 +1145,15 @@ impl Filesystem {
         let inode = self.read_inode(ino)?;
         if !inode.is_symlink() {
             return Err(Error::NotAFile);
+        }
+        // A link's target is a path, and no path is longer than
+        // PATH_MAX. Without this the inode's raw `size` reached
+        // `read_file`'s allocation from `fs_btrfs_readlink`.
+        if inode.size > MAX_SYMLINK_TARGET {
+            return Err(Error::BadSuperblock(format!(
+                "inode {ino}: symlink target of {} bytes is longer than any path",
+                inode.size
+            )));
         }
         self.read_file(ino)
     }

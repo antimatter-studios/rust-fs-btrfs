@@ -74,6 +74,22 @@ impl Compression {
     }
 }
 
+/// The most a compressed extent decodes to.
+///
+/// Btrfs compresses in units of 128 KiB (`BTRFS_MAX_UNCOMPRESSED`) and
+/// never writes a larger one. Measured against btrfs-progs 6.x: every
+/// compressed extent an 8 MiB file produced has `ram_bytes` of exactly
+/// 131072, and none is larger.
+pub const MAX_UNCOMPRESSED: usize = 128 * 1024;
+
+/// The most a compressed extent occupies on disk.
+///
+/// `BTRFS_MAX_COMPRESSED`, the same number for the same reason.
+/// Measured: a barely-compressible 128 KiB extent came out at 102400
+/// bytes, and the encoder stores the extent uncompressed rather than
+/// let it grow past the unit it started from.
+pub const MAX_COMPRESSED: u64 = 128 * 1024;
+
 /// Decode `input` into exactly `ram_bytes` bytes.
 ///
 /// `sectorsize` is the filesystem's sector size, which the LZO framing
@@ -88,6 +104,25 @@ pub fn decompress(
     ram_bytes: usize,
     sectorsize: usize,
 ) -> Result<Vec<u8>> {
+    // `ram_bytes` IS THE ALLOCATION, and it comes off the disk.
+    //
+    // Every branch below sizes its output buffer from it before any
+    // input is decoded, so an inline extent of about thirty bytes
+    // claiming 2^55 asks for 36 petabytes. That does not fail politely:
+    // `handle_alloc_error` aborts, and an abort is not something
+    // `capi::guard`'s `catch_unwind` can turn into an EIO -- the host
+    // process dies.
+    //
+    // Btrfs compresses in units of 128 KiB and never writes a larger
+    // one. Measured rather than assumed: every compressed extent an
+    // 8 MiB file produced under `compress-force=zstd` has `ram_bytes`
+    // of exactly 131072, and none is larger.
+    if ram_bytes > MAX_UNCOMPRESSED {
+        return Err(Error::BadSuperblock(format!(
+            "{algo:?} extent says it decodes to {ram_bytes} bytes, more than the \
+             {MAX_UNCOMPRESSED} a compressed extent can hold"
+        )));
+    }
     let out = match algo {
         Compression::None => input.to_vec(),
         Compression::Zlib => decompress_zlib(input, ram_bytes)?,
@@ -242,6 +277,32 @@ fn read_u32(b: &[u8], at: usize) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ram_bytes` is the allocation, and it comes off the disk. Every
+    /// branch sizes its output buffer from it before decoding any
+    /// input, so an inline extent of about thirty bytes claiming 2^55
+    /// asked for 36 petabytes -- and `handle_alloc_error` answers that
+    /// by aborting, which `capi::guard`'s `catch_unwind` cannot turn
+    /// into an EIO.
+    ///
+    /// Btrfs compresses in units of 128 KiB. Measured against
+    /// btrfs-progs 6.x: every compressed extent an 8 MiB file produced
+    /// under `compress-force=zstd` has `ram_bytes` of exactly 131072.
+    #[test]
+    fn an_extent_decoding_to_more_than_a_compression_unit_is_refused() {
+        for algo in [Compression::Zlib, Compression::Lzo, Compression::Zstd] {
+            let outcome = decompress(algo, &[0u8; 4], MAX_UNCOMPRESSED + 1, 4096);
+            let why = format!("{outcome:?}");
+            assert!(
+                why.contains("more than the"),
+                "{algo:?} accepted a declared size of {} and was refused as {why}",
+                MAX_UNCOMPRESSED + 1
+            );
+            // The shape that reached the abort: an inline extent
+            // claiming a size no allocator will satisfy.
+            assert!(decompress(algo, &[0u8; 4], 1 << 55, 4096).is_err());
+        }
+    }
 
     #[test]
     fn compression_bytes_map_to_the_defined_algorithms() {

@@ -835,7 +835,8 @@ impl<'a> Tree<'a> {
         root: u64,
         visit: &mut dyn FnMut(&DiskKey, &[u8]) -> Result<bool>,
     ) -> Result<()> {
-        self.walk(root, None, 0, visit).map(|_| ())
+        self.walk(root, None, &mut WalkState::new(), visit)
+            .map(|_| ())
     }
 
     /// Visit every item from `start` onwards, in key order.
@@ -849,7 +850,8 @@ impl<'a> Tree<'a> {
         start: &DiskKey,
         visit: &mut dyn FnMut(&DiskKey, &[u8]) -> Result<bool>,
     ) -> Result<()> {
-        self.walk(root, Some(start), 0, visit).map(|_| ())
+        self.walk(root, Some(start), &mut WalkState::new(), visit)
+            .map(|_| ())
     }
 
     /// Depth-first, left-to-right walk. Returns `false` once `visit` has
@@ -862,16 +864,49 @@ impl<'a> Tree<'a> {
         &self,
         logical: u64,
         start: Option<&DiskKey>,
-        depth: u8,
+        state: &mut WalkState,
         visit: &mut dyn FnMut(&DiskKey, &[u8]) -> Result<bool>,
     ) -> Result<bool> {
-        if depth >= MAX_LEVEL {
+        if state.depth >= MAX_LEVEL {
             return Err(bad_block(
                 logical,
                 format!("walk went deeper than {MAX_LEVEL} levels"),
             ));
         }
+        // ONCE EACH. A tree reaches every block by exactly one path, so
+        // a block reached twice means the structure is not a tree.
+        //
+        // `MAX_LEVEL` bounds depth and says nothing about fan-out, and
+        // the two are not the same bound at all: eight blocks totalling
+        // 32 KiB, each interior one pointing all its slots at the same
+        // child a level down, cost 2.4 million reads at a fanout of
+        // eight. At the real fanout of a 4 KiB node -- 121 -- that is
+        // about 4e14, and at 64 KiB nodes 1e23. Every one of those
+        // blocks passes each individual check, because each genuinely
+        // is the block at its own address.
+        //
+        // This is reached three times during mount, before any user
+        // call: the chunk tree, `root_item_target`, and `load_fs_tree`.
+        if !state.seen.insert(logical) {
+            return Err(bad_block(
+                logical,
+                "block appears twice in one walk — the tree is not a tree",
+            ));
+        }
         let block = self.read_block(logical)?;
+        // The same rule `descend` enforces: a child sits one level below
+        // its parent. `walk` did not check it.
+        if let Some(want) = state.expected_level {
+            if block.header.level != want {
+                return Err(bad_block(
+                    logical,
+                    format!(
+                        "level {} where the parent said {want} — the tree is inconsistent",
+                        block.header.level
+                    ),
+                ));
+            }
+        }
         match &block.body {
             Body::Leaf(items) => {
                 let first = start.map_or(0, |k| leaf_slot(items, k));
@@ -887,17 +922,59 @@ impl<'a> Tree<'a> {
             }
             Body::Node(ptrs) => {
                 let first = start.map_or(0, |k| node_slot(ptrs, k));
+                let child_level = block
+                    .header
+                    .level
+                    .checked_sub(1)
+                    .ok_or_else(|| bad_block(logical, "a node at level 0 has children"))?;
                 for (i, ptr) in ptrs.iter().enumerate().skip(first) {
                     // Only the subtree the start key lands in needs to be
                     // entered partway; everything to its right is whole.
                     let child_start = if i == first { start } else { None };
-                    if !self.walk(ptr.blockptr, child_start, depth + 1, visit)? {
+                    let outer = state.enter(child_level);
+                    let keep_going = self.walk(ptr.blockptr, child_start, state, visit);
+                    state.leave(outer);
+                    if !keep_going? {
                         return Ok(false);
                     }
                 }
                 Ok(true)
             }
         }
+    }
+}
+
+/// What one walk has to remember about itself.
+///
+/// The blocks it has already visited, how deep it is, and what level the
+/// block it is about to read should be at. See `Tree::walk`.
+struct WalkState {
+    seen: std::collections::HashSet<u64>,
+    depth: u8,
+    expected_level: Option<u8>,
+}
+
+impl WalkState {
+    fn new() -> Self {
+        Self {
+            seen: std::collections::HashSet::new(),
+            depth: 0,
+            expected_level: None,
+        }
+    }
+
+    /// Step into a child at `level`, returning what to restore on the
+    /// way back out.
+    fn enter(&mut self, level: u8) -> Option<u8> {
+        let outer = self.expected_level;
+        self.expected_level = Some(level);
+        self.depth += 1;
+        outer
+    }
+
+    fn leave(&mut self, outer: Option<u8>) {
+        self.expected_level = outer;
+        self.depth -= 1;
     }
 }
 
@@ -1271,6 +1348,71 @@ mod tests {
         );
     }
 
+    /// Four interior blocks, each pointing all eight of its slots at
+    /// the same block one level down, over a single leaf. Every block
+    /// passes every check the parser makes -- ascending keys, non-null
+    /// pointers, a level one below its parent, a header whose bytenr is
+    /// its own address -- because each one genuinely is the block at
+    /// its own address.
+    ///
+    /// It is a DAG rather than a tree, and a depth-first walk of a DAG
+    /// costs the product of the fan-outs: 8^4 leaf visits from five
+    /// blocks. `MAX_LEVEL` bounds depth and says nothing about this.
+    fn one_child_reached_eight_ways() -> HashMap<u64, Vec<u8>> {
+        const FANOUT: u64 = 8;
+        let leaf_block = leaf(LEAF_A, objectid::FS_TREE, &[(key(1, 1, 0), b"a".to_vec())]);
+        let mut blocks = HashMap::from([(LEAF_A, leaf_block)]);
+
+        // Levels 1..=4, each at its own address, each pointing eight
+        // ways at the one below.
+        let addresses = [0x6000u64, 0x5000, 0x4000, ROOT];
+        let mut below = LEAF_A;
+        for (i, &at) in addresses.iter().enumerate() {
+            let children: Vec<(DiskKey, u64)> = (0..FANOUT)
+                .map(|slot| (key(1 + slot, 1, 0), below))
+                .collect();
+            blocks.insert(at, node(at, objectid::FS_TREE, (i + 1) as u8, &children));
+            below = at;
+        }
+        blocks
+    }
+
+    #[test]
+    fn a_block_reached_twice_in_one_walk_is_refused() {
+        let blocks = one_child_reached_eight_ways();
+        let reads = std::cell::Cell::new(0usize);
+        let read = |logical: u64, buf: &mut [u8]| match blocks.get(&logical) {
+            Some(block) => {
+                reads.set(reads.get() + 1);
+                buf.copy_from_slice(block);
+                Ok(())
+            }
+            None => Err(Error::Io(format!("no block at {logical:#x}"))),
+        };
+        let tree = Tree::new(geom(), &read);
+
+        let mut visited = 0usize;
+        let outcome = tree.for_each(ROOT, &mut |_, _| {
+            visited += 1;
+            Ok(true)
+        });
+
+        assert!(
+            outcome.is_err(),
+            "a walk of a five-block DAG visited {visited} items and read \
+             {} blocks without objecting",
+            reads.get()
+        );
+        assert!(
+            reads.get() <= blocks.len(),
+            "the walk read {} blocks from an image holding {}",
+            reads.get(),
+            blocks.len()
+        );
+    }
+
+    /// A well-formed tree still walks: the guard is about a block
+    /// appearing twice, not about a block appearing at all.
     #[test]
     fn walks_a_two_level_tree_in_key_order() {
         let blocks = two_level_tree();

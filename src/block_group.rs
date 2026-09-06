@@ -82,8 +82,17 @@ pub struct BlockGroup {
 
 impl BlockGroup {
     /// One past the last byte.
+    ///
+    /// Saturating, because `start` and `length` are the objectid and
+    /// the offset of a BLOCK_GROUP_ITEM key -- raw disk fields with no
+    /// validation between the tree and here. In release, where this
+    /// crate ships with overflow-checks off, the sum wrapped and
+    /// `contains`, `gaps` and `cached_free_extents` then answered
+    /// about a range that runs backwards. Saturating leaves a group
+    /// that ends at the top of the address space, which those answer
+    /// about correctly.
     pub fn end(&self) -> u64 {
-        self.start + self.length
+        self.start.saturating_add(self.length)
     }
 
     /// Whether this group may hold tree blocks.
@@ -119,8 +128,10 @@ pub struct FreeExtent {
 }
 
 impl FreeExtent {
+    /// One past the last byte. Saturating, for the reason
+    /// [`BlockGroup::end`] gives.
     pub fn end(&self) -> u64 {
-        self.start + self.len
+        self.start.saturating_add(self.len)
     }
 }
 
