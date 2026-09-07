@@ -78,6 +78,18 @@ jobs:
   # scripts/fixture-geometries.sh list.
   kernel-gate:
     name: validate against kernel btrfs driver
+    # THE JOB THAT BUILDS FIXTURES IS THE JOB THAT MUST HAVE THEM.
+    #
+    # `tests/fixtures_present.rs` refuses to run the suite here without
+    # them, because eight steps below exist only to produce them and a
+    # broken one would otherwise leave every oracle skipping while this
+    # job reported success.
+    #
+    # Deliberately not keyed on `CI`: the `test` job above runs the same
+    # suites with no fixtures at all, where skipping is correct, and a
+    # `CI` check would fail it for a condition that is right there.
+    env:
+      AM_FIXTURES_REQUIRED: '1'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -117,6 +129,18 @@ jobs:
       # Same matrix, same naming, same output directory as the VM builder
       # a developer runs on macOS. Aborts if the default geometry cannot
       # be built, and prints a loud block for any geometry it had to skip.
+      # THE GUARD RUNS FIRST, and it has to be named here to run at all.
+      #
+      # This job invokes suites by name and has no catch-all `cargo
+      # test`, so a suite absent from the list executes nowhere. The
+      # first version of this change added `fixtures_present.rs` and
+      # mentioned it only in a comment — so the check written to catch
+      # silently-skipping suites was itself silently skipped, in the very
+      # commit that introduced it, and reported green.
+      #
+      # It runs after the fixture steps below rather than before them,
+      # which is why this step sits at the end of the build sequence
+      # despite being the cheapest thing here.
       - name: Build the fixture matrix
         run: bash scripts/build-fixtures-native.sh
 
@@ -182,6 +206,12 @@ jobs:
       # written anything.
       - name: Reproduce each committed superblock
         run: cargo test --test super_write_oracle -- --nocapture
+
+      # Fail here, once, with a sentence naming the cause — rather than
+      # as a screen of unrelated oracle failures whose common reason is
+      # a build step that produced nothing.
+      - name: The fixtures the steps above were supposed to build
+        run: cargo test --test fixtures_present -- --nocapture
 
       # Compared against `btrfs subvolume list` for the same filesystem,
       # which is the reference a user would check against.
