@@ -6,6 +6,31 @@ never does.
 
 ## [Unreleased]
 
+### Added
+
+- **Extended attributes can be read.** `XATTR_ITEM` was parsed as far as
+  its shape and the value thrown away, so an attribute sitting in the
+  tree could not be reached from anywhere. `Filesystem::list_xattrs` and
+  `Filesystem::get_xattr` return names and values, and the C ABI gains
+  `fs_btrfs_listxattr` and `fs_btrfs_getxattr` with the same signatures
+  and semantics `fs_ext4_*` already has.
+  - Names that hash to the same key share one item, and every record in
+    it is returned. `tests/xattr_oracle.rs` sets two such names — found
+    by searching the hash — and requires both to come back.
+  - Btrfs stores the namespace prefix as part of the name, so nothing is
+    expanded on the way out: `trusted.x` comes back spelled in full.
+  - A zero-length value is distinct from an absent attribute, in both
+    APIs.
+- A fixture carrying attributes, built by
+  `scripts/build-xattr-fixtures.sh` from a mounted filesystem, with
+  `getfattr`'s own dump recorded beside it as the reference answer.
+
+### Changed
+
+- `dir::parse_dir_items` and the new `xattr::parse_xattr_items` share one
+  record walk, so the bounds arithmetic over a packed
+  `struct btrfs_dir_item` sequence exists once rather than twice.
+
 ## [0.6.2] — 2026-09-06
 
 ### Fixed

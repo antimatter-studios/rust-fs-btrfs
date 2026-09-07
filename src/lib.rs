@@ -64,8 +64,10 @@ pub mod superblock;
 pub mod transaction;
 pub mod tree_write;
 pub mod write;
+pub mod xattr;
 
 pub use chunk::{Chunk, ChunkMap, ChunkProfile, Mapping};
 pub use error::{Error, Result};
 pub use fs::Filesystem;
 pub use superblock::{ChecksumType, Superblock};
+pub use xattr::XattrEntry;

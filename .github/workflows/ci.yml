@@ -13,7 +13,7 @@ env:
   # (`am-fs-core = { path = "../rust-fs-core", version = "0.2" }`). Must match
   # the `am-fs-core` version recorded in Cargo.lock, or `--locked` will refuse
   # to build. Bump in lockstep with the constraint in Cargo.toml.
-  FS_CORE_REF: v0.2.8
+  FS_CORE_REF: v0.2.10
 
 jobs:
   test:
@@ -98,7 +98,12 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq btrfs-progs
+          # `attr` provides setfattr/getfattr, which the extended-attribute
+          # fixture both sets attributes with and takes its reference
+          # answer from. Without it that fixture builds a filesystem with
+          # no attributes and a manifest saying so, and its oracle test
+          # passes having compared nothing.
+          sudo apt-get install -y -qq btrfs-progs attr
           btrfs --version
           mkfs.btrfs --version
           # The exotic checksum algorithms live in separate crypto
@@ -156,6 +161,13 @@ jobs:
       # it.
       - name: Build the subvolume fixture
         run: sudo bash scripts/build-subvol-fixtures.sh
+
+      # Extended attributes have to be SET, which needs a mount, so this
+      # cannot come from the mkfs-only matrix either. Same script the VM
+      # runner calls. Without it tests/xattr_oracle.rs finds no fixture
+      # and skips, which reads exactly like passing.
+      - name: Build the extended-attribute fixture
+        run: sudo bash scripts/build-xattr-fixtures.sh
 
       # Seven superblocks of one filesystem, six commits apart. Six
       # rather than one because the backup ring has four slots and the
@@ -317,7 +329,7 @@ jobs:
         run: |
           set -euo pipefail
           for t in bootstrap_chain btree_oracle capi compression_oracle \
-                   fs_oracle fstree_oracle write_oracle; do
+                   fs_oracle fstree_oracle write_oracle xattr_oracle; do
             echo "::group::$t"
             cargo test --test "$t" -- --nocapture
             echo "::endgroup::"
