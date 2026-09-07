@@ -40,11 +40,47 @@ use fs_core::{BlockRead, FileDevice};
 mod common;
 
 /// The fixture with a checksummed file and a `NODATASUM` one.
+///
+/// Absent on a fresh clone, where these tests skip. Present wherever
+/// the fixture has been built — and *required* wherever the caller says
+/// it should be, which is what [`fixtures_are_required`] is for.
 fn nodatacow_image() -> Option<PathBuf> {
     let p = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(".vm-share")
         .join("btrfs-nodatacow.img");
-    p.exists().then_some(p)
+    if p.exists() {
+        return Some(p);
+    }
+    assert!(
+        !fixtures_are_required(),
+        "BTRFS_ORACLE_FIXTURES=required, but {} is not there. The job that \
+         sets that variable is the one that builds it, with \
+         scripts/build-nodatacow-fixtures.sh — so either the build step is \
+         missing or it failed silently.",
+        p.display()
+    );
+    eprintln!("skipping: {} not built", p.display());
+    None
+}
+
+/// Whether a missing fixture is a failure rather than a skip.
+///
+/// A skip reads exactly like a pass. Every test in this file opens with
+/// an early return when its image is absent, and on a machine or a CI
+/// job without the image that makes four green lines out of four bodies
+/// that never ran — which is what happened to this file's first
+/// revision: the whole mechanism it tests could be removed and nothing
+/// went red.
+///
+/// So the caller that knows the fixture should be there says so.
+/// `BTRFS_ORACLE_FIXTURES=required` is set by the CI job that builds
+/// it, and by a developer who has built it and wants to know if the
+/// harness quietly stopped finding it. Everywhere else — a fresh clone,
+/// the fixture-less test job — the skip stands.
+fn fixtures_are_required() -> bool {
+    std::env::var("BTRFS_ORACLE_FIXTURES")
+        .map(|v| v == "required")
+        .unwrap_or(false)
 }
 
 /// A device that flips the first byte of the sector holding `marker`.
@@ -222,9 +258,17 @@ fn the_wrapper_is_transparent_when_it_is_not_armed() {
 #[test]
 fn every_fixture_still_reads_with_verification_on() {
     let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
-    let Ok(entries) = std::fs::read_dir(&share) else {
-        eprintln!("skipping: no fixtures built");
-        return;
+    let entries = match std::fs::read_dir(&share) {
+        Ok(entries) => entries,
+        Err(e) => {
+            assert!(
+                !fixtures_are_required(),
+                "BTRFS_ORACLE_FIXTURES=required, but {} cannot be read: {e}",
+                share.display()
+            );
+            eprintln!("skipping: no fixtures built");
+            return;
+        }
     };
     let mut checked = 0usize;
     for image in entries
