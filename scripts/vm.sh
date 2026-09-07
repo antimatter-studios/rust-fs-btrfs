@@ -27,6 +27,12 @@ SHARE="$REPO/.vm-share"
 # alone. Inside .vagrant/, which is already gitignored, and beside the
 # machine state it describes.
 HOLD="$VAGRANT_DIR/.vagrant/keep-running"
+# One oracle VM runs at a time, across every repository — see
+# scripts/vm-slot.sh for why. Absent (an older checkout, a partial
+# copy), everything below still works and the serialisation is simply
+# not enforced; that is deliberate, because a missing helper should not
+# stop a developer building fixtures.
+SLOT="$REPO/scripts/vm-slot.sh"
 
 mkdir -p "$SHARE"
 
@@ -51,6 +57,15 @@ vm_up() {
     require_host_tools
     if ! (cd "$VAGRANT_DIR" && vagrant status --machine-readable 2>/dev/null \
             | grep -q ',state,running'); then
+        # TAKE THE SLOT BEFORE BOOTING, and only when actually booting.
+        # A machine that is already up took the slot when it started, so
+        # asking again here would deadlock a second `up` against itself.
+        if [ -x "$SLOT" ]; then
+            "$SLOT" acquire || {
+                echo "vm: could not get the oracle slot; not booting a second VM." >&2
+                exit 1
+            }
+        fi
         echo "[vm] booting Debian arm64 oracle (first run provisions, ~2 min)..." >&2
         # Retried, because the forwarded SSH port is not always free the
         # instant the previous machine stops:
@@ -68,6 +83,11 @@ vm_up() {
                 break
             fi
             if [ "$attempt" -eq 3 ]; then
+                # Give the slot back. A boot that failed three times is
+                # not holding a VM, and leaving the slot taken would make
+                # every other repository wait for a machine that will
+                # never exist.
+                [ -x "$SLOT" ] && "$SLOT" release || true
                 echo "vm: the machine would not boot after 3 attempts." >&2
                 exit 1
             fi
@@ -122,6 +142,14 @@ case "${1:-}" in
                 # poweroff, not_created, aborted, or a status that could
                 # not be read because the machine was never made. None of
                 # those is a running VM, which is all this promises.
+                #
+                # The slot is given back HERE rather than beside the
+                # `vagrant halt` above, because it is released on the
+                # strength of the confirmation, not of the attempt. A
+                # halt that reported success while the machine kept
+                # running must keep the slot, or the next repository
+                # boots a second VM alongside it.
+                [ -x "$SLOT" ] && "$SLOT" release || true
                 ;;
         esac
 
@@ -194,6 +222,10 @@ case "${1:-}" in
     destroy)
         rm -f "$HOLD"
         (cd "$VAGRANT_DIR" && vagrant destroy -f)
+        # `-f` leaves nothing running whether or not it printed a
+        # complaint, so the slot goes back unconditionally. `reap` needs
+        # no such line: it execs `down`, which releases on confirmation.
+        [ -x "$SLOT" ] && "$SLOT" release || true
         ;;
     *)
         sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
