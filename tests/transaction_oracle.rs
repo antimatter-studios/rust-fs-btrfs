@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod common;
-use common::le64;
+use common::{le16, le64};
 
 fn share() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
@@ -38,6 +38,12 @@ fn share() -> PathBuf {
 fn image(name: &str) -> Option<PathBuf> {
     let p = share().join(name);
     p.exists().then_some(p)
+}
+
+fn cow_image(name: &str) -> Option<PathBuf> {
+    let suffix = std::env::var("BTRFS_COW_SUFFIX").unwrap_or_default();
+    let stem = name.strip_suffix(".img").unwrap_or(name);
+    image(&format!("{stem}{suffix}.img"))
 }
 
 fn mount(p: &Path) -> Filesystem {
@@ -112,12 +118,15 @@ fn committed(before: &Path, after: &Path) -> bool {
 fn pairs() -> Vec<(&'static str, PathBuf, PathBuf)> {
     let mut out = Vec::new();
     if let (Some(b), Some(c)) = (
-        image("btrfs-cow-before.img"),
-        image("btrfs-cow-control.img"),
+        cow_image("btrfs-cow-before.img"),
+        cow_image("btrfs-cow-control.img"),
     ) {
         out.push(("an empty commit", b, c));
     }
-    if let (Some(b), Some(a)) = (image("btrfs-cow-before.img"), image("btrfs-cow-after.img")) {
+    if let (Some(b), Some(a)) = (
+        cow_image("btrfs-cow-before.img"),
+        cow_image("btrfs-cow-after.img"),
+    ) {
         out.push(("one touch", b, a));
     }
     out
@@ -376,7 +385,7 @@ fn every_block_recorded_as_allocated_is_really_on_the_disk() {
 /// If this does not fail, the sum check is decoration.
 #[test]
 fn an_image_whose_accounts_disagree_is_caught() {
-    let Some(path) = image("btrfs-cow-before.img") else {
+    let Some(path) = cow_image("btrfs-cow-before.img") else {
         eprintln!("no fixtures — skipping");
         return;
     };
@@ -396,7 +405,12 @@ fn an_image_whose_accounts_disagree_is_caught() {
     raw[at..at + 8].copy_from_slice(&(was + nodesize).to_le_bytes());
     // Re-checksummed, or it would not mount and this would prove
     // nothing about the check under test.
-    fs_btrfs::super_write::stamp_checksum(&mut raw, fs_btrfs::superblock::ChecksumType::Crc32c);
+    let csum_type = fs_btrfs::superblock::ChecksumType::from_raw(le16(
+        &raw,
+        fs_btrfs::superblock::offsets::CSUM_TYPE,
+    ))
+    .expect("captured superblock names a supported checksum");
+    fs_btrfs::super_write::stamp_checksum(&mut raw, csum_type);
     bytes[sb_at..sb_at + 4096].copy_from_slice(&raw);
 
     let broken = std::env::temp_dir().join("btrfs-cow-accounts-disagree.img");

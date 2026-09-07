@@ -27,6 +27,12 @@ fn share() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
 }
 
+fn cow_name(name: &str) -> String {
+    let suffix = std::env::var("BTRFS_COW_SUFFIX").unwrap_or_default();
+    let stem = name.strip_suffix(".img").unwrap_or(name);
+    format!("{stem}{suffix}.img")
+}
+
 fn fixture(name: &str) -> Option<Filesystem> {
     let p = share().join(name);
     if !p.exists() {
@@ -34,6 +40,10 @@ fn fixture(name: &str) -> Option<Filesystem> {
     }
     let dev = Arc::new(FileDevice::open(&p).ok()?);
     Filesystem::mount(dev).ok()
+}
+
+fn cow_fixture(name: &str) -> Option<Filesystem> {
+    fixture(&cow_name(name))
 }
 
 /// The fs tree's root, which is the block a change to a file reaches.
@@ -53,7 +63,7 @@ fn fs_tree_root(fs: &Filesystem) -> Option<u64> {
 /// A plan for changing the fs tree covers the spine above it.
 #[test]
 fn a_change_to_the_fs_tree_rewrites_it_and_the_root_tree() {
-    let Some(fs) = fixture("btrfs-cow-before.img") else {
+    let Some(fs) = cow_fixture("btrfs-cow-before.img") else {
         eprintln!("no fixtures; build them with ./scripts/vm-build-cow-fixtures.sh");
         return;
     };
@@ -104,8 +114,8 @@ fn a_change_to_the_fs_tree_rewrites_it_and_the_root_tree() {
 #[test]
 fn the_plan_touches_no_tree_the_kernel_left_alone() {
     let (Some(before), Some(after)) = (
-        fixture("btrfs-cow-before.img"),
-        fixture("btrfs-cow-after.img"),
+        cow_fixture("btrfs-cow-before.img"),
+        cow_fixture("btrfs-cow-after.img"),
     ) else {
         eprintln!("no fixtures — skipping");
         return;
@@ -117,7 +127,7 @@ fn the_plan_touches_no_tree_the_kernel_left_alone() {
     // Which trees the kernel rewrote: any block in the after image
     // newer than the before image belongs to one.
     let old_gen = before.superblock().generation;
-    let path = share().join("btrfs-cow-after.img");
+    let path = share().join(cow_name("btrfs-cow-after.img"));
     let image = std::fs::read(&path).expect("reading the after image");
     let sb = after.superblock();
     let n = sb.nodesize as usize;
@@ -161,7 +171,7 @@ fn the_plan_touches_no_tree_the_kernel_left_alone() {
 /// Nothing is placed where something already is.
 #[test]
 fn every_new_address_is_free_distinct_and_aligned() {
-    let Some(fs) = fixture("btrfs-cow-before.img") else {
+    let Some(fs) = cow_fixture("btrfs-cow-before.img") else {
         eprintln!("no fixtures — skipping");
         return;
     };
@@ -217,7 +227,7 @@ fn every_new_address_is_free_distinct_and_aligned() {
 /// A block nothing points at cannot be planned around.
 #[test]
 fn planning_an_unreachable_block_is_refused() {
-    let Some(fs) = fixture("btrfs-cow-before.img") else {
+    let Some(fs) = cow_fixture("btrfs-cow-before.img") else {
         eprintln!("no fixtures — skipping");
         return;
     };
@@ -307,7 +317,7 @@ fn a_change_to_a_leaf_rewrites_the_nodes_above_it() {
 /// measurement settles — that is what this asks.
 #[test]
 fn closing_the_plan_over_its_own_bookkeeping_settles() {
-    let Some(fs) = fixture("btrfs-cow-before.img") else {
+    let Some(fs) = cow_fixture("btrfs-cow-before.img") else {
         eprintln!("no fixtures; build them with ./scripts/vm-build-cow-fixtures.sh");
         return;
     };
@@ -349,7 +359,7 @@ fn closing_the_plan_over_its_own_bookkeeping_settles() {
 /// A closed plan still places everything somewhere free and distinct.
 #[test]
 fn a_closed_plan_places_every_block_somewhere_free() {
-    let Some(fs) = fixture("btrfs-cow-before.img") else {
+    let Some(fs) = cow_fixture("btrfs-cow-before.img") else {
         eprintln!("no fixtures — skipping");
         return;
     };

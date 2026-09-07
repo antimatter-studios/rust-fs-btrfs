@@ -22,6 +22,9 @@
 #                           NOTHING
 #   btrfs-cow-after.img     one `touch` and one `sync` later
 #
+# Set BTRFS_FIXTURE_SUFFIX to keep multiple geometries in the same fixture
+# directory, for example `-sha256-dup`.
+#
 # The control is what makes the measurement mean anything. Mounting a
 # filesystem read-write commits by itself, so a before/after pair around
 # a `touch` contains the touch AND whatever a bare mount cycle does.
@@ -41,6 +44,7 @@ OUT="${BTRFS_FIXTURE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.vm-s
 SIZE="${BTRFS_FIXTURE_SIZE:-512M}"
 CSUM="${BTRFS_CSUM:-crc32c}"
 GEOMETRY_ARGS="${BTRFS_GEOMETRY_ARGS:-}"
+SUFFIX="${BTRFS_FIXTURE_SUFFIX:-}"
 
 mkfs_args=()
 if [[ -n "$GEOMETRY_ARGS" ]]; then
@@ -53,8 +57,8 @@ SUDO=""
 command -v mkfs.btrfs >/dev/null || { echo "mkfs.btrfs not found" >&2; exit 1; }
 
 mkdir -p "$OUT"
-before="$OUT/btrfs-cow-before.img"
-after="$OUT/btrfs-cow-after.img"
+before="$OUT/btrfs-cow-before${SUFFIX}.img"
+after="$OUT/btrfs-cow-after${SUFFIX}.img"
 rm -f "$before" "$after"
 
 truncate -s "$SIZE" "$before"
@@ -66,7 +70,7 @@ m="$(mktemp -d)"
 $SUDO mount -o loop "$before" "$m"
 $SUDO umount "$m"
 
-control="$OUT/btrfs-cow-control.img"
+control="$OUT/btrfs-cow-control${SUFFIX}.img"
 rm -f "$control"
 cp --sparse=always "$before" "$control"
 cp --sparse=always "$before" "$after"
