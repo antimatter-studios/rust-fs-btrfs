@@ -965,7 +965,7 @@ impl Superblock {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! Unit tests over hand-built superblocks.
     //!
     //! **These are necessary but not sufficient.** Every fixture below is
@@ -981,12 +981,12 @@ mod tests {
 
     use super::*;
 
-    const TEST_FSID: [u8; UUID_SIZE] = [0xA1; UUID_SIZE];
+    pub(crate) const TEST_FSID: [u8; UUID_SIZE] = [0xA1; UUID_SIZE];
     const TEST_DEV_UUID: [u8; UUID_SIZE] = [0xB2; UUID_SIZE];
 
     /// Build a syntactically valid superblock: 4 KiB sectors, 16 KiB
     /// nodes, single device, CRC32C.
-    fn sb_bytes() -> Vec<u8> {
+    pub(crate) fn sb_bytes() -> Vec<u8> {
         let mut b = vec![0u8; SUPER_INFO_SIZE];
         b[offsets::MAGIC..offsets::MAGIC + 8].copy_from_slice(&BTRFS_MAGIC);
         b[offsets::FSID..offsets::FSID + UUID_SIZE].copy_from_slice(&TEST_FSID);
@@ -1034,7 +1034,7 @@ mod tests {
     }
 
     /// Recompute the checksum after mutating a fixture.
-    fn reseal(b: &mut [u8]) {
+    pub(crate) fn reseal(b: &mut [u8]) {
         let t = ChecksumType::from_raw(le16(b, offsets::CSUM_TYPE)).unwrap_or(ChecksumType::Crc32c);
         let digest = t.digest(&b[CSUM_SIZE..SUPER_INFO_SIZE]);
         b[..CSUM_SIZE].copy_from_slice(&digest);
@@ -1046,7 +1046,7 @@ mod tests {
     fn put32(b: &mut [u8], off: usize, v: u32) {
         b[off..off + 4].copy_from_slice(&v.to_le_bytes());
     }
-    fn put64(b: &mut [u8], off: usize, v: u64) {
+    pub(crate) fn put64(b: &mut [u8], off: usize, v: u64) {
         b[off..off + 8].copy_from_slice(&v.to_le_bytes());
     }
 
