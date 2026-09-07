@@ -292,7 +292,28 @@ pub fn build_node(sb: &Superblock, id: BlockIdentity, ptrs: &[KeyPtr]) -> Result
 /// The checksum is left for [`stamp_checksum`], which has to run last
 /// because it covers everything after itself.
 fn write_header(block: &mut [u8], sb: &Superblock, id: BlockIdentity, nritems: u32) {
-    block[o::FSID..o::FSID + 16].copy_from_slice(&sb.fsid);
+    // THE UUID A HEADER CARRIES IS `node_uuid`, NOT `fsid`.
+    //
+    // This stamped `sb.fsid` while the reader demands `sb.node_uuid()`
+    // — `TreeGeometry::from_superblock` says so, and says why. On a
+    // volume that has had `btrfstune -m` or `-M` applied the two are
+    // deliberately different; that is the entire point of the
+    // `METADATA_UUID` feature, and such a volume is in the accepted
+    // incompat mask, so this driver mounts one.
+    //
+    // Every block `render_plan` produced then carried the visible fsid,
+    // `commit` wrote them and pointed the superblock at them, and the
+    // very next read — by this driver or by the kernel — rejected them:
+    //
+    //     fsid a1a1a1a1... is not this volume's 5a5a5a5a...
+    //
+    // The transaction reported success. The filesystem did not mount.
+    //
+    // `node_uuid()` is the accessor that holds the rule, so both sides
+    // now derive the field the same way rather than each reaching into
+    // the superblock for a name that happens to be right on an ordinary
+    // volume.
+    block[o::FSID..o::FSID + 16].copy_from_slice(&sb.node_uuid());
     block[o::BYTENR..o::BYTENR + 8].copy_from_slice(&id.bytenr.to_le_bytes());
     block[o::FLAGS..o::FLAGS + 8].copy_from_slice(&id.flags.to_le_bytes());
     block[o::CHUNK_TREE_UUID..o::CHUNK_TREE_UUID + 16].copy_from_slice(&id.chunk_tree_uuid);
@@ -329,6 +350,105 @@ fn key_before(a: &DiskKey, b: &DiskKey) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::btree::{KeyPtr, TreeBlock, TreeGeometry};
+    use crate::superblock::tests::{put64, reseal, sb_bytes, TEST_FSID};
+    use crate::superblock::{dev_item_offsets, incompat, offsets, UUID_SIZE};
+
+    /// A superblock for a volume that has had `btrfstune -m` run on it:
+    /// `METADATA_UUID` is set, and the visible `fsid` and the UUID
+    /// stamped into tree blocks are deliberately different. That is the
+    /// entire point of the feature, and it is the only shape that can
+    /// tell the two fields apart.
+    fn sb_with_metadata_uuid() -> Superblock {
+        let mut b = sb_bytes();
+        let existing = u64::from_le_bytes(
+            b[offsets::INCOMPAT_FLAGS..offsets::INCOMPAT_FLAGS + 8]
+                .try_into()
+                .unwrap(),
+        );
+        put64(
+            &mut b,
+            offsets::INCOMPAT_FLAGS,
+            existing | incompat::METADATA_UUID,
+        );
+        let meta = [0x5Au8; UUID_SIZE];
+        b[offsets::METADATA_UUID..offsets::METADATA_UUID + UUID_SIZE].copy_from_slice(&meta);
+        // dev_item.fsid tracks the metadata UUID once the feature is on.
+        let d = offsets::DEV_ITEM + dev_item_offsets::FSID;
+        b[d..d + UUID_SIZE].copy_from_slice(&meta);
+        reseal(&mut b);
+        let sb = Superblock::parse(&b).unwrap();
+        assert_eq!(sb.fsid, TEST_FSID);
+        assert_ne!(
+            sb.fsid,
+            sb.node_uuid(),
+            "the fixture must separate the two UUIDs, or it cannot tell them apart"
+        );
+        sb
+    }
+
+    fn identity(bytenr: u64, generation: u64, level: u8) -> BlockIdentity {
+        BlockIdentity {
+            bytenr,
+            owner: 5,
+            generation,
+            level,
+            flags: 1,
+            chunk_tree_uuid: [0x33; 16],
+        }
+    }
+
+    /// A block this crate writes is one this crate can read back, on a
+    /// volume whose two UUIDs differ.
+    ///
+    /// `write_header` stamped `sb.fsid` and the reader demands
+    /// `sb.node_uuid()`. On any volume that has had `btrfstune -m` or
+    /// `-M` applied those are deliberately different, so every block the
+    /// writer produced was rejected by the very next read — including
+    /// the kernel's. The commit reports success and the filesystem does
+    /// not mount.
+    ///
+    /// This is a round trip, and a round trip catches it, because the
+    /// two sides read different fields — which is the defect.
+    #[test]
+    fn a_block_we_write_carries_the_uuid_the_reader_demands() {
+        let sb = sb_with_metadata_uuid();
+        const AT: u64 = 0x2000_0000;
+
+        let block = build_leaf(&sb, identity(AT, 7, 0), &[]).expect("build a leaf");
+        TreeBlock::parse(block, AT, &TreeGeometry::from_superblock(&sb))
+            .expect("a block we wrote must be one we can read");
+
+        // And a node, since `write_header` serves both and a fix that
+        // reached only one of them would pass on the leaf alone.
+        let child = KeyPtr {
+            key: key(1, 1, 0),
+            blockptr: 0x3000_0000,
+            generation: 7,
+        };
+        let node = build_node(&sb, identity(AT, 7, 1), &[child]).expect("build a node");
+        TreeBlock::parse(node, AT, &TreeGeometry::from_superblock(&sb))
+            .expect("and so must a node");
+    }
+
+    /// The ordinary volume, where the two UUIDs are the same, still
+    /// round-trips.
+    ///
+    /// Without this, stamping some third value would pass the test
+    /// above — and every fixture in the suite is an ordinary volume, so
+    /// this is also what says the change did not move the common case.
+    #[test]
+    fn a_block_we_write_on_an_ordinary_volume_still_reads_back() {
+        let sb = Superblock::parse(&sb_bytes()).unwrap();
+        assert_eq!(sb.fsid, sb.node_uuid(), "no METADATA_UUID on this one");
+        const AT: u64 = 0x2000_0000;
+
+        let block = build_leaf(&sb, identity(AT, 7, 0), &[]).expect("build a leaf");
+        let parsed = TreeBlock::parse(block, AT, &TreeGeometry::from_superblock(&sb))
+            .expect("a block we wrote must be one we can read");
+        assert_eq!(parsed.header.fsid, sb.fsid);
+    }
 
     fn key(objectid: u64, key_type: u8, offset: u64) -> DiskKey {
         DiskKey {
