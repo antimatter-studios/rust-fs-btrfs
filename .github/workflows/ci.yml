@@ -183,6 +183,19 @@ jobs:
       - name: Reproduce each committed superblock
         run: cargo test --test super_write_oracle -- --nocapture
 
+      # The default fixture above exercises CRC32C only. Rebuild the same
+      # commit sequence with the widest checksum and DUP data/metadata
+      # profiles so the writer is judged against the other superblock
+      # checksum width and a different chunk layout as well.
+      - name: Build SHA-256 DUP commit fixtures
+        env:
+          BTRFS_CSUM: sha256
+          BTRFS_GEOMETRY_ARGS: -d dup -m dup
+        run: sudo env BTRFS_CSUM="$BTRFS_CSUM" BTRFS_GEOMETRY_ARGS="$BTRFS_GEOMETRY_ARGS" bash scripts/build-commit-fixtures.sh
+
+      - name: Reproduce SHA-256 DUP committed superblocks
+        run: cargo test --test super_write_oracle -- --nocapture
+
       # Compared against `btrfs subvolume list` for the same filesystem,
       # which is the reference a user would check against.
       - name: Compare the subvolume listing against btrfs-progs
@@ -238,6 +251,26 @@ jobs:
       # What a planned transaction contains, bounded above by what the
       # kernel actually rewrote for the same change.
       - name: Transaction plan
+        run: cargo test --test transaction_plan -- --nocapture
+
+      # Repeat the transaction oracle against a non-default checksum and
+      # profile, keeping the default pair beside it so both configurations
+      # can reach the end-to-end kernel gate below.
+      - name: Build SHA-256 DUP transaction fixtures
+        env:
+          BTRFS_CSUM: sha256
+          BTRFS_GEOMETRY_ARGS: -d dup -m dup
+          BTRFS_FIXTURE_SUFFIX: -sha256-dup
+        run: sudo env BTRFS_CSUM="$BTRFS_CSUM" BTRFS_GEOMETRY_ARGS="$BTRFS_GEOMETRY_ARGS" BTRFS_FIXTURE_SUFFIX="$BTRFS_FIXTURE_SUFFIX" bash scripts/build-cow-fixtures.sh
+
+      - name: Transaction invariants on SHA-256 DUP
+        env:
+          BTRFS_COW_SUFFIX: -sha256-dup
+        run: cargo test --test transaction_oracle -- --nocapture
+
+      - name: Transaction plan on SHA-256 DUP COW fixtures
+        env:
+          BTRFS_COW_SUFFIX: -sha256-dup
         run: cargo test --test transaction_plan -- --nocapture
 
       # Recording an allocation is an insert into the extent tree and
@@ -302,23 +335,28 @@ jobs:
             echo "::endgroup::"
           done
 
-      - name: Write a transaction and let the kernel judge it
+      - name: Write both transactions and let the kernel judge them
         run: |
           set -euo pipefail
-          cargo run --release --example write_transaction \
-              .vm-share/btrfs-cow-before.img /tmp/written.img
-          echo "::group::btrfs check"
-          sudo btrfs check --readonly /tmp/written.img
-          echo "::endgroup::"
-          m=$(mktemp -d)
-          sudo mount -o loop /tmp/written.img "$m"
-          echo "hello from the kernel" | sudo tee "$m/newfile" >/dev/null
-          sudo sync
-          sudo umount "$m"
-          rmdir "$m"
-          echo "::group::btrfs check after the kernel used it"
-          sudo btrfs check --readonly /tmp/written.img
-          echo "::endgroup::"
+          for suffix in "" "-sha256-dup"; do
+            input=".vm-share/btrfs-cow-before${suffix}.img"
+            output="/tmp/written${suffix}.img"
+            echo "::group::write transaction ${suffix:-default}"
+            cargo run --release --example write_transaction "$input" "$output"
+            echo "::group::btrfs check"
+            sudo btrfs check --readonly "$output"
+            echo "::endgroup::"
+            m=$(mktemp -d)
+            sudo mount -o loop "$output" "$m"
+            echo "hello from the kernel" | sudo tee "$m/newfile" >/dev/null
+            sudo sync
+            sudo umount "$m"
+            rmdir "$m"
+            echo "::group::btrfs check after the kernel used it"
+            sudo btrfs check --readonly "$output"
+            echo "::endgroup::"
+            echo "::endgroup::"
+          done
 
       - name: Loop-mount with the in-kernel btrfs driver
         run: |

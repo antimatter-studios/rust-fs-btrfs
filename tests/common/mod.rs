@@ -58,6 +58,12 @@ pub fn le32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(b[at..at + 4].try_into().expect("4 bytes in range"))
 }
 
+/// Little-endian `u16` at `at`. See [`le32`] on why this is not the
+/// crate's own reader.
+pub fn le16(b: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes(b[at..at + 2].try_into().expect("2 bytes in range"))
+}
+
 /// Little-endian `u64` at `at`. See [`le32`] on why this is not the
 /// crate's own reader.
 ///
