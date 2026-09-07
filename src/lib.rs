@@ -52,6 +52,7 @@ pub mod capi;
 pub mod chunk;
 pub mod commit;
 pub mod compression;
+pub mod csum;
 pub mod dir;
 pub mod error;
 pub mod extent_write;

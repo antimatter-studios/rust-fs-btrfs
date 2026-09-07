@@ -264,6 +264,12 @@ pub struct Filesystem {
     pub(crate) sb: Superblock,
     pub(crate) map: ChunkMap,
     fs_tree_root: u64,
+    /// The csum tree's root, when the filesystem has one.
+    ///
+    /// `None` only for a filesystem whose root tree holds no ROOT_ITEM
+    /// for it, which the kernel does not produce; the read path then
+    /// verifies nothing, which is what it did everywhere before.
+    csum_tree_root: Option<u64>,
     /// Every item in the fs tree, keyed by its on-disk key.
     ///
     /// Loaded once at mount. Btrfs answers even a single `stat` by
@@ -603,13 +609,21 @@ impl Filesystem {
             }
         }
 
-        // Step 4: the root tree names the fs tree.
-        let fs_tree_root = {
+        // Step 4: the root tree names the fs tree, and the csum tree.
+        let (fs_tree_root, csum_tree_root) = {
             let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
                 Self::read_logical(&device, &map, logical, buf)
             };
             let tree = Tree::from_superblock(&sb, &read);
-            root_item_target(&tree, sb.root, FS_TREE_OBJECTID)?
+            (
+                root_item_target(&tree, sb.root, FS_TREE_OBJECTID)?,
+                // Absent is not fatal: `root_item_target` reports a
+                // missing ROOT_ITEM as an error, and for an optional
+                // tree that is how a caller learns it is not there.
+                // Every filesystem the kernel makes has one, so this
+                // is a `None` nothing is expected to take.
+                root_item_target(&tree, sb.root, crate::csum::CSUM_TREE_OBJECTID).ok(),
+            )
         };
 
         let mut fs = Filesystem {
@@ -619,6 +633,7 @@ impl Filesystem {
             sb,
             map,
             fs_tree_root,
+            csum_tree_root,
             items: BTreeMap::new(),
         };
         fs.load_fs_tree()?;
@@ -770,6 +785,9 @@ impl Filesystem {
             sb: self.sb.clone(),
             map: self.map.clone(),
             fs_tree_root,
+            // A subvolume is another tree on the same volume, so its
+            // data is checksummed by the same csum tree.
+            csum_tree_root: self.csum_tree_root,
             items: BTreeMap::new(),
         };
         fs.load_fs_tree()?;
@@ -1200,6 +1218,80 @@ impl Filesystem {
         Ok(out)
     }
 
+    /// Read data at a logical address and check it against the csum
+    /// tree before handing it back.
+    ///
+    /// Data checksums cover whole sectors, so a read that starts or
+    /// ends mid-sector cannot be verified as it stands: there is
+    /// nothing to compare a fragment against. The read is widened to
+    /// sector boundaries, every sector the tree names is checked, and
+    /// the caller's slice is filled from the middle of the result. The
+    /// widening costs at most two extra sectors per extent and is what
+    /// makes the check cover the bytes actually returned rather than
+    /// only the aligned ones.
+    ///
+    /// A sector the tree does not name is passed through unchecked. See
+    /// [`crate::csum`] for why absence is not a failure.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ChecksumMismatch`] naming the logical address of the
+    /// first sector whose digest does not match — the address, not the
+    /// file offset, because that is what a caller comparing against
+    /// `btrfs inspect-internal` or the kernel's own message will see.
+    fn read_data_verified(&self, logical: u64, dst: &mut [u8], verify: bool) -> Result<()> {
+        if !verify || dst.is_empty() {
+            return Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, dst);
+        }
+        let Some(csum_root) = self.csum_tree_root else {
+            return Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, dst);
+        };
+        let sector = u64::from(self.sb.sectorsize);
+        if sector == 0 {
+            return Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, dst);
+        }
+
+        let first = logical - logical % sector;
+        let end = logical
+            .checked_add(dst.len() as u64)
+            .ok_or(Error::UnmappedLogical(logical))?;
+        let last = end.div_ceil(sector) * sector;
+        let span = last - first;
+
+        let mut whole = vec![0u8; span as usize];
+        Self::read_logical_pool(&self.device, &self.devices, &self.map, first, &mut whole)?;
+
+        let digests = {
+            let reader = self.pool_reader();
+            let tree = reader.tree();
+            crate::csum::digests_for_range(
+                &tree,
+                csum_root,
+                self.sb.csum_type.digest_len(),
+                sector,
+                first,
+                span,
+            )?
+        };
+
+        for (i, chunk) in whole.chunks_exact(sector as usize).enumerate() {
+            let at = first + i as u64 * sector;
+            let Some(expected) = digests.get(&at) else {
+                continue;
+            };
+            if !self.sb.csum_type.verify(chunk, expected) {
+                return Err(Error::ChecksumMismatch {
+                    what: "a data extent",
+                    offset: at,
+                });
+            }
+        }
+
+        let skip = (logical - first) as usize;
+        dst.copy_from_slice(&whole[skip..skip + dst.len()]);
+        Ok(())
+    }
+
     /// Fill `buf` with the file's bytes from `from` onwards.
     ///
     /// `buf` is zeroed first, so a hole and a preallocated extent need
@@ -1216,6 +1308,13 @@ impl Filesystem {
             return Ok(());
         }
         let ino = inode.ino;
+        // A file the filesystem never checksummed has nothing to check
+        // against. Asked per file rather than per sector because it is
+        // the answer for every sector of this file, and because a
+        // `NODATASUM` file would otherwise pay a csum-tree descent per
+        // extent to be told each time that there is nothing there.
+        let verify =
+            inode.flags & (crate::write::INODE_NODATASUM | crate::write::INODE_NODATACOW) == 0;
         let want_end = from.saturating_add(buf.len() as u64).min(inode.size);
 
         for ((objectid, key_type, offset), data) in self
@@ -1257,13 +1356,7 @@ impl Filesystem {
                     let at_logical = logical
                         .checked_add(skip as u64)
                         .ok_or_else(|| short_extent(ino, "regular"))?;
-                    Self::read_logical_pool(
-                        &self.device,
-                        &self.devices,
-                        &self.map,
-                        at_logical,
-                        dst,
-                    )?;
+                    self.read_data_verified(at_logical, dst, verify)?;
                 }
                 Piece::Compressed {
                     logical,
@@ -1274,13 +1367,11 @@ impl Filesystem {
                     ..
                 } => {
                     let mut packed = vec![0u8; disk_len as usize];
-                    Self::read_logical_pool(
-                        &self.device,
-                        &self.devices,
-                        &self.map,
-                        logical,
-                        &mut packed,
-                    )?;
+                    // A compressed extent's checksums cover the bytes
+                    // as they are on disk, not the decoded ones, so
+                    // this is the read to verify — and it is the whole
+                    // extent, so it is sector-aligned already.
+                    self.read_data_verified(logical, &mut packed, verify)?;
                     let decoded = compression::decompress(
                         algo,
                         &packed,
