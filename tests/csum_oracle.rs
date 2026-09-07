@@ -118,11 +118,23 @@ impl FlipsTheSectorHolding {
 impl BlockRead for FlipsTheSectorHolding {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
         self.inner.read_at(offset, buf)?;
-        if self.armed
-            && buf.len() >= self.marker.len()
-            && buf[..self.marker.len()] == self.marker[..]
+        if !self.armed || buf.len() < self.marker.len() {
+            return Ok(());
+        }
+        // The marker is looked for anywhere in the buffer, not only at
+        // its start. A read is widened to sector boundaries before it
+        // is verified, so the driver asks for a span that begins at the
+        // start of the extent whatever the caller asked for — a marker
+        // taken from the second sector then sits 4 KiB into the buffer,
+        // and a wrapper matching only at position 0 would never fire.
+        // That is not hypothetical: it is what the first version of
+        // this did, and the test that needed it failed with "the
+        // wrapper never matched" rather than passing quietly.
+        if let Some(at) = buf
+            .windows(self.marker.len())
+            .position(|w| w == &self.marker[..])
         {
-            buf[0] ^= 0xFF;
+            buf[at] ^= 0xFF;
             self.flipped.store(true, Ordering::SeqCst);
         }
         Ok(())
@@ -251,10 +263,15 @@ fn the_wrapper_is_transparent_when_it_is_not_armed() {
 /// The refusal tests say the check fires. This says it does not fire
 /// where it should not — the failure that would arrive as "this driver
 /// will not read my filesystem", which is worse for a user than the
-/// crash it replaced. Four checksum algorithms are among these
-/// fixtures, so it also covers the digest widths: a driver reading a
-/// 32-byte sha256 digest four bytes at a time would fail here and
-/// nowhere else.
+/// one it replaced.
+///
+/// It does **not** cover the digest widths, and an earlier version of
+/// this comment claimed it did. The `csum-sha256`, `csum-xxhash` and
+/// `csum-blake2` fixtures are freshly-made filesystems with no ordinary
+/// files on them, so this sweep never reads one: every file it does
+/// read is crc32c, and fixing the digest length to four bytes fails
+/// nothing here. That gap needs a populated non-crc32c fixture and is
+/// filed as #102.
 #[test]
 fn every_fixture_still_reads_with_verification_on() {
     let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
@@ -324,4 +341,94 @@ fn every_fixture_still_reads_with_verification_on() {
         checked > 0,
         "no file was read on any fixture, so this test asserted nothing"
     );
+}
+
+/// An unaligned read returns the caller's bytes, not the sector's.
+///
+/// Checksums cover whole sectors, so a read that starts or ends
+/// mid-sector is widened to sector boundaries, verified, and then
+/// sliced. Every read the rest of this file makes goes through
+/// `read_file`, which starts at zero on a file whose length is a whole
+/// number of sectors — so both halves of that widening are the identity
+/// on every one of them, and a widening that was right for aligned
+/// reads and wrong for unaligned ones would pass the whole suite.
+///
+/// The window here starts 100 bytes into a sector and ends 150 bytes
+/// in, so neither end is aligned. Slicing the widened buffer from zero
+/// rather than from the offset within it returns the sector's first
+/// fifty bytes with `Ok` — wrong bytes, no error, which is the failure
+/// this whole issue is about, one layer in.
+#[test]
+fn an_unaligned_read_of_a_checksummed_file_returns_the_bytes_asked_for() {
+    let Some(image) = nodatacow_image() else {
+        eprintln!("skipping: .vm-share/btrfs-nodatacow.img not built");
+        return;
+    };
+    let clean = read_clean(&image, "/cow.bin");
+
+    let dev: Arc<dyn BlockRead> = Arc::new(FileDevice::open(&image).expect("open fixture"));
+    let fs = Filesystem::mount(dev).expect("mount fixture");
+    let inode = fs.lookup_path("/cow.bin").expect("look up the file");
+
+    let mut buf = [0u8; 50];
+    let n = fs
+        .read_at(inode.ino, 100, &mut buf)
+        .expect("an unaligned read of an undamaged file");
+    assert_eq!(n, buf.len());
+    assert_eq!(
+        &buf[..],
+        &clean[100..150],
+        "an unaligned window returned the wrong bytes"
+    );
+
+    // And one that starts mid-sector and runs past the end of it, so
+    // the widening has to cover two sectors rather than one.
+    let mut across = vec![0u8; 4096];
+    let at = 4096 - 100;
+    fs.read_at(inode.ino, at as u64, &mut across)
+        .expect("a read spanning a sector boundary");
+    assert_eq!(&across[..], &clean[at..at + across.len()]);
+}
+
+/// A flipped byte is refused even when the read does not start on the
+/// sector holding it.
+///
+/// This is what the widening is *for*. Without it a mid-sector read has
+/// no whole sector to compare against, and the choice is between
+/// serving the fragment unchecked and refusing a read the kernel
+/// serves. The window below starts in the sector before the damage and
+/// ends inside the damaged one, so the sector that has to be verified
+/// is neither the first the caller asked for nor one it asked for
+/// wholly.
+#[test]
+fn an_unaligned_read_overlapping_damage_is_still_refused() {
+    let Some(image) = nodatacow_image() else {
+        eprintln!("skipping: .vm-share/btrfs-nodatacow.img not built");
+        return;
+    };
+    let clean = read_clean(&image, "/cow.bin");
+    // The marker is the second sector's first 32 bytes, so the flip
+    // lands there rather than at the file's start.
+    let marker = &clean[4096..4096 + 32];
+
+    let (fs, dev) = mount_flipping(&image, marker, true);
+    let inode = fs.lookup_path("/cow.bin").expect("look up the file");
+
+    let mut buf = [0u8; 300];
+    let got = fs.read_at(inode.ino, 4096 - 100, &mut buf);
+
+    assert!(
+        dev.flipped(),
+        "the wrapper never matched the second sector, so nothing was damaged"
+    );
+    match got {
+        Err(Error::ChecksumMismatch { what, .. }) => {
+            assert_eq!(what, "a data extent", "the wrong structure was blamed");
+        }
+        Err(other) => panic!("a flipped byte in an overlapped sector gave {other:?}"),
+        Ok(_) => panic!(
+            "a read overlapping a damaged sector returned successfully, so the \
+             widening does not cover the bytes actually served"
+        ),
+    }
 }
