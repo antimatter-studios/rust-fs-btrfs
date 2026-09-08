@@ -480,7 +480,14 @@ impl Filesystem {
     pub(crate) fn tree_root(&self, objectid: u64) -> Result<u64> {
         let reader = self.pool_reader();
         let tree = reader.tree();
-        crate::fs::root_item_target(&tree, self.sb.root, objectid)
+        // `required_root_item_target`, not `root_item_target` directly:
+        // this function's own contract, documented above and on
+        // `tree_root_public`, is that absence is `Error::BadSuperblock`.
+        // The plain form returns `Ok(None)` for that case, which would
+        // silently satisfy this `Result<u64>` return type by being
+        // pattern-matched wrong rather than by failing to compile --
+        // exactly the shape of bug this crate keeps finding.
+        crate::fs::required_root_item_target(&tree, self.sb.root, objectid)
     }
 
     /// Find somewhere to put one new tree block.
