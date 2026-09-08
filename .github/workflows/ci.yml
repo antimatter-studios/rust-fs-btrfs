@@ -169,6 +169,30 @@ jobs:
       - name: Build the extended-attribute fixture
         run: sudo bash scripts/build-xattr-fixtures.sh
 
+      # A filesystem holding a checksummed file and a NODATASUM one, so
+      # the data-checksum path can be judged on both. `chattr +C` needs
+      # a mount, so this cannot come from the mkfs-only matrix either.
+      #
+      # This build existed inline in the VM orchestrator, which no
+      # workflow calls — so the image was built on developers' machines
+      # and nowhere else, and tests/csum_oracle.rs skipped here and
+      # reported success on every branch. A skip reads exactly like a
+      # pass, which is why the test below sets BTRFS_ORACLE_FIXTURES and
+      # the harness turns a missing fixture into a failure.
+      - name: Build the nodatacow fixture
+        run: sudo bash scripts/build-nodatacow-fixtures.sh
+
+      # Data checksums, against a filesystem the kernel made: a flipped
+      # byte in a checksummed file must be refused, and the same flip in
+      # a NODATASUM file must still read. The second half is the one
+      # that would be a regression rather than a bug — a driver refusing
+      # every file in a `chattr +C` directory is worse for a user than
+      # one that does not verify at all.
+      - name: Data checksums against the kernel's own
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test csum_oracle -- --nocapture
+
       # Seven superblocks of one filesystem, six commits apart. Six
       # rather than one because the backup ring has four slots and the
       # index is (generation - 1) mod 4 — a single commit exercises one
