@@ -145,8 +145,20 @@ fn runs_covering_the_library_unit_tests(workflow: &str) -> Vec<String> {
                 return None;
             }
             // `--test <name>` builds one integration target and no
-            // library unit tests. Note the trailing space: it must not
-            // match `--all-targets`, which does build them.
+            // library unit tests.
+            //
+            // THE TRAILING SPACE PROTECTS `--tests`, NOT `--all-targets`.
+            // An earlier version of this comment named `--all-targets`,
+            // and the test written to pin it could not fail: the
+            // substring `--test` does not appear in `--all-targets` at
+            // all, so the space made no difference to it. `--tests` is
+            // the spelling that matters -- cargo accepts it, it DOES
+            // build the library unit tests, and it contains `--test`
+            // but not `--test `. Dropping the space would exclude a run
+            // that genuinely satisfies this guard.
+            //   "--test " in "--all-targets"  -> false
+            //   "--test " in "--tests"        -> false   (so it counts)
+            //   "--test"  in "--tests"        -> true    (so it would not)
             if command.contains("--test ") {
                 return None;
             }
@@ -378,6 +390,46 @@ fn runs_on_pull_request(wf: &Workflow) -> bool {
 /// Keys whose presence on a step or job means its result does not gate.
 const NON_GATING_KEYS: [&str; 2] = ["if", "continue-on-error"];
 
+/// The run commands of steps that cover the library in debug AND
+/// actually gate a pull request -- without requiring the handshake.
+///
+/// The headline assertion used the line-based scan while only the
+/// handshake assertion was step-aware, so the headline passed for a
+/// step carrying `if: false` and its failure message would have
+/// claimed the gate could see an overflow when it could not. Every
+/// defeat spelling still turned the suite red through the other test,
+/// so this was a precision defect rather than a hole -- but it left
+/// the "still covers the library" property verified line-based, and
+/// defeatable if the handshake assertion were ever weakened. Both
+/// halves are step-aware now.
+fn gating_runs_covering_the_library(workflow: &str) -> Vec<String> {
+    let wf = parse_workflow(workflow);
+    if !runs_on_pull_request(&wf) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for job in &wf.jobs {
+        if job
+            .keys
+            .iter()
+            .any(|k| NON_GATING_KEYS.contains(&k.as_str()))
+        {
+            continue;
+        }
+        for step in &job.steps {
+            if step
+                .keys
+                .iter()
+                .any(|k| NON_GATING_KEYS.contains(&k.as_str()))
+            {
+                continue;
+            }
+            out.extend(runs_covering_the_library_unit_tests(&step.run));
+        }
+    }
+    out
+}
+
 /// The run commands of steps that both cover the library in debug with
 /// the handshake AND actually gate a pull request.
 fn gating_runs_that_prove_the_build_traps(workflow: &str) -> Vec<String> {
@@ -437,7 +489,7 @@ fn the_pr_gate_still_tests_the_library_in_a_profile_that_can_see_an_overflow() {
     let path = ci_yml();
     let workflow = read_or_panic(&path);
 
-    let covering = runs_covering_the_library_unit_tests(&workflow);
+    let covering = gating_runs_covering_the_library(&workflow);
     assert!(
         !covering.is_empty(),
         "no `cargo test` in {} builds the library unit tests without \
@@ -861,11 +913,34 @@ jobs:
     /// would be excluded and the guard would refuse a workflow that
     /// satisfies it.
     #[test]
-    fn all_targets_is_not_excluded_by_the_single_target_rule() {
-        let line = "      - run: cargo test --locked --all-targets\n";
+    fn a_tests_flag_run_counts_which_is_what_the_trailing_space_protects() {
+        // `--tests` builds the library unit tests, so a run using it
+        // satisfies this guard and must be counted. It contains the
+        // substring `--test` but NOT `--test `, which is precisely
+        // what the trailing space in the exclusion is for.
+        //
+        // THIS REPLACES A TEST THAT COULD NOT FAIL. Its predecessor
+        // asserted `--all-targets` was not excluded, and `--all-targets`
+        // does not contain `--test` in any spelling -- so removing the
+        // space left it green. Measured: with the space removed this
+        // test fails, and the old one did not.
+        let yaml = "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --tests\n";
         assert_eq!(
-            runs_covering_the_library_unit_tests(line),
-            vec!["- run: cargo test --locked --all-targets".to_string()],
+            runs_covering_the_library_unit_tests(yaml),
+            vec!["- run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --tests".to_string()],
+            "`--tests` builds the library unit tests; excluding it would refuse a workflow \
+             that genuinely satisfies this guard"
+        );
+
+        // And `--all-targets` too, for the same reason -- kept because
+        // it is a real spelling a workflow might use, but it is NOT
+        // what the trailing space protects.
+        let all_targets =
+            "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --all-targets\n";
+        assert_eq!(
+            runs_covering_the_library_unit_tests(all_targets).len(),
+            1,
+            "`--all-targets` builds the library too"
         );
     }
 
