@@ -184,7 +184,23 @@ case "${1:-}" in
         # machine has to survive the next one, and the one after that.
         mkdir -p "$(dirname "$HOLD")"
         : > "$HOLD"
-        echo 'vm: held — reap will leave it running until vm.sh down.' >&2
+        # The guest schedules its own poweroff at boot, and that timer
+        # does not read this file -- it reads a marker inside the guest.
+        # A hold that cancelled reap but let the machine shut itself off
+        # in eight hours would be a hold in name only, so cancel both.
+        # Piped into `ssh -- -T 'sudo bash -s'` and run from
+        # VAGRANT_DIR, matching `run)` above: a bare `vagrant ssh` finds
+        # no machine outside that directory, and `ssh -c` mangles
+        # quoting. Both mistakes were made here first.
+        if printf '%s\n' 'touch /run/am-oracle-vm-held; shutdown -c' \
+             | (cd "$VAGRANT_DIR" && vagrant ssh -- -T 'sudo bash -s') \
+             >/dev/null 2>&1; then
+            echo 'vm: held — reap will leave it up, and the guest deadline is cancelled.' >&2
+        else
+            echo 'vm: held for reap, but the guest is not reachable: its own' >&2
+            echo '    deadline still stands and it will power off on schedule.' >&2
+            echo '    Re-run `vm.sh hold` once it is up to cancel that too.' >&2
+        fi
         ;;
     reap)
         # The safety net, run from chores.yml as `lifecycle: after_all`

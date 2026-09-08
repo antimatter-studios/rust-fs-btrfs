@@ -144,4 +144,72 @@ Vagrant.configure("2") do |config|
   # repository.
   config.vm.provision "stress-tools", type: "shell",
                       path: "provision-stress-tools.sh"
+
+  # A DEADLINE THE HOST CANNOT FAIL TO ENFORCE.
+  #
+  # Three teardowns already existed and all three were passive. `defer:`
+  # covers a task that reached the step registering it. `vm.sh reap`
+  # fires on the next chore invocation. The oracle slot's age check runs
+  # only inside `acquire`, so it needs another repository to want the
+  # slot. Each waits for somebody else to act.
+  #
+  # On 2026-09-07 nobody did. The process that booted this machine was
+  # killed, no chore ran, no second repository asked for the slot, and
+  # the VM stayed up for THIRTEEN HOURS holding the global lock -- with
+  # every net behaving exactly as written. No hold file was set; it was a
+  # plain leak that nothing was positioned to notice.
+  #
+  # `defer:` has its place and keeps it -- it fails the task when
+  # teardown fails, which is what makes a leak impossible to miss on the
+  # path where it runs. It just cannot be the backstop, because it
+  # depends on the host's control flow reaching it.
+  #
+  # A HUNG PROCESS IS WORSE THAN A DEAD ONE, and it is the case where
+  # every host-side check fails at once. A dead process at least leaves
+  # a lock whose liveness test can eventually answer "nothing is running
+  # here". A hung one holds the slot while its qemu is genuinely alive,
+  # so `holder_is_dead` correctly reports it is not dead and correctly
+  # declines to reclaim -- and the machine stays up forever with every
+  # guard behaving properly.
+  #
+  # So the limit lives in the guest, the only party that cannot fail to
+  # observe its own uptime and the only one that does not consult the
+  # host to decide. The shutdown is scheduled at boot: if the host is
+  # killed, hangs, loses the agent driving it, or simply forgets, the
+  # machine still goes away.
+  #
+  # `run: "always"` re-arms it on every `up` rather than on first
+  # provision only, and `shutdown -c` first so a reboot cannot stack two
+  # timers.
+  #
+  # Generous by design -- a full fixture matrix is tens of minutes and
+  # this is not a scheduler. `vm.sh hold` writes the marker that cancels
+  # it, for the one case where an indefinite machine is what was wanted:
+  # a person working in the guest.
+  #
+  # The marker lives in /run rather than /etc so tmpfs clears it at boot.
+  # A hold therefore lasts as long as the machine it was granted on: it
+  # survives every host process, which is the point, but a halt and
+  # restart re-arms the deadline instead of inheriting an exemption
+  # nobody remembers granting.
+  # The minutes are interpolated by Ruby on the HOST, not read from the
+  # guest's environment. Vagrant does not forward the host environment
+  # into an inline provisioner, so `${AM_ORACLE_VM_DEADLINE_MINS}` inside
+  # the script expands to nothing and silently falls back to the default
+  # -- a knob that appears to work, reports the default, and cannot be
+  # changed. Measured: exporting 90 produced "powering off in 480".
+  deadline_mins = ENV.fetch("AM_ORACLE_VM_DEADLINE_MINS", "480")
+
+  config.vm.provision "deadline", type: "shell", run: "always",
+                      inline: <<-SHELL
+    set -euo pipefail
+    MINS="#{deadline_mins}"
+    shutdown -c >/dev/null 2>&1 || true
+    if [ -f /run/am-oracle-vm-held ]; then
+      echo "deadline: held by /run/am-oracle-vm-held, no shutdown scheduled"
+    else
+      nohup shutdown -h "+${MINS}" >/dev/null 2>&1 &
+      echo "deadline: powering off in ${MINS} minutes unless held"
+    fi
+  SHELL
 end
