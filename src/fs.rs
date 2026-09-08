@@ -128,16 +128,123 @@ pub mod root_item {
 /// closure they built it from — which is the only thing that ever
 /// genuinely differed between the three copies.
 ///
+/// # `Ok(None)` means absent, not "an error occurred and was discarded"
+///
+/// A tree with no `ROOT_ITEM` for `objectid` and a walk that failed
+/// partway through it are different facts, and this signature is what
+/// keeps a caller from being able to conflate them. `Ok(None)` is only
+/// reached by a walk that completed and found nothing; a read failure,
+/// a checksum mismatch or a corrupt block encountered while walking
+/// comes back through `for_each`'s `?` as `Err`, never as `None`. A
+/// caller for whom absence is not legitimate should not call `.ok()` on
+/// this — see [`required_root_item_target`], which turns `Ok(None)`
+/// into the same named error this function used to return directly, and
+/// exists so that turning "absent" into an error and turning "any
+/// failure" into an error are not the same line of code.
+///
 /// # Errors
 ///
-/// [`Error::BadSuperblock`] when there is no `ROOT_ITEM` for
-/// `objectid`. For an optional tree, that is how a caller learns the
-/// tree is absent.
+/// Propagates a genuine failure walking the root tree. Never returns an
+/// error to report that `objectid` is simply not present — see above.
+/// The sector-aligned window that covers `[logical, logical+len)`,
+/// as `(first, span)`.
+///
+/// Pulled out of [`Filesystem::read_data_verified`] so the arithmetic
+/// can be tested directly rather than only through a fully mounted
+/// filesystem, which is what let this go unwitnessed the first time.
+///
+/// `None` on any overflow, which the caller turns into
+/// [`Error::UnmappedLogical`]. `logical` is an extent address read off
+/// disk, so a corrupted or hostile image can put any of these within
+/// reach:
+///
+/// - `logical + len`, guarded by `checked_add`;
+/// - the round-up to a sector boundary, `div_ceil(sector) * sector` --
+///   `div_ceil` cannot overflow, division only shrinks, but the
+///   multiplication that rounds back up can, for an `end` within one
+///   sector of `u64::MAX`. This is the guard that matters: `checked_mul`
+///   catches every case, and dropping it is not covered by the
+///   subtraction below despite first appearances.
+/// - `last - first`, guarded by `checked_sub` -- and, given the
+///   multiplication above already succeeded (so `last` is the true,
+///   un-wrapped ceiling), THIS CANNOT ACTUALLY UNDERFLOW: ceiling and
+///   floor give `first <= logical <= end <= last` unconditionally, so
+///   `last >= first` always holds once `checked_mul` returned `Some`.
+///   It stays as a second line of defence in case that invariant is
+///   ever disturbed by a future edit to the lines above it, not because
+///   it is load-bearing today.
+///
+/// Provable, and worth being precise about because the obvious intuition
+/// is the opposite one and it is wrong: `checked_sub` does NOT generally
+/// stand in for `checked_mul`. Picking `logical` near `u64::MAX` makes
+/// `first` huge, and a wrapped `last` (small, having overflowed past
+/// zero) then IS caught as an apparent underflow -- which looks like the
+/// subtraction is doing the real work. But `logical = 0` with an
+/// enormous `len` reaches the identical multiplication overflow while
+/// `first` stays `0`, and a wrapped `last` of `0` gives
+/// `checked_sub(0, 0) = Some(0)`: a small, entirely plausible span,
+/// silently wrong rather than refused. Both shapes are regression-tested
+/// below.
+///
+/// A wrapped `span` that got past both guards would reach `vec![0u8;
+/// span as usize]` as something near `u64::MAX` bytes -- an allocation
+/// that either aborts the process or, on a 32-bit `usize`, truncates and
+/// wraps again into an undersized buffer a later write overruns. See
+/// rust-fs-btrfs#114.
+fn sector_aligned_span(logical: u64, len: u64, sector: u64) -> Option<(u64, u64)> {
+    let first = logical - logical % sector;
+    let end = logical.checked_add(len)?;
+    let last = end.div_ceil(sector).checked_mul(sector)?;
+    let span = last.checked_sub(first)?;
+    Some((first, span))
+}
+
+/// The two named trees a mount reads from the root tree: the fs tree,
+/// which must exist, and the checksum tree, which legitimately may not.
+///
+/// One call rather than two `root_item_target` calls at the mount site,
+/// so this decision is made once and named rather than reproduced
+/// inline where it is easy to weaken by editing one arm and not the
+/// other.
+///
+/// # `Ok((_, None))` means absent, not "an error occurred and was
+/// discarded"
+///
+/// The checksum tree's `Ok(None)` is reached only when the walk for it
+/// completed and genuinely found no `ROOT_ITEM` -- every filesystem the
+/// kernel makes lacks one exactly this way, pre-checksumming or with the
+/// feature never enabled. Any OTHER failure looking for it -- an I/O
+/// error, a corrupt block, anything `for_each` can fail on while walking
+/// further into the root tree than the fs-tree lookup needed to go --
+/// comes back as `Err` and is propagated by `?`, never folded into this
+/// `None`.
+///
+/// It used to be `root_item_target(...).ok()` at the call site, which
+/// discarded an `Err` exactly as it discarded a legitimate absence: a
+/// corrupt or unreadable root tree was indistinguishable from "no
+/// checksum tree," and every subsequent read for the rest of the mount
+/// went unverified with nothing logged. See rust-fs-btrfs#114, and
+/// `fs_and_csum_tree_roots_tests` for the regression -- a fixture where
+/// the fs-tree lookup succeeds without ever reaching the block that
+/// fails, so the failure can only be observed if the csum-tree lookup's
+/// own error is not swallowed.
+///
+/// # Errors
+///
+/// [`Error::BadSuperblock`] if the fs tree itself is absent. Any error
+/// encountered walking for either tree.
+fn fs_and_csum_tree_roots(tree: &crate::btree::Tree, root_tree: u64) -> Result<(u64, Option<u64>)> {
+    Ok((
+        required_root_item_target(tree, root_tree, FS_TREE_OBJECTID)?,
+        root_item_target(tree, root_tree, crate::csum::CSUM_TREE_OBJECTID)?,
+    ))
+}
+
 pub(crate) fn root_item_target(
     tree: &crate::btree::Tree,
     root_tree: u64,
     objectid: u64,
-) -> Result<u64> {
+) -> Result<Option<u64>> {
     let mut root = None;
     tree.for_each(root_tree, &mut |key: &DiskKey, data: &[u8]| {
         if key.objectid == objectid
@@ -149,7 +256,23 @@ pub(crate) fn root_item_target(
         }
         Ok(true)
     })?;
-    root.ok_or_else(|| {
+    Ok(root)
+}
+
+/// [`root_item_target`], refusing an absent tree.
+///
+/// For a tree every caller of this function needs to exist — the fs
+/// tree, or any tree reached through [`crate::block_group`]'s public
+/// lookup, which documents absence as an error — `Ok(None)` is itself
+/// the failure, and a bare `?` on `root_item_target` would let it
+/// through disguised as success. This is the one place that distinction
+/// is made, so every "tree must exist" caller reports the same message.
+pub(crate) fn required_root_item_target(
+    tree: &crate::btree::Tree,
+    root_tree: u64,
+    objectid: u64,
+) -> Result<u64> {
+    root_item_target(tree, root_tree, objectid)?.ok_or_else(|| {
         Error::BadSuperblock(format!(
             "the root tree holds no ROOT_ITEM for tree {objectid}"
         ))
@@ -610,20 +733,13 @@ impl Filesystem {
         }
 
         // Step 4: the root tree names the fs tree, and the csum tree.
+        // See `fs_and_csum_tree_roots` for why this is not `.ok()`.
         let (fs_tree_root, csum_tree_root) = {
             let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
                 Self::read_logical(&device, &map, logical, buf)
             };
             let tree = Tree::from_superblock(&sb, &read);
-            (
-                root_item_target(&tree, sb.root, FS_TREE_OBJECTID)?,
-                // Absent is not fatal: `root_item_target` reports a
-                // missing ROOT_ITEM as an error, and for an optional
-                // tree that is how a caller learns it is not there.
-                // Every filesystem the kernel makes has one, so this
-                // is a `None` nothing is expected to take.
-                root_item_target(&tree, sb.root, crate::csum::CSUM_TREE_OBJECTID).ok(),
-            )
+            fs_and_csum_tree_roots(&tree, sb.root)?
         };
 
         let mut fs = Filesystem {
@@ -1251,12 +1367,8 @@ impl Filesystem {
             return Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, dst);
         }
 
-        let first = logical - logical % sector;
-        let end = logical
-            .checked_add(dst.len() as u64)
+        let (first, span) = sector_aligned_span(logical, dst.len() as u64, sector)
             .ok_or(Error::UnmappedLogical(logical))?;
-        let last = end.div_ceil(sector) * sector;
-        let span = last - first;
 
         let mut whole = vec![0u8; span as usize];
         Self::read_logical_pool(&self.device, &self.devices, &self.map, first, &mut whole)?;
@@ -1487,7 +1599,7 @@ mod root_item_target_tests {
         (block, LEAF_A)
     }
 
-    fn lookup(entries: &[(DiskKey, Vec<u8>)], objectid: u64) -> Result<u64> {
+    fn lookup(entries: &[(DiskKey, Vec<u8>)], objectid: u64) -> Result<Option<u64>> {
         let (block, at) = tree_over(leaf(LEAF_A, crate::chunk::objectid::ROOT_TREE, entries));
         let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
             assert_eq!(logical, at, "the walk asked for a block that is not there");
@@ -1498,21 +1610,43 @@ mod root_item_target_tests {
         root_item_target(&tree, at, objectid)
     }
 
+    /// The version of [`lookup`] that goes through
+    /// [`required_root_item_target`], for the one test that is about
+    /// the "absent tree must be an error" contract rather than about
+    /// `root_item_target` itself.
+    fn required_lookup(entries: &[(DiskKey, Vec<u8>)], objectid: u64) -> Result<u64> {
+        let (block, at) = tree_over(leaf(LEAF_A, crate::chunk::objectid::ROOT_TREE, entries));
+        let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
+            assert_eq!(logical, at, "the walk asked for a block that is not there");
+            buf.copy_from_slice(&block[..buf.len()]);
+            Ok(())
+        };
+        let tree = Tree::new(geom(), &read);
+        required_root_item_target(&tree, at, objectid)
+    }
+
     /// The bound is what the function reads, not the whole structure.
     #[test]
     fn a_root_item_long_enough_to_answer_from_is_accepted() {
         let entries = vec![(key(7, ROOT_ITEM_KEY, 0), minimal_root_item(0xABCD_0000))];
-        assert_eq!(lookup(&entries, 7).unwrap(), 0xABCD_0000);
+        assert_eq!(lookup(&entries, 7).unwrap(), Some(0xABCD_0000));
     }
 
     /// One byte short and it is refused, rather than read past.
+    ///
+    /// Refusing it means not matching it as a `ROOT_ITEM` for this
+    /// objectid at all, so the walk completes having found nothing --
+    /// the same `Ok(None)` a genuinely absent tree produces, and for the
+    /// same reason: a malformed candidate is not a different flavour of
+    /// error, it is simply not the item being looked for.
     #[test]
     fn a_root_item_one_byte_too_short_is_not_used() {
         let mut short = minimal_root_item(0xABCD_0000);
         short.pop();
         let entries = vec![(key(7, ROOT_ITEM_KEY, 0), short)];
-        assert!(
-            lookup(&entries, 7).is_err(),
+        assert_eq!(
+            lookup(&entries, 7).unwrap(),
+            None,
             "a body that cannot hold the field must not be read from"
         );
     }
@@ -1529,18 +1663,58 @@ mod root_item_target_tests {
             (key(7, ROOT_ITEM_KEY, 0), minimal_root_item(0x1111_0000)),
             (key(7, ROOT_ITEM_KEY, 1), minimal_root_item(0x2222_0000)),
         ];
-        assert_eq!(lookup(&entries, 7).unwrap(), 0x1111_0000);
+        assert_eq!(lookup(&entries, 7).unwrap(), Some(0x1111_0000));
     }
 
-    /// An absent tree is an error, which is how an optional tree's
-    /// caller learns it is not there.
+    /// A genuinely absent tree is `Ok(None)` from `root_item_target`
+    /// itself -- not every caller treats that as fatal, so the error is
+    /// not this function's to raise.
     #[test]
-    fn a_missing_root_item_is_an_error_naming_the_tree() {
+    fn a_missing_root_item_is_ok_none_not_an_error() {
         let entries = vec![(key(7, ROOT_ITEM_KEY, 0), minimal_root_item(1))];
-        let err = lookup(&entries, 9).unwrap_err();
+        assert_eq!(
+            lookup(&entries, 9).unwrap(),
+            None,
+            "root_item_target must not itself decide that absence is fatal"
+        );
+    }
+
+    /// For a caller that goes through [`required_root_item_target`],
+    /// that same absence becomes an error naming the tree -- this is
+    /// where the `.ok()` bug of rust-fs-btrfs#114 would have hidden had
+    /// it moved here instead of being fixed: a caller that needs "absent
+    /// is fatal" must not be able to get that by discarding every error
+    /// this reports, real failures included.
+    #[test]
+    fn required_root_item_target_turns_absence_into_an_error_naming_the_tree() {
+        let entries = vec![(key(7, ROOT_ITEM_KEY, 0), minimal_root_item(1))];
+        let err = required_lookup(&entries, 9).unwrap_err();
         assert!(
             err.to_string().contains('9'),
             "the error should name the tree that is missing, got: {err}"
+        );
+    }
+
+    /// And a real failure walking the tree must not be swallowed by
+    /// either form -- this is the defect itself, pinned at the source
+    /// rather than only at the mount call site.
+    #[test]
+    fn a_real_walk_failure_is_not_confused_with_absence() {
+        let read = |_logical: u64, _buf: &mut [u8]| -> Result<()> {
+            Err(Error::Io("simulated device failure".to_string()))
+        };
+        let tree = Tree::new(geom(), &read);
+        let plain = root_item_target(&tree, LEAF_A, 9);
+        assert!(
+            plain.is_err(),
+            "a walk failure must be Err, not Ok(None) -- otherwise it is \
+             indistinguishable from a tree that simply has no ROOT_ITEM"
+        );
+        let required = required_root_item_target(&tree, LEAF_A, 9);
+        assert!(
+            required.is_err(),
+            "and the required form must not turn that Err into its own \
+             'tree is absent' message, losing the original cause"
         );
     }
 
@@ -1548,7 +1722,11 @@ mod root_item_target_tests {
     #[test]
     fn only_root_items_are_considered() {
         let entries = vec![(key(7, ROOT_ITEM_KEY + 1, 0), minimal_root_item(0x3333_0000))];
-        assert!(lookup(&entries, 7).is_err());
+        assert_eq!(
+            lookup(&entries, 7).unwrap(),
+            None,
+            "an item of the wrong type must not be mistaken for a match"
+        );
     }
 
     /// The block builder's own assumption, so a change to `NODESIZE`
@@ -1556,6 +1734,312 @@ mod root_item_target_tests {
     /// somewhere confusing.
     #[test]
     fn the_fixture_leaf_has_room_for_two_root_items() {
+        assert!(NODESIZE as usize > 2 * (root_item::BYTENR + 8) + 128);
+    }
+}
+
+#[cfg(test)]
+mod sector_aligned_span_tests {
+    use super::sector_aligned_span;
+
+    /// The ordinary case: rounds the span up to whole sectors.
+    #[test]
+    fn a_read_inside_one_sector_spans_exactly_that_sector() {
+        let sector = 4096u64;
+        assert_eq!(sector_aligned_span(100, 16, sector), Some((0, 4096)));
+    }
+
+    /// A read crossing a sector boundary spans both.
+    #[test]
+    fn a_read_crossing_a_boundary_spans_both_sectors() {
+        let sector = 4096u64;
+        assert_eq!(sector_aligned_span(4090, 16, sector), Some((0, 8192)));
+    }
+
+    /// `logical + len` overflowing `u64` is refused.
+    #[test]
+    fn an_overflowing_add_is_refused() {
+        assert_eq!(sector_aligned_span(u64::MAX - 4, 16, 4096), None);
+    }
+
+    /// THE DEFECT ITSELF: `end` is comfortably representable and the
+    /// checked add above it does not fire, but rounding `end` up to the
+    /// next sector overflows the multiplication. Before this fix that
+    /// wrapped in release and panicked in debug; either way it must now
+    /// come back `None`, not a `Some` whose `last` sits before `first`.
+    #[test]
+    fn a_round_up_that_overflows_the_multiplication_is_refused_not_wrapped() {
+        let sector = 4096u64;
+        // logical + len = u64::MAX - 10, which checked_add accepts.
+        // div_ceil(4096) * 4096 on that value overflows u64.
+        let logical = u64::MAX - 4096;
+        let len = 4086u64;
+        assert_eq!(
+            sector_aligned_span(logical, len, sector),
+            None,
+            "the multiplication overflowed and must not silently wrap"
+        );
+    }
+
+    /// A SECOND, DISTINCT WAY TO REACH THE SAME OVERFLOW, where
+    /// `first` is small rather than huge.
+    ///
+    /// `a_round_up_that_overflows_the_multiplication_is_refused_not_wrapped`
+    /// picks a `logical` near `u64::MAX`, which makes `first` huge too --
+    /// and a huge `first` means that if the round-up wraps to something
+    /// small, `checked_sub` catches the wrap as an underflow even
+    /// without `checked_mul`'s own guard. That is not the only route to
+    /// the same overflow: `logical` near zero with an enormous `len`
+    /// drives `end` just as close to `u64::MAX`, while `first` stays
+    /// small (here, zero) -- so a wrapped `last` can land AT OR ABOVE
+    /// `first` instead of below it, and `checked_sub` sees nothing
+    /// wrong. Measured directly: with the multiplication left
+    /// unguarded, `logical=0, len=u64::MAX, sector=4096` wraps `last` to
+    /// exactly `0`, `checked_sub(0, 0)` is `Some(0)`, and the function
+    /// would return `Some((0, 0))` -- a small, entirely plausible span
+    /// that is completely wrong, accepted rather than refused. This is
+    /// the reason `checked_mul` is not redundant with `checked_sub`
+    /// despite the other test's input suggesting it might be.
+    #[test]
+    fn a_small_first_does_not_let_the_multiplication_wrap_through_uncaught() {
+        let sector = 4096u64;
+        assert_eq!(
+            sector_aligned_span(0, u64::MAX, sector),
+            None,
+            "logical=0 with an enormous len drives the same round-up \
+             overflow while first stays small, so a wrapped `last` can \
+             land at or above `first` and slip past a bare subtraction \
+             undetected -- this must still be refused"
+        );
+    }
+
+    /// The same overflow, exhaustively at the boundary: every `end`
+    /// within the last two sectors of the address space is refused, not
+    /// just one hand-picked value.
+    #[test]
+    fn every_end_near_u64_max_that_would_overflow_the_round_up_is_refused() {
+        let sector = 4096u64;
+        for len in 0..=(2 * sector) {
+            let logical = u64::MAX - len;
+            let result = sector_aligned_span(logical, 1, sector);
+            if let Some((first, span)) = result {
+                // If it did not refuse, the arithmetic must still be
+                // sound: first <= logical, and the span must actually
+                // cover the requested byte without wrapping.
+                assert!(
+                    first <= logical,
+                    "first ({first:#x}) must not be after logical ({logical:#x})"
+                );
+                assert!(
+                    first.checked_add(span).is_some(),
+                    "a returned (first, span) must not itself overflow when added back \
+                     together: first={first:#x} span={span:#x}"
+                );
+            }
+        }
+    }
+
+    /// `first` never lands after `logical`, and the span always covers
+    /// the requested length -- the ordinary correctness property,
+    /// preserved by the extraction.
+    #[test]
+    fn the_span_always_covers_the_request() {
+        for (logical, len, sector) in [
+            (0u64, 0u64, 512u64),
+            (1, 1, 512),
+            (511, 2, 512),
+            (512, 1, 512),
+        ] {
+            let Some((first, span)) = sector_aligned_span(logical, len, sector) else {
+                continue;
+            };
+            assert!(first <= logical);
+            assert!(
+                first + span >= logical + len,
+                "span [{first}, {}) does not cover the request [{logical}, {})",
+                first + span,
+                logical + len
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod fs_and_csum_tree_roots_tests {
+    use super::*;
+    use crate::btree::test_blocks::{geom, key, leaf, node, LEAF_A, LEAF_B, NODESIZE, ROOT};
+    use crate::btree::Tree;
+    use std::collections::HashMap;
+
+    /// A `ROOT_ITEM` body long enough for `root_item_target` to answer
+    /// from.
+    fn minimal_root_item(bytenr: u64) -> Vec<u8> {
+        let mut body = vec![0u8; root_item::BYTENR + 8];
+        body[root_item::BYTENR..root_item::BYTENR + 8].copy_from_slice(&bytenr.to_le_bytes());
+        body
+    }
+
+    /// Leaf A holds the fs tree's `ROOT_ITEM` (objectid 5) as its only
+    /// item; leaf B is where the csum tree's `ROOT_ITEM` (objectid 7)
+    /// would live, if this fixture put one there.
+    ///
+    /// Keys ascend by objectid, so the walk for `FS_TREE_OBJECTID`
+    /// matches on the first and only item in leaf A and stops there --
+    /// `for_each`'s visitor returns `Ok(false)` on a match -- without
+    /// ever reading leaf B. The walk for `CSUM_TREE_OBJECTID` finds
+    /// nothing in leaf A (wrong objectid) and must continue rightward
+    /// into leaf B to find out there is nothing there either -- or, in
+    /// the failing variant, to hit whatever `read` does with that
+    /// address.
+    fn fs_tree_root_only(leaf_b: Vec<u8>) -> (HashMap<u64, Vec<u8>>, u64) {
+        let a = leaf(
+            LEAF_A,
+            crate::chunk::objectid::ROOT_TREE,
+            &[(
+                key(FS_TREE_OBJECTID, ROOT_ITEM_KEY, 0),
+                minimal_root_item(0xF00D),
+            )],
+        );
+        let r = node(
+            ROOT,
+            crate::chunk::objectid::ROOT_TREE,
+            1,
+            &[
+                (key(FS_TREE_OBJECTID, ROOT_ITEM_KEY, 0), LEAF_A),
+                (
+                    key(crate::csum::CSUM_TREE_OBJECTID, ROOT_ITEM_KEY, 0),
+                    LEAF_B,
+                ),
+            ],
+        );
+        (
+            HashMap::from([(LEAF_A, a), (LEAF_B, leaf_b), (ROOT, r)]),
+            ROOT,
+        )
+    }
+
+    /// An empty leaf B: the csum tree is genuinely absent. This is the
+    /// case the original `.ok()` comment reasoned about, and it must
+    /// still be `Ok((_, None))`.
+    #[test]
+    fn a_genuinely_absent_csum_tree_is_ok_none() {
+        let empty_b = leaf(LEAF_B, crate::chunk::objectid::ROOT_TREE, &[]);
+        let (blocks, root) = fs_tree_root_only(empty_b);
+        let read = move |logical: u64, buf: &mut [u8]| -> Result<()> {
+            let block = blocks
+                .get(&logical)
+                .unwrap_or_else(|| panic!("no block at {logical:#x} in this fixture"));
+            buf.copy_from_slice(&block[..buf.len()]);
+            Ok(())
+        };
+        let tree = Tree::new(geom(), &read);
+        let (fs_root, csum_root) = fs_and_csum_tree_roots(&tree, root).unwrap();
+        assert_eq!(fs_root, 0xF00D);
+        assert_eq!(
+            csum_root, None,
+            "no ROOT_ITEM for the csum tree anywhere in this fixture"
+        );
+    }
+
+    /// THE REGRESSION. Leaf B — reached only by the csum-tree search,
+    /// never by the fs-tree one — fails to read. Before the fix this
+    /// came back `Ok((fs_root, None))`, indistinguishable from the
+    /// tree being absent, and every subsequent read for the mount ran
+    /// unverified. It must now be `Err`.
+    #[test]
+    fn a_read_failure_reaching_only_the_csum_tree_search_is_not_confused_with_absence() {
+        let mut blocks = HashMap::new();
+        blocks.insert(
+            LEAF_A,
+            leaf(
+                LEAF_A,
+                crate::chunk::objectid::ROOT_TREE,
+                &[(
+                    key(FS_TREE_OBJECTID, ROOT_ITEM_KEY, 0),
+                    minimal_root_item(0xF00D),
+                )],
+            ),
+        );
+        blocks.insert(
+            ROOT,
+            node(
+                ROOT,
+                crate::chunk::objectid::ROOT_TREE,
+                1,
+                &[
+                    (key(FS_TREE_OBJECTID, ROOT_ITEM_KEY, 0), LEAF_A),
+                    (
+                        key(crate::csum::CSUM_TREE_OBJECTID, ROOT_ITEM_KEY, 0),
+                        LEAF_B,
+                    ),
+                ],
+            ),
+        );
+        // LEAF_B is deliberately absent from `blocks`: reading it fails.
+        let read = move |logical: u64, buf: &mut [u8]| -> Result<()> {
+            match blocks.get(&logical) {
+                Some(block) => {
+                    buf.copy_from_slice(&block[..buf.len()]);
+                    Ok(())
+                }
+                None => Err(Error::Io(format!(
+                    "simulated device failure reading {logical:#x}"
+                ))),
+            }
+        };
+        let tree = Tree::new(geom(), &read);
+
+        let result = fs_and_csum_tree_roots(&tree, ROOT);
+        assert!(
+            result.is_err(),
+            "a read failure reaching leaf B while searching for the csum \
+             tree must propagate, not collapse into Ok((fs_root, None)) \
+             the way rust-fs-btrfs#114 describes"
+        );
+    }
+
+    /// The fixture's own precondition: the fs-tree lookup really does
+    /// stop before touching leaf B, so the test above is exercising the
+    /// csum-tree search specifically and not incidentally failing on
+    /// the fs-tree one.
+    #[test]
+    fn the_fs_tree_lookup_alone_never_touches_leaf_b() {
+        let a = leaf(
+            LEAF_A,
+            crate::chunk::objectid::ROOT_TREE,
+            &[(
+                key(FS_TREE_OBJECTID, ROOT_ITEM_KEY, 0),
+                minimal_root_item(0xF00D),
+            )],
+        );
+        let r = node(
+            ROOT,
+            crate::chunk::objectid::ROOT_TREE,
+            1,
+            &[
+                (key(FS_TREE_OBJECTID, ROOT_ITEM_KEY, 0), LEAF_A),
+                (
+                    key(crate::csum::CSUM_TREE_OBJECTID, ROOT_ITEM_KEY, 0),
+                    LEAF_B,
+                ),
+            ],
+        );
+        let blocks = HashMap::from([(LEAF_A, a), (ROOT, r)]);
+        let read = move |logical: u64, buf: &mut [u8]| -> Result<()> {
+            let block = blocks.get(&logical).unwrap_or_else(|| {
+                panic!("the fs-tree lookup touched {logical:#x}, expected only ROOT and LEAF_A")
+            });
+            buf.copy_from_slice(&block[..buf.len()]);
+            Ok(())
+        };
+        let tree = Tree::new(geom(), &read);
+        let found = required_root_item_target(&tree, ROOT, FS_TREE_OBJECTID).unwrap();
+        assert_eq!(found, 0xF00D);
+    }
+
+    /// The block builder's own assumption.
+    #[test]
+    fn the_fixture_leaf_has_room_for_the_root_item() {
         assert!(NODESIZE as usize > 2 * (root_item::BYTENR + 8) + 128);
     }
 }

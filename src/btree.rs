@@ -1059,6 +1059,26 @@ pub(crate) mod test_blocks {
         seal(&mut b);
         b
     }
+
+    /// A block one level above the leaves: `level` interior, holding a
+    /// `KeyPtr` per child rather than items.
+    ///
+    /// Public for the same reason [`leaf`] is: a genuine multi-leaf tree
+    /// is needed outside this module too, and a second hand-rolled
+    /// internal-node builder would drift from this one the way the
+    /// crate's three leaf builders once did.
+    pub fn node(bytenr: u64, owner: u64, level: u8, children: &[(DiskKey, u64)]) -> Vec<u8> {
+        let mut b = vec![0u8; NODESIZE as usize];
+        put_header(&mut b, bytenr, owner, children.len() as u32, level);
+        for (i, (k, child)) in children.iter().enumerate() {
+            let at = HEADER_SIZE + i * KEY_PTR_SIZE;
+            put_key(&mut b, at, k);
+            b[at + DISK_KEY_SIZE..at + DISK_KEY_SIZE + 8].copy_from_slice(&child.to_le_bytes());
+            b[at + DISK_KEY_SIZE + 8..at + DISK_KEY_SIZE + 16].copy_from_slice(&8u64.to_le_bytes());
+        }
+        seal(&mut b);
+        b
+    }
 }
 
 #[cfg(test)]

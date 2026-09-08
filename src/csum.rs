@@ -293,3 +293,125 @@ mod tests {
         assert_eq!(b[8], EXTENT_CSUM_KEY);
     }
 }
+
+/// A checksum run that crosses a leaf boundary is not missed.
+///
+/// The predecessor lookup in `digests_for_range` finds the item covering
+/// `start` by examining the leaf the descent lands on, and the walk that
+/// follows relies on `for_each_from` to continue rightward past that
+/// leaf's last item into the next one. Every other test in this module
+/// builds a single-leaf, single-block tree, so neither half of that had
+/// ever been exercised: the predecessor lookup only ever had one leaf to
+/// search, and the walk never had a leaf boundary to cross. Filed as
+/// rust-fs-btrfs#114 alongside the `.ok()` defect, as a claimed non-bug
+/// that was nonetheless untested.
+#[cfg(test)]
+mod cross_leaf {
+    use super::*;
+    use crate::btree::test_blocks::{geom, key, leaf, node, LEAF_A, LEAF_B, ROOT};
+    use crate::btree::Tree;
+    use std::collections::HashMap;
+
+    /// One four-sector run per leaf, back to back: leaf A covers
+    /// sectors `[base, base+4)`, leaf B covers `[base+4, base+8)`. A
+    /// root node with two key pointers, one per leaf, sits above them.
+    fn two_leaf_tree(base: u64, sectorsize: u64) -> (HashMap<u64, Vec<u8>>, u64) {
+        let mut a_data = Vec::new();
+        let mut b_data = Vec::new();
+        for i in 0..4u8 {
+            a_data.extend_from_slice(&[0xA0 + i; 4]);
+            b_data.extend_from_slice(&[0xB0 + i; 4]);
+        }
+        let a_key = key(EXTENT_CSUM_OBJECTID, EXTENT_CSUM_KEY, base);
+        let b_key = key(EXTENT_CSUM_OBJECTID, EXTENT_CSUM_KEY, base + 4 * sectorsize);
+        let a = leaf(LEAF_A, CSUM_TREE_OBJECTID, &[(a_key, a_data)]);
+        let b = leaf(LEAF_B, CSUM_TREE_OBJECTID, &[(b_key, b_data)]);
+        let r = node(
+            ROOT,
+            CSUM_TREE_OBJECTID,
+            1,
+            &[(a_key, LEAF_A), (b_key, LEAF_B)],
+        );
+        (HashMap::from([(LEAF_A, a), (LEAF_B, b), (ROOT, r)]), ROOT)
+    }
+
+    fn reader(blocks: &HashMap<u64, Vec<u8>>) -> impl Fn(u64, &mut [u8]) -> Result<()> + '_ {
+        move |logical: u64, buf: &mut [u8]| -> Result<()> {
+            let block = blocks
+                .get(&logical)
+                .unwrap_or_else(|| panic!("no block at {logical:#x} in this fixture"));
+            buf.copy_from_slice(&block[..buf.len()]);
+            Ok(())
+        }
+    }
+
+    /// A range starting inside leaf A's run and ending inside leaf B's
+    /// gets every sector from both, in one call.
+    #[test]
+    fn a_range_starting_in_one_leaf_and_ending_in_the_next_gets_both_halves() {
+        let sectorsize = 4096u64;
+        let base = 1 << 20;
+        let (blocks, root) = two_leaf_tree(base, sectorsize);
+        let read = reader(&blocks);
+        let tree = Tree::new(geom(), &read);
+
+        // Starts two sectors into leaf A's run (not at its first key --
+        // that is the predecessor-lookup case) and runs four sectors,
+        // ending two sectors into leaf B's run.
+        let start = base + 2 * sectorsize;
+        let found = digests_for_range(&tree, root, 4, sectorsize, start, 4 * sectorsize).unwrap();
+
+        assert_eq!(
+            found.len(),
+            4,
+            "expected 2 sectors from the tail of leaf A's run and 2 from \
+             the head of leaf B's, got {}: {:?}",
+            found.len(),
+            found.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            found[&(base + 2 * sectorsize)],
+            vec![0xA2; 4],
+            "leaf A, sector 2"
+        );
+        assert_eq!(
+            found[&(base + 3 * sectorsize)],
+            vec![0xA3; 4],
+            "leaf A, sector 3"
+        );
+        assert_eq!(
+            found[&(base + 4 * sectorsize)],
+            vec![0xB0; 4],
+            "leaf B, sector 0"
+        );
+        assert_eq!(
+            found[&(base + 5 * sectorsize)],
+            vec![0xB1; 4],
+            "leaf B, sector 1"
+        );
+    }
+
+    /// The whole two-leaf tree in one call: eight sectors, two runs.
+    #[test]
+    fn the_entire_two_leaf_tree_is_read_in_one_call() {
+        let sectorsize = 4096u64;
+        let base = 1 << 20;
+        let (blocks, root) = two_leaf_tree(base, sectorsize);
+        let read = reader(&blocks);
+        let tree = Tree::new(geom(), &read);
+
+        let found = digests_for_range(&tree, root, 4, sectorsize, base, 8 * sectorsize).unwrap();
+        assert_eq!(
+            found.len(),
+            8,
+            "expected all 4+4 sectors across both leaves"
+        );
+        for i in 0..4u64 {
+            assert_eq!(found[&(base + i * sectorsize)], vec![0xA0 + i as u8; 4]);
+            assert_eq!(
+                found[&(base + (4 + i) * sectorsize)],
+                vec![0xB0 + i as u8; 4]
+            );
+        }
+    }
+}
