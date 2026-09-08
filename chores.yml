@@ -132,6 +132,45 @@ tasks:
     # booted the machine, and it FAILS THE TASK if the machine will not
     # stop. The reaper is a net for the paths no defer can reach, and it
     # fails soft. Having both is the point; either alone leaves a hole.
+    #
+    # `timeout:` is the third layer, and it covers what neither of the
+    # other two can: a task that HANGS. `defer:` needs the body to end,
+    # and a body that never returns ends nothing. The reaper needs a
+    # LATER chore invocation, and nobody runs one while they are waiting
+    # for this. So a stalled `cargo test` -- a suite deadlocked, an ssh
+    # into the guest that never comes back -- holds the machine and the
+    # global oracle slot with every net behaving exactly as written.
+    #
+    # That is not hypothetical. On 2026-09-07 a VM was held for THIRTEEN
+    # HOURS by a task whose process had been killed: no chore ran, no
+    # second repository asked for the slot, and no hold file was set. A
+    # plain leak that nothing was positioned to notice.
+    #
+    # Measured against that exact case, a hung task holding a live VM:
+    # 23 seconds against a 20-second budget, the guest halted properly
+    # rather than orphaned, and the slot released.
+    #
+    # The handler runs FIRST, while the process group is still alive,
+    # which is what lets `vm.sh down` reach the guest and halt it rather
+    # than leave a parentless qemu behind. chore then signals the group
+    # itself, so this is not only as reliable as the handler.
+    #
+    # `$TIMEOUT_PGID` is space-separated -- concurrent `deps:` can have
+    # several groups in flight -- and empty for an `interactive:` task,
+    # so the loop is the portable form rather than a bare `kill`.
+    #
+    # AND IT DOES NOT REPLACE THE GUEST'S OWN DEADLINE. A timer dies
+    # with the process that owns it, so a SIGKILL to chore defeats this
+    # entirely -- which is precisely what happened on the night above.
+    # The guest schedules its own poweroff at boot for that case, and
+    # `chore help timeouts` argues for keeping both rather than merely
+    # permitting it. Fast precise net inside, dumb unkillable net
+    # outside.
+    timeout: 45m
+    on_timeout:
+      - cmd: 'echo "timeout: reclaiming the oracle VM (spent $TIMEOUT)"'
+      - cmd: './scripts/vm.sh down'
+      - cmd: 'for g in $TIMEOUT_PGID; do kill -TERM -"$g" 2>/dev/null || true; done'
     cmds:
       - defer: ./scripts/vm.sh down
       - cargo test
