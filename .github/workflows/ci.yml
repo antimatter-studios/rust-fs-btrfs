@@ -43,7 +43,48 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --release
+      # `--locked` so a drifting Cargo.lock fails the gate instead of
+      # being silently resolved past. Every other `cargo test` in the
+      # constellation pins it; this one did not. See #103.
+      - run: cargo test --locked --release
+
+      # AND ONCE WITHOUT `--release`, COVERING THE LIBRARY UNIT TESTS --
+      # NOTHING ELSE ON THIS TRIGGER DOES.
+      #
+      # overflow-checks defaults on in [profile.dev] and off in
+      # [profile.release]. Cargo.toml's [profile.release] carries lto,
+      # codegen-units, opt-level and panic only, and its [profile.dev]
+      # carries opt-level and panic only -- neither overrides the
+      # default, so the run above wraps a bad addition silently and
+      # reports success.
+      #
+      # This repository is NOT in the same position as its siblings, and
+      # the difference is worth stating so nobody "simplifies" this
+      # away. There IS debug coverage on this trigger: the kernel-gate
+      # job below runs eighteen `cargo test --test <name>` invocations
+      # in the debug profile, on every pull request. But `--test <name>`
+      # selects ONE integration target and never builds the library's
+      # own unit tests, so the library unit tests in src/ -- the largest
+      # body of arithmetic in the crate -- run under --release and
+      # nowhere else. `release.yml:66`, `cargo test --all-targets`, does
+      # cover them in debug, but triggers on a version TAG, so a
+      # wrapping defect merges green and surfaces when someone else cuts
+      # the next release.
+      #
+      # `EXPECT_OVERFLOW_CHECKS=1` tells
+      # `overflow_checks::the_build_the_gate_asked_to_check_does_check`
+      # in src/lib.rs that this is the run that must trap an overflow --
+      # asking the build directly rather than inferring it from which
+      # spellings of "disabled" happen to be absent from Cargo.toml. The
+      # release run must NOT set it: the checks are off there
+      # deliberately, because that is what ships.
+      #
+      # Do not remove this as a duplicate of the kernel-gate runs, and
+      # do not drop the variable from it: tests/ci_profile.rs asserts
+      # that ci.yml still runs a `cargo test` which covers the library
+      # unit tests, without `--release`, setting this variable -- and
+      # that the kernel-gate's `--test <name>` runs do not satisfy it.
+      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
 
       # The VM-teardown guards, which decide whether a machine is left
       # running. They stub pgrep and vagrant, so they need neither.
