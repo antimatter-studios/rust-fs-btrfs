@@ -200,6 +200,19 @@ Vagrant.configure("2") do |config|
   # changed. Measured: exporting 90 produced "powering off in 480".
   deadline_mins = ENV.fetch("AM_ORACLE_VM_DEADLINE_MINS", "480")
 
+  # VALIDATED BEFORE IT IS INTERPOLATED, because the next thing that
+  # happens to this string is a verbatim splice into a heredoc that
+  # Vagrant runs as root in the guest on every `up`. The default is a
+  # safe literal; a caller-supplied override was not checked at all.
+  #
+  # \A and \z, NOT ^ and $. Ruby's ^ and $ match at line boundaries, so
+  # /^[0-9]+$/ accepts "480\nrm -rf /" -- the first line satisfies the
+  # pattern and the rest becomes its own command inside the script.
+  unless deadline_mins =~ /\A[1-9][0-9]{0,5}\z/
+    raise "AM_ORACLE_VM_DEADLINE_MINS must be a positive integer of at " \
+          "most six digits, got #{deadline_mins.inspect}"
+  end
+
   config.vm.provision "deadline", type: "shell", run: "always",
                       inline: <<-SHELL
     set -euo pipefail
@@ -207,9 +220,41 @@ Vagrant.configure("2") do |config|
     shutdown -c >/dev/null 2>&1 || true
     if [ -f /run/am-oracle-vm-held ]; then
       echo "deadline: held by /run/am-oracle-vm-held, no shutdown scheduled"
+      exit 0
+    fi
+    # NOT BACKGROUNDED, AND ITS EXIT STATUS IS READ.
+    #
+    # This was `nohup shutdown -h "+${MINS}" >/dev/null 2>&1 &`, which
+    # put the one call this whole provisioner exists to make out of
+    # `set -e`'s reach -- backgrounding is exactly how a command opts
+    # out -- and discarded its status and its diagnostics. The
+    # unconditional echo below it then announced a timer that may never
+    # have been set. A backstop that reports success it did not verify
+    # is worse than no backstop, because the other two teardown layers
+    # are justified partly by this one working.
+    #
+    # There is nothing to background: shutdown returns as soon as the
+    # timer is armed.
+    if ! shutdown -h "+${MINS}"; then
+      echo "deadline: FAILED to schedule poweroff in ${MINS} minutes" >&2
+      exit 1
+    fi
+    # An accepted request and an armed timer are not the same claim, so
+    # where the guest can be asked what it has scheduled, ask it.
+    if command -v systemctl >/dev/null 2>&1; then
+      scheduled="$(systemctl show -p ScheduledShutdownUSec --value 2>/dev/null || true)"
+      case "${scheduled}" in
+        ""|"n/a"|0)
+          echo "deadline: shutdown accepted the request but no timer is armed" >&2
+          exit 1
+          ;;
+      esac
+      echo "deadline: powering off in ${MINS} minutes unless held (timer armed: ${scheduled})"
     else
-      nohup shutdown -h "+${MINS}" >/dev/null 2>&1 &
-      echo "deadline: powering off in ${MINS} minutes unless held"
+      # Said differently on purpose: this machine reported a weaker
+      # fact than the branch above, and the operator should be able to
+      # see which one they got.
+      echo "deadline: powering off in ${MINS} minutes unless held (request accepted, no systemctl to confirm)"
     fi
   SHELL
 end
