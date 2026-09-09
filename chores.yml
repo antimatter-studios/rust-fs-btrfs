@@ -1,5 +1,5 @@
 version: "3"
-chore_min_version: 0.6.0
+chore_min_version: 0.10.0
 
 # THE CONTRACT THIS FILE EXISTS TO OWN.
 #
