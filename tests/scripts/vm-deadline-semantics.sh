@@ -161,7 +161,10 @@ run_deadline_script() {
 
     if [ "$sd_exit" != NONE ]; then
     cat > "$stubs/shutdown" <<STUB
-#!/usr/bin/env bash
+#!/bin/sh
+# /bin/sh by ABSOLUTE path: this stub runs under a PATH holding only
+# the stub directory, so `env` would look up `bash` there and fail with
+# "No such file or directory". Neither stub needs bash.
 # -c (cancel) always succeeds; the scheduling call is the one under test.
 case "\$1" in
   -c) exit 0 ;;
@@ -174,16 +177,38 @@ STUB
 
     if [ "$sysctl_out" != NONE ]; then
         cat > "$stubs/systemctl" <<STUB
-#!/usr/bin/env bash
+#!/bin/sh
 printf '%s\n' "$sysctl_out"
 STUB
         chmod +x "$stubs/systemctl"
     fi
 
-    # /usr/bin and /bin only, so a real /sbin/shutdown cannot stand in
-    # for the stub and the "absent" case is genuinely absent.
+    # THE STUB DIRECTORY IS THE WHOLE PATH, and that is the point.
+    #
+    # This was "$stubs:/usr/bin:/bin", which let the HOST decide whether
+    # `systemctl` exists -- so the "no systemctl to confirm" case tested
+    # the machine rather than the script. It passed on macOS and in a
+    # bare container, where systemctl is absent, and FAILED on GitHub's
+    # ubuntu runner, where /usr/bin/systemctl is real: the script found
+    # it, asked a systemd that has scheduled nothing, and correctly
+    # reported "no timer is armed" -- to a test expecting success.
+    #
+    # The extracted script needs no other program. `command` is a shell
+    # builtin and the only externals it names are `shutdown` and
+    # `systemctl`, both stubbed here, so an empty PATH beyond $stubs
+    # makes absence mean absence on every host.
+    # bash is resolved BEFORE the PATH is narrowed and then invoked by
+    # absolute path: `PATH=x bash ...` applies the new PATH to the
+    # lookup of `bash` itself, which is `command not found`.
+    local shell
+    shell="$(command -v bash)"
     set +e
-    PATH="$stubs:/usr/bin:/bin" bash "$script" 2>&1
+    # stdin from /dev/null: the child runs inside `$( )`, and a
+    # command substitution does not finish until every writer to the
+    # pipe has exited. Leaving the child on an inherited stdin let a
+    # run block indefinitely, which in CI is worse than a failure --
+    # nothing is reported at all.
+    PATH="$stubs" "$shell" "$script" </dev/null 2>&1
     rc=$?
     set -e
     rm -rf "$sandbox"
