@@ -204,6 +204,122 @@ fn a_damaged_first_copy_of_any_named_root_does_not_stop_the_mount() {
     );
 }
 
+/// THE POOL READER'S TREE, which a single-device mount never reaches.
+///
+/// `PoolReader::tree` (`fs.rs:1640`) is the fourth of the four
+/// production opt-ins and is served by a different fixture:
+/// `.vm-share/btrfs-pool-{a,b}.img`, a real two-device filesystem whose
+/// metadata mkfs put in RAID1 — so a tree block's two copies are on
+/// DIFFERENT devices, and damaging one means writing to one image and
+/// leaving the other alone.
+///
+/// This was going to be a follow-up row on the grounds that the site was
+/// unreachable. It is reachable: the fixture already ships, the way
+/// `btrfs-dup.img` did. Establish the wall by trying.
+#[test]
+fn a_damaged_copy_on_one_pool_device_does_not_stop_the_pool_reading() {
+    let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
+    let (a, b) = (
+        share.join("btrfs-pool-a.img"),
+        share.join("btrfs-pool-b.img"),
+    );
+    if !a.exists() || !b.exists() {
+        eprintln!(
+            "no .vm-share/btrfs-pool-{{a,b}}.img — run ./scripts/vm-build-pool-fixtures.sh; \
+             skipping, and this suite proved nothing"
+        );
+        return;
+    }
+    let bytes_a = std::fs::read(&a).expect("read pool a");
+    let bytes_b = std::fs::read(&b).expect("read pool b");
+
+    let open = |pa: &Path, pb: &Path| -> Vec<Arc<dyn fs_core::BlockRead>> {
+        vec![
+            Arc::new(FileDevice::open(pa).expect("open a")) as Arc<dyn fs_core::BlockRead>,
+            Arc::new(FileDevice::open(pb).expect("open b")) as Arc<dyn fs_core::BlockRead>,
+        ]
+    };
+
+    // The control, and the map: a pristine pool opens, and the mount is
+    // what builds the ChunkMap that says where the copies live.
+    let pristine_a = Scratch::new("pool-a", &bytes_a);
+    let pristine_b = Scratch::new("pool-b", &bytes_b);
+    let fs = fs_btrfs::fs::Filesystem::mount_pool(open(&pristine_a.0, &pristine_b.0))
+        .expect("the undamaged pool must open");
+    fs.list_path("/").expect("the undamaged pool must read");
+    let sb = fs.superblock().clone();
+    let map = fs.chunk_map();
+
+    // BOTH ROOTS, one damaged image pair each. `sb.root` alone reaches
+    // the root-tree walk; `sb.chunk_root` is what the bootstrap walk
+    // reads, and on this fixture its two copies really are on different
+    // devices -- printed below, because if they were not, the pool-aware
+    // read there could not be witnessed here at all.
+    let mut exercised = 0usize;
+    for (what, addr) in [("chunk_root", sb.chunk_root), ("root", sb.root)] {
+        let Ok(copies) = map.mirrors_at(addr) else {
+            continue;
+        };
+        if copies < 2 {
+            eprintln!(
+                "dup_mirror_fallback: pool {what} has {copies} copy; nothing to fall back to"
+            );
+            continue;
+        }
+        let first = map.map_mirror(addr, 0).expect("mirror 0");
+        let second = map.map_mirror(addr, 1).expect("mirror 1");
+        assert_ne!(
+            (first.devid, first.physical),
+            (second.devid, second.physical),
+            "{what}: the two copies are the same bytes on the same device"
+        );
+        eprintln!(
+            "dup_mirror_fallback: pool {what} copies on devid {} @ {} and devid {} @ {}",
+            first.devid, first.physical, second.devid, second.physical
+        );
+
+        // devid 1 is image a, devid 2 is image b -- asserted rather than
+        // assumed, because getting it the wrong way round damages the
+        // copy this test needs intact and the failure would look like
+        // the fallback not working.
+        assert!(
+            first.devid == 1 || first.devid == 2,
+            "{what}: unexpected devid {}",
+            first.devid
+        );
+        let mut damaged_a = bytes_a.clone();
+        let mut damaged_b = bytes_b.clone();
+        {
+            let target = if first.devid == 1 {
+                &mut damaged_a
+            } else {
+                &mut damaged_b
+            };
+            target[(first.physical + 200) as usize] ^= 0xFF;
+        }
+
+        let da = Scratch::new("pool-a-damaged", &damaged_a);
+        let db = Scratch::new("pool-b-damaged", &damaged_b);
+        let fs = fs_btrfs::fs::Filesystem::mount_pool(open(&da.0, &db.0)).unwrap_or_else(|e| {
+            panic!(
+                "{what}: copy 0 at devid {} physical {} was damaged and copy 1 at devid {} \
+                 physical {} is intact; the pool must fall back to it. Got {e:?}",
+                first.devid, first.physical, second.devid, second.physical
+            )
+        });
+        fs.list_path("/")
+            .unwrap_or_else(|e| panic!("{what}: and the pool must still read: {e}"));
+        eprintln!("dup_mirror_fallback: pool read with copy 0 of {what} damaged");
+        exercised += 1;
+    }
+
+    assert!(
+        exercised >= 2,
+        "only {exercised} pool root(s) had a second copy, so this test reached fewer \
+         opt-ins than it claims to"
+    );
+}
+
 /// The other direction, and it is the one that stops the tests above
 /// passing for the wrong reason: damage BOTH copies and the mount must
 /// refuse. Without this, a driver that ignored checksums entirely would

@@ -711,8 +711,16 @@ impl Filesystem {
                 Self::read_logical(&device, &boot, logical, buf)
             };
             let mirrors = |logical: u64| -> Result<usize> { boot.mirrors_at(logical) };
+            // POOL-AWARE, BECAUSE A RAID1 COPY IS ON ANOTHER DISK. The
+            // single-device form reads every mirror from `device` at the
+            // mapping's physical offset, ignoring the devid the mapping
+            // names -- so on a two-device pool the fallback read the
+            // right offset on the wrong disk and the retry failed the
+            // same checksum. Measured: copy 0 of the pool's root damaged
+            // on devid 1, copy 1 intact on devid 2, and the mount still
+            // returned ChecksumMismatch at copy 0's offset.
             let read_mirror = |logical: u64, mirror: usize, buf: &mut [u8]| -> Result<()> {
-                Self::read_logical_on_mirror(&device, &boot, u64::MAX, mirror, logical, buf)
+                Self::read_logical_pool_mirror(&device, &devices, &boot, mirror, logical, buf)
             };
             let tree = Tree::from_superblock(&sb, &read).with_redundancy(&mirrors, &read_mirror);
             let mut found = Vec::new();
@@ -744,7 +752,7 @@ impl Filesystem {
             };
             let mirrors = |logical: u64| -> Result<usize> { map.mirrors_at(logical) };
             let read_mirror = |logical: u64, mirror: usize, buf: &mut [u8]| -> Result<()> {
-                Self::read_logical_on_mirror(&device, &map, u64::MAX, mirror, logical, buf)
+                Self::read_logical_pool_mirror(&device, &devices, &map, mirror, logical, buf)
             };
             let tree = Tree::from_superblock(&sb, &read).with_redundancy(&mirrors, &read_mirror);
             fs_and_csum_tree_roots(&tree, sb.root)?
@@ -972,6 +980,14 @@ impl Filesystem {
         let read_mirror = |logical: u64, mirror: usize, buf: &mut [u8]| -> Result<()> {
             Self::read_logical_on_mirror(&device, &map, u64::MAX, mirror, logical, buf)
         };
+        // NOT WITNESSED, AND SAYING SO HERE RATHER THAN ONLY ON THE PR.
+        // tests/dup_mirror_fallback.rs covers the two opt-ins a MOUNT
+        // reaches -- the chunk-tree bootstrap walk and the root-tree
+        // walk. Removing this one alone leaves that suite green, because
+        // reaching it means damaging the fs tree's own root block and
+        // that address is not public: it is read out of the root tree
+        // during the mount and kept private here. A test for it wants
+        // that address exposed, or a fixture built with a known one.
         let tree = Tree::new(TreeGeometry::from_superblock(&self.sb), &read)
             .with_redundancy(&mirrors, &read_mirror);
 
@@ -1635,6 +1651,12 @@ type OwnedReadMirror<'a> = Box<dyn Fn(u64, usize, &mut [u8]) -> Result<()> + 'a>
 impl PoolReader<'_> {
     /// A walker over any tree in this pool. The root address is a
     /// per-call argument, so one reader serves every tree.
+    /// NOT WITNESSED. Removing the `with_redundancy` here alone leaves
+    /// tests/dup_mirror_fallback.rs green: that suite damages tree roots
+    /// the MOUNT reads, and this reader serves the trees a mount has
+    /// already finished with. A test for it wants a damaged block inside
+    /// a subvolume or csum tree, reached through a read after the mount
+    /// rather than during it.
     pub(crate) fn tree(&self) -> crate::btree::Tree<'_> {
         crate::btree::Tree::new(self.geom, &*self.read)
             .with_redundancy(&*self.mirrors, &*self.read_mirror)
