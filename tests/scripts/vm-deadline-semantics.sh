@@ -32,10 +32,26 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 VAGRANTFILE="$REPO/tests/vagrant/debian/Vagrantfile"
 VM_SH="$REPO/scripts/vm.sh"
 fails=0
+# A FILE, NOT A VARIABLE. `expect_run` calls `run_deadline_script`
+# through `out="$(run_deadline_script "$@")"`, and a command
+# substitution runs its command in a SUBSHELL -- an assignment made
+# inside `run_deadline_script` to a shell variable does not survive
+# past that `$(...)`. A file outside `$sandbox` (which is removed
+# before the function returns) is the only thing that crosses that
+# boundary.
+LAST_SHUTDOWN_ARGS_FILE="$(mktemp)"
+trap 'rm -f "$LAST_SHUTDOWN_ARGS_FILE"' EXIT
 
 ok()   { printf 'ok    %s\n' "$1"; }
 bad()  { printf 'FAIL  %s\n' "$1"; fails=$((fails + 1)); }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
+check_eq() {
+    if [ "$2" = "$3" ]; then
+        ok "$1"
+    else
+        bad "$1 (expected '$3', got '$2')"
+    fi
+}
 
 # 1. The deadline must be armed on every boot, not only on the first
 #    provision. Without `run: "always"` a machine that was provisioned
@@ -242,6 +258,24 @@ STUB
     PATH="$stubs" "$shell" "$script" </dev/null 2>&1
     rc=$?
     set -e
+
+    # CAPTURED BEFORE THE SANDBOX IS REMOVED, into a file that survives
+    # the subshell `expect_run`'s `$(...)` runs this function in.
+    #
+    # This was written and never read: `echo "$@" >> "$sandbox/
+    # shutdown.args"` inside the stub, with nothing in this file
+    # checking what landed there. A capture nobody asserts on is worse
+    # than no capture -- it looks like evidence that the scheduling
+    # call was validated end-to-end, when only Ruby's side of the
+    # interpolation was ever checked. `vm-reap-semantics.sh`'s
+    # `vagrant.log` in this same directory is the shape this should
+    # have been from the start: written, then read back through a
+    # named accessor and asserted against.
+    : > "$LAST_SHUTDOWN_ARGS_FILE"
+    if [ -f "$sandbox/shutdown.args" ]; then
+        cat "$sandbox/shutdown.args" > "$LAST_SHUTDOWN_ARGS_FILE"
+    fi
+
     rm -rf "$sandbox"
     return $rc
 }
@@ -294,6 +328,15 @@ expect_run "a missing shutdown command fails rather than reporting success" \
 expect_run "a scheduled shutdown reports the armed timer" \
     ok "powering off in 480 minutes" "" \
     480 0 armed notheld
+
+# THE CAPTURE, READ RATHER THAN LEFT UNCHECKED. The whole claim of "the
+# minutes are validated" was Ruby-side only until this: nothing
+# confirmed the validated value actually reached the shell call. `-h`
+# is the flag this provisioner exists to issue, and `+480` is `MINS`
+# spliced into the `"+${MINS}"` argument -- so this is the end-to-end
+# witness the Ruby-only regex check above cannot be.
+check_eq "the scheduling call carries -h and the requested minutes" \
+    "$(cat "$LAST_SHUTDOWN_ARGS_FILE")" "-h +480"
 
 # THE THREE STATES THAT USED TO BE ONE. systemd is running, so
 # logind's record is authoritative and its absence is a real answer:
