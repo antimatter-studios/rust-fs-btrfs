@@ -32,10 +32,33 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 VAGRANTFILE="$REPO/tests/vagrant/debian/Vagrantfile"
 VM_SH="$REPO/scripts/vm.sh"
 fails=0
+# A FILE, NOT A VARIABLE. `expect_run` calls `run_deadline_script`
+# through `out="$(run_deadline_script "$@")"`, and a command
+# substitution runs its command in a SUBSHELL -- an assignment made
+# inside `run_deadline_script` to a shell variable does not survive
+# past that `$(...)`. A file outside `$sandbox` (which is removed
+# before the function returns) is the only thing that crosses that
+# boundary.
+LAST_SHUTDOWN_ARGS_FILE="$(mktemp)"
+trap 'rm -f "$LAST_SHUTDOWN_ARGS_FILE"' EXIT
+
+# A NAMED ACCESSOR, for the same reason `vm-reap-semantics.sh` gives its
+# `vagrant.log` a `halted()`: a capture is only evidence if reading it
+# is as easy as writing it. `run_deadline_script` truncates this file on
+# every call, so what it holds always belongs to the run that just
+# finished and to no other.
+shutdown_args() { cat "$LAST_SHUTDOWN_ARGS_FILE"; }
 
 ok()   { printf 'ok    %s\n' "$1"; }
 bad()  { printf 'FAIL  %s\n' "$1"; fails=$((fails + 1)); }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
+check_eq() {
+    if [ "$2" = "$3" ]; then
+        ok "$1"
+    else
+        bad "$1 (expected '$3', got '$2')"
+    fi
+}
 
 # 1. The deadline must be armed on every boot, not only on the first
 #    provision. Without `run: "always"` a machine that was provisioned
@@ -121,16 +144,19 @@ extract_deadline_script() {
          f{print}' "$VAGRANTFILE"
 }
 
-# Runs the shipped script with `shutdown`/`systemctl` stubbed.
+# Runs the shipped script with `shutdown` stubbed and the guest's
+# systemd state built as files under the sandbox.
 #   $1 minutes to interpolate (Ruby does this on the host)
 #   $2 exit status the `shutdown -h` stub should return, or the literal
 #      NONE to leave `shutdown` off PATH entirely
-#   $3 what the `systemctl` stub prints, or the literal NONE to leave
-#      systemctl off PATH entirely
+#   $3 the guest's systemd state, one of:
+#        armed      -- systemd running, logind has a scheduled shutdown
+#        unarmed    -- systemd running, logind has scheduled nothing
+#        nosystemd  -- no /run/systemd/system, so nothing can confirm
 #   $4 "held" to create the hold marker, anything else for not held
 # Prints the script's own output; returns the script's exit status.
 run_deadline_script() {
-    local mins="$1" sd_exit="$2" sysctl_out="$3" held="$4"
+    local mins="$1" sd_exit="$2" sysd="$3" held="$4"
     local sandbox stubs script marker rc
     sandbox="$(mktemp -d)"
     stubs="$sandbox/bin"
@@ -156,15 +182,26 @@ run_deadline_script() {
     # Ruby interpolates the minutes on the host; the marker path is
     # redirected the same way so the hold branch is reachable without
     # writing to the real /run.
+    # /run is redirected wholesale: the hold marker AND logind's
+    # scheduled-shutdown record both live there, and a test may not
+    # write to the real one.
     sed -e "s|#{deadline_mins}|$mins|g" \
-        -e "s|/run/am-oracle-vm-held|$marker|g" "$script.raw" > "$script"
+        -e "s|/run/am-oracle-vm-held|$marker|g" \
+        -e "s|/run/systemd|$sandbox/run/systemd|g" "$script.raw" > "$script"
 
     if [ "$sd_exit" != NONE ]; then
     cat > "$stubs/shutdown" <<STUB
 #!/bin/sh
-# /bin/sh by ABSOLUTE path: this stub runs under a PATH holding only
-# the stub directory, so `env` would look up `bash` there and fail with
-# "No such file or directory". Neither stub needs bash.
+# /bin/sh by ABSOLUTE path, NOT a /usr/bin/env shebang: this stub runs
+# under a PATH holding only the stub directory, so env would look up
+# its interpreter there and fail. Neither stub needs bash.
+#
+# NO BACKTICKS ANYWHERE IN THIS HEREDOC. It is unquoted, because
+# $sandbox and $sd_exit below have to expand -- which means backticks
+# are command substitution too. A pair around a word in this comment
+# ran that word and spliced its output into the stub: the environment
+# landed in the middle of the file and the stub failed at "line 54"
+# with a PATH for a command name.
 # -c (cancel) always succeeds; the scheduling call is the one under test.
 case "\$1" in
   -c) exit 0 ;;
@@ -175,28 +212,45 @@ STUB
     chmod +x "$stubs/shutdown"
     fi
 
-    if [ "$sysctl_out" != NONE ]; then
-        cat > "$stubs/systemctl" <<STUB
-#!/bin/sh
-printf '%s\n' "$sysctl_out"
-STUB
-        chmod +x "$stubs/systemctl"
-    fi
+    # THE GUEST'S SYSTEMD STATE IS A FILESYSTEM FACT, not a command's
+    # output. logind writes /run/systemd/shutdown/scheduled when a
+    # shutdown is scheduled and removes it on cancel, and
+    # /run/systemd/system exists only where systemd is managing the
+    # guest -- so "no timer" and "nothing here can tell you" are
+    # distinguishable, which is exactly what the previous
+    # `systemctl show -p ScheduledShutdownUSec` could not do.
+    case "$sysd" in
+      armed)
+        mkdir -p "$sandbox/run/systemd/system" "$sandbox/run/systemd/shutdown"
+        printf 'USEC=1788700000000000\nMODE=poweroff\n' \
+          > "$sandbox/run/systemd/shutdown/scheduled"
+        ;;
+      unarmed)
+        mkdir -p "$sandbox/run/systemd/system"
+        ;;
+      nosystemd) ;;
+      *)
+        echo "HARNESS: unknown systemd state $sysd" >&2
+        rm -rf "$sandbox"
+        return 111
+        ;;
+    esac
 
     # THE STUB DIRECTORY IS THE WHOLE PATH, and that is the point.
     #
     # This was "$stubs:/usr/bin:/bin", which let the HOST decide whether
-    # `systemctl` exists -- so the "no systemctl to confirm" case tested
-    # the machine rather than the script. It passed on macOS and in a
-    # bare container, where systemctl is absent, and FAILED on GitHub's
-    # ubuntu runner, where /usr/bin/systemctl is real: the script found
-    # it, asked a systemd that has scheduled nothing, and correctly
-    # reported "no timer is armed" -- to a test expecting success.
+    # a given program exists -- so a case meaning "this guest has no
+    # such tool" tested the machine rather than the script. That is how
+    # the systemctl arm passed on macOS and in a bare container and
+    # FAILED on GitHub's ubuntu runner, where /usr/bin/systemctl is
+    # real. The confirmation no longer runs a program at all, but the
+    # narrowing stays: `shutdown` is still stubbed, and the "missing
+    # shutdown" case must mean missing everywhere.
     #
     # The extracted script needs no other program. `command` is a shell
     # builtin and the only externals it names are `shutdown` and
-    # `systemctl`, both stubbed here, so an empty PATH beyond $stubs
-    # makes absence mean absence on every host.
+    # `systemctl`, so an empty PATH beyond $stubs makes absence mean
+    # absence on every host.
     # bash is resolved BEFORE the PATH is narrowed and then invoked by
     # absolute path: `PATH=x bash ...` applies the new PATH to the
     # lookup of `bash` itself, which is `command not found`.
@@ -211,6 +265,24 @@ STUB
     PATH="$stubs" "$shell" "$script" </dev/null 2>&1
     rc=$?
     set -e
+
+    # CAPTURED BEFORE THE SANDBOX IS REMOVED, into a file that survives
+    # the subshell `expect_run`'s `$(...)` runs this function in.
+    #
+    # This was written and never read: `echo "$@" >> "$sandbox/
+    # shutdown.args"` inside the stub, with nothing in this file
+    # checking what landed there. A capture nobody asserts on is worse
+    # than no capture -- it looks like evidence that the scheduling
+    # call was validated end-to-end, when only Ruby's side of the
+    # interpolation was ever checked. `vm-reap-semantics.sh`'s
+    # `vagrant.log` in this same directory is the shape this should
+    # have been from the start: written, then read back through a
+    # named accessor and asserted against.
+    : > "$LAST_SHUTDOWN_ARGS_FILE"
+    if [ -f "$sandbox/shutdown.args" ]; then
+        cat "$sandbox/shutdown.args" > "$LAST_SHUTDOWN_ARGS_FILE"
+    fi
+
     rm -rf "$sandbox"
     return $rc
 }
@@ -252,34 +324,72 @@ expect_run() {
 # could not satisfy: it exited 0 and printed the success line.
 expect_run "a shutdown that cannot be scheduled fails loudly" \
     fail "FAILED to schedule" "powering off in 480 minutes" \
-    480 1 "Wed 2026-09-09 23:00:00 UTC" notheld
+    480 1 armed notheld
 
 # And `shutdown` missing altogether is the same class of failure.
 expect_run "a missing shutdown command fails rather than reporting success" \
     fail "" "powering off in 480 minutes" \
-    480 NONE "Wed 2026-09-09 23:00:00 UTC" notheld
+    480 NONE armed notheld
 
-# The success path still works, and now says the timer was confirmed.
+# The success path: logind has a record, so the timer is confirmed.
 expect_run "a scheduled shutdown reports the armed timer" \
     ok "powering off in 480 minutes" "" \
-    480 0 "Wed 2026-09-09 23:00:00 UTC" notheld
+    480 0 armed notheld
 
-# An accepted request is not an armed timer. systemd answering "n/a"
-# means nothing is scheduled, whatever shutdown's exit status said.
-expect_run "an accepted request with no armed timer is a failure" \
-    fail "no timer is armed" "powering off in 480 minutes" \
-    480 0 "n/a" notheld
+# THE CAPTURE, READ RATHER THAN LEFT UNCHECKED. The whole claim of "the
+# minutes are validated" was Ruby-side only until this: nothing
+# confirmed the validated value actually reached the shell call. `-h`
+# is the flag this provisioner exists to issue, and `+480` is `MINS`
+# spliced into the `"+${MINS}"` argument -- so this is the end-to-end
+# witness the Ruby-only regex check above cannot be.
+check_eq "the scheduling call carries -h and the requested minutes" \
+    "$(shutdown_args)" "-h +480"
 
-# Where the timer cannot be confirmed, say so rather than implying it
-# was. The operator should be able to tell the two apart.
-expect_run "an unconfirmable timer is reported as unconfirmed" \
-    ok "no systemctl to confirm" "" \
-    480 0 NONE notheld
+# AND A SECOND VALUE, BECAUSE ONE PROVES ONLY THAT SOMETHING WAS PASSED.
+#
+# Every other case in this file asks for 480 minutes, so a script that
+# had stopped interpolating `MINS` and hardcoded `+480` would satisfy
+# the check above exactly. What makes it a witness that the REQUESTED
+# minutes reach the call is a run that asks for a different number and
+# gets that number back. 37 is deliberately unlike the default and
+# unlike any other literal here.
+expect_run "a different deadline is accepted" \
+    ok "powering off in 37 minutes" "" \
+    37 0 armed notheld
+check_eq "and the scheduling call carries THAT number, not the usual one" \
+    "$(shutdown_args)" "-h +37"
+
+# THE THREE STATES THAT USED TO BE ONE. systemd is running, so
+# logind's record is authoritative and its absence is a real answer:
+# shutdown returned 0 and scheduled nothing.
+expect_run "an accepted request that logind did not record is a failure" \
+    fail "logind has scheduled nothing" "powering off in 480 minutes" \
+    480 0 unarmed notheld
+
+# Where nothing can confirm, say so rather than claiming the timer is
+# missing. The previous version aborted provisioning here, on a guest
+# that may well have had a perfectly good timer.
+expect_run "a guest with no systemd is reported as unconfirmed, not unarmed" \
+    ok "no systemd to confirm" "logind has scheduled nothing" \
+    480 0 nosystemd notheld
 
 # A held machine schedules nothing and still succeeds.
 expect_run "a held machine schedules no shutdown" \
     ok "no shutdown scheduled" "powering off in 480 minutes" \
-    480 0 "Wed 2026-09-09 23:00:00 UTC" held
+    480 0 armed held
+
+# AND "SCHEDULES NOTHING" IS CHECKED AT THE CALL, NOT ONLY IN THE
+# OUTPUT. The line above reads what the script SAID; this reads what it
+# DID. They are not the same claim, and the difference is the whole
+# reason this capture exists: a regression that armed a poweroff on a
+# machine somebody had deliberately held would still print the hold
+# message and pass every other assertion in this file.
+#
+# This is also what makes the two checks above mean something. A capture
+# asserted only where it is expected to be non-empty cannot tell a
+# working recorder from one that records the same thing every time.
+check_eq "and nothing was passed to shutdown at all" \
+    "$(shutdown_args)" ""
 
 # The specific construct that caused this, kept out by name.
 # Anchored to an indented CODE line. The unanchored version matched the
