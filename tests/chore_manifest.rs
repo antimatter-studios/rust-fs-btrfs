@@ -18,6 +18,32 @@
 //! noticed by the person who makes it, because their own chore is new
 //! enough.
 //!
+//! # This parses the file rather than scanning it
+//!
+//! The key check used to be `line.starts_with("timeout:")` over the
+//! file's text, and that is the shape it was returned for. Two
+//! ordinary spellings defeat it SILENTLY -- the guard stays green
+//! while the floor is wrong:
+//!
+//! ```text
+//! floor 0.9.0, keys left plain            EXIT=101   <- the control
+//! floor 0.9.0, "timeout:" / "on_timeout:" EXIT=0     <- DEFEAT
+//! floor 0.9.0, net: { timeout: 45m }      EXIT=0     <- DEFEAT
+//! ```
+//!
+//! A quoted key is the same key; a flow mapping puts it on a line that
+//! starts with something else. Parsed, neither is an edge case: the
+//! quoting is resolved before this file sees anything, and a mapping
+//! is a mapping wherever it is written.
+//!
+//! THE FLOOR LOOKUP WAS NOT THE SAME RISK, and lumping the two together
+//! would misdescribe both. It was the same raw-scan shape, but a quoted
+//! floor is simply not FOUND, `violations` then reports "declares no
+//! chore_min_version at all", and the test goes red. It failed closed.
+//! It is parsed here too, because the document is already parsed and
+//! two techniques in one file is how the next defect arrives -- not
+//! because it was dangerous.
+//!
 //! # What this guard does NOT do
 //!
 //! It is not a model of chore's schema and cannot be: nothing available
@@ -28,14 +54,19 @@
 //! of the shape. A guard that under-claims and says so is worth more
 //! than one that implies coverage it has not got.
 
+use saphyr::{LoadableYamlNode, Yaml};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 /// Keys whose presence requires a chore at least this new.
+///
+/// Names, not line prefixes. The parser hands back the key itself, so
+/// there is no colon to remember and no quoting to strip.
 const KEYS_REQUIRING: &[(&str, Version)] = &[
     // chore ab59c04, "Add timeout:/on_timeout:, the net for a task
     // that hangs", released in 0.10.0.
-    ("timeout:", (0, 10, 0)),
-    ("on_timeout:", (0, 10, 0)),
+    ("timeout", (0, 10, 0)),
+    ("on_timeout", (0, 10, 0)),
 ];
 
 type Version = (u64, u64, u64);
@@ -44,27 +75,42 @@ fn chores_yml() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("chores.yml")
 }
 
-/// A line with any trailing comment removed.
+/// The document, or a loud failure.
 ///
-/// A line that is ONLY a comment needs no case of its own: `#` stays
-/// glued to whatever follows it, so `# timeout: 45m` does not start
-/// with `timeout:` and `# chore_min_version: 0.9.0` does not start
-/// with `chore_min_version:`. An earlier draft rejected comment lines
-/// explicitly, and the mutation deleting that branch left all eight
-/// tests green -- which is what a REDUNDANT check looks like, as
-/// distinct from an unwitnessed one, so it is gone rather than
-/// propped up with a test written to justify it.
+/// A file this cannot parse is a FAILURE and never a pass: chore would
+/// not load it either, so "I could not read it" is a real answer about
+/// the manifest rather than a reason to stay quiet.
+fn document(text: &str) -> Yaml<'_> {
+    let documents = Yaml::load_from_str(text).unwrap_or_else(|e| {
+        panic!(
+            "chores.yml is not valid YAML: {e}. This guard reads the manifest rather \
+             than scanning its text, so a file it cannot parse is a failure."
+        )
+    });
+    documents
+        .into_iter()
+        .next()
+        .expect("chores.yml must contain a document")
+}
+
+/// Every mapping key anywhere in the document.
 ///
-/// The trailing case is the one that bites: `chore_min_version: 0.6.0
-/// # bump when adopting a newer key` parses as the version `0.6.0 #
-/// bump when adopting a newer key` without this, which is no version
-/// at all, and a floor that fails to parse is a floor that is not
-/// checked.
-fn without_comment(line: &str) -> &str {
-    let t = line.trim();
-    match t.split_once(" #") {
-        Some((before, _)) => before.trim(),
-        None => t,
+/// Recursive, because the keys this asks about are nested inside tasks
+/// rather than at the top level, and a `timeout:` is the same adoption
+/// wherever it appears. Sequences are walked too: a task's `cmds:` is a
+/// list of mappings.
+fn all_keys(node: &Yaml, out: &mut BTreeSet<String>) {
+    if let Some(mapping) = node.as_mapping() {
+        for (key, value) in mapping.iter() {
+            if let Some(name) = key.as_str() {
+                out.insert(name.to_string());
+            }
+            all_keys(value, out);
+        }
+    } else if let Some(sequence) = node.as_sequence() {
+        for item in sequence {
+            all_keys(item, out);
+        }
     }
 }
 
@@ -80,26 +126,34 @@ fn parse_version(raw: &str) -> Option<Version> {
     Some((major, minor, patch))
 }
 
-fn declared_floor(text: &str) -> Option<Version> {
-    text.lines()
-        .map(without_comment)
-        .find_map(|l| l.strip_prefix("chore_min_version:"))
+/// The declared floor, or `None` if there is not one this can read.
+///
+/// `None` is the safe direction and is reported as a violation: a
+/// manifest whose floor cannot be read is a manifest with no effective
+/// floor. That is also why the previous raw-scan version of this was
+/// not the dangerous half -- a quoted floor was simply not found, and
+/// not-found is red.
+fn declared_floor(doc: &Yaml) -> Option<Version> {
+    doc.as_mapping()?
+        .iter()
+        .find(|(key, _)| key.as_str() == Some("chore_min_version"))
+        .and_then(|(_, value)| value.as_str())
         .and_then(parse_version)
 }
 
 /// Every key present in `text` that the declared floor does not cover,
 /// as a sentence naming the key, what it needs and what is declared.
 fn violations(text: &str) -> Vec<String> {
-    let Some(declared) = declared_floor(text) else {
-        return vec!["chores.yml declares no chore_min_version at all".to_string()];
+    let doc = document(text);
+    let Some(declared) = declared_floor(&doc) else {
+        return vec!["chores.yml declares no readable chore_min_version at all".to_string()];
     };
+    let mut keys = BTreeSet::new();
+    all_keys(&doc, &mut keys);
+
     let mut out = Vec::new();
     for (key, required) in KEYS_REQUIRING {
-        let used = text
-            .lines()
-            .map(without_comment)
-            .any(|l| l.starts_with(key));
-        if used && declared < *required {
+        if keys.contains(*key) && declared < *required {
             out.push(format!(
                 "`{key}` needs chore {}.{}.{}, chore_min_version declares {}.{}.{}",
                 required.0, required.1, required.2, declared.0, declared.1, declared.2
@@ -116,7 +170,7 @@ fn the_declared_floor_covers_the_keys_this_repository_uses() {
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     assert!(
-        declared_floor(&text).is_some(),
+        declared_floor(&document(&text)).is_some(),
         "control: chores.yml must declare a chore_min_version, or every assertion \
          below passes for the wrong reason"
     );
@@ -129,7 +183,7 @@ fn the_declared_floor_covers_the_keys_this_repository_uses() {
 }
 
 mod parser {
-    use super::{declared_floor, violations};
+    use super::{declared_floor, document, violations};
 
     const OLD_FLOOR: &str = "\
 version: \"3\"
@@ -157,6 +211,98 @@ tasks:
         assert!(
             found[0].contains("0.6.0"),
             "and the one declared, or it cannot be acted on"
+        );
+    }
+
+    /// LEGAL INPUT THE SCAN USED TO REJECT, which is the other half of
+    /// the witness and the half that is easy to skip. The old lookup
+    /// was `line.strip_prefix("chore_min_version:")`, so a QUOTED KEY
+    /// -- `"chore_min_version": 0.10.0`, which chore reads identically
+    /// -- was not found at all, and `violations` then reported "no
+    /// floor declared". Red, so it failed closed rather than letting
+    /// anything through; but red on a correct manifest is still a
+    /// guard refusing something legal, and only the parser makes it
+    /// pass.
+    #[test]
+    fn a_quoted_floor_key_is_still_the_floor() {
+        let yaml = OLD_FLOOR
+            .replace("chore_min_version: 0.6.0", "\"chore_min_version\": 0.10.0")
+            .replace("      - cmd: 'cargo test'\n", "    timeout: 45m\n");
+        assert_eq!(
+            declared_floor(&document(&yaml)),
+            Some((0, 10, 0)),
+            "a quoted key is the same key"
+        );
+        assert!(
+            violations(&yaml).is_empty(),
+            "0.10.0 covers `timeout`, and the manifest is correct"
+        );
+    }
+
+    /// THE FIRST OF THE TWO SPELLINGS THIS WAS RETURNED FOR. A quoted
+    /// key is the same key -- chore reads it identically -- and
+    /// `line.starts_with("timeout:")` matched neither `"timeout":` nor
+    /// `'timeout':`. Measured before the conversion: floor 0.9.0 with
+    /// the keys quoted gave EXIT=0, 8 passed, with the floor wrong.
+    #[test]
+    fn a_quoted_key_is_the_same_key() {
+        for spelling in ["\"timeout\"", "'timeout'"] {
+            let yaml = OLD_FLOOR.replace(
+                "      - cmd: 'cargo test'\n",
+                &format!("    {spelling}: 45m\n"),
+            );
+            let found = violations(&yaml);
+            assert_eq!(
+                found.len(),
+                1,
+                "{spelling} is the key `timeout`, and the floor does not cover it: \
+                 {found:?}"
+            );
+        }
+    }
+
+    /// THE SECOND. A flow mapping puts the key on a line that starts
+    /// with something else entirely, so a line-prefix scan never sees
+    /// it. Measured before the conversion: floor 0.9.0 with
+    /// `net: { timeout: 45m }` gave EXIT=0, 8 passed.
+    #[test]
+    fn a_flow_mapping_hides_nothing() {
+        let yaml = OLD_FLOOR.replace(
+            "      - cmd: 'cargo test'\n",
+            "    net: { timeout: 45m, on_timeout: [] }\n",
+        );
+        let found = violations(&yaml);
+        assert_eq!(
+            found.len(),
+            2,
+            "both keys are declared inside the flow mapping: {found:?}"
+        );
+    }
+
+    /// A key nested deeper than the task is still an adoption of that
+    /// key. The walk is recursive for this reason, and a scan that only
+    /// looked at one indent would be a third spelling to miss.
+    #[test]
+    fn a_key_nested_deeper_is_still_used() {
+        let yaml = OLD_FLOOR.replace(
+            "      - cmd: 'cargo test'\n",
+            "      - cmd: 'cargo test'\n        on_timeout:\n          - cmd: 'echo late'\n",
+        );
+        assert_eq!(
+            violations(&yaml).len(),
+            1,
+            "on_timeout is used, wherever it sits"
+        );
+    }
+
+    /// A key that merely CONTAINS the name is a different key, which a
+    /// prefix scan could not tell apart either.
+    #[test]
+    fn a_similarly_named_key_is_a_different_key() {
+        let yaml = OLD_FLOOR.replace("      - cmd: 'cargo test'\n", "    timeout_secs: 45\n");
+        assert!(
+            violations(&yaml).is_empty(),
+            "`timeout_secs` is not `timeout`, and this table says nothing about it"
         );
     }
 
@@ -199,7 +345,7 @@ tasks:
     fn a_quoted_floor_is_the_same_floor() {
         let yaml = OLD_FLOOR.replace("chore_min_version: 0.6.0", "chore_min_version: \"0.6.0\"");
         assert_eq!(
-            declared_floor(&yaml),
+            declared_floor(&document(&yaml)),
             Some((0, 6, 0)),
             "a quoted version string is the same version -- the spelling that has \
              defeated three other comparisons in this repository"
@@ -212,7 +358,7 @@ tasks:
             "chore_min_version: 0.6.0",
             "chore_min_version: 0.6.0 # bump when adopting a newer key",
         );
-        assert_eq!(declared_floor(&yaml), Some((0, 6, 0)));
+        assert_eq!(declared_floor(&document(&yaml)), Some((0, 6, 0)));
     }
 
     #[test]
