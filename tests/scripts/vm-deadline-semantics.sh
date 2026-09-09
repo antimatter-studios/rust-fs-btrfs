@@ -248,9 +248,8 @@ STUB
     # shutdown" case must mean missing everywhere.
     #
     # The extracted script needs no other program. `command` is a shell
-    # builtin and the only externals it names are `shutdown` and
-    # `systemctl`, so an empty PATH beyond $stubs makes absence mean
-    # absence on every host.
+    # builtin and the only external it names is `shutdown`, so an empty
+    # PATH beyond $stubs makes absence mean absence on every host.
     # bash is resolved BEFORE the PATH is narrowed and then invoked by
     # absolute path: `PATH=x bash ...` applies the new PATH to the
     # lookup of `bash` itself, which is `command not found`.
