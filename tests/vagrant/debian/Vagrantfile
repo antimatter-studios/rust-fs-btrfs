@@ -239,22 +239,44 @@ Vagrant.configure("2") do |config|
       echo "deadline: FAILED to schedule poweroff in ${MINS} minutes" >&2
       exit 1
     fi
-    # An accepted request and an armed timer are not the same claim, so
     # where the guest can be asked what it has scheduled, ask it.
-    if command -v systemctl >/dev/null 2>&1; then
-      scheduled="$(systemctl show -p ScheduledShutdownUSec --value 2>/dev/null || true)"
-      case "${scheduled}" in
-        ""|"n/a"|0)
-          echo "deadline: shutdown accepted the request but no timer is armed" >&2
-          exit 1
-          ;;
-      esac
-      echo "deadline: powering off in ${MINS} minutes unless held (timer armed: ${scheduled})"
+    # CONFIRMED FROM LOGIND'S OWN RECORD, and only where that record
+    # is meaningful.
+    #
+    # This asked `systemctl show -p ScheduledShutdownUSec`, which was
+    # wrong twice over. Scheduled-shutdown state belongs to logind, not
+    # to the systemd manager, so the property does not exist -- and
+    # `systemctl show` EXITS 0 AND PRINTS NOTHING for a property it
+    # does not know. That collapsed three different states onto one
+    # empty string: no timer armed, property unsupported, and systemctl
+    # failing outright (which `2>/dev/null || true` made silent). All
+    # three then printed "no timer is armed", a claim the script had
+    # not established, and aborted provisioning on a false premise.
+    #
+    # An empty result read as a negative answer, with the stderr that
+    # would have distinguished them thrown away. This is the same
+    # defect as the one the provisioner itself was fixed for, pointing
+    # the other way: that one could report armed while unarmed, this
+    # reported unarmed while armed.
+    #
+    # logind writes /run/systemd/shutdown/scheduled when a shutdown is
+    # scheduled and removes it on cancel, so its absence is a real
+    # answer -- but ONLY on a guest systemd is running, which
+    # /run/systemd/system tells us. Where it is not, the script says it
+    # could not confirm rather than claiming the timer is missing.
+    if [ -d /run/systemd/system ]; then
+      if [ -r /run/systemd/shutdown/scheduled ]; then
+        echo "deadline: powering off in ${MINS} minutes unless held (timer armed)"
+      else
+        echo "deadline: shutdown returned 0 but logind has scheduled nothing" >&2
+        exit 1
+      fi
     else
       # Said differently on purpose: this machine reported a weaker
       # fact than the branch above, and the operator should be able to
-      # see which one they got.
-      echo "deadline: powering off in ${MINS} minutes unless held (request accepted, no systemctl to confirm)"
+      # see which one they got rather than read the stronger claim into
+      # the weaker case.
+      echo "deadline: powering off in ${MINS} minutes unless held (request accepted, no systemd to confirm)"
     fi
   SHELL
 end
