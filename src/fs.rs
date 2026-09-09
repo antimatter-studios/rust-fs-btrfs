@@ -710,7 +710,11 @@ impl Filesystem {
             let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
                 Self::read_logical(&device, &boot, logical, buf)
             };
-            let tree = Tree::from_superblock(&sb, &read);
+            let mirrors = |logical: u64| -> Result<usize> { boot.mirrors_at(logical) };
+            let read_mirror = |logical: u64, mirror: usize, buf: &mut [u8]| -> Result<()> {
+                Self::read_logical_on_mirror(&device, &boot, u64::MAX, mirror, logical, buf)
+            };
+            let tree = Tree::from_superblock(&sb, &read).with_redundancy(&mirrors, &read_mirror);
             let mut found = Vec::new();
             tree.for_each(sb.chunk_root, &mut |key: &DiskKey, data: &[u8]| {
                 if let Ok(chunk) = Chunk::parse(key.offset, data) {
@@ -738,7 +742,11 @@ impl Filesystem {
             let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
                 Self::read_logical(&device, &map, logical, buf)
             };
-            let tree = Tree::from_superblock(&sb, &read);
+            let mirrors = |logical: u64| -> Result<usize> { map.mirrors_at(logical) };
+            let read_mirror = |logical: u64, mirror: usize, buf: &mut [u8]| -> Result<()> {
+                Self::read_logical_on_mirror(&device, &map, u64::MAX, mirror, logical, buf)
+            };
+            let tree = Tree::from_superblock(&sb, &read).with_redundancy(&mirrors, &read_mirror);
             fs_and_csum_tree_roots(&tree, sb.root)?
         };
 
@@ -808,6 +816,17 @@ impl Filesystem {
             read: Box::new(move |logical, buf| {
                 Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
             }),
+            mirrors: Box::new(move |logical| self.map.mirrors_at(logical)),
+            read_mirror: Box::new(move |logical, mirror, buf| {
+                Self::read_logical_pool_mirror(
+                    &self.device,
+                    &self.devices,
+                    &self.map,
+                    mirror,
+                    logical,
+                    buf,
+                )
+            }),
         }
     }
 
@@ -818,12 +837,28 @@ impl Filesystem {
         logical: u64,
         buf: &mut [u8],
     ) -> Result<()> {
+        Self::read_logical_pool_mirror(device, devices, map, 0, logical, buf)
+    }
+
+    /// [`Filesystem::read_logical_pool`], from copy `mirror`.
+    ///
+    /// On a RAID1 pool the second copy is on a different device, which
+    /// is the case this exists for: the mapping names its own device,
+    /// so following the mirror follows the disk with it.
+    pub(crate) fn read_logical_pool_mirror(
+        device: &Arc<dyn BlockRead>,
+        devices: &BTreeMap<u64, Arc<dyn BlockRead>>,
+        map: &ChunkMap,
+        mirror: usize,
+        logical: u64,
+        buf: &mut [u8],
+    ) -> Result<()> {
         if devices.is_empty() {
-            return Self::read_logical(device, map, logical, buf);
+            return Self::read_logical_on_mirror(device, map, u64::MAX, mirror, logical, buf);
         }
         let mut done = 0usize;
         while done < buf.len() {
-            let m = map.map(logical + done as u64)?;
+            let m = map.map_mirror(logical + done as u64, mirror)?;
             let n = (m.len as usize).min(buf.len() - done);
             if n == 0 {
                 return Err(Error::UnmappedLogical(logical + done as u64));
@@ -860,9 +895,26 @@ impl Filesystem {
         logical: u64,
         buf: &mut [u8],
     ) -> Result<()> {
+        Self::read_logical_on_mirror(device, map, devid, 0, logical, buf)
+    }
+
+    /// [`Filesystem::read_logical_on`], from copy `mirror`.
+    ///
+    /// Mirror 0 is the copy every other read path uses. The rest are
+    /// the copies DUP and RAID1 keep, and the reason the read path can
+    /// survive one damaged block: see [`crate::btree::Tree::read_block`],
+    /// which is where a failed verification turns into a second attempt.
+    pub(crate) fn read_logical_on_mirror(
+        device: &Arc<dyn BlockRead>,
+        map: &ChunkMap,
+        devid: u64,
+        mirror: usize,
+        logical: u64,
+        buf: &mut [u8],
+    ) -> Result<()> {
         let mut done = 0usize;
         while done < buf.len() {
-            let m = map.map(logical + done as u64)?;
+            let m = map.map_mirror(logical + done as u64, mirror)?;
             if devid != u64::MAX && m.devid != devid {
                 return Err(Error::UnsupportedFeature(format!(
                     "the range at {} lives on device {} and this filesystem was opened \
@@ -916,7 +968,12 @@ impl Filesystem {
         let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
             Self::read_logical(&device, &map, logical, buf)
         };
-        let tree = Tree::new(TreeGeometry::from_superblock(&self.sb), &read);
+        let mirrors = |logical: u64| -> Result<usize> { map.mirrors_at(logical) };
+        let read_mirror = |logical: u64, mirror: usize, buf: &mut [u8]| -> Result<()> {
+            Self::read_logical_on_mirror(&device, &map, u64::MAX, mirror, logical, buf)
+        };
+        let tree = Tree::new(TreeGeometry::from_superblock(&self.sb), &read)
+            .with_redundancy(&mirrors, &read_mirror);
 
         let mut items = BTreeMap::new();
         tree.for_each(self.fs_tree_root, &mut |key: &DiskKey, data: &[u8]| {
@@ -1559,6 +1616,8 @@ impl Filesystem {
 pub(crate) struct PoolReader<'a> {
     geom: crate::btree::TreeGeometry,
     read: OwnedReadBlock<'a>,
+    mirrors: OwnedMirrorCount<'a>,
+    read_mirror: OwnedReadMirror<'a>,
 }
 
 /// An owned block reader, the counterpart to
@@ -1568,11 +1627,17 @@ pub(crate) struct PoolReader<'a> {
 /// something is [`PoolReader`].
 type OwnedReadBlock<'a> = Box<dyn Fn(u64, &mut [u8]) -> Result<()> + 'a>;
 
+/// The owned counterparts to [`crate::btree::MirrorCount`] and
+/// [`crate::btree::ReadMirror`], for the same reason.
+type OwnedMirrorCount<'a> = Box<dyn Fn(u64) -> Result<usize> + 'a>;
+type OwnedReadMirror<'a> = Box<dyn Fn(u64, usize, &mut [u8]) -> Result<()> + 'a>;
+
 impl PoolReader<'_> {
     /// A walker over any tree in this pool. The root address is a
     /// per-call argument, so one reader serves every tree.
     pub(crate) fn tree(&self) -> crate::btree::Tree<'_> {
         crate::btree::Tree::new(self.geom, &*self.read)
+            .with_redundancy(&*self.mirrors, &*self.read_mirror)
     }
 }
 
