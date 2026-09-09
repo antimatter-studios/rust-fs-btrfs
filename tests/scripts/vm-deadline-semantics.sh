@@ -42,6 +42,13 @@ fails=0
 LAST_SHUTDOWN_ARGS_FILE="$(mktemp)"
 trap 'rm -f "$LAST_SHUTDOWN_ARGS_FILE"' EXIT
 
+# A NAMED ACCESSOR, for the same reason `vm-reap-semantics.sh` gives its
+# `vagrant.log` a `halted()`: a capture is only evidence if reading it
+# is as easy as writing it. `run_deadline_script` truncates this file on
+# every call, so what it holds always belongs to the run that just
+# finished and to no other.
+shutdown_args() { cat "$LAST_SHUTDOWN_ARGS_FILE"; }
+
 ok()   { printf 'ok    %s\n' "$1"; }
 bad()  { printf 'FAIL  %s\n' "$1"; fails=$((fails + 1)); }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
@@ -336,7 +343,21 @@ expect_run "a scheduled shutdown reports the armed timer" \
 # spliced into the `"+${MINS}"` argument -- so this is the end-to-end
 # witness the Ruby-only regex check above cannot be.
 check_eq "the scheduling call carries -h and the requested minutes" \
-    "$(cat "$LAST_SHUTDOWN_ARGS_FILE")" "-h +480"
+    "$(shutdown_args)" "-h +480"
+
+# AND A SECOND VALUE, BECAUSE ONE PROVES ONLY THAT SOMETHING WAS PASSED.
+#
+# Every other case in this file asks for 480 minutes, so a script that
+# had stopped interpolating `MINS` and hardcoded `+480` would satisfy
+# the check above exactly. What makes it a witness that the REQUESTED
+# minutes reach the call is a run that asks for a different number and
+# gets that number back. 37 is deliberately unlike the default and
+# unlike any other literal here.
+expect_run "a different deadline is accepted" \
+    ok "powering off in 37 minutes" "" \
+    37 0 armed notheld
+check_eq "and the scheduling call carries THAT number, not the usual one" \
+    "$(shutdown_args)" "-h +37"
 
 # THE THREE STATES THAT USED TO BE ONE. systemd is running, so
 # logind's record is authoritative and its absence is a real answer:
@@ -356,6 +377,19 @@ expect_run "a guest with no systemd is reported as unconfirmed, not unarmed" \
 expect_run "a held machine schedules no shutdown" \
     ok "no shutdown scheduled" "powering off in 480 minutes" \
     480 0 armed held
+
+# AND "SCHEDULES NOTHING" IS CHECKED AT THE CALL, NOT ONLY IN THE
+# OUTPUT. The line above reads what the script SAID; this reads what it
+# DID. They are not the same claim, and the difference is the whole
+# reason this capture exists: a regression that armed a poweroff on a
+# machine somebody had deliberately held would still print the hold
+# message and pass every other assertion in this file.
+#
+# This is also what makes the two checks above mean something. A capture
+# asserted only where it is expected to be non-empty cannot tell a
+# working recorder from one that records the same thing every time.
+check_eq "and nothing was passed to shutdown at all" \
+    "$(shutdown_args)" ""
 
 # The specific construct that caused this, kept out by name.
 # Anchored to an indented CODE line. The unanchored version matched the
