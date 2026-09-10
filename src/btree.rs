@@ -783,11 +783,30 @@ impl<'a> Tree<'a> {
     /// that reads without an I/O error but does not checksum is not a
     /// copy, which is the whole reason a retry can be trusted to have
     /// improved matters.
+    ///
+    /// # A COPY THAT CANNOT BE READ IS A COPY THAT FAILED
+    ///
+    /// The primary read was a `?`, so it returned before `redundancy`
+    /// was consulted at all: the retry ran only when copy 0 was READ
+    /// successfully and then failed to parse. An unreadable sector
+    /// under copy 0 -- which is the ordinary way a disk goes bad, and
+    /// the case in this function's own title -- still made a DUP or
+    /// RAID1 volume unreadable. Inside the loop below the same error
+    /// has always been a `continue`; the two halves disagreed about
+    /// whether an I/O error is a reason to try the other copy.
+    ///
+    /// The buffer is deliberately NOT parsed when the read fails.
+    /// `parse` on a partly-written or zeroed buffer reports a checksum
+    /// mismatch, which would replace the real I/O error with a
+    /// description of the wreckage -- and it is copy 0's error that
+    /// this function promises to report.
     pub fn read_block(&self, logical: u64) -> Result<TreeBlock> {
         let mut buf = vec![0u8; self.geom.nodesize as usize];
-        (self.read)(logical, &mut buf)?;
-        let first = match TreeBlock::parse(buf, logical, &self.geom) {
-            Ok(block) => return Ok(block),
+        let first = match (self.read)(logical, &mut buf) {
+            Ok(()) => match TreeBlock::parse(buf, logical, &self.geom) {
+                Ok(block) => return Ok(block),
+                Err(e) => e,
+            },
             Err(e) => e,
         };
         let Some((mirrors, read_mirror)) = self.redundancy else {

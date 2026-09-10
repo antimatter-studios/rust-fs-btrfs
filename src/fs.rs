@@ -707,8 +707,15 @@ impl Filesystem {
         // Step 3: walk the chunk tree through it and fold in every chunk.
         let mut map = boot.clone();
         {
+            // POOL-AWARE ON THE PRIMARY READ TOO. This was
+            // `read_logical`, which reads `device` -- the lowest devid
+            // -- at whatever physical offset the mapping names, ignoring
+            // the devid it names. The mirror read below was fixed for
+            // exactly that and the primary was left behind, so the two
+            // halves of one fallback disagreed about which disk a copy
+            // is on.
             let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-                Self::read_logical(&device, &boot, logical, buf)
+                Self::read_logical_pool(&device, &devices, &boot, logical, buf)
             };
             let mirrors = |logical: u64| -> Result<usize> { boot.mirrors_at(logical) };
             // POOL-AWARE, BECAUSE A RAID1 COPY IS ON ANOTHER DISK. The
@@ -747,8 +754,9 @@ impl Filesystem {
         // Step 4: the root tree names the fs tree, and the csum tree.
         // See `fs_and_csum_tree_roots` for why this is not `.ok()`.
         let (fs_tree_root, csum_tree_root) = {
+            // Pool-aware on both halves; see the bootstrap walk above.
             let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-                Self::read_logical(&device, &map, logical, buf)
+                Self::read_logical_pool(&device, &devices, &map, logical, buf)
             };
             let mirrors = |logical: u64| -> Result<usize> { map.mirrors_at(logical) };
             let read_mirror = |logical: u64, mirror: usize, buf: &mut [u8]| -> Result<()> {
@@ -770,16 +778,6 @@ impl Filesystem {
         };
         fs.load_fs_tree()?;
         Ok(fs)
-    }
-
-    /// Read `buf.len()` bytes at a logical address through `map`.
-    pub(crate) fn read_logical(
-        device: &Arc<dyn BlockRead>,
-        map: &ChunkMap,
-        logical: u64,
-        buf: &mut [u8],
-    ) -> Result<()> {
-        Self::read_logical_on(device, map, u64::MAX, logical, buf)
     }
 
     /// Read a logical range from whichever device of a pool holds it.
@@ -896,17 +894,21 @@ impl Filesystem {
     ///
     /// `u64::MAX` means "do not check", used where the caller has
     /// already established there is only one device.
-    pub(crate) fn read_logical_on(
-        device: &Arc<dyn BlockRead>,
-        map: &ChunkMap,
-        devid: u64,
-        logical: u64,
-        buf: &mut [u8],
-    ) -> Result<()> {
-        Self::read_logical_on_mirror(device, map, devid, 0, logical, buf)
-    }
-
-    /// [`Filesystem::read_logical_on`], from copy `mirror`.
+    ///
+    /// # THE TWO CONVENIENCE WRAPPERS OVER THIS ARE GONE
+    ///
+    /// `read_logical` and `read_logical_on` used to wrap this with
+    /// `devid = u64::MAX` and `mirror = 0`, and three sites in the
+    /// mount path picked them for a POOL -- reading the right offset on
+    /// the lowest devid whatever devid the mapping named. Changing the
+    /// three call sites would have left the wrappers there for the
+    /// fourth, so they are deleted instead: on a pool the only
+    /// spellings available now are the `_pool` pair, which resolve the
+    /// devid. Anything that genuinely has one device passes that
+    /// device's own devid here and gets an error rather than the wrong
+    /// bytes.
+    ///
+    /// From copy `mirror`.
     ///
     /// Mirror 0 is the copy every other read path uses. The rest are
     /// the copies DUP and RAID1 keep, and the reason the read path can
@@ -972,13 +974,20 @@ impl Filesystem {
 
     fn load_fs_tree(&mut self) -> Result<()> {
         let device = self.device.clone();
+        let devices = self.devices.clone();
         let map = self.map.clone();
+        // THE SAME DEFECT A THIRD TIME, and fixed here for consistency
+        // rather than because a test reaches it: both halves were the
+        // single-device form, so a POOL's fs tree was read entirely off
+        // the lowest devid. Leaving one of the three sites disagreeing
+        // with the other two is how the first two came to disagree with
+        // each other.
         let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical(&device, &map, logical, buf)
+            Self::read_logical_pool(&device, &devices, &map, logical, buf)
         };
         let mirrors = |logical: u64| -> Result<usize> { map.mirrors_at(logical) };
         let read_mirror = |logical: u64, mirror: usize, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical_on_mirror(&device, &map, u64::MAX, mirror, logical, buf)
+            Self::read_logical_pool_mirror(&device, &devices, &map, mirror, logical, buf)
         };
         // NOT WITNESSED, AND SAYING SO HERE RATHER THAN ONLY ON THE PR.
         // tests/dup_mirror_fallback.rs covers the two opt-ins a MOUNT
@@ -2128,5 +2137,140 @@ mod fs_and_csum_tree_roots_tests {
     #[test]
     fn the_fixture_leaf_has_room_for_the_root_item() {
         assert!(NODESIZE as usize > 2 * (root_item::BYTENR + 8) + 128);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chunk::{block_group, Chunk, Stripe};
+
+    /// A device that answers every read with one byte value, so which
+    /// device a read landed on is visible in the bytes it returned.
+    struct Marked(u8, u64);
+
+    impl BlockRead for Marked {
+        fn read_at(&self, _offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+            buf.fill(self.0);
+            Ok(())
+        }
+        fn size_bytes(&self) -> u64 {
+            self.1
+        }
+    }
+
+    /// A two-device RAID1 chunk whose FIRST copy is on devid 2 — the
+    /// arrangement the shipped pool fixture does not have.
+    fn raid1_stripe0_on_devid2() -> ChunkMap {
+        let mut map = ChunkMap::new();
+        map.insert(Chunk {
+            logical: 0x100000,
+            length: 0x100000,
+            owner: 2,
+            stripe_len: 0x10000,
+            chunk_type: block_group::METADATA | block_group::RAID1,
+            io_align: 4096,
+            io_width: 4096,
+            sector_size: 4096,
+            num_stripes: 2,
+            sub_stripes: 0,
+            stripes: vec![
+                Stripe {
+                    devid: 2,
+                    offset: 0x200000,
+                    dev_uuid: [0; 16],
+                },
+                Stripe {
+                    devid: 1,
+                    offset: 0x300000,
+                    dev_uuid: [0; 16],
+                },
+            ],
+        })
+        .expect("a two-stripe RAID1 chunk is well-formed");
+        map
+    }
+
+    /// THE SEMANTIC THE MOUNT PATH'S PRIMARY READ DEPENDS ON, WITNESSED
+    /// WITHOUT A FIXTURE.
+    ///
+    /// `read_logical` reads whichever handle it was given at the
+    /// physical offset the mapping names, IGNORING the devid the
+    /// mapping names. On a pool that is a read of the right offset on
+    /// the wrong disk, and it returns wrong bytes rather than failing —
+    /// the one outcome a caller cannot detect. `read_logical_pool`
+    /// resolves the devid.
+    ///
+    /// # WHY THIS IS A UNIT TEST AND NOT A FIXTURE TEST
+    ///
+    /// `.vm-share/btrfs-pool-{a,b}.img` cannot show the difference.
+    /// Measured on it: every chunk — system, metadata and data — puts
+    /// stripe 0 on devid 1, which is also the handle `mount_pool` picks
+    /// (`by_id.values().next()`, so the lowest devid). So on that
+    /// fixture the two functions agree for every address, and reverting
+    /// any of the three call sites to `read_logical` leaves
+    /// `tests/dup_mirror_fallback.rs` green — measured, three arms, all
+    /// `EXIT=0`, 7 passed.
+    ///
+    /// That is why this test exists at this level: it holds the
+    /// difference the call sites rely on.
+    ///
+    /// # WHAT WITNESSES THE CALL SITES IS THE COMPILER
+    ///
+    /// No test here can, on the shipped fixture. So the two wrappers
+    /// that made the wrong choice available -- `read_logical` and
+    /// `read_logical_on` -- are deleted rather than left unused, and
+    /// reverting any of the three mount-path sites to one of them is a
+    /// COMPILE ERROR rather than a green suite. That is the control,
+    /// and it is a stronger one than a failing assertion.
+    ///
+    /// Still open, and not this job: a second pool fixture whose stripe
+    /// 0 is on the higher devid -- `mkfs.btrfs` produces one if the
+    /// devices are given in the other order -- would let
+    /// `tests/dup_mirror_fallback.rs` witness the routing end to end
+    /// through `mount_pool`. That is a change to
+    /// `scripts/vm-build-pool-fixtures.sh`.
+    #[test]
+    fn the_primary_read_of_a_pool_follows_the_devid_not_only_the_offset() {
+        let map = raid1_stripe0_on_devid2();
+        let logical = 0x100000;
+
+        // Stripe 0 really is on devid 2, or this test is measuring the
+        // arrangement it was written to avoid.
+        let m0 = map.map_mirror(logical, 0).expect("mirror 0");
+        let m1 = map.map_mirror(logical, 1).expect("mirror 1");
+        assert_eq!(m0.devid, 2, "stripe 0 must be on devid 2 for this test");
+        assert_eq!(m1.devid, 1, "stripe 1 must be on devid 1 for this test");
+
+        let dev1: Arc<dyn BlockRead> = Arc::new(Marked(0x11, 1 << 30));
+        let dev2: Arc<dyn BlockRead> = Arc::new(Marked(0x22, 1 << 30));
+        let devices: BTreeMap<u64, Arc<dyn BlockRead>> =
+            [(1, dev1.clone()), (2, dev2.clone())].into_iter().collect();
+
+        // `mount_pool` hands the lowest devid to `device`, so that is
+        // what the single-device form would read.
+        let device = dev1.clone();
+
+        let mut buf = [0u8; 8];
+        Filesystem::read_logical_pool(&device, &devices, &map, logical, &mut buf)
+            .expect("the pool read must succeed");
+        assert_eq!(
+            buf, [0x22; 8],
+            "copy 0 lives on devid 2, so the pool read must return devid 2's bytes"
+        );
+
+        // What the deleted `read_logical` did, spelled against the
+        // primitive that survives: mirror 0, devid unchecked. Written
+        // this way so the contrast keeps its meaning now that the
+        // wrapper it used to name is gone.
+        let mut buf = [0u8; 8];
+        Filesystem::read_logical_on_mirror(&device, &map, u64::MAX, 0, logical, &mut buf)
+            .expect("the devid-unchecked read succeeds -- that is the problem");
+        assert_eq!(
+            buf, [0x11; 8],
+            "the single-device form returned devid 1's bytes for a copy that is on \
+             devid 2, and reported success: wrong data rather than an error, which is \
+             why the mount path must not use it on a pool"
+        );
     }
 }

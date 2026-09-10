@@ -5,10 +5,31 @@
 //! `Tree::read_block`'s fallback is witnessed three ways in the unit
 //! tests — the retry, which error is reported when no copy verifies, and
 //! that a good first copy is not read twice. None of them reaches
-//! `Filesystem`. Removing all four production opt-ins together
-//! (`fs.rs:717`, `:749`, `:976`, `:1640`) — that is, the driver never
-//! asking for a second copy at all, which IS the filed defect — leaves
-//! the whole suite green at **416 passed, 0 failed**.
+//! `Filesystem`. Before this file existed, removing all four production
+//! opt-ins together — that is, the driver never asking for a second
+//! copy at all, which IS the filed defect — left the whole suite green
+//! at **416 passed, 0 failed**, which is a figure from that tree and
+//! is quoted as history rather than as a current measurement. With this
+//! file present the same mutation is EXIT=101 with named failures here.
+//!
+//! THE OPT-INS ARE NAMED BY FUNCTION AS WELL AS BY LINE, because the
+//! numbers in the first version of this paragraph were already stale by
+//! the time it was reviewed and a stale pointer sends the next reader
+//! to the wrong site:
+//!
+//! Each removed on its own, re-measured on THIS tree — the earlier
+//! figures described a different one:
+//!
+//! | opt-in | at | removed alone |
+//! |---|---|---|
+//! | `open_pool`, chunk-tree bootstrap walk | `fs.rs:732` | EXIT=101, 4 named failures |
+//! | `open_pool`, root-tree walk | `fs.rs:765` | EXIT=101, 2 named failures |
+//! | `load_fs_tree` | `fs.rs:1007` | **green** — unwitnessed |
+//! | `PoolReader::tree` | `fs.rs:1677` | **green** — unwitnessed |
+//!
+//! Two of the four are held, and the two that are not say so at their
+//! own sites. Zero compile errors in every arm, counted separately from
+//! named failures.
 //!
 //! So the mechanism was held and the plumbing was not. This file is the
 //! plumbing: it damages a real `mkfs.btrfs` image and requires the
@@ -204,18 +225,29 @@ fn a_damaged_first_copy_of_any_named_root_does_not_stop_the_mount() {
     );
 }
 
-/// THE POOL READER'S TREE, which a single-device mount never reaches.
+/// A POOL'S SECOND COPY IS ON THE OTHER DISK, and following it means
+/// following the devid the mapping names, not just its offset.
 ///
-/// `PoolReader::tree` (`fs.rs:1640`) is the fourth of the four
-/// production opt-ins and is served by a different fixture:
+/// THIS DOES NOT REACH `PoolReader::tree` (`fs.rs:1677`, inside
+/// `impl PoolReader<'_>`) — measured, and RE-measured on this tree
+/// rather than renumbered: removing that opt-in alone still leaves this
+/// suite green, and the site says so. The number was stale and the
+/// sentence is a measured negative result rather than a pointer, so
+/// correcting the digits without re-running the mutation would have
+/// turned a fact into an assertion nobody had checked. What it holds is the pool form of the two opt-ins a mount
+/// does reach, whose mirror read must be `read_logical_pool_mirror`
+/// rather than the single-device form: reverting either one alone fails
+/// this test and nothing else. It is served by a different fixture:
 /// `.vm-share/btrfs-pool-{a,b}.img`, a real two-device filesystem whose
 /// metadata mkfs put in RAID1 — so a tree block's two copies are on
 /// DIFFERENT devices, and damaging one means writing to one image and
 /// leaving the other alone.
 ///
-/// This was going to be a follow-up row on the grounds that the site was
-/// unreachable. It is reachable: the fixture already ships, the way
-/// `btrfs-dup.img` did. Establish the wall by trying.
+/// A NOTE SAYING "THE POOL CASE IS UNREACHABLE" WAS ABOUT TO SHIP.
+/// The fixture already ships, the way `btrfs-dup.img` did, and writing
+/// the test instead found the fallback did not work on a two-device
+/// pool at all — the RAID1 half of the case the issue was filed for.
+/// Establish the wall by trying.
 #[test]
 fn a_damaged_copy_on_one_pool_device_does_not_stop_the_pool_reading() {
     let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
@@ -320,6 +352,71 @@ fn a_damaged_copy_on_one_pool_device_does_not_stop_the_pool_reading() {
     );
 }
 
+/// THE ACCEPTANCE HALF, AND IT VARIES WHICH COPY IS ROTTEN RATHER THAN
+/// WHETHER ONE IS.
+///
+/// Every test above damages copy 0. A fix that read every mirror and
+/// required them all to verify would pass all of them and would refuse
+/// this: a volume whose FIRST copy is good and whose second has rotted
+/// is a volume the kernel mounts without a word, and it is the common
+/// case on a disk with one bad sector, since which copy the sector
+/// lands under is a coin toss.
+///
+/// It is deliberately not witnessed by any mutation of the fallback —
+/// removing the fallback entirely leaves it green, because copy 0 is
+/// intact. That is what an acceptance case is for. What it fails is the
+/// over-correction, which no defeat case here can see.
+#[test]
+fn a_damaged_second_copy_is_not_noticed_at_all() {
+    let Some(src) = dup_image() else {
+        eprintln!("no .vm-share/btrfs-dup.img; skipping, and this suite proved nothing");
+        return;
+    };
+    let bytes = std::fs::read(&src).expect("read fixture");
+    let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
+        .expect("superblock");
+
+    let pristine = Scratch::new("map2", &bytes);
+    let dev = FileDevice::open(&pristine.0).expect("open pristine");
+    let mounted = fs_btrfs::fs::Filesystem::mount(Arc::new(dev)).expect("pristine must mount");
+    let map = mounted.chunk_map();
+
+    let mut exercised = 0usize;
+    for (what, addr) in [("chunk_root", sb.chunk_root), ("root", sb.root)] {
+        let Ok(copies) = map.mirrors_at(addr) else {
+            continue;
+        };
+        if copies < 2 {
+            continue;
+        }
+        let first = map.map_mirror(addr, 0).expect("mirror 0");
+        let second = map.map_mirror(addr, 1).expect("mirror 1");
+        assert_ne!(first.physical, second.physical, "{what}: copies coincide");
+
+        let mut damaged = bytes.clone();
+        damaged[(second.physical + 200) as usize] ^= 0xFF;
+        let image = Scratch::new(&format!("{what}-second"), &damaged);
+        let dev = FileDevice::open(&image.0).expect("open damaged");
+        let fs = fs_btrfs::fs::Filesystem::mount(Arc::new(dev)).unwrap_or_else(|e| {
+            panic!(
+                "{what}: copy 1 at physical {} is damaged and copy 0 at {} is intact; \
+                 a healthy first copy must be enough. Got {e:?}",
+                second.physical, first.physical
+            )
+        });
+        fs.list_path("/")
+            .unwrap_or_else(|e| panic!("{what}: and it must still read: {e}"));
+        eprintln!("dup_mirror_fallback: mounted with copy 1 of {what} damaged");
+        exercised += 1;
+    }
+
+    assert!(
+        exercised >= 2,
+        "only {exercised} root(s) had a second copy, so this acceptance case covered \
+         less than it claims to"
+    );
+}
+
 /// The other direction, and it is the one that stops the tests above
 /// passing for the wrong reason: damage BOTH copies and the mount must
 /// refuse. Without this, a driver that ignored checksums entirely would
@@ -351,4 +448,175 @@ fn damaging_every_copy_is_still_refused() {
         .err()
         .expect("with every copy damaged the mount must refuse, not fall back to nothing");
     eprintln!("dup_mirror_fallback: both copies damaged -> {err:?}");
+}
+
+/// AN UNREADABLE COPY IS THE CASE THIS ISSUE IS NAMED FOR, AND IT WAS
+/// THE ONE STILL BROKEN.
+///
+/// Every other test here damages a BYTE: the read succeeds and
+/// `TreeBlock::parse` refuses the checksum. That is not how a disk
+/// usually goes bad. A bad sector makes the read itself fail, and the
+/// primary read was `(self.read)(logical, &mut buf)?` — a `?` that
+/// returned before `redundancy` was consulted at all. So the retry ran
+/// only when copy 0 could be read and merely failed to verify, while
+/// inside the mirror loop the same I/O error had always been a
+/// `continue`. The two halves of one fallback disagreed about whether
+/// an unreadable copy is a reason to try the other one.
+///
+/// This is not reachable by damaging the image, which is why the eight
+/// mutation arms on this branch could not see it: it needs a device
+/// that returns `Err`, not a device that returns wrong bytes.
+/// [`Unreadable`] is that device, and it fails exactly the sectors copy
+/// 0 occupies and nothing else — asserted below by reading copy 1
+/// through the same wrapper first, so a pass cannot come from the
+/// wrapper failing everything or nothing.
+struct Unreadable {
+    inner: FileDevice,
+    bad: std::ops::Range<u64>,
+    /// Reads refused, so the test can prove the wrapper actually fired
+    /// rather than having been bypassed.
+    refused: std::sync::atomic::AtomicUsize,
+}
+
+impl fs_core::BlockRead for Unreadable {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+        let end = offset + buf.len() as u64;
+        if offset < self.bad.end && end > self.bad.start {
+            self.refused
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(fs_core::Error::Io(std::io::Error::other(
+                "simulated bad sector",
+            )));
+        }
+        self.inner.read_at(offset, buf)
+    }
+
+    fn size_bytes(&self) -> u64 {
+        self.inner.size_bytes()
+    }
+}
+
+#[test]
+fn an_unreadable_first_copy_does_not_stop_the_mount() {
+    let Some(src) = dup_image() else {
+        eprintln!("no .vm-share/btrfs-dup.img; skipping, and this suite proved nothing");
+        return;
+    };
+    let bytes = std::fs::read(&src).expect("read fixture");
+    let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
+        .expect("superblock");
+    let map = ChunkMap::bootstrap(&sb).expect("bootstrap");
+
+    let addr = sb.chunk_root;
+    let copies = map.mirrors_at(addr).expect("mirrors_at");
+    assert!(
+        copies >= 2,
+        "not a DUP fixture: {addr:#x} has {copies} copy, so there is nothing to fall back to"
+    );
+    let first = map.map_mirror(addr, 0).expect("mirror 0");
+    let second = map.map_mirror(addr, 1).expect("mirror 1");
+    assert_ne!(
+        first.physical, second.physical,
+        "the two copies are the same bytes"
+    );
+
+    let pristine = Scratch::new("unreadable", &bytes);
+    let nodesize = sb.nodesize as u64;
+    let bad = first.physical..first.physical + nodesize;
+
+    // THE WRAPPER IS CHECKED BEFORE IT IS TRUSTED. Copy 1 must still
+    // read through it, or "the mount succeeded" would only mean the
+    // damage missed; and copy 0 must actually be refused, or it would
+    // only mean the wrapper missed.
+    {
+        let probe = Unreadable {
+            inner: FileDevice::open(&pristine.0).expect("open"),
+            bad: bad.clone(),
+            refused: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut buf = vec![0u8; nodesize as usize];
+        fs_core::BlockRead::read_at(&probe, second.physical, &mut buf)
+            .expect("copy 1 must still be readable through the wrapper");
+        fs_core::BlockRead::read_at(&probe, first.physical, &mut buf)
+            .expect_err("copy 0 must be refused by the wrapper");
+        assert_eq!(
+            probe.refused.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the wrapper must refuse copy 0 exactly once, not everything and not nothing"
+        );
+    }
+
+    let dev = Arc::new(Unreadable {
+        inner: FileDevice::open(&pristine.0).expect("open"),
+        bad,
+        refused: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let fs = fs_btrfs::fs::Filesystem::mount(dev.clone()).unwrap_or_else(|e| {
+        panic!(
+            "copy 0 of chunk_root at physical {} is UNREADABLE and copy 1 at {} is intact; \
+             the mount must fall back to it rather than propagating the I/O error. Got {e:?}",
+            first.physical, second.physical
+        )
+    });
+    fs.list_path("/")
+        .expect("and it must still read the root directory");
+    let refused = dev.refused.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        refused >= 1,
+        "the mount never tried to read copy 0, so this test did not exercise the fallback"
+    );
+    eprintln!("dup_mirror_fallback: mounted with copy 0 of chunk_root unreadable ({refused} refused reads)");
+}
+
+/// AND WHEN NOTHING IS LEFT, IT IS THE I/O ERROR THAT IS REPORTED.
+///
+/// `read_block` promises "the error returned is copy 0's". Making the
+/// primary read fall through rather than `?` opens a way to break that
+/// promise while still passing every fallback test: parse the buffer
+/// anyway. A zeroed or half-written buffer fails its checksum, so the
+/// mount would report `ChecksumMismatch` for a disk that returned an
+/// I/O error — describing the wreckage instead of the damage, and
+/// sending whoever reads the message looking for corruption rather than
+/// for a bad sector.
+///
+/// So: copy 0 unreadable, copy 1 damaged, nothing to fall back to, and
+/// the error must still be the read's.
+#[test]
+fn an_unreadable_first_copy_reports_the_io_error_not_a_checksum() {
+    let Some(src) = dup_image() else {
+        eprintln!("no .vm-share/btrfs-dup.img; skipping, and this suite proved nothing");
+        return;
+    };
+    let bytes = std::fs::read(&src).expect("read fixture");
+    let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
+        .expect("superblock");
+    let map = ChunkMap::bootstrap(&sb).expect("bootstrap");
+
+    let addr = sb.chunk_root;
+    assert!(
+        map.mirrors_at(addr).expect("mirrors_at") >= 2,
+        "not a DUP fixture"
+    );
+    let first = map.map_mirror(addr, 0).expect("mirror 0");
+    let second = map.map_mirror(addr, 1).expect("mirror 1");
+
+    // Copy 1 rotted, copy 0 unreadable.
+    let mut damaged = bytes.clone();
+    damaged[(second.physical + 200) as usize] ^= 0xFF;
+    let image = Scratch::new("unreadable-both", &damaged);
+
+    let dev = Arc::new(Unreadable {
+        inner: FileDevice::open(&image.0).expect("open"),
+        bad: first.physical..first.physical + sb.nodesize as u64,
+        refused: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let err = fs_btrfs::fs::Filesystem::mount(dev)
+        .err()
+        .expect("with copy 0 unreadable and copy 1 rotten the mount must refuse");
+    assert!(
+        matches!(err, fs_btrfs::Error::Io(_)),
+        "copy 0 returned an I/O error, so that is what must be reported rather than a \
+         checksum verdict on a buffer that was never filled. Got {err:?}"
+    );
+    eprintln!("dup_mirror_fallback: copy 0 unreadable + copy 1 rotten -> {err:?}");
 }
