@@ -388,13 +388,17 @@ jobs:
       # job builds, which means they had never executed an assertion on
       # a pull request at all.
       #
-      # Run as one step rather than seven so the next suite added is
-      # covered by default instead of waiting to be remembered.
+      # One step rather than one per suite. THE LIST IS STILL A LIST: a
+      # new fixture-backed suite is NOT covered until its name is added
+      # here, and `dup_mirror_fallback` was written, committed and
+      # measured locally before anyone noticed CI had never run it with
+      # fixtures. The other job runs it with none, where it skips.
       - name: The remaining fixture-backed suites
         run: |
           set -euo pipefail
           for t in bootstrap_chain btree_oracle capi compression_oracle \
-                   fs_oracle fstree_oracle write_oracle xattr_oracle; do
+                   dup_mirror_fallback fs_oracle fstree_oracle write_oracle \
+                   xattr_oracle; do
             echo "::group::$t"
             cargo test --test "$t" -- --nocapture
             echo "::endgroup::"

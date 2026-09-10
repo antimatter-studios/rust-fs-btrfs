@@ -24,7 +24,11 @@ test-disks/test-run/
 test-disks/.vm-cache/
 .claude/
 # VM harness shared dir (images exchanged with the oracle VM)
-.vm-share/
+# Fixture images, and the SYMLINK to them that tests/dup_mirror_fallback.rs
+# tells you to make. No trailing slash: `.vm-share/` matches a directory
+# only, so a symlink named `.vm-share` was not ignored and `git add -A`
+# committed it onto a fix branch. Measured here, on this branch.
+.vm-share
 
 # chore fingerprint cache (sources:/generates: checksums). Derived data.
 .chore/

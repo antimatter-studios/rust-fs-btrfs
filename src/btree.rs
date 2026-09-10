@@ -680,6 +680,16 @@ fn leaf_slot(items: &[Item], key: &DiskKey) -> usize {
 /// this module from depending on the block-device layer.
 pub type ReadBlock<'a> = &'a dyn Fn(u64, &mut [u8]) -> Result<()>;
 
+/// Read copy `mirror` of the block at a logical address.
+///
+/// Mirror 0 is the copy [`ReadBlock`] returns; the others are the ones
+/// DUP and RAID1 keep, and are what a damaged first copy is supposed to
+/// be recoverable from.
+pub type ReadMirror<'a> = &'a dyn Fn(u64, usize, &mut [u8]) -> Result<()>;
+
+/// How many copies the volume keeps of the block at a logical address.
+pub type MirrorCount<'a> = &'a dyn Fn(u64) -> Result<usize>;
+
 /// One item lifted out of a leaf, with its data copied.
 ///
 /// The copy is deliberate: the leaf it came from is a temporary, and an
@@ -701,12 +711,40 @@ pub struct LeafItem {
 pub struct Tree<'a> {
     geom: TreeGeometry,
     read: ReadBlock<'a>,
+    /// The other copies, where the caller can supply them. `None` means
+    /// "one copy, or the caller cannot reach the others", and is what
+    /// every in-memory walker uses.
+    redundancy: Option<(MirrorCount<'a>, ReadMirror<'a>)>,
 }
 
 impl<'a> Tree<'a> {
     /// Build a walker over an explicit geometry.
+    ///
+    /// The walker reads one copy. Use [`Tree::with_redundancy`] to give
+    /// it the others.
     pub fn new(geom: TreeGeometry, read: ReadBlock<'a>) -> Self {
-        Tree { geom, read }
+        Tree {
+            geom,
+            read,
+            redundancy: None,
+        }
+    }
+
+    /// Let the walker fall back to the volume's other copies of a block
+    /// when the first one does not verify.
+    ///
+    /// # WHY THIS IS AN OPT-IN RATHER THAN THE DEFAULT
+    ///
+    /// A `Tree` is deliberately readable against a plain byte slice --
+    /// that is what makes the traversal testable without a block device
+    /// -- and a slice has one copy. Requiring a mirror reader
+    /// everywhere would push the chunk map into every caller that only
+    /// wants to walk some bytes. So the fallback arrives where a
+    /// [`crate::chunk::ChunkMap`] already exists, and nowhere else
+    /// changes.
+    pub fn with_redundancy(mut self, mirrors: MirrorCount<'a>, read: ReadMirror<'a>) -> Self {
+        self.redundancy = Some((mirrors, read));
+        self
     }
 
     /// Build a walker using the geometry a parsed superblock implies.
@@ -719,11 +757,77 @@ impl<'a> Tree<'a> {
         &self.geom
     }
 
-    /// Read, verify and parse the block at `logical`.
+    /// Read, verify and parse the block at `logical`, trying the
+    /// volume's other copies if the first one does not verify.
+    ///
+    /// # THE COPIES EXIST TO BE READ
+    ///
+    /// This used to read copy 0 and stop. A tree block whose first copy
+    /// failed [`TreeBlock::parse`] -- its own checksum, or an identity
+    /// that does not match the address it was fetched from -- made the
+    /// whole operation fail, on a volume the kernel mounts without
+    /// complaint by reading the second copy. `mkfs.btrfs` picks DUP for
+    /// metadata on a single disk in many configurations, so this is the
+    /// ordinary case rather than an exotic one, and a driver that
+    /// refuses a volume the kernel accepts is hard to tell, from
+    /// outside, from a driver that is simply wrong.
+    ///
+    /// # THE FIRST ERROR IS THE ONE REPORTED
+    ///
+    /// When no copy verifies, the error returned is copy 0's. A later
+    /// mirror can fail for a duller reason -- a short device, an
+    /// unmapped address -- and reporting that one would describe the
+    /// recovery attempt rather than the damage.
+    ///
+    /// Verification is [`TreeBlock::parse`] and nothing weaker: a copy
+    /// that reads without an I/O error but does not checksum is not a
+    /// copy, which is the whole reason a retry can be trusted to have
+    /// improved matters.
+    ///
+    /// # A COPY THAT CANNOT BE READ IS A COPY THAT FAILED
+    ///
+    /// The primary read was a `?`, so it returned before `redundancy`
+    /// was consulted at all: the retry ran only when copy 0 was READ
+    /// successfully and then failed to parse. An unreadable sector
+    /// under copy 0 -- which is the ordinary way a disk goes bad, and
+    /// the case in this function's own title -- still made a DUP or
+    /// RAID1 volume unreadable. Inside the loop below the same error
+    /// has always been a `continue`; the two halves disagreed about
+    /// whether an I/O error is a reason to try the other copy.
+    ///
+    /// The buffer is deliberately NOT parsed when the read fails.
+    /// `parse` on a partly-written or zeroed buffer reports a checksum
+    /// mismatch, which would replace the real I/O error with a
+    /// description of the wreckage -- and it is copy 0's error that
+    /// this function promises to report.
     pub fn read_block(&self, logical: u64) -> Result<TreeBlock> {
         let mut buf = vec![0u8; self.geom.nodesize as usize];
-        (self.read)(logical, &mut buf)?;
-        TreeBlock::parse(buf, logical, &self.geom)
+        let first = match (self.read)(logical, &mut buf) {
+            Ok(()) => match TreeBlock::parse(buf, logical, &self.geom) {
+                Ok(block) => return Ok(block),
+                Err(e) => e,
+            },
+            Err(e) => e,
+        };
+        let Some((mirrors, read_mirror)) = self.redundancy else {
+            return Err(first);
+        };
+        // A volume that cannot say how many copies it keeps has told us
+        // nothing to try, not that there are none to try -- either way
+        // there is nothing further to read.
+        let Ok(count) = mirrors(logical) else {
+            return Err(first);
+        };
+        for mirror in 1..count {
+            let mut buf = vec![0u8; self.geom.nodesize as usize];
+            if read_mirror(logical, mirror, &mut buf).is_err() {
+                continue;
+            }
+            if let Ok(block) = TreeBlock::parse(buf, logical, &self.geom) {
+                return Ok(block);
+            }
+        }
+        Err(first)
     }
 
     /// Descend from `root` to the leaf that would hold `key`.
@@ -1328,6 +1432,103 @@ mod tests {
         assert!(
             format!("{err}").contains("inside the item array"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// A DAMAGED FIRST COPY IS READ FROM THE SECOND.
+    ///
+    /// The volume keeps two copies -- DUP is what `mkfs.btrfs` picks
+    /// for metadata on a single disk in many configurations -- and the
+    /// first one does not verify. The kernel reads the second, logs a
+    /// corrected error and carries on. This used to read copy 0 and
+    /// report the volume unreadable.
+    #[test]
+    fn a_damaged_first_copy_is_read_from_the_second() {
+        let good = leaf(LEAF_A, objectid::FS_TREE, &[(key(1, 1, 0), b"a".to_vec())]);
+        let mut damaged = good.clone();
+        // One flipped byte in the item area: the header still says it
+        // is the block at this address, so only the checksum catches it
+        // -- which is the failure a bad sector actually produces.
+        damaged[NODESIZE as usize - 1] ^= 0xff;
+
+        let read = |_logical: u64, buf: &mut [u8]| -> Result<()> {
+            buf.copy_from_slice(&damaged);
+            Ok(())
+        };
+        let mirrors = |_logical: u64| -> Result<usize> { Ok(2) };
+        let read_mirror = |_logical: u64, mirror: usize, buf: &mut [u8]| -> Result<()> {
+            buf.copy_from_slice(if mirror == 0 { &damaged } else { &good });
+            Ok(())
+        };
+
+        let one_copy = Tree::new(geom(), &read);
+        assert!(
+            one_copy.read_block(LEAF_A).is_err(),
+            "copy 0 does not verify, and without the others there is nothing else to read"
+        );
+
+        let with_copies = Tree::new(geom(), &read).with_redundancy(&mirrors, &read_mirror);
+        let block = with_copies
+            .read_block(LEAF_A)
+            .expect("copy 1 verifies and is what the caller gets");
+        assert_eq!(block.header.bytenr, LEAF_A);
+    }
+
+    /// THE FIRST ERROR IS THE ONE REPORTED.
+    ///
+    /// A later mirror can fail for a duller reason than the damage --
+    /// here an unmapped address -- and reporting that would describe
+    /// the recovery attempt rather than what is wrong with the volume.
+    #[test]
+    fn when_no_copy_verifies_the_damage_is_what_is_reported() {
+        let good = leaf(LEAF_A, objectid::FS_TREE, &[(key(1, 1, 0), b"a".to_vec())]);
+        let mut damaged = good.clone();
+        damaged[NODESIZE as usize - 1] ^= 0xff;
+
+        let read = |_logical: u64, buf: &mut [u8]| -> Result<()> {
+            buf.copy_from_slice(&damaged);
+            Ok(())
+        };
+        let mirrors = |_logical: u64| -> Result<usize> { Ok(2) };
+        let read_mirror = |logical: u64, mirror: usize, _buf: &mut [u8]| -> Result<()> {
+            assert_eq!(mirror, 1, "copy 0 was already read through `read`");
+            Err(Error::UnmappedLogical(logical))
+        };
+
+        let tree = Tree::new(geom(), &read).with_redundancy(&mirrors, &read_mirror);
+        let err = tree.read_block(LEAF_A).unwrap_err();
+        assert!(
+            !matches!(err, Error::UnmappedLogical(_)),
+            "the second copy's failure is not the finding: {err}"
+        );
+    }
+
+    /// THE ACCEPTANCE HALF: a copy that verifies is not read twice.
+    ///
+    /// Every read on the volume goes through here, so a fallback that
+    /// fired on success would double the I/O of a healthy filesystem.
+    #[test]
+    fn a_first_copy_that_verifies_is_not_read_again() {
+        let good = leaf(LEAF_A, objectid::FS_TREE, &[(key(1, 1, 0), b"a".to_vec())]);
+        let read = |_logical: u64, buf: &mut [u8]| -> Result<()> {
+            buf.copy_from_slice(&good);
+            Ok(())
+        };
+        let asked = std::cell::Cell::new(0usize);
+        let mirrors = |_logical: u64| -> Result<usize> {
+            asked.set(asked.get() + 1);
+            Ok(2)
+        };
+        let read_mirror = |_logical: u64, _mirror: usize, _buf: &mut [u8]| -> Result<()> {
+            panic!("the first copy verified; nothing else should be read");
+        };
+
+        let tree = Tree::new(geom(), &read).with_redundancy(&mirrors, &read_mirror);
+        tree.read_block(LEAF_A).expect("the first copy verifies");
+        assert_eq!(
+            asked.get(),
+            0,
+            "a healthy read must not even ask how many copies there are"
         );
     }
 
