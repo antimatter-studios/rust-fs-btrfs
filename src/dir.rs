@@ -3,7 +3,7 @@
 //! # Two indexes over one set of names
 //!
 //! Btrfs files every directory entry twice, under two key types built
-//! from the same [`DirItem`] payload:
+//! from the same `btrfs_dir_item` payload:
 //!
 //! - **`DIR_ITEM`** (`(dir_ino, 84, hash)`) is the lookup index. The key
 //!   offset is [`name_hash`] of the entry's name, so resolving a name is
@@ -32,7 +32,7 @@
 //! `XATTR_ITEM` uses the same struct with its `data` field holding the
 //! attribute value, and collides in the same way — several attribute
 //! names hashing to one key share an item. So the record walk is shared:
-//! [`parse_items`] does the bounds arithmetic once, and
+//! `parse_items` does the bounds arithmetic once, and
 //! [`parse_dir_items`] and [`crate::xattr::parse_xattr_items`] each read
 //! the fields they care about out of the result.
 //!
@@ -212,7 +212,7 @@ pub struct DirEntry {
     pub name: Vec<u8>,
     /// Objectid the name resolves to. An inode number when
     /// [`location_type`](Self::location_type) is
-    /// [`INODE_ITEM_KEY`](crate::inode::INODE_ITEM_KEY); a subvolume's
+    /// [`crate::inode::INODE_ITEM_KEY`]; a subvolume's
     /// tree id otherwise.
     pub ino: u64,
     /// File type, when the entry records one this driver represents.
@@ -333,7 +333,7 @@ pub(crate) fn parse_items<'a>(data: &'a [u8], what: &str) -> Result<Vec<RawItem<
 ///
 /// # Errors
 ///
-/// As [`parse_items`], plus [`Error::BadSuperblock`] for a `type` byte
+/// As `parse_items`, plus [`Error::BadSuperblock`] for a `type` byte
 /// that is not a defined value.
 pub fn parse_dir_items(data: &[u8]) -> Result<Vec<DirEntry>> {
     parse_items(data, "directory item")?

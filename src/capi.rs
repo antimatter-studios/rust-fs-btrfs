@@ -595,9 +595,10 @@ pub unsafe extern "C" fn fs_btrfs_dir_close(iter: *mut fs_btrfs_dir_iter) {
 /// Read up to `length` bytes of `path` from `offset`.
 ///
 /// Returns bytes read, 0 at end of file, or -1 on failure. Holes and
-/// preallocated extents read as zeros. A compressed extent fails with
-/// ENOTSUP rather than returning its undecoded bytes, which a caller
-/// could not distinguish from a corrupt file.
+/// preallocated extents read as zeros. A compressed extent is decoded
+/// (zlib, LZO or zstd) and its decoded bytes returned; one that does not
+/// decode fails rather than returning compressed bytes a caller could not
+/// tell from a corrupt file.
 ///
 /// # Safety
 ///

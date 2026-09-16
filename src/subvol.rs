@@ -262,7 +262,7 @@ impl Filesystem {
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`] if no subvolume has that id, and whatever the
+    /// [`crate::error::Error::NotFound`] if no subvolume has that id, and whatever the
     /// tree walk returns.
     pub fn open_subvolume(&self, id: u64) -> Result<Filesystem> {
         let subvol = self
