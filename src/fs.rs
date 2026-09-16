@@ -511,28 +511,6 @@ impl Filesystem {
         self.writable.is_some()
     }
 
-    /// Write to a logical address, following the chunk map exactly as
-    /// the read path does — a write that ignored a chunk boundary would
-    /// run past the end of one device and into another.
-    /// Write to EVERY copy of a logical range.
-    ///
-    /// [`Filesystem::write_logical`] writes the first copy only, which is
-    /// right for reading and wrong for writing. On a `DUP` or `RAID1`
-    /// chunk it leaves the other copy holding what was there before, and
-    /// the two then disagree with no record of which is current — a
-    /// later read may return either.
-    ///
-    /// The commit trace confirms this is what the kernel does: both
-    /// mirrors of every tree block go out BEFORE the barrier, so a torn
-    /// write to one leaves the other and the barrier still orders both
-    /// against the superblock.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the first write failure. A partial result is possible
-    /// and is not cleaned up: some mirrors may hold the new contents and
-    /// some the old, which is the same state a power loss produces and
-    /// is what the commit ordering exists to survive.
     /// Where a mapped range lands on the device, once it is known to be
     /// on it.
     ///
@@ -563,46 +541,64 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Every `(physical, length)` a write of `len` bytes at `logical`
+    /// lands on: each mirror, split at chunk-stripe boundaries, each span
+    /// checked against the device before anything is written.
+    pub(crate) fn mirror_spans(
+        device: &Arc<dyn BlockDevice>,
+        map: &ChunkMap,
+        logical: u64,
+        len: usize,
+    ) -> Result<Vec<(u64, usize, usize)>> {
+        let mut spans = Vec::new();
+        for mirror in 0..map.mirrors_at(logical)? {
+            let mut done = 0usize;
+            while done < len {
+                let m = map.map_mirror(logical + done as u64, mirror)?;
+                let n = (m.len as usize).min(len - done);
+                if n == 0 {
+                    return Err(Error::UnmappedLogical(logical + done as u64));
+                }
+                Self::writable_span(device, m.physical, n)?;
+                spans.push((m.physical, done, n));
+                done += n;
+            }
+        }
+        Ok(spans)
+    }
+
+    /// Write to EVERY copy of a logical range, following the chunk map
+    /// exactly as the read path does -- a write that ignored a chunk
+    /// boundary would run past the end of one device and into another.
+    ///
+    /// The first copy alone is right for reading and wrong for writing.
+    /// On a `DUP` or `RAID1` chunk it leaves the other copy holding what
+    /// was there before, and the two then disagree with no record of
+    /// which is current -- a later read may return either. The data path
+    /// did exactly that until #71; it is why there is no single-copy
+    /// write any more.
+    ///
+    /// The commit trace confirms this is what the kernel does: both
+    /// mirrors of every tree block go out BEFORE the barrier, so a torn
+    /// write to one leaves the other and the barrier still orders both
+    /// against the superblock.
+    ///
+    /// # Errors
+    ///
+    /// Every span is resolved and checked against the device first, so
+    /// an unmapped address or a stripe past the end writes nothing. A
+    /// device write failure after that propagates, and a partial result
+    /// is possible and not cleaned up: some mirrors may hold the new
+    /// contents and some the old, which is the same state a power loss
+    /// produces and is what the commit ordering exists to survive.
     pub(crate) fn write_logical_all_mirrors(
         device: &Arc<dyn BlockDevice>,
         map: &ChunkMap,
         logical: u64,
         buf: &[u8],
     ) -> Result<()> {
-        let mirrors = map.mirrors_at(logical)?;
-        for mirror in 0..mirrors {
-            let mut done = 0usize;
-            while done < buf.len() {
-                let m = map.map_mirror(logical + done as u64, mirror)?;
-                let n = (m.len as usize).min(buf.len() - done);
-                if n == 0 {
-                    return Err(Error::UnmappedLogical(logical + done as u64));
-                }
-                Self::writable_span(device, m.physical, n)?;
-                Self::writable_span(device, m.physical, n)?;
-                Self::writable_span(device, m.physical, n)?;
-                device.write_at(m.physical, &buf[done..done + n])?;
-                done += n;
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn write_logical(
-        device: &Arc<dyn BlockDevice>,
-        map: &ChunkMap,
-        logical: u64,
-        buf: &[u8],
-    ) -> Result<()> {
-        let mut done = 0usize;
-        while done < buf.len() {
-            let m = map.map(logical + done as u64)?;
-            let n = (m.len as usize).min(buf.len() - done);
-            if n == 0 {
-                return Err(Error::UnmappedLogical(logical + done as u64));
-            }
-            device.write_at(m.physical, &buf[done..done + n])?;
-            done += n;
+        for (physical, from, n) in Self::mirror_spans(device, map, logical, buf.len())? {
+            device.write_at(physical, &buf[from..from + n])?;
         }
         Ok(())
     }
