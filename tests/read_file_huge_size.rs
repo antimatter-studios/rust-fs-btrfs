@@ -24,10 +24,19 @@ use std::sync::Arc;
 const SUPERBLOCK: usize = 0x1_0000;
 /// `btrfs_inode_item.size`.
 const INODE_SIZE: usize = 16;
-const CLAIMED: u64 = 1 << 60;
+/// Removes the scratch directory on every exit path, including a skip
+/// and a failed assertion.
+struct Scratch(std::path::PathBuf);
 
-fn image() -> Option<std::path::PathBuf> {
-    let dir = std::env::temp_dir().join(format!("btrfs-huge-size-{}", std::process::id()));
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn image(tag: &str) -> Option<(Scratch, std::path::PathBuf)> {
+    let dir = std::env::temp_dir().join(format!("btrfs-huge-size-{tag}-{}", std::process::id()));
+    let scratch = Scratch(dir.clone());
     let root = dir.join("root");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("file.bin"), b"a small file").unwrap();
@@ -57,16 +66,25 @@ fn image() -> Option<std::path::PathBuf> {
         "{}",
         String::from_utf8_lossy(&made.stderr)
     );
-    Some(img)
+    Some((scratch, img))
 }
 
 fn le64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
+/// 2^60 bytes, past any allocator; and one byte past the ceiling, well
+/// inside the patched volume, which an overcommitting allocator would
+/// have reserved and then failed to back.
 #[test]
 fn an_impossible_file_size_is_an_error_not_an_abort() {
-    let Some(img) = image() else {
+    for claimed in [1u64 << 60, fs_btrfs::fs::MAX_WHOLE_FILE_READ + 1] {
+        refuses(claimed);
+    }
+}
+
+fn refuses(claimed: u64) {
+    let Some((_scratch, img)) = image(&claimed.to_string()) else {
         eprintln!("no mkfs.btrfs -- skipping");
         return;
     };
@@ -106,7 +124,7 @@ fn an_impossible_file_size_is_an_error_not_an_abort() {
                 let off = HEADER_SIZE
                     + u32::from_le_bytes(block[item + 17..item + 21].try_into().unwrap()) as usize;
                 block[off + INODE_SIZE..off + INODE_SIZE + 8]
-                    .copy_from_slice(&CLAIMED.to_le_bytes());
+                    .copy_from_slice(&claimed.to_le_bytes());
                 hit = true;
             }
         }
@@ -126,15 +144,15 @@ fn an_impossible_file_size_is_an_error_not_an_abort() {
         .expect("the patched volume still mounts");
     assert_eq!(
         fs.read_inode(ino).unwrap().size,
-        CLAIMED,
+        claimed,
         "fixture: the size patch took"
     );
     match fs.read_file(ino) {
-        Err(e) => assert!(
+        Err(e @ fs_btrfs::Error::UnsupportedFeature(_)) => assert!(
             format!("{e}").contains("read_at"),
             "refused, but without saying what to use: {e}"
         ),
-        Ok(_) => panic!("2^60 bytes were read into memory"),
+        Err(e) => panic!("refused as {e:?}, which reads as a device or volume fault"),
+        Ok(_) => panic!("{claimed} bytes were read into memory"),
     }
-    let _ = std::fs::remove_dir_all(img.parent().unwrap());
 }
