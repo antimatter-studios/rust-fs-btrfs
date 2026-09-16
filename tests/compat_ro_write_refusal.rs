@@ -5,7 +5,10 @@
 //! writes: a block group tree volume would be written by code that looks
 //! for block group items in the extent tree and finds none. The image is
 //! made fresh by `mkfs.btrfs` on a plain file -- no mount, no root -- and
-//! the test skips when btrfs-progs is not installed.
+//! the test skips when btrfs-progs is not installed, unless
+//! `BTRFS_ORACLE_FIXTURES=required`. The CI job that installs btrfs-progs
+//! sets that, so there a missing `mkfs.btrfs` fails rather than reading as a
+//! pass.
 
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::super_write::stamp_checksum;
@@ -27,11 +30,16 @@ fn image_with_compat_ro(name: &str, bits: u64) -> Option<std::path::PathBuf> {
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
-    let made = Command::new("mkfs.btrfs")
-        .arg("-f")
-        .arg(&path)
-        .output()
-        .ok()?;
+    let made = match Command::new("mkfs.btrfs").arg("-f").arg(&path).output() {
+        Ok(made) => made,
+        Err(e) => {
+            assert!(
+                std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() != Ok("required"),
+                "BTRFS_ORACLE_FIXTURES=required, but mkfs.btrfs is not runnable: {e}"
+            );
+            return None;
+        }
+    };
     assert!(
         made.status.success(),
         "mkfs.btrfs failed: {}",
