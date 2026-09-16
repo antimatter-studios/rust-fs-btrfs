@@ -62,18 +62,21 @@ struct Pass {
     read: Cost,
 }
 
-fn fixture() -> Option<PathBuf> {
+/// Every fixture present, each measured on its own.
+///
+/// `docs/read-path-cost.md` publishes a table for `rich` and one for
+/// `deep4k`, because they cost differently: a varied tree is a descent,
+/// 20,000 files in one directory is one leaf scan repeated. This used to
+/// return the first image found, from a list whose order contradicted
+/// its own comment, so with the full matrix present only `deep4k` was
+/// ever measured and the `rich` table could not be regenerated (#107).
+fn fixtures() -> Vec<PathBuf> {
     let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
-    // `rich` first: a varied tree is a better shape for a walk than
-    // 20,000 files in one directory, which measures one leaf scan
-    // repeated rather than a descent.
-    for name in ["btrfs-deep4k.img", "btrfs-rich.img", "btrfs-commit.img"] {
-        let p = share.join(name);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
+    ["btrfs-rich.img", "btrfs-deep4k.img", "btrfs-commit.img"]
+        .into_iter()
+        .map(|name| share.join(name))
+        .filter(|p| p.exists())
+        .collect()
 }
 
 /// The counter sits BELOW the cache, so what it reports is what
@@ -160,16 +163,23 @@ fn report(what: &str, c: &Cost) {
 /// a fixture rebuild.
 #[test]
 fn what_a_read_costs_in_calls_to_the_device() {
-    let Some(img) = fixture() else {
+    let images = fixtures();
+    if images.is_empty() {
         eprintln!("no fixture to measure — skipping");
         return;
-    };
-    eprintln!("measuring {}", img.display());
+    }
+    for img in &images {
+        measure_fixture(img);
+    }
+}
+
+fn measure_fixture(img: &Path) {
+    eprintln!("=== measuring {}", img.display());
 
     eprintln!("--- uncached ---");
-    let uncached = measure_one(&img, 0);
+    let uncached = measure_one(img, 0);
     eprintln!("--- cached ---");
-    let cached = measure_one(&img, 512);
+    let cached = measure_one(img, 512);
 
     // THE ASSERTIONS ARE ON THE UNCACHED PASS, because it is the one
     // that must reach the device: if the counter reports nothing there,
@@ -192,11 +202,23 @@ fn what_a_read_costs_in_calls_to_the_device() {
         ("stat", &uncached.stat, &cached.stat),
         ("read", &uncached.read, &cached.read),
     ] {
-        // `mount` is exempt from the comparison. A cache sized in
-        // sectors splits one node-sized read into four, so the cached
-        // mount legitimately makes MORE calls -- which is the finding
-        // that decided `DEFAULT_CACHE_BLOCKS`, not a regression.
-        if what != "mount" {
+        // BYTES FOR EVERY SHAPE, CALLS ONLY WHERE A CALL CANNOT SPLIT. A
+        // cache sized in sectors splits one node- or extent-sized read
+        // into several, so the cached mount -- and, on a fixture whose
+        // files hold real data, the cached read -- legitimately makes
+        // MORE calls; that is the finding that decided
+        // `DEFAULT_CACHE_BLOCKS`, not a regression. `mount` used to be
+        // exempted for it, and `read` only ever passed because the one
+        // fixture measured made no data reads at all (`rich`, measured
+        // since #107: 24 uncached calls, 136 cached). What a cache must
+        // never do is fetch more BYTES.
+        assert!(
+            ca.bytes <= un.bytes,
+            "{what}: the cache made it fetch more bytes ({} vs {})",
+            ca.bytes,
+            un.bytes
+        );
+        if what == "walk" || what == "stat" {
             assert!(
                 ca.reads <= un.reads,
                 "{what}: the cache made it ask for more ({} vs {})",
@@ -230,22 +252,68 @@ fn measure_one(img: &Path, blocks: usize) -> Pass {
         .map(|(p, _)| p.clone())
         .collect();
 
+    // WHAT THE DRIVER RETURNED, not what the device was asked for (#138).
+    // The published `deep4k` row is zero reads and zero bytes for a
+    // working driver, because the mount already loaded everything, so no
+    // device-counter floor can tell a pass that did its work from one
+    // that failed before any I/O. `items` for stat and read is therefore
+    // the number of calls that SUCCEEDED, and a failure is a failure
+    // rather than a shorter, cheaper pass.
+    //
     // RESOLVING THE SAME PREFIXES AGAIN AND AGAIN is the shape a cache
     // is for: every path here descends from the root of the filesystem
     // tree through the same interior nodes.
-    let stat = measure(&counting, files.len(), || {
+    let mut resolved = 0usize;
+    let mut declared = 0u64;
+    let stat = measure(&counting, 0, || {
         for p in &files {
-            let _ = fs.lookup_path(p);
+            match fs.lookup_path(p) {
+                Ok(inode) => {
+                    resolved += 1;
+                    declared += inode.size;
+                }
+                Err(e) => panic!("lookup_path({p}) failed during the measurement: {e:?}"),
+            }
         }
     });
+    let stat = Cost {
+        items: resolved,
+        ..stat
+    };
     report("stat", &stat);
 
-    let read = measure(&counting, files.len(), || {
+    let mut read_ok = 0usize;
+    let mut returned = 0u64;
+    let read = measure(&counting, 0, || {
         for p in &files {
-            let _ = fs.read_path(p);
+            match fs.read_path(p) {
+                Ok(bytes) => {
+                    read_ok += 1;
+                    returned += bytes.len() as u64;
+                }
+                Err(e) => panic!("read_path({p}) failed during the measurement: {e:?}"),
+            }
         }
     });
+    let read = Cost {
+        items: read_ok,
+        ..read
+    };
     report("read", &read);
+    assert_eq!(
+        (resolved, read_ok),
+        (files.len(), files.len()),
+        "not every walked file was resolved and read"
+    );
+    assert_eq!(
+        returned, declared,
+        "the reads returned {returned} bytes where the files declare {declared}"
+    );
+    assert!(
+        files.is_empty() || returned > 0,
+        "every read succeeded and returned no bytes, over {} files",
+        files.len()
+    );
 
     Pass {
         mount,
