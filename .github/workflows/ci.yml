@@ -423,6 +423,15 @@ jobs:
       - name: Leaf editing
         run: cargo test --test leaf_edit_oracle -- --nocapture
 
+      # A relocation whose old block's record is not under the key the plan
+      # expects, on an image the test edits after mkfs.btrfs, which only
+      # this job installs. `required` turns a missing mkfs.btrfs into a
+      # failure instead of a skip that reads as a pass (#87).
+      - name: A missing extent record refuses the relocation
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test extent_record_missing -- --nocapture
+
       # A filesystem either side of one leaf splitting, plus a second
       # pair with deliberately uneven item sizes — without which
       # half-the-count and half-the-bytes cannot be told apart.
