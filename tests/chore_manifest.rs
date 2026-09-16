@@ -27,7 +27,7 @@
 //!
 //! ```text
 //! floor 0.9.0, keys left plain            EXIT=101   <- the control
-//! floor 0.9.0, "timeout:" / "on_timeout:" EXIT=0     <- DEFEAT
+//! floor 0.9.0, "timeout": / "on_timeout": EXIT=0     <- DEFEAT
 //! floor 0.9.0, net: { timeout: 45m }      EXIT=0     <- DEFEAT
 //! ```
 //!
@@ -93,7 +93,16 @@ fn document(text: &str) -> Yaml<'_> {
         .expect("chores.yml must contain a document")
 }
 
-/// Every mapping key anywhere in the document.
+/// Maps whose keys the user names, not chore.
+///
+/// A `vars:` or `env:` entry called `timeout` is a variable the task's
+/// own commands read, and says nothing about chore's `timeout:` field.
+/// The key `vars` itself is still collected; only the names inside it
+/// are not.
+const FREE_FORM_MAPS: &[&str] = &["vars", "env"];
+
+/// Every mapping key in the document, except the names inside a
+/// [`FREE_FORM_MAPS`] map.
 ///
 /// Recursive, because the keys this asks about are nested inside tasks
 /// rather than at the top level, and a `timeout:` is the same adoption
@@ -104,6 +113,9 @@ fn all_keys(node: &Yaml, out: &mut BTreeSet<String>) {
         for (key, value) in mapping.iter() {
             if let Some(name) = key.as_str() {
                 out.insert(name.to_string());
+                if FREE_FORM_MAPS.contains(&name) {
+                    continue;
+                }
             }
             all_keys(value, out);
         }
@@ -320,6 +332,35 @@ tasks:
             violations(&yaml).is_empty(),
             "the prose above a key is not the key"
         );
+    }
+
+    /// A VARIABLE NAMED LIKE A FEATURE IS NOT THE FEATURE. `vars:` and
+    /// `env:` hold names the user picks, so a `timeout` there is read by
+    /// the task's commands and not by chore; reporting it would reject a
+    /// manifest that needs no newer chore. The control beside each
+    /// spelling puts the real key back and must still be reported, so
+    /// the skip cannot have swallowed the task it sits in.
+    #[test]
+    fn a_variable_named_like_a_key_is_not_the_key() {
+        for spelling in [
+            "    vars:\n      timeout: '30'\n",
+            "    env:\n      on_timeout: 'kill'\n",
+            "    vars: { timeout: '30', on_timeout: x }\n",
+        ] {
+            let yaml = OLD_FLOOR.replace("      - cmd: 'cargo test'\n", spelling);
+            assert_ne!(yaml, OLD_FLOOR, "the mutation must actually apply");
+            assert!(
+                violations(&yaml).is_empty(),
+                "a variable is not chore's key: {spelling:?} gave {:?}",
+                violations(&yaml)
+            );
+            let control = yaml.replace("tasks:\n  test:\n", "tasks:\n  test:\n    timeout: 45m\n");
+            assert_eq!(
+                violations(&control).len(),
+                1,
+                "control: the real key beside {spelling:?} is still reported"
+            );
+        }
     }
 
     #[test]
