@@ -31,7 +31,18 @@
 //! length, no checksum and no end marker that a decoder can find without
 //! being told how many bytes it holds. Btrfs therefore supplies its own
 //! framing, and that framing is this module's real work. See
-//! [`decompress_lzo`].
+//! `decompress_lzo`.
+//!
+//! # A short decode is padded with zeros
+//!
+//! A decoder may stop early on a file's last extent, where the tail of
+//! the final sector holds nothing, so [`decompress`] pads a short result
+//! to `ram_bytes` rather than refusing it. That also means a truncated
+//! stream in any OTHER extent reads as trailing zeros instead of an
+//! error. Telling the two apart needs the caller to say whether this is
+//! the file's last extent, which this function is not told; until it is,
+//! this is a known place where damaged data can read as plausible zeros
+//! (#91).
 
 use crate::error::{Error, Result};
 
@@ -42,7 +53,7 @@ pub enum Compression {
     None,
     /// zlib, i.e. DEFLATE inside a zlib wrapper.
     Zlib,
-    /// LZO1X, in the segmented framing described in [`decompress_lzo`].
+    /// LZO1X, in the segmented framing described in `decompress_lzo`.
     Lzo,
     /// zstd.
     Zstd,
@@ -189,10 +200,13 @@ const LZO_LEN: usize = 4;
 ///   compressed length, counting those four bytes.
 /// - Each segment is a little-endian `u32` of its own compressed length,
 ///   then that many bytes, decoding to at most one sector.
-/// - **A segment never straddles a sector boundary.** When what remains
-///   of the current sector cannot hold another header and its data, the
-///   rest of the sector is skipped and the next segment begins at the
-///   following boundary.
+/// - **A segment's header never straddles a sector boundary.** When what
+///   remains of the current sector cannot hold another four-byte header,
+///   the rest of the sector (at most three bytes) is skipped and the next
+///   header begins at the following boundary. The segment's DATA may run
+///   across a boundary freely; the kernel's `lzo.c` says the same, and a
+///   check that also required the data to fit would misread every extent
+///   whose payload spans a sector.
 ///
 /// That last rule is the whole reason this function exists rather than a
 /// single call to the LZO decoder, and it is invisible in any extent
@@ -404,6 +418,47 @@ mod tests {
         framed[4..8].copy_from_slice(&9999u32.to_le_bytes());
         let err = decompress(Compression::Lzo, &framed, 4096, 4096).unwrap_err();
         assert!(format!("{err}").contains("past the end"), "got {err}");
+    }
+
+    /// An LZO1X stream of `n` literals (4..=238) and nothing else: the
+    /// first byte `17 + n` announces the run, and `0x11 0x00 0x00` is the
+    /// end-of-stream marker. Enough to exercise the framing through the
+    /// real decoder without an LZO compressor.
+    fn lzo_literals(bytes: &[u8]) -> Vec<u8> {
+        assert!((4..=238).contains(&bytes.len()));
+        let mut out = vec![17 + bytes.len() as u8];
+        out.extend_from_slice(bytes);
+        out.extend_from_slice(&[0x11, 0, 0]);
+        out
+    }
+
+    /// A segment's HEADER never straddles a sector; its PAYLOAD may, and is
+    /// read straight across the boundary (#91).
+    ///
+    /// The kernel's `lzo.c`: the header does not cross a sector, "thus it's
+    /// possible to have at most 3 padding zeros at the end of the sector",
+    /// and nothing more. The doc once said header AND data, which reads as
+    /// if this decoder's header-only check were too weak.
+    ///
+    /// With 64-byte sectors: the extent header and the first segment's
+    /// header take 8 bytes, a 48-byte first segment ends at 56, the second
+    /// header fits in 56..60, and the second segment's 14 bytes run from 60
+    /// across the boundary at 64.
+    #[test]
+    fn an_lzo_payload_crosses_a_sector_boundary_and_is_read_through() {
+        let sectorsize = 64;
+        let a: Vec<u8> = (0..44u8).collect();
+        let b: Vec<u8> = (100..110u8).collect();
+        let first = lzo_literals(&a);
+        let second = lzo_literals(&b);
+        assert_eq!(first.len(), 48);
+        let framed = lzo_frame(&[first, second], sectorsize);
+        assert_eq!(read_u32(&framed, 56).unwrap(), 14, "fixture: header at 56");
+
+        let got = decompress(Compression::Lzo, &framed, a.len() + b.len(), sectorsize)
+            .expect("a payload crossing a sector is legal");
+        assert_eq!(&got[..a.len()], &a[..]);
+        assert_eq!(&got[a.len()..], &b[..]);
     }
 
     /// The layout a straddling header produces, written down.

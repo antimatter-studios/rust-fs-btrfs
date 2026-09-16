@@ -425,7 +425,7 @@ impl TreeBlock {
     ///
     /// [`Error::ChecksumMismatch`] if the stored digest disagrees,
     /// [`Error::BlockIdentityMismatch`] if the header's `bytenr` is not
-    /// `logical`, and [`Error::BadSuperblock`] — see [`bad_block`] — if
+    /// `logical`, and [`Error::BadSuperblock`] — see `bad_block` — if
     /// the fsid is foreign or the block's internal geometry does not
     /// hold up.
     pub fn parse(bytes: Vec<u8>, logical: u64, geom: &TreeGeometry) -> Result<Self> {
