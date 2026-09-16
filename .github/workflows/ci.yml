@@ -268,6 +268,15 @@ jobs:
           BTRFS_ORACLE_FIXTURES: required
         run: cargo test --test csum_oracle -- --nocapture
 
+      # mount_rw's compat_ro refusal is tested on images the test makes
+      # itself with mkfs.btrfs, which only this job installs. `required`
+      # turns a missing mkfs.btrfs into a failure instead of a skip that
+      # reads as a pass (#72).
+      - name: An unmaintained compat_ro feature refuses a read-write mount
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test compat_ro_write_refusal -- --nocapture
+
       # Seven superblocks of one filesystem, six commits apart. Six
       # rather than one because the backup ring has four slots and the
       # index is (generation - 1) mod 4 — a single commit exercises one
