@@ -47,8 +47,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// `BTRFS_FS_TREE_OBJECTID` — the subvolume holding the default
-/// filesystem namespace.
-pub const FS_TREE_OBJECTID: u64 = 5;
+/// filesystem namespace. The one copy is `chunk::objectid`.
+pub use crate::chunk::objectid::FS_TREE as FS_TREE_OBJECTID;
 
 /// One item of the root tree: `(objectid, key_type, offset, data)`.
 ///
