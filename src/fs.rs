@@ -495,17 +495,11 @@ impl Filesystem {
     /// A volume whose chosen superblock is not the primary copy -- the
     /// primary is damaged, or older than a mirror -- is refused: something
     /// happened to it, and committing on top of that is not a decision to
-    /// make without the user. It still mounts read-only (#90).
+    /// make without the user. It still mounts read-only (#90). The check
+    /// is made on the superblock the mount then uses, in `open_pool`.
     pub fn mount_rw(device: Arc<dyn BlockDevice>) -> Result<Self> {
         if !device.is_writable() {
             return Err(Error::ReadOnly);
-        }
-        let (_, copy) = crate::superblock::read_superblock(&*device)?;
-        if copy != 0 {
-            return Err(Error::UnsupportedFeature(format!(
-                "the primary superblock is damaged or older than copy {copy}; the volume can be \
-                 mounted read-only from that copy, and should be checked before it is written"
-            )));
         }
         Self::open(device.clone(), Some(device))
     }
@@ -679,7 +673,16 @@ impl Filesystem {
         devices: BTreeMap<u64, Arc<dyn BlockRead>>,
         writable: Option<Arc<dyn BlockDevice>>,
     ) -> Result<Self> {
-        let (sb, _) = crate::superblock::read_superblock(&*device)?;
+        let (sb, copy) = crate::superblock::read_superblock(&*device)?;
+        // ON THE SELECTION THIS MOUNT USES. Checked on a separate read
+        // beforehand, a mirror that failed to read then and read now was
+        // mounted writable from the mirror (Greptile on #146).
+        if writable.is_some() && copy != 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "the primary superblock is damaged or older than copy {copy}; the volume can be \
+                 mounted read-only from that copy, and should be checked before it is written"
+            )));
+        }
 
         // One device open, and the filesystem says it has more.
         //

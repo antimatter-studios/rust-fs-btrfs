@@ -5,7 +5,8 @@
 //! damaged could not be mounted though the commit path writes all three.
 //! A fresh `mkfs.btrfs` image of 256 MiB has copies 0 and 1 and no copy 2,
 //! so the absent copy is exercised by every case. Skips without
-//! btrfs-progs.
+//! btrfs-progs, unless `BTRFS_ORACLE_FIXTURES=required`, which the CI job
+//! that installs them sets.
 
 use fs_btrfs::error::Error;
 use fs_btrfs::fs::Filesystem;
@@ -23,11 +24,16 @@ fn fresh_image(name: &str) -> Option<std::path::PathBuf> {
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
-    let made = Command::new("mkfs.btrfs")
-        .arg("-f")
-        .arg(&path)
-        .output()
-        .ok()?;
+    let made = match Command::new("mkfs.btrfs").arg("-f").arg(&path).output() {
+        Ok(made) => made,
+        Err(e) => {
+            assert!(
+                std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() != Ok("required"),
+                "BTRFS_ORACLE_FIXTURES=required, but mkfs.btrfs is not runnable: {e}"
+            );
+            return None;
+        }
+    };
     assert!(
         made.status.success(),
         "{}",
@@ -36,11 +42,21 @@ fn fresh_image(name: &str) -> Option<std::path::PathBuf> {
     Some(path)
 }
 
+/// Rewrite one superblock copy in place: 4 KiB read and written, not
+/// the whole image.
 fn edit_copy(path: &std::path::Path, copy: usize, edit: impl FnOnce(&mut [u8])) {
-    let mut bytes = std::fs::read(path).unwrap();
-    let at = SUPER_OFFSETS[copy] as usize;
-    edit(&mut bytes[at..at + 4096]);
-    std::fs::write(path, &bytes).unwrap();
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let mut bytes = [0u8; 4096];
+    file.seek(SeekFrom::Start(SUPER_OFFSETS[copy])).unwrap();
+    file.read_exact(&mut bytes).unwrap();
+    edit(&mut bytes);
+    file.seek(SeekFrom::Start(SUPER_OFFSETS[copy])).unwrap();
+    file.write_all(&bytes).unwrap();
 }
 
 fn read(path: &std::path::Path) -> (u64, usize) {
@@ -110,5 +126,73 @@ fn the_copy_with_the_newer_generation_wins() {
         (gen0 + 1, 1),
         "the older primary was preferred"
     );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// A file device whose first read of superblock copy 1 fails and whose
+/// later reads succeed.
+struct MirrorFailsOnce {
+    inner: FileDevice,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl BlockRead for MirrorFailsOnce {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+        if offset == SUPER_OFFSETS[1]
+            && !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(fs_core::Error::OutOfBounds {
+                offset,
+                len: buf.len() as u64,
+                size: 0,
+            });
+        }
+        self.inner.read_at(offset, buf)
+    }
+    fn size_bytes(&self) -> u64 {
+        BlockRead::size_bytes(&self.inner)
+    }
+}
+
+impl BlockDevice for MirrorFailsOnce {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> fs_core::Result<()> {
+        self.inner.write_at(offset, buf)
+    }
+    fn flush(&self) -> fs_core::Result<()> {
+        self.inner.flush()
+    }
+    fn is_writable(&self) -> bool {
+        true
+    }
+}
+
+/// The read-write refusal is made on the superblock the mount uses.
+///
+/// Copy 1 is newer, and its first read fails. A refusal checked on its own
+/// read beforehand saw only copy 0 and let the mount through, and the
+/// mount's own selection then read copy 1 and mounted it writable
+/// (Greptile on #146). A writable mount must never be of a mirror.
+#[test]
+fn a_mirror_that_reads_only_the_second_time_is_not_mounted_writable() {
+    let Some(path) = fresh_image("flaky") else {
+        eprintln!("no mkfs.btrfs -- skipping");
+        return;
+    };
+    let (gen0, _) = read(&path);
+    edit_copy(&path, 1, |sb| {
+        sb[offsets::GENERATION..offsets::GENERATION + 8].copy_from_slice(&(gen0 + 1).to_le_bytes());
+        stamp_checksum(sb, ChecksumType::Crc32c);
+    });
+    let dev = Arc::new(MirrorFailsOnce {
+        inner: FileDevice::open_rw(&path).unwrap(),
+        failed: std::sync::atomic::AtomicBool::new(false),
+    });
+    if let Ok(fs) = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>) {
+        assert_eq!(
+            fs.superblock().generation,
+            gen0,
+            "mounted writable from the mirror"
+        );
+    }
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
