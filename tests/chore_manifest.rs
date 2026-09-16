@@ -99,6 +99,10 @@ fn document(text: &str) -> Yaml<'_> {
 /// own commands read, and says nothing about chore's `timeout:` field.
 /// The key `vars` itself is still collected; only the names inside it
 /// are not.
+///
+/// Only where chore puts such a map: at the top level or in a task. Under
+/// `tasks:` the keys are task names, which the user also picks, so a task
+/// NAMED `vars` or `env` is a task, and its body is walked like any other.
 const FREE_FORM_MAPS: &[&str] = &["vars", "env"];
 
 /// Every mapping key in the document, except the names inside a
@@ -109,19 +113,25 @@ const FREE_FORM_MAPS: &[&str] = &["vars", "env"];
 /// wherever it appears. Sequences are walked too: a task's `cmds:` is a
 /// list of mappings.
 fn all_keys(node: &Yaml, out: &mut BTreeSet<String>) {
+    collect_keys(node, None, out);
+}
+
+/// [`all_keys`], knowing the key whose value `node` is.
+fn collect_keys(node: &Yaml, parent: Option<&str>, out: &mut BTreeSet<String>) {
     if let Some(mapping) = node.as_mapping() {
         for (key, value) in mapping.iter() {
-            if let Some(name) = key.as_str() {
+            let name = key.as_str();
+            if let Some(name) = name {
                 out.insert(name.to_string());
-                if FREE_FORM_MAPS.contains(&name) {
+                if FREE_FORM_MAPS.contains(&name) && parent != Some("tasks") {
                     continue;
                 }
             }
-            all_keys(value, out);
+            collect_keys(value, name, out);
         }
     } else if let Some(sequence) = node.as_sequence() {
         for item in sequence {
-            all_keys(item, out);
+            collect_keys(item, parent, out);
         }
     }
 }
@@ -359,6 +369,27 @@ tasks:
                 violations(&control).len(),
                 1,
                 "control: the real key beside {spelling:?} is still reported"
+            );
+        }
+    }
+
+    /// A TASK NAMED LIKE A FREE-FORM MAP IS A TASK (Greptile on
+    /// rust-fs-xfs#173). Under `tasks:` the keys are task names, so a task
+    /// called `vars` or `env` has its body walked, and a `timeout:` in it
+    /// is reported.
+    #[test]
+    fn a_task_named_vars_or_env_is_still_walked() {
+        for task in ["vars", "env"] {
+            let yaml = OLD_FLOOR.replace(
+                "  test:\n    cmds:\n      - cmd: 'cargo test'\n",
+                &format!("  {task}:\n    timeout: 45m\n    cmds:\n      - cmd: 'cargo test'\n"),
+            );
+            assert_ne!(yaml, OLD_FLOOR, "the mutation must actually apply");
+            assert_eq!(
+                violations(&yaml).len(),
+                1,
+                "the task `{task}` uses timeout: {:?}",
+                violations(&yaml)
             );
         }
     }
