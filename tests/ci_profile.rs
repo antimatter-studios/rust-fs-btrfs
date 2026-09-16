@@ -273,6 +273,8 @@ struct Step {
 
 #[derive(Debug)]
 struct Job {
+    /// The job's key under `jobs:`, such as `kernel-gate`.
+    id: String,
     keys: Vec<String>,
     steps: Vec<Step>,
 }
@@ -356,7 +358,7 @@ fn parse_workflow(text: &str) -> Workflow {
 
     let mut jobs = Vec::new();
     if let Some(mapping) = field(document, "jobs").and_then(Yaml::as_mapping) {
-        for (_, body) in mapping.iter() {
+        for (id, body) in mapping.iter() {
             let steps = field(body, "steps")
                 .and_then(Yaml::as_sequence)
                 .into_iter()
@@ -376,6 +378,7 @@ fn parse_workflow(text: &str) -> Workflow {
                 })
                 .collect();
             jobs.push(Job {
+                id: id.as_str().unwrap_or_default().to_string(),
                 keys: keys_of(body),
                 steps,
             });
@@ -700,26 +703,28 @@ jobs:
 ///
 /// The kernel-gate's per-target runs are deliberately exempt: they are
 /// invoked from shell bodies, several inside loops, and pinning them is
-/// a larger change than this one is scoped to. The exemption is stated
-/// as a list rather than left implicit, so adding a new unpinned step
-/// outside the kernel-gate job fails here.
+/// a larger change than this one is scoped to. The exemption is by job,
+/// in [`LOCKED_EXEMPT_JOBS`], so adding a new unpinned step to any other
+/// job fails here.
+///
+/// The runs are read from the parsed workflow, every `run:` of every
+/// step (#123). The scan this replaces matched lines starting `- run: `,
+/// so a `cargo test` inside a `run: |` block was never checked, and the
+/// kernel-gate was exempt only because its steps spell `run:` on a line
+/// of its own.
 #[test]
 fn the_gates_own_cargo_test_runs_pin_locked() {
     let path = ci_yml();
     let workflow = read_or_panic(&path);
 
-    let steps: Vec<&str> = workflow
-        .lines()
-        .map(str::trim_start)
-        .filter(|line| line.starts_with("- run: ") && line.contains("cargo test"))
-        .collect();
+    let steps = cargo_test_runs_outside(&workflow, LOCKED_EXEMPT_JOBS);
 
     // Non-emptiness first: `all()` over nothing is true, and a rewritten
-    // workflow with no `- run:` cargo test steps would satisfy the loop
-    // below while establishing nothing at all.
+    // workflow with no cargo test runs outside the exempt jobs would
+    // satisfy the loop below while establishing nothing at all.
     assert!(
         !steps.is_empty(),
-        "{} has no `- run:` step invoking `cargo test`, so this guard is \
+        "{} has no `cargo test` run outside {LOCKED_EXEMPT_JOBS:?}, so this guard is \
          asserting nothing. Re-read it before changing the workflow's step \
          layout.",
         path.display()
@@ -732,6 +737,120 @@ fn the_gates_own_cargo_test_runs_pin_locked() {
              is resolved past instead of failing the gate.",
             path.display()
         );
+    }
+}
+
+/// Jobs whose `cargo test` runs need not pin `--locked`; see
+/// [`the_gates_own_cargo_test_runs_pin_locked`].
+const LOCKED_EXEMPT_JOBS: &[&str] = &["kernel-gate"];
+
+/// Every `cargo test` command in `workflow`'s steps, except in the jobs
+/// named in `exempt`: each non-comment line of each step's `run:`, with
+/// any trailing ` #` comment cut off.
+fn cargo_test_runs_outside(workflow: &str, exempt: &[&str]) -> Vec<String> {
+    parse_workflow(workflow)
+        .jobs
+        .iter()
+        .filter(|job| !exempt.contains(&job.id.as_str()))
+        .flat_map(|job| &job.steps)
+        .flat_map(|step| step.run.lines())
+        .map(str::trim_start)
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| line.split(" #").next().unwrap_or(line).trim())
+        .filter(|command| command.contains("cargo test"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The pieces of the `--locked` guard, against workflows whose answers
+/// are known.
+mod locked {
+    use super::{cargo_test_runs_outside, parse_workflow, LOCKED_EXEMPT_JOBS};
+
+    const WORKFLOW: &str = "\
+on:
+  pull_request:
+jobs:
+  test:
+    steps:
+      - run: cargo test --locked --release
+  kernel-gate:
+    steps:
+      - name: per target
+        run: cargo test --test pool_oracle
+";
+
+    #[test]
+    fn the_control_finds_the_pinned_run_and_exempts_the_kernel_gate() {
+        assert_eq!(
+            cargo_test_runs_outside(WORKFLOW, LOCKED_EXEMPT_JOBS),
+            vec!["cargo test --locked --release".to_string()]
+        );
+    }
+
+    /// THE HOLE (#123). A `cargo test` inside a block scalar is on a
+    /// line of its own, which a `- run: ` line scan never collected.
+    #[test]
+    fn a_run_inside_a_block_scalar_is_checked() {
+        for style in ["|", "|-", ">"] {
+            let yaml = WORKFLOW.replace(
+                "      - run: cargo test --locked --release\n",
+                &format!(
+                    "      - run: cargo test --locked --release\n      - run: {style}\n          set -e\n          cargo test --lib  # unpinned\n"
+                ),
+            );
+            assert_ne!(yaml, WORKFLOW, "the mutation must actually apply");
+            let runs = cargo_test_runs_outside(&yaml, LOCKED_EXEMPT_JOBS);
+            assert!(
+                // `>` folds the block onto one line; the run is still
+                // collected, and still lacks `--locked`.
+                runs.iter()
+                    .any(|r| r.contains("cargo test --lib") && !r.contains("--locked")),
+                "run: {style}: the unpinned run inside the block was not collected: {runs:?}"
+            );
+        }
+    }
+
+    /// The exemption is by job, so the same unpinned run in any other job
+    /// is still checked, whatever the step looks like.
+    #[test]
+    fn the_exemption_covers_only_the_named_job() {
+        let yaml = WORKFLOW.replace("  kernel-gate:\n", "  another-gate:\n");
+        assert_ne!(yaml, WORKFLOW, "the mutation must actually apply");
+        assert!(cargo_test_runs_outside(&yaml, LOCKED_EXEMPT_JOBS)
+            .contains(&"cargo test --test pool_oracle".to_string()));
+    }
+
+    /// A commented-out command is not a run.
+    #[test]
+    fn a_comment_inside_a_run_block_is_not_a_run() {
+        let yaml = WORKFLOW.replace(
+            "      - run: cargo test --locked --release\n",
+            "      - run: |\n          # cargo test --lib\n          cargo test --locked --release\n",
+        );
+        assert_eq!(
+            cargo_test_runs_outside(&yaml, LOCKED_EXEMPT_JOBS),
+            vec!["cargo test --locked --release".to_string()]
+        );
+    }
+
+    /// Every exempt job exists in the real `ci.yml`. A renamed job would
+    /// otherwise leave the exemption naming nothing, and the renamed
+    /// job's unpinned runs would fail the guard with no pointer to why.
+    #[test]
+    fn every_exempt_job_exists_in_ci_yml() {
+        let workflow = super::read_or_panic(&super::ci_yml());
+        let ids: Vec<String> = parse_workflow(&workflow)
+            .jobs
+            .into_iter()
+            .map(|job| job.id)
+            .collect();
+        for exempt in LOCKED_EXEMPT_JOBS {
+            assert!(
+                ids.iter().any(|id| id == exempt),
+                "LOCKED_EXEMPT_JOBS names `{exempt}`, which ci.yml does not have: {ids:?}"
+            );
+        }
     }
 }
 
