@@ -1283,6 +1283,34 @@ impl Filesystem {
                     let _ = num_bytes;
                     return Ok(Piece::Zeros);
                 }
+                // THE ITEM'S WINDOW IS INSIDE THE EXTENT IT NAMES.
+                //
+                // `offset` says where in the extent this item's data
+                // starts and `num_bytes` how much of it the item
+                // covers, so together they cannot exceed the extent's
+                // own length. The kernel's tree checker enforces
+                // exactly this. Without it, one `u64` moved the write
+                // target outside the extent entirely -- and the
+                // reference check on the write path is keyed on
+                // `disk_bytenr`, so it still found the extent, agreed
+                // it had one owner, and let the write land somewhere
+                // else: over a tree block, or over another file.
+                //
+                // BEFORE THE COMPRESSED BRANCH, NOT AFTER IT (#73). The
+                // rule is a property of the item, not of how its bytes
+                // are stored, and for a compressed extent `offset` is an
+                // index into the DECODED buffer that never meets the chunk
+                // map: unchecked, one le64 overflowed that index into a
+                // panic in any build with overflow checks on.
+                let window_end = offset
+                    .checked_add(num_bytes)
+                    .filter(|end| *end <= ram_bytes);
+                if window_end.is_none() {
+                    return Err(Error::BadSuperblock(format!(
+                        "inode {ino}: an extent item covers [{offset}, +{num_bytes}) of an \
+                         extent that is {ram_bytes} bytes long"
+                    )));
+                }
                 if algo.is_compressed() {
                     // `disk_len` is the buffer the compressed bytes are
                     // read into, and it is a raw le64. Btrfs never
@@ -1304,27 +1332,6 @@ impl Filesystem {
                         len: num_bytes,
                         algo,
                     });
-                }
-                // THE ITEM'S WINDOW IS INSIDE THE EXTENT IT NAMES.
-                //
-                // `offset` says where in the extent this item's data
-                // starts and `num_bytes` how much of it the item
-                // covers, so together they cannot exceed the extent's
-                // own length. The kernel's tree checker enforces
-                // exactly this. Without it, one `u64` moved the write
-                // target outside the extent entirely -- and the
-                // reference check on the write path is keyed on
-                // `disk_bytenr`, so it still found the extent, agreed
-                // it had one owner, and let the write land somewhere
-                // else: over a tree block, or over another file.
-                let window_end = offset
-                    .checked_add(num_bytes)
-                    .filter(|end| *end <= ram_bytes);
-                if window_end.is_none() {
-                    return Err(Error::BadSuperblock(format!(
-                        "inode {ino}: an extent item covers [{offset}, +{num_bytes}) of an \
-                         extent that is {ram_bytes} bytes long"
-                    )));
                 }
                 Ok(Piece::Regular {
                     // Both halves are raw le64s. In release, where this
@@ -1579,9 +1586,11 @@ impl Filesystem {
                     )?;
                     // `within` indexes the decoded bytes, which is the
                     // whole reason this is not a Regular read.
-                    let src_at = (within as usize).saturating_add(skip);
-                    let src = decoded
-                        .get(src_at..src_at + take)
+                    let src = usize::try_from(within)
+                        .ok()
+                        .and_then(|w| w.checked_add(skip))
+                        .and_then(|at| Some(at..at.checked_add(take)?))
+                        .and_then(|range| decoded.get(range))
                         .ok_or_else(|| short_extent(ino, "compressed"))?;
                     dst.copy_from_slice(src);
                 }
