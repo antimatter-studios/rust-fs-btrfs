@@ -35,7 +35,7 @@
 //! Holes read as zeros, which is what they are.
 
 use crate::btree::{Tree, TreeGeometry};
-use crate::chunk::{Chunk, ChunkMap, DiskKey};
+use crate::chunk::{ChunkMap, DiskKey};
 use crate::compression::{self, Compression};
 use crate::dir::{self, DirEntry, DIR_INDEX_KEY, XATTR_ITEM_KEY};
 use crate::error::{Error, Result};
@@ -737,8 +737,11 @@ impl Filesystem {
             };
             let tree = Tree::from_superblock(&sb, &read).with_redundancy(&mirrors, &read_mirror);
             let mut found = Vec::new();
+            // Only chunk items, and a chunk item that does not parse or
+            // does not fit the sector size fails the mount by name rather
+            // than leaving a hole in the map (#85).
             tree.for_each(sb.chunk_root, &mut |key: &DiskKey, data: &[u8]| {
-                if let Ok(chunk) = Chunk::parse(key.offset, data) {
+                if let Some(chunk) = crate::chunk::chunk_from_item(key, data, sb.sectorsize)? {
                     found.push(chunk);
                 }
                 Ok(true)
