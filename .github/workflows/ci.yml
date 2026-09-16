@@ -369,6 +369,15 @@ jobs:
       - name: Commit ordering and barriers
         run: cargo test --test commit_order -- --nocapture
 
+      # A preallocated extent, made by retyping an extent item on an image
+      # the test builds with mkfs.btrfs, which only this job installs.
+      # `required` turns a missing mkfs.btrfs into a failure instead of a
+      # skip that reads as a pass (#74).
+      - name: A preallocated extent is refused as preallocated
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test prealloc_extent_write -- --nocapture
+
       # A whole image before and after one change, so what a transaction
       # actually does can be measured rather than reasoned about. The
       # control pair — a mount cycle that changes nothing — is what makes
