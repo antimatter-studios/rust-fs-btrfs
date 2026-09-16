@@ -155,7 +155,7 @@ impl Filesystem {
             if piece.compressed || piece.logical.is_none() {
                 return Ok(false);
             }
-            if self.extent_refs(piece.extent_start)? != 1 {
+            if self.extent_item(piece.extent_start)?.0 != 1 {
                 return Ok(false);
             }
         }
@@ -194,7 +194,28 @@ impl Filesystem {
             };
 
             // The check that `nodatacow` alone does not give us.
-            let refs = self.extent_refs(piece.extent_start)?;
+            let (refs, extent_len) = self.extent_item(piece.extent_start)?;
+            // INSIDE THE EXTENT, BY THE EXTENT TREE'S RECORD OF IT (#89).
+            // The window's bound in `decode_extent` is `ram_bytes`, a field
+            // of the same item that moved the window, so a crafted item
+            // raised both and sent this write past the extent -- over a
+            // tree block, or another file -- while the reference check
+            // below, keyed on the extent's start, still found one owner.
+            // The EXTENT_ITEM's key offset is the length the allocator
+            // recorded, and nothing in the file's item can change it.
+            let piece_end = logical.checked_add(piece.len);
+            let extent_end = piece.extent_start.checked_add(extent_len);
+            if logical < piece.extent_start
+                || piece_end.is_none()
+                || extent_end.is_none()
+                || piece_end > extent_end
+            {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino}: offset {pos} maps to [{logical}, +{}), outside the \
+                     {extent_len}-byte extent the extent tree records at {}",
+                    piece.len, piece.extent_start
+                )));
+            }
             if refs != 1 {
                 return Err(Error::UnsupportedFeature(format!(
                     "inode {ino}: the extent at {} has {refs} references, so something \
@@ -211,12 +232,14 @@ impl Filesystem {
         Ok(plan)
     }
 
-    /// How many references the extent beginning at `bytenr` has.
+    /// How many references the extent beginning at `bytenr` has, and how
+    /// long the extent tree records it as.
     ///
-    /// One means it belongs to a single file. Anything more means a
-    /// snapshot or a reflink is also pointing at it, and writing in
-    /// place would change what that other reader sees.
-    fn extent_refs(&self, bytenr: u64) -> Result<u64> {
+    /// One reference means it belongs to a single file. Anything more
+    /// means a snapshot or a reflink is also pointing at it, and writing
+    /// in place would change what that other reader sees. The length is
+    /// the `EXTENT_ITEM`'s key offset: what the allocator reserved.
+    fn extent_item(&self, bytenr: u64) -> Result<(u64, u64)> {
         let root = self.extent_tree_root()?;
         let reader = self.pool_reader();
         let tree = reader.tree();
@@ -227,10 +250,13 @@ impl Filesystem {
                 && key.key_type == key_type::EXTENT_ITEM
                 && data.len() >= extent_item::REFS + 8
             {
-                refs = Some(u64::from_le_bytes(
-                    data[extent_item::REFS..extent_item::REFS + 8]
-                        .try_into()
-                        .expect("8 bytes"),
+                refs = Some((
+                    u64::from_le_bytes(
+                        data[extent_item::REFS..extent_item::REFS + 8]
+                            .try_into()
+                            .expect("8 bytes"),
+                    ),
+                    key.offset,
                 ));
                 return Ok(false);
             }
