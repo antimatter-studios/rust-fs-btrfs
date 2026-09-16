@@ -33,11 +33,16 @@ fn image_with_damaged_chunk(name: &str, damage: fn(&mut [u8])) -> Option<std::pa
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
-    let made = Command::new("mkfs.btrfs")
-        .arg("-f")
-        .arg(&path)
-        .output()
-        .ok()?;
+    let made = match Command::new("mkfs.btrfs").arg("-f").arg(&path).output() {
+        Ok(made) => made,
+        Err(e) => {
+            assert!(
+                std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() != Ok("required"),
+                "BTRFS_ORACLE_FIXTURES=required, but mkfs.btrfs is not runnable: {e}"
+            );
+            return None;
+        }
+    };
     assert!(
         made.status.success(),
         "{}",
@@ -99,7 +104,10 @@ fn a_chunk_item_that_does_not_parse_fails_the_mount_by_name() {
         return;
     };
     match mount(&path) {
-        Err(Error::BadChunkItem(why)) => assert!(why.contains("zero stripes"), "{why}"),
+        Err(Error::BadChunkItem(why)) => assert!(
+            why.contains("zero stripes") && why.contains("chunk item at logical 0x"),
+            "the refusal should name the reason and the chunk: {why}"
+        ),
         Err(other) => panic!("refused for the wrong reason: {other:?}"),
         Ok(_) => panic!("a chunk item with zero stripes was dropped and the volume mounted"),
     }
@@ -114,7 +122,10 @@ fn a_chunk_item_with_unaligned_geometry_fails_the_mount() {
         return;
     };
     match mount(&path) {
-        Err(Error::BadChunkItem(why)) => assert!(why.contains("aligned"), "{why}"),
+        Err(Error::BadChunkItem(why)) => assert!(
+            why.contains("aligned") && why.contains("chunk item at logical 0x"),
+            "the refusal should name the reason and the chunk: {why}"
+        ),
         Err(other) => panic!("refused for the wrong reason: {other:?}"),
         Ok(_) => panic!("a chunk item with an unaligned stripe was never geometry-checked"),
     }

@@ -689,13 +689,16 @@ pub fn chunk_from_item(key: &DiskKey, data: &[u8], sectorsize: u32) -> Result<Op
             objectid::FIRST_CHUNK_TREE
         )));
     }
-    let chunk = Chunk::parse(key.offset, data).map_err(|e| match e {
+    // Both refusals name the item, so a mount that fails here points at
+    // the chunk rather than at a reason with no address.
+    let named = |e| match e {
         Error::BadChunkItem(why) => {
             Error::BadChunkItem(format!("chunk item at logical {:#x}: {why}", key.offset))
         }
         other => other,
-    })?;
-    chunk.validate_geometry(sectorsize)?;
+    };
+    let chunk = Chunk::parse(key.offset, data).map_err(named)?;
+    chunk.validate_geometry(sectorsize).map_err(named)?;
     Ok(Some(chunk))
 }
 
