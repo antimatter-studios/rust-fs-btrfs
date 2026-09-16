@@ -11,7 +11,8 @@
 //! The image is `mkfs.btrfs --rootdir` of a file whose bytes ARE a zlib
 //! stream; its extent item is then marked zlib-compressed with a chosen
 //! window, in every copy of the leaf, and restamped. Skips without
-//! btrfs-progs.
+//! btrfs-progs, unless `BTRFS_ORACLE_FIXTURES=required`, which the CI job
+//! that installs them sets.
 
 use fs_btrfs::btree::{header_offsets, HEADER_SIZE, ITEM_SIZE};
 use fs_btrfs::chunk::objectid;
@@ -67,13 +68,22 @@ fn image(name: &str, offset: u64, num_bytes: u64) -> Option<(std::path::PathBuf,
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
-    let made = Command::new("mkfs.btrfs")
+    let made = match Command::new("mkfs.btrfs")
         .arg("-f")
         .arg("--rootdir")
         .arg(&root)
         .arg(&img)
         .output()
-        .ok()?;
+    {
+        Ok(made) => made,
+        Err(e) => {
+            assert!(
+                std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() != Ok("required"),
+                "BTRFS_ORACLE_FIXTURES=required, but mkfs.btrfs is not runnable: {e}"
+            );
+            return None;
+        }
+    };
     assert!(
         made.status.success(),
         "{}",

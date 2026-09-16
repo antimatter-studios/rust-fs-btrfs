@@ -327,6 +327,15 @@ jobs:
       - name: Compare the subvolume listing against btrfs-progs
         run: cargo test --test subvol_oracle -- --nocapture
 
+      # Compressed-extent windows, on an image the test builds with
+      # mkfs.btrfs, which only this job installs. `required` turns a
+      # missing mkfs.btrfs into a failure instead of a skip that reads as a
+      # pass (#73).
+      - name: A compressed extent's window is checked before it is read
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test compressed_extent_window -- --nocapture
+
       - name: Run the oracle test against the fixtures
         run: cargo test --test oracle_vm_fixtures -- --nocapture
 
