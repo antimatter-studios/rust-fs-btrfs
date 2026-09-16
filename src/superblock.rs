@@ -315,9 +315,16 @@ pub mod incompat {
         | RAID1C34;
 }
 
-/// `compat_ro_flags` bits. Unknown bits here still permit a read-only
-/// mount, which is exactly what this driver does today, so none of them
-/// is a rejection reason.
+/// `compat_ro_flags` bits: features an implementation may ignore while
+/// READING and must not ignore while WRITING.
+///
+/// A read-only mount accepts any of them. [`Filesystem::mount_rw`] refuses
+/// a volume with a bit outside [`compat_ro::SUPPORTED`] -- this driver
+/// writes, and a writer that ignores a structure the bit announces leaves
+/// it describing a filesystem that no longer exists (#72). See
+/// [`refuse_unmaintained_compat_ro`].
+///
+/// [`Filesystem::mount_rw`]: crate::fs::Filesystem::mount_rw
 pub mod compat_ro {
     /// A free-space tree (space_cache v2) is present.
     pub const FREE_SPACE_TREE: u64 = 1 << 0;
@@ -327,6 +334,94 @@ pub mod compat_ro {
     pub const VERITY: u64 = 1 << 2;
     /// Block group items live in their own tree.
     pub const BLOCK_GROUP_TREE: u64 = 1 << 3;
+
+    /// Every `compat_ro` feature this driver MAINTAINS when it writes.
+    ///
+    /// The free-space tree is updated by every transaction beside the
+    /// extent tree it complements, and its validity bit is cleared when a
+    /// commit could not, which is the state the format defines for that.
+    /// Not `VERITY`, whose Merkle tree a data write invalidates, and not
+    /// `BLOCK_GROUP_TREE`, whose block group items this driver looks for
+    /// in the extent tree and would not find.
+    pub const SUPPORTED: u64 = FREE_SPACE_TREE | FREE_SPACE_TREE_VALID;
+}
+
+/// Refuse to WRITE a volume carrying a `compat_ro` feature this driver
+/// does not maintain (#72).
+///
+/// Reading such a volume is sound, which is what the bit's class says, so
+/// this is checked at `mount_rw` and not at parse.
+pub fn refuse_unmaintained_compat_ro(compat_ro_flags: u64) -> Result<()> {
+    let mut unmaintained = compat_ro_flags & !compat_ro::SUPPORTED;
+    if unmaintained == 0 {
+        return Ok(());
+    }
+    let mut named = Vec::new();
+    for (bit, name) in [
+        (compat_ro::VERITY, "fs-verity"),
+        (compat_ro::BLOCK_GROUP_TREE, "the block group tree"),
+    ] {
+        if unmaintained & bit != 0 {
+            named.push(name.to_string());
+            unmaintained &= !bit;
+        }
+    }
+    if unmaintained != 0 {
+        named.push(format!("unknown bits {unmaintained:#018x}"));
+    }
+    Err(Error::UnsupportedFeature(format!(
+        "this volume uses read-only-compatible features this driver does not maintain \
+         ({}), so it can be read but not written",
+        named.join(", ")
+    )))
+}
+
+#[cfg(test)]
+mod compat_ro_tests {
+    use super::*;
+
+    /// The bit values, against `include/uapi/linux/btrfs.h` on
+    /// torvalds/linux master.
+    #[test]
+    fn the_compat_ro_bits_are_upstreams() {
+        assert_eq!(compat_ro::FREE_SPACE_TREE, 1 << 0);
+        assert_eq!(compat_ro::FREE_SPACE_TREE_VALID, 1 << 1);
+        assert_eq!(compat_ro::VERITY, 1 << 2);
+        assert_eq!(compat_ro::BLOCK_GROUP_TREE, 1 << 3);
+    }
+
+    #[test]
+    fn a_volume_with_only_maintained_features_may_be_written() {
+        for flags in [
+            0,
+            compat_ro::FREE_SPACE_TREE,
+            compat_ro::FREE_SPACE_TREE | compat_ro::FREE_SPACE_TREE_VALID,
+        ] {
+            refuse_unmaintained_compat_ro(flags)
+                .unwrap_or_else(|e| panic!("{flags:#x} must be writable: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn a_volume_with_an_unmaintained_feature_is_refused_by_name() {
+        for (flags, needle) in [
+            (compat_ro::VERITY, "fs-verity"),
+            (compat_ro::BLOCK_GROUP_TREE, "block group tree"),
+            (1 << 40, "0x0000010000000000"),
+            (
+                compat_ro::FREE_SPACE_TREE | compat_ro::BLOCK_GROUP_TREE | (1 << 7),
+                "0x0000000000000080",
+            ),
+        ] {
+            match refuse_unmaintained_compat_ro(flags) {
+                Err(Error::UnsupportedFeature(m)) => {
+                    assert!(m.contains(needle), "{flags:#x}: {m}");
+                    assert!(m.contains("can be read but not written"), "{flags:#x}: {m}");
+                }
+                other => panic!("{flags:#x} gave {other:?}"),
+            }
+        }
+    }
 }
 
 /// The hash algorithm protecting this volume's metadata, from

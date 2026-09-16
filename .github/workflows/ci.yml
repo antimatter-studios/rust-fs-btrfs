@@ -227,12 +227,31 @@ jobs:
       - name: Build the subvolume fixture
         run: sudo bash scripts/build-subvol-fixtures.sh
 
+      # The chunk-tree walk's refusals, on images the test damages itself
+      # after mkfs.btrfs, which only this job installs. `required` turns a
+      # missing mkfs.btrfs into a failure instead of a skip that reads as a
+      # pass (#85).
+      - name: A malformed chunk item fails the mount by name
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test chunk_tree_items -- --nocapture
+
       # Extended attributes have to be SET, which needs a mount, so this
       # cannot come from the mkfs-only matrix either. Same script the VM
       # runner calls. Without it tests/xattr_oracle.rs finds no fixture
       # and skips, which reads exactly like passing.
       - name: Build the extended-attribute fixture
         run: sudo bash scripts/build-xattr-fixtures.sh
+
+      # The checked-in fixture's attribute names are all UTF-8, so a name
+      # that is not only gets tested here, where btrfs-progs and attr are
+      # installed: the test builds its own image with `mkfs.btrfs
+      # --rootdir`. `required` turns a missing tool into a failure instead
+      # of a skip that reads as a pass (#104).
+      - name: A non-UTF-8 attribute name reads back through the C ABI
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test getxattr_byte_names -- --nocapture
 
       # A filesystem holding a checksummed file and a NODATASUM one, so
       # the data-checksum path can be judged on both. `chattr +C` needs
@@ -266,6 +285,15 @@ jobs:
         env:
           BTRFS_ORACLE_FIXTURES: required
         run: cargo test --test csum_oracle -- --nocapture
+
+      # mount_rw's compat_ro refusal is tested on images the test makes
+      # itself with mkfs.btrfs, which only this job installs. `required`
+      # turns a missing mkfs.btrfs into a failure instead of a skip that
+      # reads as a pass (#72).
+      - name: An unmaintained compat_ro feature refuses a read-write mount
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test compat_ro_write_refusal -- --nocapture
 
       # Seven superblocks of one filesystem, six commits apart. Six
       # rather than one because the backup ring has four slots and the

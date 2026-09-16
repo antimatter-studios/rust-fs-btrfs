@@ -35,7 +35,7 @@
 //! Holes read as zeros, which is what they are.
 
 use crate::btree::{Tree, TreeGeometry};
-use crate::chunk::{Chunk, ChunkMap, DiskKey};
+use crate::chunk::{ChunkMap, DiskKey};
 use crate::compression::{self, Compression};
 use crate::dir::{self, DirEntry, DIR_INDEX_KEY, XATTR_ITEM_KEY};
 use crate::error::{Error, Result};
@@ -497,11 +497,17 @@ impl Filesystem {
     /// happened to it, and committing on top of that is not a decision to
     /// make without the user. It still mounts read-only (#90). The check
     /// is made on the superblock the mount then uses, in `open_pool`.
+    ///
+    /// A volume with a `compat_ro` feature this driver does not maintain
+    /// is refused here, and can still be mounted read-only; see
+    /// [`crate::superblock::refuse_unmaintained_compat_ro`] (#72).
     pub fn mount_rw(device: Arc<dyn BlockDevice>) -> Result<Self> {
         if !device.is_writable() {
             return Err(Error::ReadOnly);
         }
-        Self::open(device.clone(), Some(device))
+        let fs = Self::open(device.clone(), Some(device))?;
+        crate::superblock::refuse_unmaintained_compat_ro(fs.sb.compat_ro_flags)?;
+        Ok(fs)
     }
 
     /// Whether this mount can write.
@@ -740,8 +746,11 @@ impl Filesystem {
             };
             let tree = Tree::from_superblock(&sb, &read).with_redundancy(&mirrors, &read_mirror);
             let mut found = Vec::new();
+            // Only chunk items, and a chunk item that does not parse or
+            // does not fit the sector size fails the mount by name rather
+            // than leaving a hole in the map (#85).
             tree.for_each(sb.chunk_root, &mut |key: &DiskKey, data: &[u8]| {
-                if let Ok(chunk) = Chunk::parse(key.offset, data) {
+                if let Some(chunk) = crate::chunk::chunk_from_item(key, data, sb.sectorsize)? {
                     found.push(chunk);
                 }
                 Ok(true)

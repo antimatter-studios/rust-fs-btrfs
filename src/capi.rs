@@ -798,9 +798,15 @@ pub unsafe extern "C" fn fs_btrfs_getxattr(
         let Some(path) = (unsafe { borrow_str(path, "path") }) else {
             return -1;
         };
-        let Some(name) = (unsafe { borrow_str(name, "name") }) else {
+        // A NAME IS BYTES. `listxattr` hands names out raw and Linux
+        // allows any NUL-terminated bytes, so the UTF-8 path helper -- which
+        // answers a non-UTF-8 name with ENOENT, "not present" -- made a
+        // listed name impossible to read back (#104).
+        if name.is_null() {
+            set_error("name is NULL".into(), ENOENT);
             return -1;
-        };
+        }
+        let name = unsafe { CStr::from_ptr(name) }.to_bytes();
         let fs = &unsafe { &*fs }.fs;
         let found = match fs.lookup_path(path) {
             Ok(i) => i,
@@ -809,10 +815,13 @@ pub unsafe extern "C" fn fs_btrfs_getxattr(
                 return -1;
             }
         };
-        let value = match fs.get_xattr(found.ino, name.as_bytes()) {
+        let value = match fs.get_xattr(found.ino, name) {
             Ok(Some(v)) => v,
             Ok(None) => {
-                set_error(format!("{path} has no attribute {name}"), ENOENT);
+                set_error(
+                    format!("{path} has no attribute {}", String::from_utf8_lossy(name)),
+                    ENOENT,
+                );
                 return -1;
             }
             Err(e) => {
