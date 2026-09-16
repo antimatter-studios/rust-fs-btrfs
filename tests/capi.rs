@@ -1043,6 +1043,64 @@ fn getxattr_distinguishes_an_empty_value_from_a_missing_one() {
     unsafe { fs_btrfs_umount(fs) };
 }
 
+/// Every name `listxattr` returns can be handed straight back to
+/// `getxattr` (#104).
+///
+/// Attribute names are bytes, and `listxattr` writes them raw, but
+/// `getxattr` took its name through the UTF-8 path helper and answered a
+/// non-UTF-8 one with -1 and ENOENT -- the errno for "not present". So a
+/// caller could list a name, pass that exact name back, and be told it
+/// does not exist.
+///
+/// The CI fixture's names are all UTF-8, so there the round trip holds
+/// either way; the second half needs no such name on disk. A local image
+/// carrying `user.caf\xe9` fails the first half before the fix.
+#[test]
+fn getxattr_accepts_every_name_listxattr_returns_and_takes_names_as_bytes() {
+    let Some(fs) = xattr_fixture() else {
+        eprintln!("no xattr fixture — skipping");
+        return;
+    };
+    let path = cstr("/plain.txt");
+    let needed = unsafe { fs_btrfs_listxattr(fs, path.as_ptr(), std::ptr::null_mut(), 0) };
+    assert!(needed > 0, "{}", last_error());
+    let mut list = vec![0u8; needed as usize];
+    let got = unsafe {
+        fs_btrfs_listxattr(
+            fs,
+            path.as_ptr(),
+            list.as_mut_ptr().cast::<c_char>(),
+            list.len(),
+        )
+    };
+    assert_eq!(got, needed);
+    for name in list.split(|&b| b == 0).filter(|n| !n.is_empty()) {
+        let c = CString::new(name.to_vec()).unwrap();
+        let size =
+            unsafe { fs_btrfs_getxattr(fs, path.as_ptr(), c.as_ptr(), std::ptr::null_mut(), 0) };
+        assert!(
+            size >= 0,
+            "listxattr returned {:?} and getxattr says it is absent: {}",
+            String::from_utf8_lossy(name),
+            last_error()
+        );
+    }
+
+    // A name that is not UTF-8 and is not set is looked up and reported
+    // absent -- not refused before the lookup as malformed.
+    let absent = CString::new(b"user.not-\xff-set".to_vec()).unwrap();
+    let r =
+        unsafe { fs_btrfs_getxattr(fs, path.as_ptr(), absent.as_ptr(), std::ptr::null_mut(), 0) };
+    assert_eq!(r, -1);
+    assert_eq!(fs_btrfs_last_errno(), ENOENT, "{}", last_error());
+    assert!(
+        !last_error().contains("UTF-8"),
+        "a byte name was refused before it was looked up: {}",
+        last_error()
+    );
+    unsafe { fs_btrfs_umount(fs) };
+}
+
 /// A file with no attributes lists nothing, and that is a successful
 /// zero rather than a failure.
 #[test]
