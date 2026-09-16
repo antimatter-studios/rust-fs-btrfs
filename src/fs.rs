@@ -343,13 +343,21 @@ enum Piece<'a> {
         len: u64,
         algo: Compression,
     },
-    /// A hole or an unwritten preallocated extent.
+    /// A hole: nothing on disk behind this range.
     ///
     /// Carries no length: the output buffer is zeroed before any extent
     /// is copied into it, so a region with nothing to copy is already
     /// correct. Naming the case explicitly rather than falling through
     /// keeps the reason visible at the match site.
-    Zeros,
+    Hole,
+    /// An unwritten preallocated extent: blocks reserved at `logical` for
+    /// `len` bytes of the file, reading as zeros.
+    ///
+    /// Not a hole. The space is this file's and the extent tree has an
+    /// item for it, so the write planner has to see it -- it was dropped
+    /// with the holes, and a write to a `fallocate`d range was refused as
+    /// a hole and `can_write_in_place` answered yes (#74).
+    Preallocated { logical: u64, len: u64 },
 }
 
 /// One extent of a file, located both in the file and on the volume.
@@ -1279,9 +1287,14 @@ impl Filesystem {
                 // disk_bytenr == 0 is a hole. A preallocated extent has
                 // blocks reserved but never written, and returning them
                 // would disclose whatever previously occupied the space.
-                if disk_bytenr == 0 || kind == EXTENT_PREALLOC {
-                    let _ = num_bytes;
-                    return Ok(Piece::Zeros);
+                if disk_bytenr == 0 {
+                    return Ok(Piece::Hole);
+                }
+                if kind == EXTENT_PREALLOC {
+                    return Ok(Piece::Preallocated {
+                        logical: disk_bytenr,
+                        len: num_bytes,
+                    });
                 }
                 // THE ITEM'S WINDOW IS INSIDE THE EXTENT IT NAMES.
                 //
@@ -1373,9 +1386,11 @@ impl Filesystem {
             let start = *offset;
             match self.decode_extent(data, ino)? {
                 // Inline data lives in the item, so there is no block to
-                // overwrite; preallocated and holes have nothing behind
-                // them. All three are reported with no logical address,
-                // and the planner refuses them by name.
+                // overwrite, and a preallocated extent's blocks read as
+                // zeros until the item is changed to say otherwise. Both
+                // are reported with no logical address, and the planner
+                // refuses them by name. A hole has nothing behind it and
+                // is not reported.
                 Piece::Inline(bytes) => out.push(FileExtent {
                     start,
                     len: bytes.len() as u64,
@@ -1383,7 +1398,14 @@ impl Filesystem {
                     extent_start: 0,
                     compressed: false,
                 }),
-                Piece::Zeros => {}
+                Piece::Preallocated { logical, len } => out.push(FileExtent {
+                    start,
+                    len,
+                    logical: None,
+                    extent_start: logical,
+                    compressed: false,
+                }),
+                Piece::Hole => {}
                 Piece::Regular { logical, len } => out.push(FileExtent {
                     start,
                     len,
@@ -1537,7 +1559,7 @@ impl Filesystem {
             let piece = self.decode_extent(data, ino)?;
             let extent_len = match &piece {
                 Piece::Inline(bytes) => bytes.len() as u64,
-                Piece::Zeros => continue,
+                Piece::Hole | Piece::Preallocated { .. } => continue,
                 Piece::Regular { len, .. } | Piece::Compressed { len, .. } => *len,
             };
             // Where this extent and the window overlap, in file offsets.
@@ -1557,7 +1579,7 @@ impl Filesystem {
                         .ok_or_else(|| short_extent(ino, "inline"))?;
                     dst.copy_from_slice(src);
                 }
-                Piece::Zeros => unreachable!("handled above"),
+                Piece::Hole | Piece::Preallocated { .. } => unreachable!("handled above"),
                 Piece::Regular { logical, .. } => {
                     let at_logical = logical
                         .checked_add(skip as u64)
