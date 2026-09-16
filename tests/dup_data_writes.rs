@@ -11,7 +11,8 @@
 //! inode is marked nodatacow and nodatasum in every copy of its fs-tree
 //! leaf (restamped), and the outcome is read from the raw image: the new
 //! pattern must be there twice and the old one nowhere. Skips without
-//! btrfs-progs.
+//! btrfs-progs, unless `BTRFS_ORACLE_FIXTURES=required`, which the CI job
+//! that installs them sets.
 
 use fs_btrfs::btree::{header_offsets, HEADER_SIZE, ITEM_SIZE};
 use fs_btrfs::chunk::objectid;
@@ -61,6 +62,10 @@ fn a_nodatacow_write_on_a_dup_filesystem_reaches_both_copies() {
         .arg(&img)
         .output()
     else {
+        assert!(
+            std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() != Ok("required"),
+            "BTRFS_ORACLE_FIXTURES=required, but mkfs.btrfs is not runnable"
+        );
         eprintln!("no mkfs.btrfs -- skipping");
         return;
     };
