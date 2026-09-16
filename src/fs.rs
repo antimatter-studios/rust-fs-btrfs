@@ -1430,10 +1430,9 @@ impl Filesystem {
     /// Read a whole file.
     ///
     /// Materialises the file in memory, so it is bounded by the size of
-    /// the filesystem: a whole-file read cannot need more memory than
-    /// the filesystem has bytes, and `inode.size` is a raw `le64` that
-    /// said otherwise. Reading part of a larger file is what
-    /// [`Filesystem::read_at`] is for.
+    /// the filesystem, and the allocation is fallible: a size no allocator
+    /// can satisfy is an error rather than an abort. Reading part of a
+    /// larger file is what [`Filesystem::read_at`] is for.
     pub fn read_file(&self, ino: u64) -> Result<Vec<u8>> {
         let inode = self.read_inode(ino)?;
         if !inode.is_regular_file() && !inode.is_symlink() {
@@ -1445,7 +1444,24 @@ impl Filesystem {
                 inode.size, self.sb.total_bytes
             )));
         }
-        let mut out = vec![0u8; inode.size as usize];
+        // FALLIBLY. `inode.size` is a raw `le64`, and `total_bytes` bounds
+        // it only as tightly as the volume is small: an 8 TB volume
+        // admits an 8 TB `Vec`. An allocation that cannot be satisfied
+        // aborts the process, which `capi::guard` cannot turn into an
+        // errno (#80). A sparse file can truly be that large, so the
+        // extents cannot bound it either; what can be refused is the
+        // allocation.
+        let too_large = || {
+            Error::Io(format!(
+                "inode {ino} is {} bytes, more than a whole-file read can hold in memory; \
+                 read it in pieces with read_at",
+                inode.size
+            ))
+        };
+        let len = usize::try_from(inode.size).map_err(|_| too_large())?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(len).map_err(|_| too_large())?;
+        out.resize(len, 0);
         self.read_range(&inode, 0, &mut out)?;
         Ok(out)
     }
