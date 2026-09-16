@@ -493,11 +493,17 @@ impl Filesystem {
     /// read-only mount, and matters more — writing to a volume whose log
     /// holds changes the trees have not seen would layer new data on top
     /// of state that is about to be replayed over it.
+    ///
+    /// A volume with a `compat_ro` feature this driver does not maintain
+    /// is refused here, and can still be mounted read-only; see
+    /// [`crate::superblock::refuse_unmaintained_compat_ro`] (#72).
     pub fn mount_rw(device: Arc<dyn BlockDevice>) -> Result<Self> {
         if !device.is_writable() {
             return Err(Error::ReadOnly);
         }
-        Self::open(device.clone(), Some(device))
+        let fs = Self::open(device.clone(), Some(device))?;
+        crate::superblock::refuse_unmaintained_compat_ro(fs.sb.compat_ro_flags)?;
+        Ok(fs)
     }
 
     /// Whether this mount can write.
