@@ -300,6 +300,15 @@ jobs:
       - name: Reproduce each committed superblock
         run: cargo test --test super_write_oracle -- --nocapture
 
+      # Data writes on a `-d dup` volume, built by the test with
+      # mkfs.btrfs, which only this job installs. `required` turns a
+      # missing mkfs.btrfs into a failure instead of a skip that reads as a
+      # pass (#71).
+      - name: A data write reaches every copy of a dup extent
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test dup_data_writes -- --nocapture
+
       # The default fixture above exercises CRC32C only. Rebuild the same
       # commit sequence with the widest checksum and DUP data/metadata
       # profiles so the writer is judged against the other superblock
