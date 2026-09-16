@@ -660,6 +660,45 @@ pub struct ChunkMap {
     chunks: Vec<Chunk>,
 }
 
+/// The chunk an item of the chunk tree or the `sys_chunk_array` describes,
+/// or `None` for an item that is not a chunk.
+///
+/// ONE PLACE FOR BOTH BUILDERS (#85). The superblock array checked the key
+/// type, the objectid and the geometry; the chunk-tree walk checked none
+/// of them and dropped any item that failed to parse. So a `DEV_ITEM` --
+/// which the chunk tree also holds, one per device -- was parsed as a
+/// chunk at logical address `devid`, kept out of the map only by its
+/// field values; a malformed `CHUNK_ITEM` was discarded and its range
+/// surfaced much later as an unmapped read somewhere unrelated; and the
+/// geometry check ran on the handful of bootstrap chunks and not on the
+/// tree's.
+///
+/// # Errors
+///
+/// [`Error::BadChunkItem`] for a `CHUNK_ITEM` under the wrong objectid,
+/// one that does not parse, or one whose geometry is not sector-aligned.
+pub fn chunk_from_item(key: &DiskKey, data: &[u8], sectorsize: u32) -> Result<Option<Chunk>> {
+    if key.key_type != key_type::CHUNK_ITEM {
+        return Ok(None);
+    }
+    if key.objectid != objectid::FIRST_CHUNK_TREE {
+        return Err(Error::BadChunkItem(format!(
+            "chunk item at logical {:#x} has objectid {}, expected {}",
+            key.offset,
+            key.objectid,
+            objectid::FIRST_CHUNK_TREE
+        )));
+    }
+    let chunk = Chunk::parse(key.offset, data).map_err(|e| match e {
+        Error::BadChunkItem(why) => {
+            Error::BadChunkItem(format!("chunk item at logical {:#x}: {why}", key.offset))
+        }
+        other => other,
+    })?;
+    chunk.validate_geometry(sectorsize)?;
+    Ok(Some(chunk))
+}
+
 impl ChunkMap {
     /// An empty map.
     pub fn new() -> Self {
@@ -703,8 +742,8 @@ impl ChunkMap {
                 )));
             }
             pos += DISK_KEY_SIZE;
-            let chunk = Chunk::parse(key.offset, &array[pos..])?;
-            chunk.validate_geometry(sectorsize)?;
+            let chunk = chunk_from_item(&key, &array[pos..], sectorsize)?
+                .expect("the key type was checked above");
             pos += chunk.encoded_len();
             map.insert(chunk)?;
         }
