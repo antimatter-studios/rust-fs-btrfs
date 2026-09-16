@@ -108,12 +108,25 @@ if [ "${#skipped[@]}" -gt 0 ]; then
     echo "!!  Check the btrfs-progs version above before trusting a green result."
 fi
 
-# The default geometry is the floor of the gate. If even that one fails
-# to build, the environment is broken and every downstream assertion is
-# meaningless — say so now rather than letting the oracle test "pass"
-# because it found nothing to compare.
+# EVERY GEOMETRY, NOT ONLY THE DEFAULT (#140). This used to abort only
+# when `btrfs-default.img` was missing, so a `dup` image that failed to
+# build left the script green, and the suites that consume it took their
+# absent-fixture path -- print and return -- while the oracle step
+# reported success. The suites skip on purpose, because they also run in
+# the job with no fixtures; so the refusal belongs here, in the one
+# script only the fixture job runs.
+#
+# `BTRFS_FIXTURES_ALLOW_MISSING=1` is for a developer on a btrfs-progs
+# that genuinely cannot make one of these. The warning above still names
+# what is missing.
 if [ ! -f "$SHARE/btrfs-default.img" ]; then
     echo "the default geometry failed to build — aborting" >&2
+    exit 1
+fi
+if [ "${#skipped[@]}" -gt 0 ] && [ "${BTRFS_FIXTURES_ALLOW_MISSING:-}" != 1 ]; then
+    echo "not every fixture was built (${skipped[*]}) — aborting; the tests that" >&2
+    echo "need them would skip and report green. Set BTRFS_FIXTURES_ALLOW_MISSING=1" >&2
+    echo "to build what can be built anyway." >&2
     exit 1
 fi
 
