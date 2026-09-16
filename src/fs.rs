@@ -40,7 +40,7 @@ use crate::compression::{self, Compression};
 use crate::dir::{self, DirEntry, DIR_INDEX_KEY, XATTR_ITEM_KEY};
 use crate::error::{Error, Result};
 use crate::inode::{Inode, FIRST_FREE_OBJECTID, INODE_ITEM_KEY};
-use crate::superblock::{le64, Superblock, SUPER_INFO_OFFSET};
+use crate::superblock::{le64, Superblock};
 use crate::xattr::{self, XattrEntry};
 use fs_core::{BlockDevice, BlockRead};
 use std::collections::BTreeMap;
@@ -469,9 +469,7 @@ impl Filesystem {
         // The sector size is not known until a superblock has been
         // parsed, and the superblock is at a fixed offset, so this one
         // read goes to the device directly.
-        let mut sb_buf = vec![0u8; 4096];
-        device.read_at(SUPER_INFO_OFFSET, &mut sb_buf)?;
-        let sb = Superblock::parse_at(&sb_buf, SUPER_INFO_OFFSET)?;
+        let (sb, _) = crate::superblock::read_superblock(&*device)?;
 
         // CACHED BY SECTOR RATHER THAN BY NODE. A node is `nodesize`,
         // typically 16 KiB, and caching whole nodes would make the unit
@@ -493,9 +491,21 @@ impl Filesystem {
     /// read-only mount, and matters more — writing to a volume whose log
     /// holds changes the trees have not seen would layer new data on top
     /// of state that is about to be replayed over it.
+    ///
+    /// A volume whose chosen superblock is not the primary copy -- the
+    /// primary is damaged, or older than a mirror -- is refused: something
+    /// happened to it, and committing on top of that is not a decision to
+    /// make without the user. It still mounts read-only (#90).
     pub fn mount_rw(device: Arc<dyn BlockDevice>) -> Result<Self> {
         if !device.is_writable() {
             return Err(Error::ReadOnly);
+        }
+        let (_, copy) = crate::superblock::read_superblock(&*device)?;
+        if copy != 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "the primary superblock is damaged or older than copy {copy}; the volume can be \
+                 mounted read-only from that copy, and should be checked before it is written"
+            )));
         }
         Self::open(device.clone(), Some(device))
     }
@@ -634,9 +644,7 @@ impl Filesystem {
         let mut by_id: BTreeMap<u64, Arc<dyn BlockRead>> = BTreeMap::new();
         let mut fsid: Option<[u8; 16]> = None;
         for dev in devices {
-            let mut buf = vec![0u8; 4096];
-            dev.read_at(SUPER_INFO_OFFSET, &mut buf)?;
-            let sb = Superblock::parse_at(&buf, SUPER_INFO_OFFSET)?;
+            let (sb, _) = crate::superblock::read_superblock(&*dev)?;
 
             match fsid {
                 None => fsid = Some(sb.fsid),
@@ -671,9 +679,7 @@ impl Filesystem {
         devices: BTreeMap<u64, Arc<dyn BlockRead>>,
         writable: Option<Arc<dyn BlockDevice>>,
     ) -> Result<Self> {
-        let mut sb_buf = vec![0u8; 4096];
-        device.read_at(SUPER_INFO_OFFSET, &mut sb_buf)?;
-        let sb = Superblock::parse_at(&sb_buf, SUPER_INFO_OFFSET)?;
+        let (sb, _) = crate::superblock::read_superblock(&*device)?;
 
         // One device open, and the filesystem says it has more.
         //
