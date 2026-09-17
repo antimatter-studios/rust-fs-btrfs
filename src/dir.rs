@@ -264,12 +264,18 @@ pub(crate) struct RawItem<'a> {
 ///
 /// # Errors
 ///
-/// [`Error::BadSuperblock`] if a header is truncated, a name runs past
-/// the end of the data, a name is empty or longer than
-/// [`MAX_NAME_LEN`], or the records do not consume the item exactly. The
-/// last of those is the load-bearing one: a leftover byte means the
-/// stride is wrong, and it is the cheapest available detector for a
-/// misread `name_len` or `data_len`.
+/// [`Error::BadSuperblock`] if a header is truncated, a record runs past
+/// the end of the data, or a name is empty or longer than
+/// [`MAX_NAME_LEN`].
+///
+/// Those per-record checks are also what catch a wrong stride. Each
+/// record is required to fit in what remains, so the walk can only stop
+/// exactly at the end, and bytes left over after a misread `name_len` or
+/// `data_len` are read as the next record's header: fewer than a header's
+/// worth report as truncated, and more usually as an empty, oversized or
+/// overrunning name. This used to end with a separate "consumed N of M
+/// bytes" check that the loop made unreachable, while the doc called it
+/// the load-bearing one (#106).
 pub(crate) fn parse_items<'a>(data: &'a [u8], what: &str) -> Result<Vec<RawItem<'a>>> {
     use offsets as o;
     let mut out: Vec<RawItem<'a>> = Vec::new();
@@ -319,12 +325,7 @@ pub(crate) fn parse_items<'a>(data: &'a [u8], what: &str) -> Result<Vec<RawItem<
         });
         pos += end;
     }
-    if pos != data.len() {
-        return Err(Error::BadSuperblock(format!(
-            "{what}s consumed {pos} of {} bytes — the item stride is wrong",
-            data.len()
-        )));
-    }
+    debug_assert_eq!(pos, data.len(), "every record is checked to fit");
     Ok(out)
 }
 
@@ -410,6 +411,27 @@ mod tests {
         assert_eq!(entries[2].name, b"ccc");
         assert_eq!(entries[1].ftype, Some(FileType::Directory));
         assert_eq!(entries[2].ino, 302);
+    }
+
+    /// Bytes left over after the records, however many, are an error:
+    /// they are read as another record and fail its checks (#106).
+    #[test]
+    fn leftover_bytes_after_the_records_are_refused() {
+        let good = one(b"hello.txt", 257, ftype::REG_FILE);
+        for leftover in 1..=DIR_ITEM_HEADER_SIZE + 12 {
+            let mut data = good.clone();
+            data.extend(std::iter::repeat_n(0xA5u8, leftover));
+            assert!(
+                parse_items(&data, "dir item").is_err(),
+                "{leftover} leftover bytes were accepted"
+            );
+            let mut zeros = good.clone();
+            zeros.extend(std::iter::repeat_n(0u8, leftover));
+            assert!(
+                parse_items(&zeros, "dir item").is_err(),
+                "{leftover} leftover zero bytes were accepted"
+            );
+        }
     }
 
     /// An `XATTR_ITEM` carries a value after the name. The value is
