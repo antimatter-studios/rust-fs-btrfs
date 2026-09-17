@@ -33,9 +33,13 @@
 //! # Status
 //!
 //! Reads a volume -- directories, files including compressed extents,
-//! symlinks, extended attributes, subvolumes, multi-device pools -- and
-//! writes in place to files marked nodatacow and nodatasum, through a
-//! copy-on-write commit of the trees that changes. Unit tests here are
+//! symlinks, extended attributes, subvolumes, multi-device pools. It
+//! writes file data only in place, to files marked nodatacow and
+//! nodatasum: [`fs::Filesystem::write_at`] overwrites the existing extents
+//! and flushes the device, and no tree is rewritten and no generation
+//! committed for it. Separately, the transaction and commit modules can
+//! relocate and rewrite tree blocks and commit a new generation; that is
+//! metadata machinery, and no file write goes through it. Unit tests here are
 //! deliberately treated as necessary-but-not-sufficient: a fixture this
 //! crate builds itself cannot catch this crate misreading the on-disk
 //! format, because the misreading would be baked into both sides.
@@ -52,8 +56,9 @@
 //! - [`fs`] — the mounted volume: inodes, directories, file data;
 //!   [`inode`], [`dir`], [`xattr`], [`subvol`], [`compression`] and
 //!   [`csum`] each decode one kind of item
-//! - [`write`](mod@write), [`transaction`], [`extent_write`], [`block_group`] and
-//!   [`commit`] — the in-place write path and the commit that records it
+//! - [`write`](mod@write) — the in-place file write, which commits nothing
+//! - [`transaction`], [`extent_write`], [`block_group`] and [`commit`] — tree
+//!   rewrites and the commit of a new generation, separate from file writes
 //! - [`capi`] — the C ABI
 
 #![deny(unsafe_op_in_unsafe_fn)]
