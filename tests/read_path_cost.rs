@@ -19,20 +19,19 @@
 //! Four shapes, because they cost differently and a change can improve
 //! one while ruining another:
 //!
-//! - **mount** — opening the filesystem. This driver loads every item
-//!   of the fs tree at mount and answers from memory afterwards, so
-//!   unlike its siblings almost the entire metadata cost lands here.
-//!   A figure that grows with the size of the volume rather than with
-//!   the work asked of it belongs to this line.
+//! - **mount** — opening the filesystem: the bootstrap, and nothing that
+//!   grows with the volume. It loaded every item of the fs tree until
+//!   #67, and a figure that grows with the size of the volume rather than
+//!   with the work asked of it belongs to this line.
 //! - **walk** — every directory in the tree, listed. Metadata only.
 //! - **stat** — every file resolved by path from the root. Metadata,
 //!   repeatedly, over the same nodes.
 //! - **read** — every file's contents. Data, and the extent items that
 //!   locate it.
 //!
-//! The eager load is why `walk` and `stat` reach the device at all
-//! only through `mount`: the nodes every path would descend were read
-//! before the first call.
+//! The node cache is why `stat` after `walk` reaches the device little or
+//! not at all: the interior nodes every path descends were read by the
+//! walk.
 //!
 //! Fixtures are gitignored, so this skips on a fresh clone.
 
@@ -191,9 +190,9 @@ fn measure_fixture(img: &Path) {
     // that must reach the device: if the counter reports nothing there,
     // it is not wired to the mount and every figure above is fiction.
     // The cached pass is allowed to reach zero, so asserting the same
-    // of it would be asserting that the cache failed. `walk` and `stat`
-    // reach zero even uncached here, because the mount loaded the items
-    // they need -- which is the finding rather than a broken counter.
+    // of it would be asserting that the cache failed. `stat` can reach
+    // zero even uncached here, because the node cache holds the blocks
+    // the walk read -- which is the finding rather than a broken counter.
     assert!(
         uncached.walk.items > 0,
         "the fixture had nothing to walk — the measurement is of nothing"
@@ -208,30 +207,21 @@ fn measure_fixture(img: &Path) {
         ("stat", &uncached.stat, &cached.stat),
         ("read", &uncached.read, &cached.read),
     ] {
-        // BYTES FOR EVERY SHAPE, CALLS ONLY WHERE A CALL CANNOT SPLIT. A
-        // cache sized in sectors splits one node- or extent-sized read
-        // into several, so the cached mount -- and, on a fixture whose
-        // files hold real data, the cached read -- legitimately makes
-        // MORE calls; that is the finding that decided
-        // `DEFAULT_CACHE_BLOCKS`, not a regression. `mount` used to be
-        // exempted for it, and `read` only ever passed because the one
-        // fixture measured made no data reads at all (`rich`, measured
-        // since #107: 24 uncached calls, 136 cached). What a cache must
-        // never do is fetch more BYTES.
+        // BYTES, NOT CALLS. A cache sized in sectors splits one node- or
+        // extent-sized read into several, so a cached pass can legitimately
+        // make MORE calls: that is the finding that decided
+        // `DEFAULT_CACHE_BLOCKS`, not a regression. `mount` and `read` were
+        // always exempt. Before #67, `walk` and `stat` made no calls at
+        // all, because mount had loaded every item. Now they descend the
+        // tree lazily, so they read nodes too, and they split the same way
+        // (`btrfs-commit.img` in CI: a walk of 1 call uncached, 4 cached).
+        // What a cache must never do is fetch more BYTES.
         assert!(
             ca.bytes <= un.bytes,
             "{what}: the cache made it fetch more bytes ({} vs {})",
             ca.bytes,
             un.bytes
         );
-        if what == "walk" || what == "stat" {
-            assert!(
-                ca.reads <= un.reads,
-                "{what}: the cache made it ask for more ({} vs {})",
-                ca.reads,
-                un.reads
-            );
-        }
         assert_eq!(
             ca.items, un.items,
             "{what}: the two passes did different amounts of work, so the \

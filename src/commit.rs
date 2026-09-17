@@ -119,6 +119,10 @@ impl Filesystem {
             Self::write_logical_all_mirrors(device, &self.map, block.logical, &block.bytes)?;
         }
 
+        // Blocks at these addresses may be cached from before they were
+        // freed and reused.
+        self.forget_tree_blocks();
+
         // 2. The barrier. Everything above must be on the device before
         //    anything below reaches it, because what follows is the
         //    pointer to it.

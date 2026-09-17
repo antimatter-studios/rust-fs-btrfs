@@ -37,6 +37,15 @@ never does.
 
 ### Changed
 
+- **Mounting no longer reads the whole filesystem tree.** The fs tree was
+  loaded into memory at mount -- 2937 device reads and 12 MB for 20,000
+  files before the first question. Items are now found by descending the
+  tree when asked, with the verified blocks a descent reads kept in a
+  node cache of `NODE_CACHE_BLOCKS` (1024) that a commit clears
+  (`btree::Tree::with_cache`). The same volume mounts
+  in 5 reads; a later path resolution through directories already listed
+  makes none.
+
 - **A lookup fetches the name by key.** `Filesystem::lookup` listed the whole
   directory and scanned it for the name, so each path component cost the
   size of its directory: 20,000 lookups in a 20,000-entry directory took
