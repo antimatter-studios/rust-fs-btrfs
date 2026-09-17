@@ -163,7 +163,7 @@ fn read_first_block(img: &std::path::Path, ino: u64) -> Result<Vec<u8>, Error> {
 #[test]
 fn a_compressed_window_that_overflows_is_refused_not_a_panic() {
     // Whole sectors at any sector size up to 64 KiB, and the sum overflows.
-    let Some((img, ino)) = image("overflow", |_, _| (u64::MAX & !0xFFFF, 0x1_0000)) else {
+    let Some((img, ino)) = image("overflow", |_, _| (!0xFFFF_u64, 0x1_0000)) else {
         eprintln!("no mkfs.btrfs -- skipping");
         return;
     };
