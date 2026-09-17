@@ -18,7 +18,9 @@
 //! includes one large enough to need several.
 //!
 //! Fixtures are gitignored, so this skips on a fresh clone. Generate
-//! them with `./scripts/vm-build-fixtures.sh`.
+//! them with `./scripts/build-compression-fixtures.sh` (Linux) or
+//! `./scripts/vm-build-fixtures.sh`. The CI job that builds them sets
+//! `BTRFS_ORACLE_FIXTURES=required`, and then a missing one fails (#69).
 
 use fs_btrfs::Filesystem;
 use fs_core::FileDevice;
@@ -38,13 +40,25 @@ fn share() -> PathBuf {
 }
 
 /// The per-algorithm fixtures present, as (algorithm, image, manifest).
+///
+/// Under `BTRFS_ORACLE_FIXTURES=required` every algorithm's fixture must
+/// be there: the job that sets it built them, so one missing is a broken
+/// build, and skipping it would read as the decoder passing.
 fn fixtures() -> Vec<(String, PathBuf, PathBuf)> {
+    let required = std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() == Ok("required");
     let mut out = Vec::new();
     for algo in ["zlib", "lzo", "zstd"] {
         let img = share().join(format!("btrfs-comp-{algo}.img"));
         let manifest = share().join(format!("btrfs-comp-{algo}.manifest"));
         if img.exists() && manifest.exists() {
             out.push((algo.to_string(), img, manifest));
+        } else {
+            assert!(
+                !required,
+                "BTRFS_ORACLE_FIXTURES=required, but {} or its manifest is not there. \
+                 The job that sets it runs scripts/build-compression-fixtures.sh first.",
+                img.display()
+            );
         }
     }
     out
@@ -134,7 +148,7 @@ fn each_fixture_really_uses_its_algorithm() {
         let record = img.with_extension("compression");
         let text = std::fs::read_to_string(&record).unwrap_or_else(|_| {
             panic!(
-                "{algo}: no {} — regenerate with ./scripts/vm-build-fixtures.sh",
+                "{algo}: no {} — regenerate with ./scripts/build-compression-fixtures.sh",
                 record.display()
             )
         });
