@@ -309,6 +309,14 @@ jobs:
           BTRFS_ORACLE_FIXTURES: required
         run: cargo test --test snapshot_shared_write -- --nocapture
 
+      # The same snapshot image: a transaction that would move a tree block
+      # both trees reference must be refused rather than delete its record
+      # (#178).
+      - name: A transaction refuses to release a shared tree block
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test shared_tree_block_release -- --nocapture
+
       # mount_rw's compat_ro refusal is tested on images the test makes
       # itself with mkfs.btrfs, which only this job installs. `required`
       # turns a missing mkfs.btrfs into a failure instead of a skip that
