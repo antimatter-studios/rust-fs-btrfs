@@ -448,3 +448,70 @@ fn a_file_inside_a_subvolume_reads_back() {
         String::from_utf8_lossy(&bytes).trim()
     );
 }
+
+/// A path that crosses subvolume boundaries reads what the kernel reads
+/// there (#62).
+///
+/// `/sub/inner/c.txt` crosses two, into `sub` and then into `inner`.
+/// `/snap` is a snapshot of `sub` taken while `inner` existed, and a
+/// snapshot does not carry nested subvolumes. Its `inner` entry still
+/// names subvolume `inner`, but no `ROOT_REF` from `snap` backs it, so the
+/// kernel shows an empty directory with inode 2 in its place, not
+/// `inner`'s files. Both facts were measured on a mount of this fixture
+/// (Linux 6.12).
+#[test]
+fn a_path_crosses_into_subvolumes() {
+    let Some(fs) = mount() else {
+        eprintln!("no subvolume fixture — skipping");
+        return;
+    };
+    for (path, want) in [
+        ("/top/a.txt", "in the default subvolume\n"),
+        ("/sub/b.txt", "in sub\n"),
+        ("/sub/inner/c.txt", "in sub/inner\n"),
+        ("/snap/b.txt", "in sub\n"),
+        ("/rosnap/b.txt", "in sub\n"),
+    ] {
+        let got = fs.read_path(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert_eq!(String::from_utf8_lossy(&got), want, "{path}");
+    }
+
+    let target = fs.resolve_path("/sub/inner/c.txt").expect("resolve");
+    assert_eq!(
+        target.fs(&fs).read_file(target.inode.ino).expect("read"),
+        b"in sub/inner\n",
+        "the inode must be read in the tree the path ended in"
+    );
+    let names: Vec<Vec<u8>> = fs
+        .list_path("/sub/inner")
+        .expect("list /sub/inner")
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, vec![b"c.txt".to_vec()]);
+
+    assert!(
+        matches!(
+            fs.read_path("/snap/after.txt"),
+            Err(fs_btrfs::error::Error::NotFound)
+        ),
+        "the snapshot must not hold what its source gained afterwards"
+    );
+
+    let stub = fs.resolve_path("/snap/inner").expect("resolve /snap/inner");
+    assert_eq!(stub.inode.ino, 2, "the kernel's empty-subvolume directory");
+    assert!(stub.inode.is_dir());
+    assert!(
+        fs.list_path("/snap/inner")
+            .expect("list the stub")
+            .is_empty(),
+        "a snapshot does not carry the subvolume nested in its source"
+    );
+    assert!(
+        matches!(
+            fs.read_path("/snap/inner/c.txt"),
+            Err(fs_btrfs::error::Error::NotFound)
+        ),
+        "the nested subvolume's file must not be reachable through the snapshot"
+    );
+}
