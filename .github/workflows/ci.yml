@@ -286,6 +286,15 @@ jobs:
           BTRFS_ORACLE_FIXTURES: required
         run: cargo test --test compat_ro_write_refusal -- --nocapture
 
+      # Data checksums of every width on a populated image: the matrix's
+      # populated fixtures are all crc32c, so the superblock's digest width
+      # never reached the data path as anything but 4 (#102). The images
+      # are mkfs.btrfs --rootdir, required here so a missing tool fails.
+      - name: Every checksum width reads and verifies file data
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test csum_width_populated -- --nocapture
+
       # Seven superblocks of one filesystem, six commits apart. Six
       # rather than one because the backup ring has four slots and the
       # index is (generation - 1) mod 4 — a single commit exercises one
