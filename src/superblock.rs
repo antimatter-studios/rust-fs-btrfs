@@ -1083,6 +1083,56 @@ impl Superblock {
     }
 }
 
+/// The superblock a mount should use: the valid copy with the highest
+/// `generation`, and which copy that was (0 is the primary).
+///
+/// EVERY COPY IS READ (#90). Every read used copy 0 alone, so a volume
+/// whose primary at 64 KiB was damaged -- by a stray `dd`, a partitioner,
+/// or a commit of this driver's interrupted after copy 0 -- could not be
+/// mounted, though the commit path writes all three. Reading every copy
+/// rather than stopping at the first that parses is what lets a torn
+/// commit's newer copy win over an older one; ties go to the lower copy.
+///
+/// A copy past the end of the device is ABSENT, not damaged: a volume
+/// under 256 GiB has no copy 2, and one under 64 MiB has only copy 0.
+///
+/// # Errors
+///
+/// When no copy is valid, the primary's own error -- the one a caller
+/// would have seen before.
+pub fn read_superblock(dev: &dyn fs_core::BlockRead) -> Result<(Superblock, usize)> {
+    let size = dev.size_bytes();
+    let mut best: Option<(Superblock, usize)> = None;
+    let mut primary_error = None;
+    for (copy, &offset) in SUPER_OFFSETS.iter().enumerate() {
+        if offset.saturating_add(SUPER_INFO_SIZE as u64) > size {
+            continue;
+        }
+        let mut buf = vec![0u8; SUPER_INFO_SIZE];
+        let parsed = dev
+            .read_at(offset, &mut buf)
+            .map_err(Error::from)
+            .and_then(|()| Superblock::parse_at(&buf, offset));
+        match parsed {
+            Ok(sb) => {
+                if best
+                    .as_ref()
+                    .is_none_or(|(b, _)| sb.generation > b.generation)
+                {
+                    best = Some((sb, copy));
+                }
+            }
+            Err(e) if copy == 0 => primary_error = Some(e),
+            Err(_) => {}
+        }
+    }
+    best.ok_or_else(|| {
+        primary_error.unwrap_or_else(|| {
+            Error::BadSuperblock("the device is too small to hold a superblock".to_string())
+        })
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     //! Unit tests over hand-built superblocks.
