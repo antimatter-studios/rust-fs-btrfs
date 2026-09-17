@@ -490,6 +490,37 @@ impl Filesystem {
         crate::fs::required_root_item_target(&tree, self.sb.root, objectid)
     }
 
+    /// Whether a tree block at `at` would share a row with a superblock
+    /// copy on any of its stripes.
+    ///
+    /// The extent tree doesn't record the copies, so free runs derived from
+    /// it include them. The kernel and btrfs-progs keep every allocation
+    /// out of the `stripe_len` row holding each copy
+    /// (`exclude_super_stripes`), and so does this. Without it, a DUP
+    /// metadata chunk crossing 64 MiB hands out the block the commit's
+    /// second superblock is then written over.
+    pub(crate) fn on_superblock_copy(&self, at: u64, len: u64) -> Result<bool> {
+        use crate::superblock::SUPER_OFFSETS;
+        let chunk = self.map.chunk_for(at).ok_or(Error::UnmappedLogical(at))?;
+        let row = chunk.stripe_len.max(1);
+        for mirror in 0..self.map.mirrors_at(at)? {
+            let m = self.map.map_mirror(at, mirror)?;
+            for stripe in chunk
+                .stripes
+                .iter()
+                .filter(|s| s.devid == m.devid && s.offset <= m.physical)
+            {
+                for &copy in SUPER_OFFSETS.iter().filter(|&&c| c >= stripe.offset) {
+                    let start = stripe.offset + (copy - stripe.offset) / row * row;
+                    if m.physical < start + row && start < m.physical + len {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Find somewhere to put one new tree block.
     ///
     /// First fit across the metadata block groups, aligned to
@@ -528,8 +559,14 @@ impl Filesystem {
         for runs in self.free_extents_by_group(&groups)? {
             for run in runs {
                 best_free = best_free.max(usable_in(run, nodesize));
-                if let Some(at) = place_in_run(run, nodesize) {
-                    return Ok(at);
+                let Some(mut at) = place_in_run(run, nodesize) else {
+                    continue;
+                };
+                while at + nodesize <= run.end() {
+                    if !self.on_superblock_copy(at, nodesize)? {
+                        return Ok(at);
+                    }
+                    at += nodesize;
                 }
             }
         }
