@@ -139,10 +139,22 @@ fn runs_covering_the_library_unit_tests(script: &str) -> Vec<String> {
             }
             let line = raw.trim_start();
             let command = line.split(" #").next().unwrap_or(line).trim();
-            if command.contains("--release") || command.contains("--profile") {
+            if command.contains("CARGO_PROFILE_") {
                 return None;
             }
-            if command.contains("CARGO_PROFILE_") {
+            // THE RUN'S OWN WORDS, NOT THE LINE'S (#136). `cargo test -r` is
+            // `--release`, and a text scan does not see it. The profile flags
+            // are read from the leading `cargo test`'s arguments, up to the
+            // first control operator outside quotes: in `cargo test --lib &&
+            // cargo test --release` the debug run still counts, and in
+            // `--target-dir "build;" -r` the `-r` is still this run's.
+            let words = leading_cargo_test_arguments(command);
+            let arguments: Vec<&str> = words.iter().map(String::as_str).collect();
+            if arguments
+                .iter()
+                .any(|a| *a == "--release" || *a == "--profile" || a.starts_with("--profile="))
+                || release_in(&arguments)
+            {
                 return None;
             }
             // `--test <name>` builds one integration target and no
@@ -160,12 +172,142 @@ fn runs_covering_the_library_unit_tests(script: &str) -> Vec<String> {
             //   "--test " in "--all-targets"  -> false
             //   "--test " in "--tests"        -> false   (so it counts)
             //   "--test"  in "--tests"        -> true    (so it would not)
-            if command.contains("--test ") {
+            if command.contains("--test ")
+                || arguments
+                    .iter()
+                    .any(|a| a.starts_with("--test=") || *a == "--test")
+            {
                 return None;
             }
             Some(command.to_string())
         })
         .collect()
+}
+
+/// The arguments of the `cargo test` a line begins with: the words after
+/// `cargo test`, past any leading `NAME=value` assignments, up to the first
+/// shell control operator. Empty when the line does not begin with one,
+/// which [`begins_with_cargo_test`] has already ruled out for every caller.
+fn leading_cargo_test_arguments(command: &str) -> Vec<String> {
+    let Some(first) = shell_commands(command).into_iter().next() else {
+        return Vec::new();
+    };
+    let at = first
+        .iter()
+        .position(|w| {
+            !w.split_once('=').is_some_and(|(name, _)| {
+                !name.is_empty()
+                    && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+                    && !name.starts_with(|c: char| c.is_ascii_digit())
+            })
+        })
+        .unwrap_or(first.len());
+    if first.get(at).map(String::as_str) != Some("cargo")
+        || first.get(at + 1).map(String::as_str) != Some("test")
+    {
+        return Vec::new();
+    }
+    first[at + 2..].to_vec()
+}
+
+/// `command` split into the commands the shell's control operators --
+/// `&&`, `||`, `;`, `|` and `&` -- separate, each as its words, with
+/// quotes and backslashes removed as the shell removes them.
+///
+/// Operators need no spaces: `true&&cargo test -r` is a `cargo test` run,
+/// and in `cargo test --lib&&rm -rf build` the `-rf` is `rm`'s. An `&` or
+/// `|` straight after `>` or `<` is part of a redirection (`2>&1`, `>|`).
+/// Inside quotes, or after a backslash, nothing is an operator or a word
+/// break, and what the quotes held is the word: `--features 'a;b' -r` is
+/// one command, and `'-r'` is `-r`.
+fn shell_commands(command: &str) -> Vec<Vec<String>> {
+    let mut commands = vec![Vec::new()];
+    let mut word: Option<String> = None;
+    let mut chars = command.chars().peekable();
+    let mut previous = None;
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                let word = word.get_or_insert_with(String::new);
+                word.extend(chars.by_ref().take_while(|&q| q != '\''));
+            }
+            '"' => {
+                let word = word.get_or_insert_with(String::new);
+                while let Some(q) = chars.next() {
+                    match q {
+                        '"' => break,
+                        '\\' if matches!(chars.peek(), Some('"' | '\\' | '$' | '`')) => {
+                            word.extend(chars.next());
+                        }
+                        _ => word.push(q),
+                    }
+                }
+            }
+            '\\' => word.get_or_insert_with(String::new).extend(chars.next()),
+            ';' | '&' | '|' if !matches!(previous, Some('>' | '<')) => {
+                if c != ';' && chars.peek() == Some(&c) {
+                    chars.next();
+                }
+                commands.last_mut().unwrap().extend(word.take());
+                commands.push(Vec::new());
+            }
+            c if c.is_whitespace() => commands.last_mut().unwrap().extend(word.take()),
+            c => word.get_or_insert_with(String::new).push(c),
+        }
+        previous = Some(c);
+    }
+    commands.last_mut().unwrap().extend(word.take());
+    commands
+}
+
+/// Whether `cargo test`'s `arguments`, up to the end of its own command,
+/// carry `-r`. See [`runs_covering_the_library_unit_tests`].
+///
+/// `arguments` are one command's words ([`shell_commands`]), so in
+/// `cargo test --lib && rm -rf build` the `r` in `-rf` is not among them.
+fn release_in(arguments: &[&str]) -> bool {
+    const LONG_OPTIONS_TAKING_A_VALUE: [&str; 15] = [
+        "--package",
+        "--exclude",
+        "--features",
+        "--target",
+        "--target-dir",
+        "--manifest-path",
+        "--profile",
+        "--test",
+        "--bin",
+        "--example",
+        "--bench",
+        "--jobs",
+        "--message-format",
+        "--color",
+        "--config",
+    ];
+    let mut next_is_a_value = false;
+    for &argument in arguments {
+        if std::mem::take(&mut next_is_a_value) {
+            continue;
+        }
+        if argument == "--" {
+            return false;
+        }
+        if argument.starts_with("--") {
+            next_is_a_value =
+                !argument.contains('=') && LONG_OPTIONS_TAKING_A_VALUE.contains(&argument);
+        } else if let Some(cluster) = argument.strip_prefix('-') {
+            for (at, flag) in cluster.char_indices() {
+                match flag {
+                    'r' => return true,
+                    'p' | 'j' | 'F' | 'Z' => {
+                        next_is_a_value = at + 1 == cluster.len();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Whether `line` of a `run:` block starts a `cargo test` the shell runs
@@ -1125,6 +1267,50 @@ cargo test --locked --release
             Vec::<String>::new(),
             "`1A=x` is not an assignment, so the line is a command named 1A=x"
         );
+    }
+
+    /// `-r` IS `--release`, IN EVERY SPELLING CLAP ACCEPTS (#136), and the
+    /// profile is read from the run's own words. Each line in the first list
+    /// builds the release profile; each in the second is a debug library run
+    /// whose `r`, or whose release run, belongs to something else.
+    #[test]
+    fn the_short_release_flag_is_read_from_the_runs_own_arguments() {
+        for line in [
+            "cargo test --locked -r --lib",
+            "cargo test --locked -qr --lib",
+            "cargo test --locked -rq --lib",
+            "cargo test --locked -j4 -r --lib",
+            "cargo test --locked -j 4 -r --lib",
+            "cargo test --locked --features x -r",
+            "cargo test --locked --features 'a;b' -r",
+            "cargo test --locked --target-dir \"build;\" -r",
+            "cargo test --locked '-r'",
+            "cargo test --locked --profile=release --lib",
+            "RUSTFLAGS=-Dwarnings cargo test --locked -r --lib",
+        ] {
+            assert_eq!(
+                runs_covering_the_library_unit_tests(&format!("{line}\n")),
+                Vec::<String>::new(),
+                "{line} builds the release profile"
+            );
+        }
+        for line in [
+            "cargo test --locked --lib -- -r",
+            "cargo test --locked --features r --lib",
+            "cargo test --locked -F r --lib",
+            "cargo test --locked -pr --lib",
+            "cargo test --locked --lib && rm -rf build",
+            "cargo test --locked --lib&&rm -rf build",
+            "cargo test --locked --lib; echo -r",
+            "cargo test --locked --lib && cargo test --locked -r",
+            "cargo test --locked --lib && cargo test --locked --release",
+        ] {
+            assert_eq!(
+                runs_covering_the_library_unit_tests(&format!("{line}\n")).len(),
+                1,
+                "{line}: the leading run is a debug library run"
+            );
+        }
     }
 
     #[test]
