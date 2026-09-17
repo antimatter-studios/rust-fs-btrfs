@@ -99,7 +99,7 @@ fn a_transaction_on_a_straddling_group_keeps_the_free_space_tree_valid() {
         let dev = Arc::new(FileDevice::open_rw(&image).unwrap());
         let fs = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>).expect("mount rw");
         let generation = fs.superblock().generation + 1;
-        fs.plan_transaction_closed(&[dirty], 8).and_then(|plan| {
+        fs.plan_transaction_closed(&[dirty], 64).and_then(|plan| {
             let blocks = fs.render_plan(&plan, generation)?;
             let root = fs
                 .planned_root(&plan)
@@ -133,7 +133,7 @@ fn a_transaction_on_a_straddling_group_keeps_the_free_space_tree_valid() {
         Err(e) => {
             let why = format!("{e:?}");
             assert!(
-                why.contains("leaf"),
+                why.contains("free-space records") && why.contains("span"),
                 "refused, but not for the straddle: {why}"
             );
         }
