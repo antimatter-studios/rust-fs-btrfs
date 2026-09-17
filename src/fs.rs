@@ -40,15 +40,15 @@ use crate::compression::{self, Compression};
 use crate::dir::{self, DirEntry, DIR_INDEX_KEY, XATTR_ITEM_KEY};
 use crate::error::{Error, Result};
 use crate::inode::{Inode, FIRST_FREE_OBJECTID, INODE_ITEM_KEY};
-use crate::superblock::{le64, Superblock, SUPER_INFO_OFFSET};
+use crate::superblock::{le64, Superblock};
 use crate::xattr::{self, XattrEntry};
 use fs_core::{BlockDevice, BlockRead};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// `BTRFS_FS_TREE_OBJECTID` — the subvolume holding the default
-/// filesystem namespace.
-pub const FS_TREE_OBJECTID: u64 = 5;
+/// filesystem namespace. The one copy is `chunk::objectid`.
+pub use crate::chunk::objectid::FS_TREE as FS_TREE_OBJECTID;
 
 /// One item of the root tree: `(objectid, key_type, offset, data)`.
 ///
@@ -418,6 +418,17 @@ pub struct Filesystem {
 /// `le64`.
 pub const MAX_SYMLINK_TARGET: u64 = 4096;
 
+/// The largest file [`Filesystem::read_file`] materialises: 1 GiB.
+///
+/// A ceiling, because a fallible reservation is not a bound where memory
+/// is overcommitted. `try_reserve_exact` can succeed for a range no
+/// process could fill, and zeroing it then commits every page, so a
+/// corrupt `inode.size` below the volume's size still ended in the OOM
+/// killer rather than an error (Greptile on #150). Anything larger is
+/// read in pieces with [`Filesystem::read_at`], which the C ABI already
+/// does for every read.
+pub const MAX_WHOLE_FILE_READ: u64 = 1 << 30;
+
 /// An extent that does not hold the bytes it claims to cover.
 fn short_extent(ino: u64, kind: &str) -> Error {
     Error::BadSuperblock(format!(
@@ -477,9 +488,7 @@ impl Filesystem {
         // The sector size is not known until a superblock has been
         // parsed, and the superblock is at a fixed offset, so this one
         // read goes to the device directly.
-        let mut sb_buf = vec![0u8; 4096];
-        device.read_at(SUPER_INFO_OFFSET, &mut sb_buf)?;
-        let sb = Superblock::parse_at(&sb_buf, SUPER_INFO_OFFSET)?;
+        let (sb, _) = crate::superblock::read_superblock(&*device)?;
 
         // CACHED BY SECTOR RATHER THAN BY NODE. A node is `nodesize`,
         // typically 16 KiB, and caching whole nodes would make the unit
@@ -502,6 +511,12 @@ impl Filesystem {
     /// holds changes the trees have not seen would layer new data on top
     /// of state that is about to be replayed over it.
     ///
+    /// A volume whose chosen superblock is not the primary copy -- the
+    /// primary is damaged, or older than a mirror -- is refused: something
+    /// happened to it, and committing on top of that is not a decision to
+    /// make without the user. It still mounts read-only (#90). The check
+    /// is made on the superblock the mount then uses, in `open_pool`.
+    ///
     /// A volume with a `compat_ro` feature this driver does not maintain
     /// is refused here, and can still be mounted read-only; see
     /// [`crate::superblock::refuse_unmaintained_compat_ro`] (#72).
@@ -511,6 +526,17 @@ impl Filesystem {
         }
         let fs = Self::open(device.clone(), Some(device))?;
         crate::superblock::refuse_unmaintained_compat_ro(fs.sb.compat_ro_flags)?;
+        // A SEED DEVICE IS READ-ONLY BY CONSTRUCTION (#76). Another
+        // filesystem is layered on it, and writes belong to that sprout;
+        // writing the seed changes blocks the sprout depends on being
+        // immutable. It still mounts read-only.
+        if fs.sb.is_seeding() {
+            return Err(Error::UnsupportedFeature(
+                "this device is a seed for another filesystem, which can be read but not \
+                 written; write to the filesystem sprouted from it"
+                    .into(),
+            ));
+        }
         Ok(fs)
     }
 
@@ -644,9 +670,7 @@ impl Filesystem {
         let mut by_id: BTreeMap<u64, Arc<dyn BlockRead>> = BTreeMap::new();
         let mut fsid: Option<[u8; 16]> = None;
         for dev in devices {
-            let mut buf = vec![0u8; 4096];
-            dev.read_at(SUPER_INFO_OFFSET, &mut buf)?;
-            let sb = Superblock::parse_at(&buf, SUPER_INFO_OFFSET)?;
+            let (sb, _) = crate::superblock::read_superblock(&*dev)?;
 
             match fsid {
                 None => fsid = Some(sb.fsid),
@@ -681,9 +705,16 @@ impl Filesystem {
         devices: BTreeMap<u64, Arc<dyn BlockRead>>,
         writable: Option<Arc<dyn BlockDevice>>,
     ) -> Result<Self> {
-        let mut sb_buf = vec![0u8; 4096];
-        device.read_at(SUPER_INFO_OFFSET, &mut sb_buf)?;
-        let sb = Superblock::parse_at(&sb_buf, SUPER_INFO_OFFSET)?;
+        let (sb, copy) = crate::superblock::read_superblock(&*device)?;
+        // ON THE SELECTION THIS MOUNT USES. Checked on a separate read
+        // beforehand, a mirror that failed to read then and read now was
+        // mounted writable from the mirror (Greptile on #146).
+        if writable.is_some() && copy != 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "the primary superblock is damaged or older than copy {copy}; the volume can be \
+                 mounted read-only from that copy, and should be checked before it is written"
+            )));
+        }
 
         // One device open, and the filesystem says it has more.
         //
@@ -707,8 +738,20 @@ impl Filesystem {
             )));
         }
 
-        if sb.log_root != 0 {
+        if sb.has_dirty_log() {
             return Err(Error::DirtyLog);
+        }
+        // A METADATA-ONLY DUMP HAS NO DATA (#76). `btrfs-image` keeps
+        // every tree and none of the extents they point at, so listing and
+        // stat would work and every read would return whatever occupies
+        // those addresses -- a confident wrong answer. The kernel refuses
+        // to mount one, and so does this.
+        if sb.is_metadump() {
+            return Err(Error::UnsupportedFeature(
+                "this image is a metadata-only dump (btrfs-image): its data extents are \
+                 absent, so no file in it can be read"
+                    .into(),
+            ));
         }
 
         // Step 2: the bootstrap map, enough to reach the chunk tree.
@@ -1455,10 +1498,16 @@ impl Filesystem {
     /// Read a whole file.
     ///
     /// Materialises the file in memory, so it is bounded by the size of
-    /// the filesystem: a whole-file read cannot need more memory than
-    /// the filesystem has bytes, and `inode.size` is a raw `le64` that
-    /// said otherwise. Reading part of a larger file is what
+    /// the filesystem and by [`MAX_WHOLE_FILE_READ`], and the allocation
+    /// is fallible: a size no allocator can satisfy is an error rather
+    /// than an abort. Reading part of a larger file is what
     /// [`Filesystem::read_at`] is for.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] for a file too large to read whole:
+    /// the request is valid and this call cannot serve it, which is not
+    /// a device failure ([`Error::Io`]) and not proof of corruption.
     pub fn read_file(&self, ino: u64) -> Result<Vec<u8>> {
         let inode = self.read_inode(ino)?;
         if !inode.is_regular_file() && !inode.is_symlink() {
@@ -1470,7 +1519,32 @@ impl Filesystem {
                 inode.size, self.sb.total_bytes
             )));
         }
-        let mut out = vec![0u8; inode.size as usize];
+        // BOUNDED, AND THEN FALLIBLY. `inode.size` is a raw `le64`, and
+        // `total_bytes` bounds it only as tightly as the volume is small:
+        // an 8 TB volume admits an 8 TB `Vec`. An allocation that cannot
+        // be satisfied aborts the process, which `capi::guard` cannot turn
+        // into an errno (#80). A sparse file can truly be that large, so
+        // the extents cannot bound it either. What can be refused is the
+        // read: past `MAX_WHOLE_FILE_READ` by a fixed ceiling, because an
+        // overcommitting allocator grants reservations it cannot back,
+        // and below it by the reservation, for one that does not.
+        //
+        // `UnsupportedFeature`, not `Io`: nothing failed on the device,
+        // and a caller matching variants must not read this as one.
+        let too_large = || {
+            Error::UnsupportedFeature(format!(
+                "inode {ino} is {} bytes, more than a whole-file read will hold in memory; \
+                 read it in pieces with read_at",
+                inode.size
+            ))
+        };
+        if inode.size > MAX_WHOLE_FILE_READ {
+            return Err(too_large());
+        }
+        let len = usize::try_from(inode.size).map_err(|_| too_large())?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(len).map_err(|_| too_large())?;
+        out.resize(len, 0);
         self.read_range(&inode, 0, &mut out)?;
         Ok(out)
     }

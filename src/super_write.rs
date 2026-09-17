@@ -206,8 +206,7 @@ pub fn apply(raw: &mut [u8], csum_type: ChecksumType, commit: &Commit) -> Result
     }
 
     if commit.invalidate_free_space_tree {
-        /// `BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID`.
-        const FREE_SPACE_TREE_VALID: u64 = 1 << 1;
+        use crate::superblock::compat_ro::FREE_SPACE_TREE_VALID;
         let flags = u64::from_le_bytes(
             raw[offsets::COMPAT_RO_FLAGS..offsets::COMPAT_RO_FLAGS + 8]
                 .try_into()
@@ -227,8 +226,8 @@ pub fn apply(raw: &mut [u8], csum_type: ChecksumType, commit: &Commit) -> Result
 /// Stamp the address this copy belongs at.
 ///
 /// The copies are not identical images: each names its own offset, and
-/// [`crate::fs::Filesystem::verify`] rejects one found where it does not
-/// claim to be. So a commit cannot write one buffer to all three — it
+/// [`crate::superblock::Superblock::parse_at`] rejects one found where it
+/// does not claim to be. So a commit cannot write one buffer to all three — it
 /// re-stamps and re-checksums per copy.
 ///
 /// Call before [`stamp_checksum`], which covers this field.

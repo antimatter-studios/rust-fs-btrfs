@@ -36,19 +36,13 @@
 //! extent item. This reads it, and refuses anything above one. That
 //! lookup is the reason this module is more than a byte copy.
 
-use crate::chunk::DiskKey;
+use crate::chunk::{key_type, objectid, DiskKey};
 use crate::error::{Error, Result};
 use crate::fs::Filesystem;
 
-/// `BTRFS_INODE_NODATASUM` — this file's blocks carry no checksums.
-pub const INODE_NODATASUM: u64 = 1 << 0;
-/// `BTRFS_INODE_NODATACOW` — this file's blocks are written in place.
-pub const INODE_NODATACOW: u64 = 1 << 1;
-
-/// `BTRFS_EXTENT_TREE_OBJECTID` — the tree holding reference counts.
-const EXTENT_TREE_OBJECTID: u64 = 2;
-/// `BTRFS_EXTENT_ITEM_KEY`.
-const EXTENT_ITEM_KEY: u8 = 168;
+/// The inode flags this module reads, defined beside `Inode::flags` and
+/// re-exported here where callers already name them.
+pub use crate::inode::{INODE_NODATACOW, INODE_NODATASUM};
 
 /// Offsets within `btrfs_extent_item`.
 mod extent_item {
@@ -257,7 +251,7 @@ impl Filesystem {
         let mut refs = None;
         tree.for_each(root, &mut |key: &DiskKey, data: &[u8]| {
             if key.objectid == bytenr
-                && key.key_type == EXTENT_ITEM_KEY
+                && key.key_type == key_type::EXTENT_ITEM
                 && data.len() >= extent_item::REFS + 8
             {
                 refs = Some((
@@ -291,7 +285,21 @@ impl Filesystem {
     /// constant, and its bound disagreed with the general one. See
     /// [`crate::fs::root_item_target`].
     fn extent_tree_root(&self) -> Result<u64> {
-        self.tree_root(EXTENT_TREE_OBJECTID)
+        self.tree_root(objectid::EXTENT_TREE)
+    }
+}
+
+/// Whether a file piece's window, `[logical, logical + len)`, lies inside
+/// the extent the extent tree records at `extent_start` for `extent_len`
+/// bytes. Shared by the write and by `can_write_in_place`, so the two
+/// cannot disagree about which windows a write refuses.
+fn window_inside_extent(logical: u64, len: u64, extent_start: u64, extent_len: u64) -> bool {
+    match (
+        logical.checked_add(len),
+        extent_start.checked_add(extent_len),
+    ) {
+        (Some(piece_end), Some(extent_end)) => logical >= extent_start && piece_end <= extent_end,
+        _ => false,
     }
 }
 

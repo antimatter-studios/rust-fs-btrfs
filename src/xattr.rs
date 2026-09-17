@@ -3,7 +3,7 @@
 //! # Where they live
 //!
 //! An attribute is filed under the key `(ino, 24, hash)`, where `hash`
-//! is [`name_hash`] of the *fully-qualified* name — `user.colour`, not
+//! is [`crate::dir::name_hash`] of the *fully-qualified* name — `user.colour`, not
 //! `colour`. Btrfs stores no namespace table and no prefix encoding: the
 //! name on disk is the name a caller asks for, prefix included. That
 //! makes this driver's job smaller than its siblings', where ext4 packs
@@ -56,14 +56,14 @@ pub struct XattrEntry {
 ///
 /// # Errors
 ///
-/// As [`parse_items`], plus [`Error::BadSuperblock`] if a record's
+/// As `parse_items`, plus [`Error::BadSuperblock`] if a record's
 /// `type` byte is not [`ftype::XATTR`].
 ///
 /// # Why the type byte is checked
 ///
 /// It is redundant against a correct caller — this is only ever handed
 /// the data of an item whose key type is already
-/// [`XATTR_ITEM_KEY`] — and that is exactly why it is cheap to keep. If
+/// [`crate::dir::XATTR_ITEM_KEY`] — and that is exactly why it is cheap to keep. If
 /// it ever fires, the item being read is not the item that was meant,
 /// and the alternative to noticing is returning a directory entry's
 /// name as an attribute with an empty value. The oracle fixture
