@@ -126,7 +126,6 @@ impl Filesystem {
 
         // 3. The superblocks, in address order. Each copy carries its
         //    own address, so they are not identical images.
-        let raw = raw;
         for &offset in &SUPER_OFFSETS {
             if !self.superblock_copy_fits(offset) {
                 continue;
