@@ -179,8 +179,8 @@ int fs_btrfs_readlink(fs_btrfs_fs_t *fs, const char *path,
  * truncation match fs_ext4_listxattr's implementation, so a layer above
  * can treat the two alike for a successful call. (fs_ext4.h says ext4
  * writes "as much as fits"; its code, like this, stops at the last whole
- * name.) The errors differ: a NULL fs is EIO and a NULL or non-UTF-8 path
- * ENOENT here, where fs_ext4_listxattr reports EINVAL for a NULL fs or
+ * name.) The errors differ: here a NULL fs is EIO and a NULL or non-UTF-8
+ * path is ENOENT, where fs_ext4_listxattr reports EINVAL for a NULL fs or
  * path.
  */
 int64_t fs_btrfs_listxattr(fs_btrfs_fs_t *fs, const char *path,
