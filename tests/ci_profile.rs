@@ -127,18 +127,18 @@ fn read_or_panic(path: &Path) -> String {
 ///   already fixed.
 ///
 /// `cargo build` lines are not `cargo test` and are not considered.
+///
+/// And before any of those: **the line must BE a `cargo test`**, not
+/// mention one (#118). See [`begins_with_cargo_test`].
 fn runs_covering_the_library_unit_tests(script: &str) -> Vec<String> {
     script
         .lines()
         .filter_map(|raw| {
+            if !begins_with_cargo_test(raw) {
+                return None;
+            }
             let line = raw.trim_start();
-            if line.starts_with('#') {
-                return None;
-            }
             let command = line.split(" #").next().unwrap_or(line).trim();
-            if !command.contains("cargo test") {
-                return None;
-            }
             if command.contains("--release") || command.contains("--profile") {
                 return None;
             }
@@ -166,6 +166,34 @@ fn runs_covering_the_library_unit_tests(script: &str) -> Vec<String> {
             Some(command.to_string())
         })
         .collect()
+}
+
+/// Whether `line` of a `run:` block starts a `cargo test` the shell runs
+/// unconditionally: at the block's own left margin, with nothing before
+/// `cargo test` but `NAME=value` assignments.
+///
+/// This does not interpret the shell, and says so. The text used to
+/// count wherever `cargo test` appeared in it, so `echo "cargo test
+/// --locked --lib"`, or the real command indented inside an `if false;
+/// then` branch, satisfied the guard with no debug run at all (#118).
+/// Requiring the command to begin an unindented line rejects both, and
+/// admits every real invocation in this workflow. A command in a
+/// conditional or loop written at the left margin would still count; a
+/// guard that parsed bash would acquire a new defeat for every way a
+/// block can be written, and this one only has to recognise the one way
+/// the gate's step is.
+fn begins_with_cargo_test(line: &str) -> bool {
+    if line.starts_with(char::is_whitespace) {
+        return false;
+    }
+    let mut words = line.split_whitespace().skip_while(|word| {
+        word.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+        })
+    });
+    words.next() == Some("cargo") && words.next() == Some("test")
 }
 
 /// WHAT ELSE DECIDES WHETHER A STEP GATES.
@@ -852,6 +880,46 @@ cargo test --locked --release
             runs_covering_the_library_unit_tests(block),
             Vec::<String>::new(),
             "a debug command quoted inside a comment is documentation, not a run"
+        );
+    }
+
+    /// A COMMAND THAT IS ONLY MENTIONED IS NOT RUN (#118). Echoed, it
+    /// is text; indented inside a branch that never fires, it is never
+    /// reached. Each must leave the guard with nothing to count.
+    #[test]
+    fn a_debug_run_that_is_echoed_or_never_reached_does_not_count() {
+        for block in [
+            "echo \"EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\"\n",
+            "if false; then\n  EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\nfi\n",
+            "true && EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n",
+        ] {
+            assert_eq!(
+                runs_covering_the_library_unit_tests(block),
+                Vec::<String>::new(),
+                "{block:?} runs no debug cargo test"
+            );
+        }
+    }
+
+    /// The control for the rule above: assignments before the command
+    /// are still the command.
+    #[test]
+    fn assignments_before_the_command_are_still_the_command() {
+        for line in [
+            "cargo test --locked --lib",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib",
+            "A=1 B_2= cargo test --locked --lib",
+        ] {
+            assert_eq!(
+                runs_covering_the_library_unit_tests(line),
+                vec![line.to_string()],
+                "{line} is a debug run"
+            );
+        }
+        assert_eq!(
+            runs_covering_the_library_unit_tests("1A=x cargo test --locked --lib"),
+            Vec::<String>::new(),
+            "`1A=x` is not an assignment, so the line is a command named 1A=x"
         );
     }
 
