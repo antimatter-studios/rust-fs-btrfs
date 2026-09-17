@@ -81,6 +81,9 @@ pub mod root_item {
     /// "parent transid verify failed". Which is exactly what `btrfs
     /// check` said before this was measured.
     pub const GENERATION: usize = 160;
+    /// `u64`. The inode number of the tree's top directory, 256 in every
+    /// tree the kernel makes.
+    pub const ROOT_DIRID: usize = 168;
     /// `u64`. The tree's root block.
     ///
     /// Measured against a real filesystem, not counted from the struct:
@@ -394,7 +397,7 @@ pub struct Filesystem {
     pub(crate) writable: Option<Arc<dyn BlockDevice>>,
     pub(crate) sb: Superblock,
     pub(crate) map: ChunkMap,
-    fs_tree_root: u64,
+    pub(crate) fs_tree_root: u64,
     /// The csum tree's root, when the filesystem has one.
     ///
     /// `None` only for a filesystem whose root tree holds no ROOT_ITEM
@@ -1258,6 +1261,28 @@ impl Filesystem {
     /// the size of its directory: a lookup in a 20,000-entry directory
     /// materialised all 20,000 entries (#64).
     pub fn lookup(&self, dir_ino: u64, name: &[u8]) -> Result<Inode> {
+        let hit = self.lookup_entry(dir_ino, name)?;
+
+        // A subvolume is a directory entry whose location names a tree
+        // rather than an inode, so there is nothing in THIS tree to
+        // return. Saying so is the point: reading the entry's objectid
+        // as an inode number finds an unrelated inode of the same
+        // number, or nothing, and `NotFound` for a name that is plainly
+        // there sends the reader looking in the wrong place entirely.
+        if !hit.is_inode() {
+            return Err(Error::UnsupportedFeature(format!(
+                "{:?} names subvolume {} rather than an inode in this tree — resolve \
+                 the path with `resolve_path`, which crosses into it",
+                String::from_utf8_lossy(name),
+                hit.ino
+            )));
+        }
+        self.read_inode(hit.ino)
+    }
+
+    /// The directory entry `name` in `dir_ino`, whether it names an inode
+    /// or a subvolume.
+    pub(crate) fn lookup_entry(&self, dir_ino: u64, name: &[u8]) -> Result<DirEntry> {
         if !self.read_inode(dir_ino)?.is_dir() {
             return Err(Error::NotADirectory);
         }
@@ -1268,27 +1293,10 @@ impl Filesystem {
         let data = self
             .item((dir_ino, dir::DIR_ITEM_KEY, dir::name_hash(name)))?
             .ok_or(Error::NotFound)?;
-        let hit = dir::parse_dir_items(&data)?
+        dir::parse_dir_items(&data)?
             .into_iter()
             .find(|e| e.name == name)
-            .ok_or(Error::NotFound)?;
-
-        // A subvolume is a directory entry whose location names a tree
-        // rather than an inode, so there is nothing in THIS tree to
-        // return. Saying so is the point: reading the entry's objectid
-        // as an inode number finds an unrelated inode of the same
-        // number, or nothing, and `NotFound` for a name that is plainly
-        // there sends the reader looking in the wrong place entirely.
-        if !hit.is_inode() {
-            return Err(Error::UnsupportedFeature(format!(
-                "{:?} names subvolume {} rather than an inode in this tree — open it \
-                 with `open_subvolume({})` and look the rest of the path up in there",
-                String::from_utf8_lossy(name),
-                hit.ino,
-                hit.ino
-            )));
-        }
-        self.read_inode(hit.ino)
+            .ok_or(Error::NotFound)
     }
 
     /// Every extended attribute on an inode, in the order the tree
@@ -1351,10 +1359,16 @@ impl Filesystem {
             .map(|e| e.value))
     }
 
-    /// Resolve an absolute path to its inode.
+    /// Resolve an absolute path to its inode in this tree.
+    ///
+    /// A path into a subvolume is refused at the boundary, because the
+    /// inode would mean nothing without its tree; [`resolve_path`]
+    /// crosses it and returns both.
     ///
     /// Symbolic links are not followed, so link loops remain the
     /// caller's policy rather than a surprise from this function.
+    ///
+    /// [`resolve_path`]: Filesystem::resolve_path
     pub fn lookup_path(&self, path: &str) -> Result<Inode> {
         let mut inode = self.root_inode()?;
         for component in path.split('/').filter(|c| !c.is_empty() && *c != ".") {
@@ -1851,16 +1865,19 @@ impl Filesystem {
         self.read_file(ino)
     }
 
-    /// List a directory by path.
+    /// List a directory by path, crossing into subvolumes on the way.
     pub fn list_path(&self, path: &str) -> Result<Vec<DirEntry>> {
-        let inode = self.lookup_path(path)?;
-        self.read_dir(inode.ino)
+        let target = self.resolve_path(path)?;
+        if target.inode.ino == crate::subvol::EMPTY_SUBVOL_DIR_OBJECTID {
+            return Ok(Vec::new());
+        }
+        target.fs(self).read_dir(target.inode.ino)
     }
 
-    /// Read a whole file by path.
+    /// Read a whole file by path, crossing into subvolumes on the way.
     pub fn read_path(&self, path: &str) -> Result<Vec<u8>> {
-        let inode = self.lookup_path(path)?;
-        self.read_file(inode.ino)
+        let target = self.resolve_path(path)?;
+        target.fs(self).read_file(target.inode.ino)
     }
 }
 

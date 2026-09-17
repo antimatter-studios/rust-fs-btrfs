@@ -88,6 +88,36 @@ mod root_ref {
 /// `BTRFS_ROOT_SUBVOL_RDONLY`.
 const ROOT_SUBVOL_RDONLY: u64 = 1 << 0;
 
+/// `ROOT_REF`: filed in the root tree under the parent tree's id, with the
+/// child's id as the offset, saying which directory of the parent holds
+/// the child and by what name.
+const ROOT_REF_KEY: u8 = 156;
+
+/// `BTRFS_EMPTY_SUBVOL_DIR_OBJECTID`: the inode number the kernel gives
+/// the empty directory it shows where a subvolume entry has no
+/// `ROOT_REF` behind it. That is what a snapshot's copy of a nested
+/// subvolume's entry looks like, because a snapshot does not carry the
+/// subvolumes nested in its source. No tree holds an inode with this
+/// number.
+pub const EMPTY_SUBVOL_DIR_OBJECTID: u64 = 2;
+
+/// Where a path ends: an inode, and the tree it is an inode of.
+pub struct PathTarget {
+    /// The subvolume the path crossed into last, or `None` when it
+    /// crossed none and the inode belongs to the handle it started from.
+    pub tree: Option<Filesystem>,
+    /// The inode, meaningful only in [`PathTarget::fs`].
+    pub inode: crate::inode::Inode,
+}
+
+impl PathTarget {
+    /// The handle to read [`inode`](Self::inode) through, given the one
+    /// the path was resolved from.
+    pub fn fs<'a>(&'a self, start: &'a Filesystem) -> &'a Filesystem {
+        self.tree.as_ref().unwrap_or(start)
+    }
+}
+
 /// One subvolume or snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Subvolume {
@@ -286,6 +316,150 @@ impl Filesystem {
     /// carries its own identity and the walk checks it.
     pub fn open_subvolume_at(&self, bytenr: u64) -> Result<Filesystem> {
         self.reroot(bytenr)
+    }
+
+    /// Resolve an absolute path to its inode, crossing into every
+    /// subvolume on the way, and hand back the tree the inode belongs to.
+    ///
+    /// A crossing follows the kernel's `fixup_tree_root_location`. The
+    /// entry names a subvolume, and a `ROOT_REF` from this tree must name
+    /// the same directory and name. Then the path continues at that
+    /// subvolume's top directory. Without a `ROOT_REF` the kernel shows an
+    /// empty directory, inode [`EMPTY_SUBVOL_DIR_OBJECTID`], and so does
+    /// this; nothing is reachable beneath it.
+    ///
+    /// Symbolic links are not followed, as in
+    /// [`lookup_path`](Filesystem::lookup_path). Every crossed-into handle
+    /// is read-only; see [`open_subvolume`](Filesystem::open_subvolume).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for a missing component,
+    /// [`Error::NotADirectory`] for a component under a non-directory,
+    /// and whatever the tree walks return.
+    ///
+    /// [`Error::NotFound`]: crate::error::Error::NotFound
+    /// [`Error::NotADirectory`]: crate::error::Error::NotADirectory
+    pub fn resolve_path(&self, path: &str) -> Result<PathTarget> {
+        use crate::error::Error;
+        let mut tree: Option<Filesystem> = None;
+        let mut inode = self.root_inode()?;
+        for component in path.split('/').filter(|c| !c.is_empty() && *c != ".") {
+            if component == ".." {
+                return Err(Error::UnsupportedFeature(
+                    "`..` in a path is not resolved by resolve_path".into(),
+                ));
+            }
+            if !inode.is_dir() {
+                return Err(Error::NotADirectory);
+            }
+            if inode.ino == EMPTY_SUBVOL_DIR_OBJECTID {
+                return Err(Error::NotFound);
+            }
+            let here = tree.as_ref().unwrap_or(self);
+            let entry = here.lookup_entry(inode.ino, component.as_bytes())?;
+            if entry.is_inode() {
+                inode = here.read_inode(entry.ino)?;
+                continue;
+            }
+            match here.subvolume_behind(inode.ino, &entry)? {
+                Some((bytenr, dirid)) => {
+                    let child = here.reroot(bytenr)?;
+                    inode = child.read_inode(dirid)?;
+                    tree = Some(child);
+                }
+                None => inode = empty_subvolume_dir(&inode),
+            }
+        }
+        Ok(PathTarget { tree, inode })
+    }
+
+    /// The root block and top directory of the subvolume `entry` names,
+    /// when a `ROOT_REF` from this tree backs it.
+    ///
+    /// This handle knows its tree by root block, not by id, so the parent
+    /// id is found as the tree whose `ROOT_ITEM` points at that block.
+    fn subvolume_behind(
+        &self,
+        dir_ino: u64,
+        entry: &crate::dir::DirEntry,
+    ) -> Result<Option<(u64, u64)>> {
+        use crate::error::Error;
+        let reader = self.pool_reader();
+        let root_tree = reader.tree();
+        let root_item_of = |id: u64| -> Result<Option<Vec<u8>>> {
+            Ok(root_tree
+                .find_all(self.sb.root, id, ROOT_ITEM_KEY)?
+                .into_iter()
+                .next()
+                .map(|item| item.data))
+        };
+        let Some(child) = root_item_of(entry.ino)? else {
+            return Ok(None);
+        };
+        if child.len() < root_item::MIN_SIZE {
+            return Err(Error::BadSuperblock(format!(
+                "subvolume {}: ROOT_ITEM is {} bytes",
+                entry.ino,
+                child.len()
+            )));
+        }
+        let le64 = |data: &[u8], at: usize| {
+            u64::from_le_bytes(data[at..at + 8].try_into().expect("8 bytes"))
+        };
+        for backref in root_tree.find_all(self.sb.root, entry.ino, ROOT_BACKREF_KEY)? {
+            let parent = backref.key.offset;
+            let same_tree = root_item_of(parent)?.is_some_and(|data| {
+                data.len() >= root_item::MIN_SIZE
+                    && le64(&data, root_item::BYTENR) == self.fs_tree_root
+            });
+            if !same_tree {
+                continue;
+            }
+            let backed = root_tree
+                .search(
+                    self.sb.root,
+                    &crate::chunk::DiskKey {
+                        objectid: parent,
+                        key_type: ROOT_REF_KEY,
+                        offset: entry.ino,
+                    },
+                )?
+                .is_some_and(|item| {
+                    item.data.len() >= 8
+                        && le64(&item.data, 0) == dir_ino
+                        && reference_name(&item.data).as_deref() == Some(&entry.name[..])
+                });
+            if backed {
+                return Ok(Some((
+                    le64(&child, root_item::BYTENR),
+                    le64(&child, root_item::ROOT_DIRID),
+                )));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// The directory the kernel shows for a subvolume entry with no
+/// `ROOT_REF` behind it (`new_simple_dir`): mode 0755, one link, and every
+/// time taken from the containing directory's change time.
+fn empty_subvolume_dir(dir: &crate::inode::Inode) -> crate::inode::Inode {
+    crate::inode::Inode {
+        ino: EMPTY_SUBVOL_DIR_OBJECTID,
+        size: 0,
+        nbytes: 0,
+        nlink: 1,
+        uid: 0,
+        gid: 0,
+        mode: 0o040755,
+        rdev: 0,
+        flags: 0,
+        atime: dir.ctime,
+        mtime: dir.ctime,
+        ctime: dir.ctime,
+        otime: dir.ctime,
+        ..dir.clone()
     }
 }
 

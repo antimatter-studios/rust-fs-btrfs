@@ -8,6 +8,16 @@ never does.
 
 ### Added
 
+- **A path can cross into subvolumes.** `Filesystem::resolve_path` walks a
+  path through any number of subvolume boundaries and returns the inode
+  together with the read-only handle of the tree it belongs to
+  (`PathTarget`). `read_path` and `list_path` use it, so `/sub/inner/c.txt`
+  reads. A crossing follows the kernel's rules: the entry must be backed by
+  a `ROOT_REF` from the tree it sits in. When one is missing, which is how
+  a snapshot's copy of a nested subvolume's entry looks, the result is the
+  empty directory the kernel shows there (inode 2), not the live
+  subvolume. `lookup` and `lookup_path` still stop at a boundary, and their
+  refusal now points at `resolve_path` (#62).
 - **Extended attributes can be read.** `XATTR_ITEM` was parsed as far as
   its shape and the value thrown away, so an attribute sitting in the
   tree could not be reached from anywhere. `Filesystem::list_xattrs` and
