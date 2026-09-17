@@ -6,22 +6,6 @@ never does.
 
 ## [Unreleased]
 
-### Fixed
-
-- **A new tree block is never placed on a superblock copy.** The extent
-  tree doesn't record the superblock copies, and the allocator took its
-  gaps as free. On a 256 MiB volume it handed out the block whose DUP copy
-  sits at 64 MiB, where a commit then writes the second superblock.
-  `plan_transaction` and `find_metadata_block` now skip the `stripe_len`
-  row holding each copy, as the kernel does (#175).
-- **A commit fills its backup-root slot.** The superblock keeps the roots of
-  the last four commits for `btrfs rescue` and `usebackuproot`, and a commit
-  by this driver left its slot describing an older commit the kernel made.
-  `Filesystem::commit` now reads the extent, filesystem, device and checksum
-  roots out of the root tree it writes and fills the slot for its
-  generation (`super_write::write_backup`), and refuses, before writing
-  anything, a root tree that does not parse.
-
 ### Added
 
 - **Extended attributes can be read.** `XATTR_ITEM` was parsed as far as
@@ -51,17 +35,38 @@ never does.
   (`btree::Tree::with_cache`). The same volume mounts
   in 5 reads; a later path resolution through directories already listed
   makes none.
-
 - **A lookup fetches the name by key.** `Filesystem::lookup` listed the whole
   directory and scanned it for the name, so each path component cost the
   size of its directory: 20,000 lookups in a 20,000-entry directory took
   96 s. It now reads the `DIR_ITEM` filed under the name's hash and matches
   within it (names that share a hash are packed there), 20 ms for the same
   work. `.` and `..` still resolve to nothing, as before.
-
 - `dir::parse_dir_items` and the new `xattr::parse_xattr_items` share one
   record walk, so the bounds arithmetic over a packed
   `struct btrfs_dir_item` sequence exists once rather than twice.
+
+### Fixed
+
+- **A new tree block is never placed on a superblock copy.** The extent
+  tree doesn't record the superblock copies, and the allocator took its
+  gaps as free. On a 256 MiB volume it handed out the block whose DUP copy
+  sits at 64 MiB, where a commit then writes the second superblock.
+  `plan_transaction` and `find_metadata_block` now skip the `stripe_len`
+  row holding each copy, as the kernel does (#175).
+- **A commit fills its backup-root slot.** The superblock keeps the roots of
+  the last four commits for `btrfs rescue` and `usebackuproot`, and a commit
+  by this driver left its slot describing an older commit the kernel made.
+  `Filesystem::commit` now reads the extent, filesystem, device and checksum
+  roots out of the root tree it writes and fills the slot for its
+  generation (`super_write::write_backup`), and refuses, before writing
+  anything, a root tree that does not parse.
+- **An in-place write no longer overwrites data a snapshot still reads.**
+  `write_at` took an extent item's single reference to mean one reader. A
+  snapshot of a subvolume whose tree is a node leaves data extents at
+  `refs 1`, so a `chattr +C` file's write changed the snapshot's copy as
+  well. The write and `can_write_in_place` now also refuse an extent from
+  a generation at or before the fs tree's `last_snapshot`, as the kernel's
+  nocow check does (#173).
 
 ## [0.6.2] — 2026-09-06
 

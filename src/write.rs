@@ -33,8 +33,14 @@
 //! check would silently rewrite what a snapshot is still pointing at.
 //!
 //! Sharing is visible in the extent tree, as a reference count on the
-//! extent item. This reads it, and refuses anything above one. That
-//! lookup is the reason this module is more than a byte copy.
+//! extent item, but not only there. A snapshot of a tree taller than one
+//! leaf adds references to the tree blocks under the root, not to the
+//! data extents, so the count stays at one while the snapshot reads the
+//! extent (#173). The kernel's nocow check handles that case with the
+//! tree's `last_snapshot`: an extent from that generation or earlier may be
+//! shared. This refuses a count above one, and also any extent the last
+//! snapshot could still be reading. Those lookups are the reason this
+//! module is more than a byte copy.
 
 use crate::chunk::{key_type, objectid, DiskKey};
 use crate::error::{Error, Result};
@@ -49,6 +55,8 @@ mod extent_item {
     /// How many references point at this extent. One means it belongs
     /// to a single file and nothing else is looking at it.
     pub const REFS: usize = 0;
+    /// The transaction that allocated the extent.
+    pub const GENERATION: usize = 8;
 }
 
 impl Filesystem {
@@ -151,6 +159,7 @@ impl Filesystem {
         {
             return Ok(false);
         }
+        let last_snapshot = self.fs_tree_last_snapshot()?;
         for piece in self.file_extents(ino)? {
             let Some(logical) = piece.logical else {
                 return Ok(false);
@@ -162,8 +171,9 @@ impl Filesystem {
             // reference count (Greptile on #156): a window outside the
             // extent's recorded length is refused by every write, so a
             // file holding one is not writable.
-            let (refs, extent_len) = self.extent_item(piece.extent_start)?;
+            let (refs, extent_len, generation) = self.extent_item(piece.extent_start)?;
             if refs != 1
+                || generation <= last_snapshot
                 || !window_inside_extent(logical, piece.len, piece.extent_start, extent_len)
             {
                 return Ok(false);
@@ -177,6 +187,7 @@ impl Filesystem {
     /// Every refusal happens here, while the file is still untouched.
     fn plan_nodatacow_write(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<(u64, usize)>> {
         let pieces = self.file_extents(ino)?;
+        let last_snapshot = self.fs_tree_last_snapshot()?;
         let mut plan = Vec::new();
         let mut done = 0usize;
 
@@ -204,7 +215,7 @@ impl Filesystem {
             };
 
             // The check that `nodatacow` alone does not give us.
-            let (refs, extent_len) = self.extent_item(piece.extent_start)?;
+            let (refs, extent_len, generation) = self.extent_item(piece.extent_start)?;
             // INSIDE THE EXTENT, BY THE EXTENT TREE'S RECORD OF IT (#89).
             // The window's bound in `decode_extent` is `ram_bytes`, a field
             // of the same item that moved the window, so a crafted item
@@ -227,6 +238,19 @@ impl Filesystem {
                     piece.extent_start
                 )));
             }
+            // ONE REFERENCE IS NOT ONE READER (#173). A snapshot of a tree
+            // whose root is a node raises the counts of the tree blocks
+            // under it, not of the data extents those blocks lead to, so
+            // an extent the snapshot reads can still count one. Anything
+            // the snapshot could see was allocated at or before it.
+            if generation <= last_snapshot {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino}: the extent at {} is from generation {generation}, at or \
+                     before the snapshot taken at {last_snapshot}, so the snapshot may \
+                     still be reading it",
+                    piece.extent_start
+                )));
+            }
 
             let within = pos - piece.start;
             let chunk = ((piece.len - within) as usize).min(len - done);
@@ -236,14 +260,15 @@ impl Filesystem {
         Ok(plan)
     }
 
-    /// How many references the extent beginning at `bytenr` has, and how
-    /// long the extent tree records it as.
+    /// How many references the extent beginning at `bytenr` has, how
+    /// long the extent tree records it as, and the generation that
+    /// allocated it.
     ///
     /// One reference means it belongs to a single file. Anything more
     /// means a snapshot or a reflink is also pointing at it, and writing
     /// in place would change what that other reader sees. The length is
     /// the `EXTENT_ITEM`'s key offset: what the allocator reserved.
-    fn extent_item(&self, bytenr: u64) -> Result<(u64, u64)> {
+    fn extent_item(&self, bytenr: u64) -> Result<(u64, u64, u64)> {
         let root = self.extent_tree_root()?;
         let reader = self.pool_reader();
         let tree = reader.tree();
@@ -252,15 +277,14 @@ impl Filesystem {
         tree.for_each(root, &mut |key: &DiskKey, data: &[u8]| {
             if key.objectid == bytenr
                 && key.key_type == key_type::EXTENT_ITEM
-                && data.len() >= extent_item::REFS + 8
+                && data.len() >= extent_item::GENERATION + 8
             {
+                let le64 =
+                    |at: usize| u64::from_le_bytes(data[at..at + 8].try_into().expect("8 bytes"));
                 refs = Some((
-                    u64::from_le_bytes(
-                        data[extent_item::REFS..extent_item::REFS + 8]
-                            .try_into()
-                            .expect("8 bytes"),
-                    ),
+                    le64(extent_item::REFS),
                     key.offset,
+                    le64(extent_item::GENERATION),
                 ));
                 return Ok(false);
             }
@@ -275,6 +299,39 @@ impl Filesystem {
                 "the extent tree holds no item for the extent at {bytenr}, so whether it \
                  is shared cannot be established"
             ))
+        })
+    }
+
+    /// The generation the default subvolume was last snapshotted at, or
+    /// zero if it never was.
+    ///
+    /// A writable mount writes only the default subvolume (a subvolume
+    /// handle never carries the write capability), so this is the tree
+    /// every write edits.
+    fn fs_tree_last_snapshot(&self) -> Result<u64> {
+        use crate::fs::{root_item, FS_TREE_OBJECTID, ROOT_ITEM_KEY};
+        let reader = self.pool_reader();
+        let mut found = None;
+        reader
+            .tree()
+            .for_each(self.sb.root, &mut |key: &DiskKey, data: &[u8]| {
+                if key.objectid == FS_TREE_OBJECTID && key.key_type == ROOT_ITEM_KEY {
+                    found = data
+                        .get(root_item::LAST_SNAPSHOT..root_item::LAST_SNAPSHOT + 8)
+                        .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")));
+                    return Ok(false);
+                }
+                Ok(true)
+            })?;
+        // No root item, or one too short to hold the field, is not "never
+        // snapshotted": treating the two the same would turn a misread
+        // into a write over shared data.
+        found.ok_or_else(|| {
+            Error::UnsupportedFeature(
+                "the root tree holds no readable ROOT_ITEM for the default subvolume, so \
+                 whether a snapshot shares its extents cannot be established"
+                    .into(),
+            )
         })
     }
 

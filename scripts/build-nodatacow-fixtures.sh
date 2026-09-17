@@ -92,3 +92,43 @@ rmdir "$m"
 btrfs inspect-internal dump-super -f "$img" > "$OUT/btrfs-nodatacow.superdump"
 
 echo "BUILT  btrfs-nodatacow"
+
+# # btrfs-nodatacow-snapshot: the same file, after a snapshot (#63)
+#
+# A snapshot does NOT raise a data extent's reference count when the
+# subvolume's tree is taller than one leaf. `btrfs_copy_root` adds a
+# reference to each block the root points at, and here those are tree
+# blocks, not data. So `nc/inplace.bin`'s extent still reads `refs 1`
+# while the snapshot reads the same bytes. The kernel tells the two
+# apart with the fs tree's `last_snapshot`: an extent from a generation
+# at or before it may be shared. This image is that case. The 3000 empty
+# files in `many/` are only there so the fs tree is a node before the
+# snapshot is taken, and the script checks that it is.
+#
+# It goes in its own directory. The suites that walk every image in
+# `.vm-share` assume what an ordinary volume holds, and a snapshot breaks
+# that on purpose: the blocks under the shared root carry two inline
+# references, a 42-byte METADATA_ITEM where every other image has 33.
+mkdir -p "$OUT/snapshot"
+img="$OUT/snapshot/btrfs-nodatacow-snapshot.img"
+rm -f "$img"
+truncate -s "$SIZE" "$img"
+mkfs.btrfs -f "$img" >/dev/null
+m="$(mktemp -d)"
+$SUDO mount -o loop "$img" "$m"
+$SUDO mkdir "$m/nc" "$m/many"
+$SUDO chattr +C "$m/nc"
+$SUDO dd if=/dev/urandom of="$m/nc/inplace.bin" bs=4096 count=64 status=none
+(cd "$m/many" && seq -f 'f%05g' 1 3000 | $SUDO xargs touch)
+$SUDO sync
+$SUDO btrfs subvolume snapshot -r "$m" "$m/snap" >/dev/null
+$SUDO lsattr "$m/nc/inplace.bin"
+$SUDO sync
+$SUDO umount "$m"
+rmdir "$m"
+level=$(btrfs inspect-internal dump-tree -t 5 "$img" | awk '/^leaf /{print 0; exit} /^node /{print $4; exit}')
+[ "${level:-0}" -ge 1 ] || {
+    echo "the fs tree is level ${level:-?}, so the snapshot raised every data reference" >&2
+    exit 1
+}
+echo "BUILT  btrfs-nodatacow-snapshot (fs tree level $level)"

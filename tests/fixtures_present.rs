@@ -81,7 +81,7 @@ fn share() -> PathBuf {
 ///   build-fixtures-native.sh      10 geometries + 2 populated + 1 rich = 13
 ///   build-subvol-fixtures.sh       1
 ///   build-xattr-fixtures.sh        1
-///   build-nodatacow-fixtures.sh    1
+///   build-nodatacow-fixtures.sh    1   (its snapshot image is in snapshot/, not counted)
 ///   build-commit-fixtures.sh       1   (the SHA-256 DUP rerun rewrites the same name)
 ///   build-cow-fixtures.sh          3 + 3 with BTRFS_FIXTURE_SUFFIX=-sha256-dup
 ///   build-split-fixtures.sh        2 + 2 with BTRFS_SPLIT_SUFFIX=-vary
