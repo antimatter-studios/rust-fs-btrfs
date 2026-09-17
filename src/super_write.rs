@@ -93,6 +93,90 @@ pub const ROOT_BACKUP_SLOTS: u64 = 4;
 pub const ROOT_BACKUPS_END: usize =
     offsets::ROOT_BACKUPS + (ROOT_BACKUP_SLOTS as usize) * ROOT_BACKUP_SIZE;
 
+/// Byte offsets inside one `btrfs_root_backup` slot.
+pub mod backup_offsets {
+    pub const TREE_ROOT: usize = 0;
+    pub const TREE_ROOT_GEN: usize = 8;
+    pub const CHUNK_ROOT: usize = 16;
+    pub const CHUNK_ROOT_GEN: usize = 24;
+    pub const EXTENT_ROOT: usize = 32;
+    pub const EXTENT_ROOT_GEN: usize = 40;
+    pub const FS_ROOT: usize = 48;
+    pub const FS_ROOT_GEN: usize = 56;
+    pub const DEV_ROOT: usize = 64;
+    pub const DEV_ROOT_GEN: usize = 72;
+    pub const CSUM_ROOT: usize = 80;
+    pub const CSUM_ROOT_GEN: usize = 88;
+    pub const TOTAL_BYTES: usize = 96;
+    pub const BYTES_USED: usize = 104;
+    pub const NUM_DEVICES: usize = 112;
+    /// After four unused 64-bit words.
+    pub const TREE_ROOT_LEVEL: usize = 152;
+    pub const CHUNK_ROOT_LEVEL: usize = 153;
+    pub const EXTENT_ROOT_LEVEL: usize = 154;
+    pub const FS_ROOT_LEVEL: usize = 155;
+    pub const DEV_ROOT_LEVEL: usize = 156;
+    pub const CSUM_ROOT_LEVEL: usize = 157;
+}
+
+/// One tree's root as a backup slot records it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackupRoot {
+    pub bytenr: u64,
+    pub generation: u64,
+    pub level: u8,
+}
+
+/// What one backup-ring slot records: the roots a commit left, and the
+/// superblock's size and usage at the time (`backup_super_roots`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackupRoots {
+    pub tree: BackupRoot,
+    pub chunk: BackupRoot,
+    pub extent: BackupRoot,
+    pub fs: BackupRoot,
+    pub dev: BackupRoot,
+    pub csum: BackupRoot,
+    pub total_bytes: u64,
+    pub bytes_used: u64,
+    pub num_devices: u64,
+}
+
+/// Fill `generation`'s backup slot with `roots`, zeroing whatever else the
+/// slot held, as the kernel's `backup_super_roots` does (#78). Call before
+/// [`stamp_checksum`], which covers the ring.
+pub fn write_backup(raw: &mut [u8], generation: u64, roots: &BackupRoots) {
+    use backup_offsets as b;
+    let at = backup_slot_offset(generation);
+    let slot = &mut raw[at..at + ROOT_BACKUP_SIZE];
+    slot.fill(0);
+    let mut put = |off: usize, v: u64| slot[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    for (root, bytenr, gen) in [
+        (&roots.tree, b::TREE_ROOT, b::TREE_ROOT_GEN),
+        (&roots.chunk, b::CHUNK_ROOT, b::CHUNK_ROOT_GEN),
+        (&roots.extent, b::EXTENT_ROOT, b::EXTENT_ROOT_GEN),
+        (&roots.fs, b::FS_ROOT, b::FS_ROOT_GEN),
+        (&roots.dev, b::DEV_ROOT, b::DEV_ROOT_GEN),
+        (&roots.csum, b::CSUM_ROOT, b::CSUM_ROOT_GEN),
+    ] {
+        put(bytenr, root.bytenr);
+        put(gen, root.generation);
+    }
+    put(b::TOTAL_BYTES, roots.total_bytes);
+    put(b::BYTES_USED, roots.bytes_used);
+    put(b::NUM_DEVICES, roots.num_devices);
+    for (root, level) in [
+        (&roots.tree, b::TREE_ROOT_LEVEL),
+        (&roots.chunk, b::CHUNK_ROOT_LEVEL),
+        (&roots.extent, b::EXTENT_ROOT_LEVEL),
+        (&roots.fs, b::FS_ROOT_LEVEL),
+        (&roots.dev, b::DEV_ROOT_LEVEL),
+        (&roots.csum, b::CSUM_ROOT_LEVEL),
+    ] {
+        slot[level] = root.level;
+    }
+}
+
 /// The whole superblock.
 pub const SUPERBLOCK_SIZE: usize = 4096;
 
@@ -162,15 +246,10 @@ pub struct Commit {
 /// # What it does not do
 ///
 /// **It does not fill the backup slot.** The ring records the roots of
-/// each of the last four commits, and doing that needs the addresses of
-/// trees this does not take — the extent, device and checksum roots
-/// among them. The slot is left as it was, which is a slot describing an
-/// older commit rather than a wrong description of this one.
-///
-/// That is a real gap and it is named rather than hidden: the backups
-/// are what `btrfs rescue` reads when the primary root will not parse,
-/// so a filesystem committed by this function is recoverable only as far
-/// back as the last commit the kernel made.
+/// each of the last four commits, and those are in the root tree the
+/// commit writes, which this function is not given.
+/// [`crate::fs::Filesystem::commit`] reads them out of the new root tree
+/// and fills the slot with [`write_backup`] (#78).
 ///
 /// # Errors
 ///

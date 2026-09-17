@@ -6,6 +6,16 @@ never does.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A commit fills its backup-root slot.** The superblock keeps the roots of
+  the last four commits for `btrfs rescue` and `usebackuproot`, and a commit
+  by this driver left its slot describing an older commit the kernel made.
+  `Filesystem::commit` now reads the extent, filesystem, device and checksum
+  roots out of the root tree it writes and fills the slot for its
+  generation (`super_write::write_backup`), and refuses, before writing
+  anything, a root tree that does not parse.
+
 ### Added
 
 - **Extended attributes can be read.** `XATTR_ITEM` was parsed as far as
