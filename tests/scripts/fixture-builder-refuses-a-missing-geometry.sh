@@ -40,8 +40,10 @@ printf '#!/usr/bin/env bash\necho "btrfs-progs v0 (stub)"\n' > "$sandbox/bin/btr
 printf '#!/usr/bin/env bash\nexit 0\n' > "$sandbox/bin/sudo"
 chmod +x "$sandbox/bin/"*
 
+# Each case states its whole environment: an override the developer
+# already exported must not decide a case that did not ask for it.
 run() {
-    env PATH="$sandbox/bin:$PATH" "$@" bash "$sandbox/repo/scripts/build-fixtures-native.sh" \
+    env -u BTRFS_FIXTURES_ALLOW_MISSING PATH="$sandbox/bin:$PATH" "$@" bash "$sandbox/repo/scripts/build-fixtures-native.sh" \
         > "$sandbox/out" 2>&1
 }
 
