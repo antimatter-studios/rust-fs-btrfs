@@ -47,8 +47,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// `BTRFS_FS_TREE_OBJECTID` — the subvolume holding the default
-/// filesystem namespace.
-pub const FS_TREE_OBJECTID: u64 = 5;
+/// filesystem namespace. The one copy is `chunk::objectid`.
+pub use crate::chunk::objectid::FS_TREE as FS_TREE_OBJECTID;
 
 /// One item of the root tree: `(objectid, key_type, offset, data)`.
 ///
@@ -417,6 +417,17 @@ pub struct Filesystem {
 /// not take a longer one, while the inode's declared size is a raw
 /// `le64`.
 pub const MAX_SYMLINK_TARGET: u64 = 4096;
+
+/// The largest file [`Filesystem::read_file`] materialises: 1 GiB.
+///
+/// A ceiling, because a fallible reservation is not a bound where memory
+/// is overcommitted. `try_reserve_exact` can succeed for a range no
+/// process could fill, and zeroing it then commits every page, so a
+/// corrupt `inode.size` below the volume's size still ended in the OOM
+/// killer rather than an error (Greptile on #150). Anything larger is
+/// read in pieces with [`Filesystem::read_at`], which the C ABI already
+/// does for every read.
+pub const MAX_WHOLE_FILE_READ: u64 = 1 << 30;
 
 /// An extent that does not hold the bytes it claims to cover.
 fn short_extent(ino: u64, kind: &str) -> Error {
@@ -1453,10 +1464,16 @@ impl Filesystem {
     /// Read a whole file.
     ///
     /// Materialises the file in memory, so it is bounded by the size of
-    /// the filesystem: a whole-file read cannot need more memory than
-    /// the filesystem has bytes, and `inode.size` is a raw `le64` that
-    /// said otherwise. Reading part of a larger file is what
+    /// the filesystem and by [`MAX_WHOLE_FILE_READ`], and the allocation
+    /// is fallible: a size no allocator can satisfy is an error rather
+    /// than an abort. Reading part of a larger file is what
     /// [`Filesystem::read_at`] is for.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] for a file too large to read whole:
+    /// the request is valid and this call cannot serve it, which is not
+    /// a device failure ([`Error::Io`]) and not proof of corruption.
     pub fn read_file(&self, ino: u64) -> Result<Vec<u8>> {
         let inode = self.read_inode(ino)?;
         if !inode.is_regular_file() && !inode.is_symlink() {
@@ -1468,7 +1485,32 @@ impl Filesystem {
                 inode.size, self.sb.total_bytes
             )));
         }
-        let mut out = vec![0u8; inode.size as usize];
+        // BOUNDED, AND THEN FALLIBLY. `inode.size` is a raw `le64`, and
+        // `total_bytes` bounds it only as tightly as the volume is small:
+        // an 8 TB volume admits an 8 TB `Vec`. An allocation that cannot
+        // be satisfied aborts the process, which `capi::guard` cannot turn
+        // into an errno (#80). A sparse file can truly be that large, so
+        // the extents cannot bound it either. What can be refused is the
+        // read: past `MAX_WHOLE_FILE_READ` by a fixed ceiling, because an
+        // overcommitting allocator grants reservations it cannot back,
+        // and below it by the reservation, for one that does not.
+        //
+        // `UnsupportedFeature`, not `Io`: nothing failed on the device,
+        // and a caller matching variants must not read this as one.
+        let too_large = || {
+            Error::UnsupportedFeature(format!(
+                "inode {ino} is {} bytes, more than a whole-file read will hold in memory; \
+                 read it in pieces with read_at",
+                inode.size
+            ))
+        };
+        if inode.size > MAX_WHOLE_FILE_READ {
+            return Err(too_large());
+        }
+        let len = usize::try_from(inode.size).map_err(|_| too_large())?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(len).map_err(|_| too_large())?;
+        out.resize(len, 0);
         self.read_range(&inode, 0, &mut out)?;
         Ok(out)
     }
