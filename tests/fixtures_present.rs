@@ -74,14 +74,14 @@ fn share() -> PathBuf {
 /// which is a silent weakening rather than a false failure, and the
 /// right direction for a check nobody wants to fight.
 ///
-/// WHERE 30 COMES FROM, since a number nobody can re-derive is a number
+/// WHERE 29 COMES FROM, since a number nobody can re-derive is a number
 /// nobody will dare change. It is what the workflow's own steps build,
 /// counted as distinct `.img` names in `.vm-share`:
 ///
 ///   build-fixtures-native.sh      10 geometries + 2 populated + 1 rich = 13
 ///   build-subvol-fixtures.sh       1
 ///   build-xattr-fixtures.sh        1
-///   build-nodatacow-fixtures.sh    2   (the second holds a snapshot, #63)
+///   build-nodatacow-fixtures.sh    1   (its snapshot image is in snapshot/, not counted)
 ///   build-commit-fixtures.sh       1   (the SHA-256 DUP rerun rewrites the same name)
 ///   build-cow-fixtures.sh          3 + 3 with BTRFS_FIXTURE_SUFFIX=-sha256-dup
 ///   build-split-fixtures.sh        2 + 2 with BTRFS_SPLIT_SUFFIX=-vary
@@ -105,7 +105,7 @@ fn share() -> PathBuf {
 /// will fail rather than pass quietly. That is the intended direction:
 /// a visible failure that names the count is worth more than a silent
 /// pass, and lowering the number with a reason is a one-line change.
-const FIXTURES_EXPECTED: usize = 30;
+const FIXTURES_EXPECTED: usize = 29;
 
 #[test]
 fn the_fixture_job_has_its_fixtures() {

@@ -9,7 +9,7 @@
 //! an extent from a generation at or before the tree's `last_snapshot` as
 //! shared.
 //!
-//! The image is `btrfs-nodatacow-snapshot.img` from
+//! The image is `snapshot/btrfs-nodatacow-snapshot.img` from
 //! `scripts/build-nodatacow-fixtures.sh`: a `chattr +C` file, then a
 //! read-only snapshot of the top-level subvolume, taken by the kernel. The
 //! test first checks with btrfs-progs that the case is real, meaning the
@@ -28,6 +28,7 @@ const FILE: &str = "/nc/inplace.bin";
 fn fixture() -> Option<PathBuf> {
     let p = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(".vm-share")
+        .join("snapshot")
         .join("btrfs-nodatacow-snapshot.img");
     if p.exists() {
         return Some(p);

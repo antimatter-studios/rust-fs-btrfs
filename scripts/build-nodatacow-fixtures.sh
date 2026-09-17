@@ -104,7 +104,13 @@ echo "BUILT  btrfs-nodatacow"
 # at or before it may be shared. This image is that case. The 3000 empty
 # files in `many/` are only there so the fs tree is a node before the
 # snapshot is taken, and the script checks that it is.
-img="$OUT/btrfs-nodatacow-snapshot.img"
+#
+# It goes in its own directory. The suites that walk every image in
+# `.vm-share` assume what an ordinary volume holds, and a snapshot breaks
+# that on purpose: the blocks under the shared root carry two inline
+# references, a 42-byte METADATA_ITEM where every other image has 33.
+mkdir -p "$OUT/snapshot"
+img="$OUT/snapshot/btrfs-nodatacow-snapshot.img"
 rm -f "$img"
 truncate -s "$SIZE" "$img"
 mkfs.btrfs -f "$img" >/dev/null
