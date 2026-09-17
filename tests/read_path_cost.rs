@@ -207,30 +207,21 @@ fn measure_fixture(img: &Path) {
         ("stat", &uncached.stat, &cached.stat),
         ("read", &uncached.read, &cached.read),
     ] {
-        // BYTES FOR EVERY SHAPE, CALLS ONLY WHERE A CALL CANNOT SPLIT. A
-        // cache sized in sectors splits one node- or extent-sized read
-        // into several, so the cached mount -- and, on a fixture whose
-        // files hold real data, the cached read -- legitimately makes
-        // MORE calls; that is the finding that decided
-        // `DEFAULT_CACHE_BLOCKS`, not a regression. `mount` used to be
-        // exempted for it, and `read` only ever passed because the one
-        // fixture measured made no data reads at all (`rich`, measured
-        // since #107: 24 uncached calls, 136 cached). What a cache must
-        // never do is fetch more BYTES.
+        // BYTES, NOT CALLS. A cache sized in sectors splits one node- or
+        // extent-sized read into several, so a cached pass can legitimately
+        // make MORE calls: that is the finding that decided
+        // `DEFAULT_CACHE_BLOCKS`, not a regression. `mount` and `read` were
+        // always exempt. Before #67, `walk` and `stat` made no calls at
+        // all, because mount had loaded every item. Now they descend the
+        // tree lazily, so they read nodes too, and they split the same way
+        // (`btrfs-commit.img` in CI: a walk of 1 call uncached, 4 cached).
+        // What a cache must never do is fetch more BYTES.
         assert!(
             ca.bytes <= un.bytes,
             "{what}: the cache made it fetch more bytes ({} vs {})",
             ca.bytes,
             un.bytes
         );
-        if what == "walk" || what == "stat" {
-            assert!(
-                ca.reads <= un.reads,
-                "{what}: the cache made it ask for more ({} vs {})",
-                ca.reads,
-                un.reads
-            );
-        }
         assert_eq!(
             ca.items, un.items,
             "{what}: the two passes did different amounts of work, so the \
