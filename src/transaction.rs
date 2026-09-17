@@ -759,6 +759,30 @@ impl Filesystem {
         self.leaves_holding(root, &keys)
     }
 
+    /// How many leaves of the free-space tree hold records of the block
+    /// group spanning `[start, end)`: its FREE_SPACE_INFO, extents or bitmaps.
+    fn free_space_leaves_of(&self, start: u64, end: u64) -> Result<usize> {
+        let Ok(root) = self.tree_root(objectid::FREE_SPACE_TREE) else {
+            return Ok(0);
+        };
+        let mut leaves = 0usize;
+        self.for_each_tree_block(root, &mut |_, block, _| {
+            let Some(items) = block.body.items() else {
+                return;
+            };
+            if items.iter().any(|i| {
+                matches!(
+                    i.key.key_type,
+                    FREE_SPACE_INFO_KEY | FREE_SPACE_EXTENT_KEY | FREE_SPACE_BITMAP_KEY
+                ) && i.key.objectid >= start
+                    && i.key.objectid < end
+            }) {
+                leaves += 1;
+            }
+        })?;
+        Ok(leaves)
+    }
+
     /// Rewrite a free-space tree leaf so it describes what the plan
     /// leaves behind.
     ///
@@ -812,6 +836,30 @@ impl Filesystem {
         let allocated: Vec<u64> = plan.allocated();
         let nodesize = self.sb.nodesize as u64;
 
+        // A GROUP'S RECORDS MAY NOT ALL BE IN THIS LEAF (#177). The rewrite
+        // below replaces a group's records from its FREE_SPACE_INFO to the
+        // end of the leaf holding it. When a leaf ends among them, the next
+        // leaf keeps its own old extents for the same range, and a rewrite
+        // of that leaf carries them unchanged because it holds no INFO item:
+        // the group's free space ends up recorded twice. Moving records
+        // between leaves, and the keys above them, is not implemented, so a
+        // touched group whose records span leaves is refused.
+        for group in groups.iter().filter(|g| {
+            released
+                .iter()
+                .chain(allocated.iter())
+                .any(|a| g.contains(*a))
+        }) {
+            let leaves = self.free_space_leaves_of(group.start, group.end())?;
+            if leaves > 1 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "the free-space records of the block group at {} span {leaves} leaves, \
+                     and rewriting a group across a leaf boundary is not implemented",
+                    group.start
+                )));
+            }
+        }
+
         let mut out: Vec<OwnedItem> = Vec::with_capacity(items.len());
         let mut i = 0usize;
         while i < items.len() {
@@ -843,7 +891,17 @@ impl Filesystem {
             match (touched, group) {
                 // Untouched, or a group that no longer exists: carry the
                 // whole run through exactly as it was.
-                (false, _) | (_, None) => out.extend_from_slice(&items[i..j]),
+                (false, _) => out.extend_from_slice(&items[i..j]),
+                // Touched, but no block group starts here: the records and
+                // the extent tree disagree about the group, and carrying
+                // the old records would leave the plan's allocations
+                // recorded as free.
+                (true, None) => {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "the free-space tree records a group at {start} that no block group \
+                         item describes, and the plan allocates or releases inside it"
+                    )))
+                }
                 (true, Some(group)) => {
                     // What is free now, plus what the plan releases,
                     // minus what it takes.
