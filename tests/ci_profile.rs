@@ -753,12 +753,70 @@ fn cargo_test_runs_outside(workflow: &str, exempt: &[&str]) -> Vec<String> {
         .iter()
         .filter(|job| !exempt.contains(&job.id.as_str()))
         .flat_map(|job| &job.steps)
-        .flat_map(|step| step.run.lines())
-        .map(str::trim_start)
-        .filter(|line| !line.starts_with('#'))
-        .map(|line| line.split(" #").next().unwrap_or(line).trim())
+        .flat_map(|step| logical_lines(&step.run))
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .flat_map(|line| {
+            let line = line.split(" #").next().unwrap_or(&line).to_string();
+            shell_commands_of(&line)
+        })
         .filter(|command| command.contains("cargo test"))
-        .map(str::to_string)
+        .collect()
+}
+
+/// A `run:` block's lines with backslash continuations joined, so
+/// `cargo test \` followed by `--locked` is one command (Greptile on
+/// #159).
+fn logical_lines(run: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut pending = String::new();
+    for line in run.lines() {
+        if let Some(head) = line.trim_end().strip_suffix('\\') {
+            pending.push_str(head);
+            pending.push(' ');
+        } else {
+            pending.push_str(line);
+            out.push(std::mem::take(&mut pending));
+        }
+    }
+    if !pending.is_empty() {
+        out.push(pending);
+    }
+    out
+}
+
+/// The commands on one line, split at `&&`, `||`, `;` and `|` outside
+/// quotes, so `cargo test --lib && cargo test --locked --release` is two
+/// commands and the first one's missing `--locked` is seen (Greptile on
+/// #159).
+fn shell_commands_of(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), _) if c == q => {
+                quote = None;
+                current.push(c);
+            }
+            (Some(_), _) => current.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                current.push(c);
+            }
+            (None, ';') => out.push(std::mem::take(&mut current)),
+            (None, '&' | '|') if chars.peek() == Some(&c) => {
+                chars.next();
+                out.push(std::mem::take(&mut current));
+            }
+            (None, '|') => out.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    out.push(current);
+    out.into_iter()
+        .map(|command| command.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|command| !command.is_empty())
         .collect()
 }
 
@@ -819,6 +877,33 @@ jobs:
         assert_ne!(yaml, WORKFLOW, "the mutation must actually apply");
         assert!(cargo_test_runs_outside(&yaml, LOCKED_EXEMPT_JOBS)
             .contains(&"cargo test --test pool_oracle".to_string()));
+    }
+
+    /// A LINE IS NOT A COMMAND (Greptile on #159). Two runs on one line
+    /// are checked one at a time, so the unpinned one is found; and a run
+    /// continued onto the next line with a backslash is one run, so its
+    /// `--locked` counts.
+    #[test]
+    fn runs_are_split_at_separators_and_joined_across_continuations() {
+        let yaml = WORKFLOW.replace(
+            "      - run: cargo test --locked --release\n",
+            "      - run: |\n          cargo test --lib && cargo test --locked --release\n          cargo test \\\n            --locked --lib\n",
+        );
+        assert_ne!(yaml, WORKFLOW, "the mutation must actually apply");
+        let runs = cargo_test_runs_outside(&yaml, LOCKED_EXEMPT_JOBS);
+        assert_eq!(
+            runs,
+            vec![
+                "cargo test --lib".to_string(),
+                "cargo test --locked --release".to_string(),
+                "cargo test --locked --lib".to_string(),
+            ],
+            "each run on its own, the continued one whole"
+        );
+        assert!(
+            runs.iter().any(|r| !r.contains("--locked")),
+            "the unpinned first run must be visible to the guard"
+        );
     }
 
     /// A commented-out command is not a run.
