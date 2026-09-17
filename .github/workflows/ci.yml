@@ -227,6 +227,15 @@ jobs:
       - name: Build the subvolume fixture
         run: sudo bash scripts/build-subvol-fixtures.sh
 
+      # The chunk-tree walk's refusals, on images the test damages itself
+      # after mkfs.btrfs, which only this job installs. `required` turns a
+      # missing mkfs.btrfs into a failure instead of a skip that reads as a
+      # pass (#85).
+      - name: A malformed chunk item fails the mount by name
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test chunk_tree_items -- --nocapture
+
       # Extended attributes have to be SET, which needs a mount, so this
       # cannot come from the mkfs-only matrix either. Same script the VM
       # runner calls. Without it tests/xattr_oracle.rs finds no fixture
@@ -291,6 +300,15 @@ jobs:
       - name: Reproduce each committed superblock
         run: cargo test --test super_write_oracle -- --nocapture
 
+      # Data writes on a `-d dup` volume, built by the test with
+      # mkfs.btrfs, which only this job installs. `required` turns a
+      # missing mkfs.btrfs into a failure instead of a skip that reads as a
+      # pass (#71).
+      - name: A data write reaches every copy of a dup extent
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test dup_data_writes -- --nocapture
+
       # The default fixture above exercises CRC32C only. Rebuild the same
       # commit sequence with the widest checksum and DUP data/metadata
       # profiles so the writer is judged against the other superblock
@@ -308,6 +326,15 @@ jobs:
       # which is the reference a user would check against.
       - name: Compare the subvolume listing against btrfs-progs
         run: cargo test --test subvol_oracle -- --nocapture
+
+      # Compressed-extent windows, on an image the test builds with
+      # mkfs.btrfs, which only this job installs. `required` turns a
+      # missing mkfs.btrfs into a failure instead of a skip that reads as a
+      # pass (#73).
+      - name: A compressed extent's window is checked before it is read
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test compressed_extent_window -- --nocapture
 
       - name: Run the oracle test against the fixtures
         run: cargo test --test oracle_vm_fixtures -- --nocapture
@@ -341,6 +368,15 @@ jobs:
       # against the sequence blktrace recorded from a live commit.
       - name: Commit ordering and barriers
         run: cargo test --test commit_order -- --nocapture
+
+      # A preallocated extent, made by retyping an extent item on an image
+      # the test builds with mkfs.btrfs, which only this job installs.
+      # `required` turns a missing mkfs.btrfs into a failure instead of a
+      # skip that reads as a pass (#74).
+      - name: A preallocated extent is refused as preallocated
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test prealloc_extent_write -- --nocapture
 
       # A whole image before and after one change, so what a transaction
       # actually does can be measured rather than reasoned about. The
@@ -386,6 +422,15 @@ jobs:
       # every item of real leaves.
       - name: Leaf editing
         run: cargo test --test leaf_edit_oracle -- --nocapture
+
+      # A relocation whose old block's record is not under the key the plan
+      # expects, on an image the test edits after mkfs.btrfs, which only
+      # this job installs. `required` turns a missing mkfs.btrfs into a
+      # failure instead of a skip that reads as a pass (#87).
+      - name: A missing extent record refuses the relocation
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test extent_record_missing -- --nocapture
 
       # A filesystem either side of one leaf splitting, plus a second
       # pair with deliberately uneven item sizes — without which

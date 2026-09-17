@@ -801,9 +801,45 @@ impl<'a> Tree<'a> {
     /// description of the wreckage -- and it is copy 0's error that
     /// this function promises to report.
     pub fn read_block(&self, logical: u64) -> Result<TreeBlock> {
+        self.read_verified(logical, None)
+    }
+
+    /// [`Tree::read_block`] for a block reached through a parent's
+    /// `KeyPtr`, which also names the transaction the child was written
+    /// in.
+    ///
+    /// # A BLOCK FROM THE WRONG TIME
+    ///
+    /// Checksum, `bytenr` and `fsid` catch a damaged block and one from
+    /// the wrong place. They all pass for a block that was freed in one
+    /// transaction and reused in a later one, then reached through a
+    /// stale parent: it is intact, it is at that address, and it belongs
+    /// to this volume. Copy-on-write makes that ordinary after a torn
+    /// commit or a rollback. The kernel's `verify_parent_transid` compares
+    /// the child's header generation with the one its parent recorded,
+    /// and so does this (#82). A copy that fails the comparison is a copy
+    /// that failed, so the other copies are tried, as the kernel does.
+    pub fn read_child(&self, logical: u64, generation: u64) -> Result<TreeBlock> {
+        self.read_verified(logical, Some(generation))
+    }
+
+    fn read_verified(&self, logical: u64, generation: Option<u64>) -> Result<TreeBlock> {
+        let parse = |buf: Vec<u8>| {
+            let block = TreeBlock::parse(buf, logical, &self.geom)?;
+            match generation {
+                Some(want) if block.header.generation != want => Err(bad_block(
+                    logical,
+                    format!(
+                        "generation {} where the parent said {want} — parent transid verify failed",
+                        block.header.generation
+                    ),
+                )),
+                _ => Ok(block),
+            }
+        };
         let mut buf = vec![0u8; self.geom.nodesize as usize];
         let first = match (self.read)(logical, &mut buf) {
-            Ok(()) => match TreeBlock::parse(buf, logical, &self.geom) {
+            Ok(()) => match parse(buf) {
                 Ok(block) => return Ok(block),
                 Err(e) => e,
             },
@@ -823,7 +859,7 @@ impl<'a> Tree<'a> {
             if read_mirror(logical, mirror, &mut buf).is_err() {
                 continue;
             }
-            if let Ok(block) = TreeBlock::parse(buf, logical, &self.geom) {
+            if let Ok(block) = parse(buf) {
                 return Ok(block);
             }
         }
@@ -845,11 +881,12 @@ impl<'a> Tree<'a> {
     pub fn descend(&self, root: u64, key: &DiskKey) -> Result<TreeBlock> {
         let mut logical = root;
         let mut expected_level: Option<u8> = None;
+        let mut expected_generation: Option<u64> = None;
         // A Btrfs tree is at most MAX_LEVEL blocks tall, so this many
         // reads is enough for any well-formed tree and few enough that a
         // cycle in a corrupt one cannot spin forever.
         for _ in 0..MAX_LEVEL {
-            let block = self.read_block(logical)?;
+            let block = self.read_verified(logical, expected_generation)?;
             if let Some(want) = expected_level {
                 if block.header.level != want {
                     return Err(bad_block(
@@ -866,6 +903,7 @@ impl<'a> Tree<'a> {
             };
             let slot = node_slot(ptrs, key);
             expected_level = Some(block.header.level - 1);
+            expected_generation = Some(ptrs[slot].generation);
             logical = ptrs[slot].blockptr;
         }
         Err(bad_block(
@@ -997,7 +1035,7 @@ impl<'a> Tree<'a> {
                 "block appears twice in one walk — the tree is not a tree",
             ));
         }
-        let block = self.read_block(logical)?;
+        let block = self.read_verified(logical, state.expected_generation)?;
         // The same rule `descend` enforces: a child sits one level below
         // its parent. `walk` did not check it.
         if let Some(want) = state.expected_level {
@@ -1035,7 +1073,7 @@ impl<'a> Tree<'a> {
                     // Only the subtree the start key lands in needs to be
                     // entered partway; everything to its right is whole.
                     let child_start = if i == first { start } else { None };
-                    let outer = state.enter(child_level);
+                    let outer = state.enter(child_level, ptr.generation);
                     let keep_going = self.walk(ptr.blockptr, child_start, state, visit);
                     state.leave(outer);
                     if !keep_going? {
@@ -1056,6 +1094,7 @@ struct WalkState {
     seen: std::collections::HashSet<u64>,
     depth: u8,
     expected_level: Option<u8>,
+    expected_generation: Option<u64>,
 }
 
 impl WalkState {
@@ -1064,20 +1103,22 @@ impl WalkState {
             seen: std::collections::HashSet::new(),
             depth: 0,
             expected_level: None,
+            expected_generation: None,
         }
     }
 
-    /// Step into a child at `level`, returning what to restore on the
-    /// way back out.
-    fn enter(&mut self, level: u8) -> Option<u8> {
-        let outer = self.expected_level;
+    /// Step into a child at `level`, written in `generation`, returning
+    /// what to restore on the way back out.
+    fn enter(&mut self, level: u8, generation: u64) -> (Option<u8>, Option<u64>) {
+        let outer = (self.expected_level, self.expected_generation);
         self.expected_level = Some(level);
+        self.expected_generation = Some(generation);
         self.depth += 1;
         outer
     }
 
-    fn leave(&mut self, outer: Option<u8>) {
-        self.expected_level = outer;
+    fn leave(&mut self, outer: (Option<u8>, Option<u64>)) {
+        (self.expected_level, self.expected_generation) = outer;
         self.depth -= 1;
     }
 }
@@ -1178,7 +1219,7 @@ pub(crate) mod test_blocks {
             let at = HEADER_SIZE + i * KEY_PTR_SIZE;
             put_key(&mut b, at, k);
             b[at + DISK_KEY_SIZE..at + DISK_KEY_SIZE + 8].copy_from_slice(&child.to_le_bytes());
-            b[at + DISK_KEY_SIZE + 8..at + DISK_KEY_SIZE + 16].copy_from_slice(&8u64.to_le_bytes());
+            b[at + DISK_KEY_SIZE + 8..at + DISK_KEY_SIZE + 16].copy_from_slice(&9u64.to_le_bytes());
         }
         seal(&mut b);
         b
@@ -1214,7 +1255,7 @@ mod tests {
             let at = HEADER_SIZE + i * KEY_PTR_SIZE;
             put_key(&mut b, at, k);
             b[at + DISK_KEY_SIZE..at + DISK_KEY_SIZE + 8].copy_from_slice(&child.to_le_bytes());
-            b[at + DISK_KEY_SIZE + 8..at + DISK_KEY_SIZE + 16].copy_from_slice(&8u64.to_le_bytes());
+            b[at + DISK_KEY_SIZE + 8..at + DISK_KEY_SIZE + 16].copy_from_slice(&9u64.to_le_bytes());
         }
         seal(&mut b);
         b
@@ -1328,7 +1369,7 @@ mod tests {
         let ptrs = block.body.key_ptrs().unwrap();
         assert_eq!(ptrs.len(), 2);
         assert_eq!(ptrs[1].blockptr, LEAF_B);
-        assert_eq!(ptrs[1].generation, 8);
+        assert_eq!(ptrs[1].generation, 9);
         assert!(block.body.items().is_none());
         assert_eq!(block.body.len(), 2);
         assert!(!block.body.is_empty());
@@ -1472,6 +1513,100 @@ mod tests {
             .read_block(LEAF_A)
             .expect("copy 1 verifies and is what the caller gets");
         assert_eq!(block.header.bytenr, LEAF_A);
+    }
+
+    /// A copy of `block` whose header says it was written in `generation`,
+    /// resealed so only the generation differs.
+    fn with_generation(block: &[u8], generation: u64) -> Vec<u8> {
+        use header_offsets as o;
+        let mut b = block.to_vec();
+        b[o::GENERATION..o::GENERATION + 8].copy_from_slice(&generation.to_le_bytes());
+        seal(&mut b);
+        b
+    }
+
+    /// A child written in a different transaction than its parent recorded
+    /// is refused, by the descent and by the walk (#82).
+    ///
+    /// Its checksum, address and fsid all hold -- it is an intact block of
+    /// this volume at this address, just not the one the parent pointed
+    /// at. The parent says 9; this leaf says 10.
+    #[test]
+    fn a_child_from_another_transaction_is_refused() {
+        let mut blocks = two_level_tree();
+        let stale = with_generation(&blocks[&LEAF_B], 10);
+        blocks.insert(LEAF_B, stale);
+        let read = reader(&blocks);
+        let tree = Tree::new(geom(), &read);
+
+        let err = tree.descend(ROOT, &key(5, 1, 0)).unwrap_err();
+        assert!(
+            format!("{err}").contains("parent transid verify failed"),
+            "descend: {err}"
+        );
+        let err = tree.for_each(ROOT, &mut |_, _| Ok(true)).unwrap_err();
+        assert!(
+            format!("{err}").contains("generation 10 where the parent said 9"),
+            "walk: {err}"
+        );
+        // The subtree that agrees with its parent still reads.
+        tree.descend(ROOT, &key(1, 1, 0))
+            .expect("leaf A matches its pointer");
+    }
+
+    /// The control: a tree whose children carry the generations their
+    /// parent recorded reads end to end. On a real volume children are
+    /// usually OLDER than their parent's own header, which is why the
+    /// comparison is with the pointer and not with the parent.
+    #[test]
+    fn children_matching_their_pointers_read_even_when_older_than_the_parent() {
+        let mut blocks = two_level_tree();
+        let newer_root = with_generation(&blocks[&ROOT], 50);
+        blocks.insert(ROOT, newer_root);
+        let read = reader(&blocks);
+        let tree = Tree::new(geom(), &read);
+        let mut n = 0;
+        tree.for_each(ROOT, &mut |_, _| {
+            n += 1;
+            Ok(true)
+        })
+        .expect("walk");
+        assert_eq!(n, 4);
+        tree.descend(ROOT, &key(9, 1, 0)).expect("descend");
+    }
+
+    /// A copy from the wrong transaction is a copy that failed, so the
+    /// others are tried, as the kernel does after a transid failure.
+    #[test]
+    fn a_stale_first_copy_is_read_from_the_second() {
+        let good = leaf(LEAF_A, objectid::FS_TREE, &[(key(1, 1, 0), b"a".to_vec())]);
+        let stale = with_generation(&good, 4);
+        let read = |_logical: u64, buf: &mut [u8]| -> Result<()> {
+            buf.copy_from_slice(&stale);
+            Ok(())
+        };
+        let mirrors = |_logical: u64| -> Result<usize> { Ok(2) };
+        let read_mirror = |_logical: u64, mirror: usize, buf: &mut [u8]| -> Result<()> {
+            buf.copy_from_slice(if mirror == 0 { &stale } else { &good });
+            Ok(())
+        };
+        let tree = Tree::new(geom(), &read).with_redundancy(&mirrors, &read_mirror);
+        let block = tree
+            .read_child(LEAF_A, 9)
+            .expect("copy 1 carries the generation the parent recorded");
+        assert_eq!(block.header.generation, 9);
+        let err = Tree::new(geom(), &read).read_child(LEAF_A, 9).unwrap_err();
+        assert!(format!("{err}").contains("generation 4"), "{err}");
+        // And every copy is held to it: two stale copies are no copy.
+        let all_stale = |_logical: u64, _mirror: usize, buf: &mut [u8]| -> Result<()> {
+            buf.copy_from_slice(&stale);
+            Ok(())
+        };
+        let tree = Tree::new(geom(), &read).with_redundancy(&mirrors, &all_stale);
+        assert!(
+            tree.read_child(LEAF_A, 9).is_err(),
+            "a stale mirror was accepted"
+        );
     }
 
     /// THE FIRST ERROR IS THE ONE REPORTED.

@@ -35,7 +35,7 @@
 //! Holes read as zeros, which is what they are.
 
 use crate::btree::{Tree, TreeGeometry};
-use crate::chunk::{Chunk, ChunkMap, DiskKey};
+use crate::chunk::{ChunkMap, DiskKey};
 use crate::compression::{self, Compression};
 use crate::dir::{self, DirEntry, DIR_INDEX_KEY, XATTR_ITEM_KEY};
 use crate::error::{Error, Result};
@@ -343,13 +343,21 @@ enum Piece<'a> {
         len: u64,
         algo: Compression,
     },
-    /// A hole or an unwritten preallocated extent.
+    /// A hole: nothing on disk behind this range.
     ///
     /// Carries no length: the output buffer is zeroed before any extent
     /// is copied into it, so a region with nothing to copy is already
     /// correct. Naming the case explicitly rather than falling through
     /// keeps the reason visible at the match site.
-    Zeros,
+    Hole,
+    /// An unwritten preallocated extent: blocks reserved at `logical` for
+    /// `len` bytes of the file, reading as zeros.
+    ///
+    /// Not a hole. The space is this file's and the extent tree has an
+    /// item for it, so the write planner has to see it -- it was dropped
+    /// with the holes, and a write to a `fallocate`d range was refused as
+    /// a hole and `can_write_in_place` answered yes (#74).
+    Preallocated { logical: u64, len: u64 },
 }
 
 /// One extent of a file, located both in the file and on the volume.
@@ -511,28 +519,6 @@ impl Filesystem {
         self.writable.is_some()
     }
 
-    /// Write to a logical address, following the chunk map exactly as
-    /// the read path does — a write that ignored a chunk boundary would
-    /// run past the end of one device and into another.
-    /// Write to EVERY copy of a logical range.
-    ///
-    /// [`Filesystem::write_logical`] writes the first copy only, which is
-    /// right for reading and wrong for writing. On a `DUP` or `RAID1`
-    /// chunk it leaves the other copy holding what was there before, and
-    /// the two then disagree with no record of which is current — a
-    /// later read may return either.
-    ///
-    /// The commit trace confirms this is what the kernel does: both
-    /// mirrors of every tree block go out BEFORE the barrier, so a torn
-    /// write to one leaves the other and the barrier still orders both
-    /// against the superblock.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the first write failure. A partial result is possible
-    /// and is not cleaned up: some mirrors may hold the new contents and
-    /// some the old, which is the same state a power loss produces and
-    /// is what the commit ordering exists to survive.
     /// Where a mapped range lands on the device, once it is known to be
     /// on it.
     ///
@@ -563,46 +549,64 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Every `(physical, length)` a write of `len` bytes at `logical`
+    /// lands on: each mirror, split at chunk-stripe boundaries, each span
+    /// checked against the device before anything is written.
+    pub(crate) fn mirror_spans(
+        device: &Arc<dyn BlockDevice>,
+        map: &ChunkMap,
+        logical: u64,
+        len: usize,
+    ) -> Result<Vec<(u64, usize, usize)>> {
+        let mut spans = Vec::new();
+        for mirror in 0..map.mirrors_at(logical)? {
+            let mut done = 0usize;
+            while done < len {
+                let m = map.map_mirror(logical + done as u64, mirror)?;
+                let n = (m.len as usize).min(len - done);
+                if n == 0 {
+                    return Err(Error::UnmappedLogical(logical + done as u64));
+                }
+                Self::writable_span(device, m.physical, n)?;
+                spans.push((m.physical, done, n));
+                done += n;
+            }
+        }
+        Ok(spans)
+    }
+
+    /// Write to EVERY copy of a logical range, following the chunk map
+    /// exactly as the read path does -- a write that ignored a chunk
+    /// boundary would run past the end of one device and into another.
+    ///
+    /// The first copy alone is right for reading and wrong for writing.
+    /// On a `DUP` or `RAID1` chunk it leaves the other copy holding what
+    /// was there before, and the two then disagree with no record of
+    /// which is current -- a later read may return either. The data path
+    /// did exactly that until #71; it is why there is no single-copy
+    /// write any more.
+    ///
+    /// The commit trace confirms this is what the kernel does: both
+    /// mirrors of every tree block go out BEFORE the barrier, so a torn
+    /// write to one leaves the other and the barrier still orders both
+    /// against the superblock.
+    ///
+    /// # Errors
+    ///
+    /// Every span is resolved and checked against the device first, so
+    /// an unmapped address or a stripe past the end writes nothing. A
+    /// device write failure after that propagates, and a partial result
+    /// is possible and not cleaned up: some mirrors may hold the new
+    /// contents and some the old, which is the same state a power loss
+    /// produces and is what the commit ordering exists to survive.
     pub(crate) fn write_logical_all_mirrors(
         device: &Arc<dyn BlockDevice>,
         map: &ChunkMap,
         logical: u64,
         buf: &[u8],
     ) -> Result<()> {
-        let mirrors = map.mirrors_at(logical)?;
-        for mirror in 0..mirrors {
-            let mut done = 0usize;
-            while done < buf.len() {
-                let m = map.map_mirror(logical + done as u64, mirror)?;
-                let n = (m.len as usize).min(buf.len() - done);
-                if n == 0 {
-                    return Err(Error::UnmappedLogical(logical + done as u64));
-                }
-                Self::writable_span(device, m.physical, n)?;
-                Self::writable_span(device, m.physical, n)?;
-                Self::writable_span(device, m.physical, n)?;
-                device.write_at(m.physical, &buf[done..done + n])?;
-                done += n;
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn write_logical(
-        device: &Arc<dyn BlockDevice>,
-        map: &ChunkMap,
-        logical: u64,
-        buf: &[u8],
-    ) -> Result<()> {
-        let mut done = 0usize;
-        while done < buf.len() {
-            let m = map.map(logical + done as u64)?;
-            let n = (m.len as usize).min(buf.len() - done);
-            if n == 0 {
-                return Err(Error::UnmappedLogical(logical + done as u64));
-            }
-            device.write_at(m.physical, &buf[done..done + n])?;
-            done += n;
+        for (physical, from, n) in Self::mirror_spans(device, map, logical, buf.len())? {
+            device.write_at(physical, &buf[from..from + n])?;
         }
         Ok(())
     }
@@ -737,8 +741,11 @@ impl Filesystem {
             };
             let tree = Tree::from_superblock(&sb, &read).with_redundancy(&mirrors, &read_mirror);
             let mut found = Vec::new();
+            // Only chunk items, and a chunk item that does not parse or
+            // does not fit the sector size fails the mount by name rather
+            // than leaving a hole in the map (#85).
             tree.for_each(sb.chunk_root, &mut |key: &DiskKey, data: &[u8]| {
-                if let Ok(chunk) = Chunk::parse(key.offset, data) {
+                if let Some(chunk) = crate::chunk::chunk_from_item(key, data, sb.sectorsize)? {
                     found.push(chunk);
                 }
                 Ok(true)
@@ -1280,9 +1287,42 @@ impl Filesystem {
                 // disk_bytenr == 0 is a hole. A preallocated extent has
                 // blocks reserved but never written, and returning them
                 // would disclose whatever previously occupied the space.
-                if disk_bytenr == 0 || kind == EXTENT_PREALLOC {
-                    let _ = num_bytes;
-                    return Ok(Piece::Zeros);
+                if disk_bytenr == 0 {
+                    return Ok(Piece::Hole);
+                }
+                if kind == EXTENT_PREALLOC {
+                    return Ok(Piece::Preallocated {
+                        logical: disk_bytenr,
+                        len: num_bytes,
+                    });
+                }
+                // THE ITEM'S WINDOW IS INSIDE THE EXTENT IT NAMES.
+                //
+                // `offset` says where in the extent this item's data
+                // starts and `num_bytes` how much of it the item
+                // covers, so together they cannot exceed the extent's
+                // own length. The kernel's tree checker enforces
+                // exactly this. Without it, one `u64` moved the write
+                // target outside the extent entirely -- and the
+                // reference check on the write path is keyed on
+                // `disk_bytenr`, so it still found the extent, agreed
+                // it had one owner, and let the write land somewhere
+                // else: over a tree block, or over another file.
+                //
+                // BEFORE THE COMPRESSED BRANCH, NOT AFTER IT (#73). The
+                // rule is a property of the item, not of how its bytes
+                // are stored, and for a compressed extent `offset` is an
+                // index into the DECODED buffer that never meets the chunk
+                // map: unchecked, one le64 overflowed that index into a
+                // panic in any build with overflow checks on.
+                let window_end = offset
+                    .checked_add(num_bytes)
+                    .filter(|end| *end <= ram_bytes);
+                if window_end.is_none() {
+                    return Err(Error::BadSuperblock(format!(
+                        "inode {ino}: an extent item covers [{offset}, +{num_bytes}) of an \
+                         extent that is {ram_bytes} bytes long"
+                    )));
                 }
                 if algo.is_compressed() {
                     // `disk_len` is the buffer the compressed bytes are
@@ -1305,27 +1345,6 @@ impl Filesystem {
                         len: num_bytes,
                         algo,
                     });
-                }
-                // THE ITEM'S WINDOW IS INSIDE THE EXTENT IT NAMES.
-                //
-                // `offset` says where in the extent this item's data
-                // starts and `num_bytes` how much of it the item
-                // covers, so together they cannot exceed the extent's
-                // own length. The kernel's tree checker enforces
-                // exactly this. Without it, one `u64` moved the write
-                // target outside the extent entirely -- and the
-                // reference check on the write path is keyed on
-                // `disk_bytenr`, so it still found the extent, agreed
-                // it had one owner, and let the write land somewhere
-                // else: over a tree block, or over another file.
-                let window_end = offset
-                    .checked_add(num_bytes)
-                    .filter(|end| *end <= ram_bytes);
-                if window_end.is_none() {
-                    return Err(Error::BadSuperblock(format!(
-                        "inode {ino}: an extent item covers [{offset}, +{num_bytes}) of an \
-                         extent that is {ram_bytes} bytes long"
-                    )));
                 }
                 Ok(Piece::Regular {
                     // Both halves are raw le64s. In release, where this
@@ -1367,9 +1386,11 @@ impl Filesystem {
             let start = *offset;
             match self.decode_extent(data, ino)? {
                 // Inline data lives in the item, so there is no block to
-                // overwrite; preallocated and holes have nothing behind
-                // them. All three are reported with no logical address,
-                // and the planner refuses them by name.
+                // overwrite, and a preallocated extent's blocks read as
+                // zeros until the item is changed to say otherwise. Both
+                // are reported with no logical address, and the planner
+                // refuses them by name. A hole has nothing behind it and
+                // is not reported.
                 Piece::Inline(bytes) => out.push(FileExtent {
                     start,
                     len: bytes.len() as u64,
@@ -1377,7 +1398,14 @@ impl Filesystem {
                     extent_start: 0,
                     compressed: false,
                 }),
-                Piece::Zeros => {}
+                Piece::Preallocated { logical, len } => out.push(FileExtent {
+                    start,
+                    len,
+                    logical: None,
+                    extent_start: logical,
+                    compressed: false,
+                }),
+                Piece::Hole => {}
                 Piece::Regular { logical, len } => out.push(FileExtent {
                     start,
                     len,
@@ -1531,7 +1559,7 @@ impl Filesystem {
             let piece = self.decode_extent(data, ino)?;
             let extent_len = match &piece {
                 Piece::Inline(bytes) => bytes.len() as u64,
-                Piece::Zeros => continue,
+                Piece::Hole | Piece::Preallocated { .. } => continue,
                 Piece::Regular { len, .. } | Piece::Compressed { len, .. } => *len,
             };
             // Where this extent and the window overlap, in file offsets.
@@ -1551,7 +1579,7 @@ impl Filesystem {
                         .ok_or_else(|| short_extent(ino, "inline"))?;
                     dst.copy_from_slice(src);
                 }
-                Piece::Zeros => unreachable!("handled above"),
+                Piece::Hole | Piece::Preallocated { .. } => unreachable!("handled above"),
                 Piece::Regular { logical, .. } => {
                     let at_logical = logical
                         .checked_add(skip as u64)
@@ -1580,9 +1608,11 @@ impl Filesystem {
                     )?;
                     // `within` indexes the decoded bytes, which is the
                     // whole reason this is not a Regular read.
-                    let src_at = (within as usize).saturating_add(skip);
-                    let src = decoded
-                        .get(src_at..src_at + take)
+                    let src = usize::try_from(within)
+                        .ok()
+                        .and_then(|w| w.checked_add(skip))
+                        .and_then(|at| Some(at..at.checked_add(take)?))
+                        .and_then(|range| decoded.get(range))
                         .ok_or_else(|| short_extent(ino, "compressed"))?;
                     dst.copy_from_slice(src);
                 }
