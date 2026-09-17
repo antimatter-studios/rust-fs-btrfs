@@ -1012,48 +1012,72 @@ impl Superblock {
     /// Whether the log tree holds changes not yet folded into the main
     /// trees. Reading the committed trees remains safe; the data is just
     /// slightly behind the last `fsync`.
+    ///
+    /// Gates: every mount refuses such a volume with `Error::DirtyLog`.
     pub fn has_dirty_log(&self) -> bool {
         self.log_root != 0
     }
 
     /// Whether this device is a read-only seed for another filesystem.
+    ///
+    /// Gates: `Filesystem::mount_rw` refuses a seed; it mounts read-only.
     pub fn is_seeding(&self) -> bool {
         self.flags & super_flags::SEEDING != 0
     }
 
     /// Whether the volume was flagged as having hit an error.
+    ///
+    /// An accessor for a consumer; the driver does not branch on it. This
+    /// crate has nowhere to surface a warning, so whether to tell a user
+    /// before a write is the caller's decision.
     pub fn has_error_flag(&self) -> bool {
         self.flags & super_flags::ERROR != 0
     }
 
     /// Whether this image came from a metadata-only dump tool. Such an
     /// image has no data extents and cannot be mounted.
+    ///
+    /// Gates: every mount refuses one.
     pub fn is_metadump(&self) -> bool {
         self.flags & (super_flags::METADUMP | super_flags::METADUMP_V2) != 0
     }
 
     /// Whether file holes are implicit rather than recorded as extents.
+    ///
+    /// An accessor; the reader handles both layouts without branching.
     pub fn has_no_holes(&self) -> bool {
         self.incompat_flags & incompat::NO_HOLES != 0
     }
 
     /// Whether metadata back-references use the compact "skinny" form.
+    ///
+    /// An accessor; `extent_write` reads the incompat bit itself.
     pub fn has_skinny_metadata(&self) -> bool {
         self.incompat_flags & incompat::SKINNY_METADATA != 0
     }
 
     /// Whether data and metadata share block groups.
+    ///
+    /// An accessor; the reader handles both layouts without branching, as
+    /// the `mixed` fixture shows.
     pub fn has_mixed_groups(&self) -> bool {
         self.incompat_flags & incompat::MIXED_GROUPS != 0
     }
 
     /// Whether a free-space tree (space_cache v2) is present and valid.
+    ///
+    /// An accessor; the write path consults the compat_ro bits directly.
     pub fn has_free_space_tree(&self) -> bool {
         self.compat_ro_flags & (compat_ro::FREE_SPACE_TREE | compat_ro::FREE_SPACE_TREE_VALID)
             == (compat_ro::FREE_SPACE_TREE | compat_ro::FREE_SPACE_TREE_VALID)
     }
 
     /// Whether block group items live in their own tree.
+    ///
+    /// Gates, through the compat_ro bit: `mount_rw` refuses such a volume
+    /// (`refuse_unmaintained_compat_ro`, #72), because the write path
+    /// looks for block group items in the extent tree. Reading does not
+    /// use block groups.
     pub fn has_block_group_tree(&self) -> bool {
         self.compat_ro_flags & compat_ro::BLOCK_GROUP_TREE != 0
     }
