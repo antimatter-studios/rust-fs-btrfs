@@ -1327,6 +1327,27 @@ impl Filesystem {
                 let offset = le64(data, file_extent::OFFSET);
                 let num_bytes = le64(data, file_extent::NUM_BYTES);
 
+                // EVERY LENGTH AND ADDRESS IS WHOLE SECTORS, which is what
+                // the kernel's tree checker (`check_extent_data_item`)
+                // requires of all five fields, holes included. It narrows
+                // the values a crafted item can use; it is not a bound on
+                // where the window points (#89).
+                let sector = u64::from(self.sb.sectorsize.max(1));
+                for (field, value) in [
+                    ("ram_bytes", ram_bytes),
+                    ("disk_bytenr", disk_bytenr),
+                    ("disk_num_bytes", le64(data, file_extent::DISK_NUM_BYTES)),
+                    ("offset", offset),
+                    ("num_bytes", num_bytes),
+                ] {
+                    if value % sector != 0 {
+                        return Err(Error::BadSuperblock(format!(
+                            "inode {ino}: extent item {field} {value} is not a multiple of \
+                             the {sector}-byte sector"
+                        )));
+                    }
+                }
+
                 // disk_bytenr == 0 is a hole. A preallocated extent has
                 // blocks reserved but never written, and returning them
                 // would disclose whatever previously occupied the space.
@@ -1344,13 +1365,17 @@ impl Filesystem {
                 // `offset` says where in the extent this item's data
                 // starts and `num_bytes` how much of it the item
                 // covers, so together they cannot exceed the extent's
-                // own length. The kernel's tree checker enforces
-                // exactly this. Without it, one `u64` moved the write
-                // target outside the extent entirely -- and the
-                // reference check on the write path is keyed on
-                // `disk_bytenr`, so it still found the extent, agreed
-                // it had one owner, and let the write land somewhere
-                // else: over a tree block, or over another file.
+                // own length. This crate's rule, not the kernel tree
+                // checker's, and a weak one: `ram_bytes` comes from the
+                // same item, so a crafted item passes it by raising
+                // `ram_bytes` too (#89). It still refuses the plain
+                // inconsistency. The bound that holds is the extent
+                // tree's own record of the extent's length, from another
+                // tree entirely; the write path checks against that
+                // before writing (`plan_nodatacow_write`), because a
+                // window moved outside its extent there writes over a
+                // tree block or another file. A read through such an
+                // item returns bytes from outside the extent.
                 //
                 // BEFORE THE COMPRESSED BRANCH, NOT AFTER IT (#73). The
                 // rule is a property of the item, not of how its bytes

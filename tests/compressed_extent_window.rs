@@ -49,9 +49,13 @@ fn plain() -> Vec<u8> {
         .collect()
 }
 
-/// An image whose file's extent is zlib with window (`offset`, `num_bytes`),
+/// An image whose file's extent is zlib with the window `window(sector,
+/// ram_bytes)` returns as (`offset`, `num_bytes`). The window is computed
+/// from the volume's sector size, because every extent field must be whole
+/// sectors (#89) and `mkfs.btrfs` picks the host page size: 4 KiB on x86,
+/// 16 KiB on a 16K-page arm64 kernel.
 /// and the file's inode number; `None` without mkfs.btrfs.
-fn image(name: &str, offset: u64, num_bytes: u64) -> Option<(std::path::PathBuf, u64)> {
+fn image(name: &str, window: impl Fn(u64, u64) -> (u64, u64)) -> Option<(std::path::PathBuf, u64)> {
     let dir = std::env::temp_dir().join(format!("btrfs-comp-window-{}-{name}", std::process::id()));
     let root = dir.join("root");
     std::fs::create_dir_all(&root).unwrap();
@@ -98,6 +102,9 @@ fn image(name: &str, offset: u64, num_bytes: u64) -> Option<(std::path::PathBuf,
     let mut bytes = std::fs::read(&img).unwrap();
     let sb = Superblock::parse(&bytes[SUPERBLOCK..SUPERBLOCK + 4096]).unwrap();
     let node = sb.nodesize as usize;
+    let sector = u64::from(sb.sectorsize);
+    let ram_bytes = (PLAIN as u64).div_ceil(sector) * sector;
+    let (offset, num_bytes) = window(sector, ram_bytes);
     let mut patched = 0;
     let mut at = 0;
     while at + node <= bytes.len() {
@@ -129,8 +136,7 @@ fn image(name: &str, offset: u64, num_bytes: u64) -> Option<(std::path::PathBuf,
                 }
                 let e = HEADER_SIZE
                     + u32::from_le_bytes(block[item + 17..item + 21].try_into().unwrap()) as usize;
-                block[e + RAM_BYTES..e + RAM_BYTES + 8]
-                    .copy_from_slice(&(PLAIN as u64).to_le_bytes());
+                block[e + RAM_BYTES..e + RAM_BYTES + 8].copy_from_slice(&ram_bytes.to_le_bytes());
                 block[e + COMPRESSION] = 1;
                 block[e + OFFSET..e + OFFSET + 8].copy_from_slice(&offset.to_le_bytes());
                 block[e + NUM_BYTES..e + NUM_BYTES + 8].copy_from_slice(&num_bytes.to_le_bytes());
@@ -156,7 +162,8 @@ fn read_first_block(img: &std::path::Path, ino: u64) -> Result<Vec<u8>, Error> {
 
 #[test]
 fn a_compressed_window_that_overflows_is_refused_not_a_panic() {
-    let Some((img, ino)) = image("overflow", u64::MAX - 100, 4096) else {
+    // Whole sectors at any sector size up to 64 KiB, and the sum overflows.
+    let Some((img, ino)) = image("overflow", |_, _| (!0xFFFF_u64, 0x1_0000)) else {
         eprintln!("no mkfs.btrfs -- skipping");
         return;
     };
@@ -174,7 +181,7 @@ fn a_compressed_window_that_overflows_is_refused_not_a_panic() {
 
 #[test]
 fn a_compressed_window_past_the_decoded_length_is_refused_by_name() {
-    let Some((img, ino)) = image("past", PLAIN as u64, 4096) else {
+    let Some((img, ino)) = image("past", |sector, ram| (ram, sector)) else {
         eprintln!("no mkfs.btrfs -- skipping");
         return;
     };
@@ -194,7 +201,7 @@ fn a_compressed_window_past_the_decoded_length_is_refused_by_name() {
 /// Control: a window inside the decoded bytes reads them.
 #[test]
 fn a_compressed_window_inside_the_extent_reads() {
-    let Some((img, ino)) = image("inside", 0, 4096) else {
+    let Some((img, ino)) = image("inside", |sector, _| (0, sector)) else {
         eprintln!("no mkfs.btrfs -- skipping");
         return;
     };
