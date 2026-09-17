@@ -666,9 +666,13 @@ impl Filesystem {
                 owner: rewrite.owner,
             }
             .key();
-            if out.iter().any(|i| i.key == key) {
-                out = delete(&out, &key)?;
-            }
+            // NOT GUARDED. A missing record is the error `delete` reports:
+            // the extent tree does not say what the plan believes, and
+            // skipping it left the old block recorded as allocated for
+            // ever -- on a volume without SKINNY_METADATA, where the record
+            // is an EXTENT_ITEM under another key, on every transaction
+            // (#87).
+            out = delete(&out, &key)?;
         }
 
         for rewrite in &plan.rewrites {
@@ -682,9 +686,9 @@ impl Filesystem {
                 owner: rewrite.owner,
             };
             let (key, body) = record_tree_block(&self.sb, alloc)?;
-            if out.iter().any(|i| i.key == key) {
-                continue;
-            }
+            // Nor here: a record already under the new address means the
+            // free-space picture that chose it was wrong, and `insert`
+            // refuses a duplicate key.
             out = insert(
                 self.sb.nodesize,
                 &out,
