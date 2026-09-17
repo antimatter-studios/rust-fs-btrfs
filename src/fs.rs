@@ -1162,9 +1162,28 @@ impl Filesystem {
     }
 
     /// Look up one name within a directory.
+    ///
+    /// # Why this is not `read_dir().find(..)`
+    ///
+    /// A name is filed under `(dir, DIR_ITEM, name_hash(name))`, so the
+    /// item holding it is fetched by key, and the scan that remains is over
+    /// the records packed into that one item -- names whose hashes collide.
+    /// Listing the directory to find one name made every path component cost
+    /// the size of its directory: a lookup in a 20,000-entry directory
+    /// materialised all 20,000 entries (#64).
     pub fn lookup(&self, dir_ino: u64, name: &[u8]) -> Result<Inode> {
-        let hit = self
-            .read_dir(dir_ino)?
+        if !self.read_inode(dir_ino)?.is_dir() {
+            return Err(Error::NotADirectory);
+        }
+        // Not stored as entries, and `read_dir` never returned them.
+        if name == b"." || name == b".." {
+            return Err(Error::NotFound);
+        }
+        let data = self
+            .items
+            .get(&(dir_ino, dir::DIR_ITEM_KEY, dir::name_hash(name)))
+            .ok_or(Error::NotFound)?;
+        let hit = dir::parse_dir_items(data)?
             .into_iter()
             .find(|e| e.name == name)
             .ok_or(Error::NotFound)?;

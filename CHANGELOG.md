@@ -27,6 +27,13 @@ never does.
 
 ### Changed
 
+- **A lookup fetches the name by key.** `Filesystem::lookup` listed the whole
+  directory and scanned it for the name, so each path component cost the
+  size of its directory: 20,000 lookups in a 20,000-entry directory took
+  96 s. It now reads the `DIR_ITEM` filed under the name's hash and matches
+  within it (names that share a hash are packed there), 20 ms for the same
+  work. `.` and `..` still resolve to nothing, as before.
+
 - `dir::parse_dir_items` and the new `xattr::parse_xattr_items` share one
   record walk, so the bounds arithmetic over a packed
   `struct btrfs_dir_item` sequence exists once rather than twice.
