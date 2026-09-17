@@ -175,8 +175,13 @@ int fs_btrfs_readlink(fs_btrfs_fs_t *fs, const char *path,
  *          -1 on error. If bufsize is less than the required size, writes
  *          as many WHOLE names as fit and still returns the required size.
  *
- * Signature and semantics match fs_ext4_listxattr, so a layer above can
- * treat the drivers alike.
+ * The signature, the probe, the size returned and the whole-names-only
+ * truncation match fs_ext4_listxattr's implementation, so a layer above
+ * can treat the two alike for a successful call. (fs_ext4.h says ext4
+ * writes "as much as fits"; its code, like this, stops at the last whole
+ * name.) The errors differ: here a NULL fs is EIO and a NULL or non-UTF-8
+ * path is ENOENT, where fs_ext4_listxattr reports EINVAL for a NULL fs or
+ * path.
  */
 int64_t fs_btrfs_listxattr(fs_btrfs_fs_t *fs, const char *path,
                            char *buf, size_t bufsize);
