@@ -53,7 +53,9 @@
 //! So this takes blocks that are already built and already placed. It is
 //! the last step of a transaction and only the last step.
 
+use crate::chunk::objectid;
 use crate::error::{Error, Result};
+use crate::fs::root_item;
 use crate::fs::Filesystem;
 use crate::super_write::SUPERBLOCK_SIZE;
 use crate::super_write::{self, Commit};
@@ -96,6 +98,12 @@ impl Filesystem {
             return Err(Error::ReadOnly);
         };
 
+        // 0. The superblock image, backup slot included, before anything is
+        //    written: its roots are read out of the new root tree, and a
+        //    root tree that does not parse is refused while refusing is
+        //    still free.
+        let raw = self.superblock_image(blocks, commit)?;
+
         // 1. Every tree block, to every mirror. Nothing points at these
         //    yet, so their order among themselves does not matter --
         //    only that all of them precede the barrier.
@@ -118,7 +126,6 @@ impl Filesystem {
 
         // 3. The superblocks, in address order. Each copy carries its
         //    own address, so they are not identical images.
-        let raw = self.superblock_image(commit)?;
         for &offset in &SUPER_OFFSETS {
             if !self.superblock_copy_fits(offset) {
                 continue;
@@ -152,10 +159,105 @@ impl Filesystem {
     /// struct: the superblock holds fields this driver does not model,
     /// and rebuilding it from what it understands would silently drop
     /// them.
-    fn superblock_image(&self, commit: &Commit) -> Result<Vec<u8>> {
+    fn superblock_image(&self, blocks: &[PlacedBlock], commit: &Commit) -> Result<Vec<u8>> {
         let mut raw = vec![0u8; SUPERBLOCK_SIZE];
         self.device.read_at(SUPER_OFFSETS[0], &mut raw)?;
         super_write::apply(&mut raw, self.sb.csum_type, commit)?;
+        let roots = self.backup_roots(&raw, blocks, commit)?;
+        super_write::write_backup(&mut raw, commit.generation, &roots);
+        super_write::stamp_checksum(&mut raw, self.sb.csum_type);
         Ok(raw)
+    }
+
+    /// The roots the commit leaves, for its backup slot (#78).
+    ///
+    /// The tree and chunk roots are in the superblock image. The extent,
+    /// filesystem, device and checksum roots are `ROOT_ITEM`s in the new root
+    /// tree, whose blocks are among `blocks` where the commit moved them and
+    /// on the device where it did not.
+    fn backup_roots(
+        &self,
+        raw: &[u8],
+        blocks: &[PlacedBlock],
+        commit: &Commit,
+    ) -> Result<super_write::BackupRoots> {
+        use crate::btree::{TreeBlock, TreeGeometry};
+        use crate::superblock::offsets as so;
+        use super_write::BackupRoot;
+        let le64 = |at: usize| u64::from_le_bytes(raw[at..at + 8].try_into().expect("8 bytes"));
+        let geom = TreeGeometry::from_superblock(&self.sb);
+        let read = |logical: u64| -> Result<TreeBlock> {
+            match blocks.iter().find(|b| b.logical == logical) {
+                Some(b) => TreeBlock::parse(b.bytes.clone(), logical, &geom),
+                None => self.read_tree_block(logical),
+            }
+        };
+
+        const CSUM_TREE: u64 = 7;
+        let mut found = std::collections::BTreeMap::new();
+        let root = read(commit.root)?;
+        let tree = BackupRoot {
+            bytenr: commit.root,
+            generation: commit.generation,
+            level: root.header.level,
+        };
+        let mut stack = vec![root];
+        // A root tree holds a few dozen items; a walk longer than the
+        // filesystem has metadata blocks is a cycle, not a tree.
+        let mut budget = self.sb.total_bytes / u64::from(self.sb.nodesize.max(1)) + 1;
+        while let Some(block) = stack.pop() {
+            budget = budget.checked_sub(1).ok_or_else(|| {
+                Error::UnsupportedFeature("the root tree being committed loops".into())
+            })?;
+            if let Some(ptrs) = block.body.key_ptrs() {
+                for p in ptrs {
+                    stack.push(read(p.blockptr)?);
+                }
+                continue;
+            }
+            for item in block.body.items().unwrap_or_default() {
+                let id = item.key.objectid;
+                if item.key.key_type != crate::fs::ROOT_ITEM_KEY
+                    || ![
+                        objectid::EXTENT_TREE,
+                        objectid::FS_TREE,
+                        objectid::DEV_TREE,
+                        CSUM_TREE,
+                    ]
+                    .contains(&id)
+                {
+                    continue;
+                }
+                let Some(data) = block.item_data(item).filter(|d| d.len() > root_item::LEVEL)
+                else {
+                    continue;
+                };
+                let at = |o: usize| u64::from_le_bytes(data[o..o + 8].try_into().expect("8 bytes"));
+                found.insert(
+                    id,
+                    BackupRoot {
+                        bytenr: at(root_item::BYTENR),
+                        generation: at(root_item::GENERATION),
+                        level: data[root_item::LEVEL],
+                    },
+                );
+            }
+        }
+        let get = |id: u64| found.get(&id).copied().unwrap_or_default();
+        Ok(super_write::BackupRoots {
+            tree,
+            chunk: BackupRoot {
+                bytenr: le64(so::CHUNK_ROOT),
+                generation: le64(so::CHUNK_ROOT_GENERATION),
+                level: raw[so::CHUNK_ROOT_LEVEL],
+            },
+            extent: get(objectid::EXTENT_TREE),
+            fs: get(objectid::FS_TREE),
+            dev: get(objectid::DEV_TREE),
+            csum: get(CSUM_TREE),
+            total_bytes: le64(so::TOTAL_BYTES),
+            bytes_used: le64(so::BYTES_USED),
+            num_devices: le64(so::NUM_DEVICES),
+        })
     }
 }

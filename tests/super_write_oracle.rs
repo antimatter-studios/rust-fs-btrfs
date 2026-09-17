@@ -93,10 +93,12 @@ fn each_commit_reproduces_the_superblock_the_kernel_wrote() {
         };
 
         let mut ours = before.clone();
-        // The backup ring is not filled by this writer, so the kernel's
-        // ring is carried across before the checksum is computed —
-        // otherwise the checksum, which covers the ring, could not match
-        // and nothing else would be checkable.
+        // The backup ring is not filled by `apply`: its roots are in the
+        // root tree, which a captured superblock does not carry. The
+        // kernel's ring is carried across so the checksum, which covers it,
+        // can match. `Filesystem::commit` does fill the slot, and
+        // tests/backup_ring.rs checks what it writes against btrfs-progs
+        // (#78).
         ours[offsets::ROOT_BACKUPS..ROOT_BACKUPS_END]
             .copy_from_slice(&after[offsets::ROOT_BACKUPS..ROOT_BACKUPS_END]);
 

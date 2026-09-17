@@ -138,7 +138,10 @@ fn tree_blocks_land_before_the_first_flush_and_superblocks_between_the_two() {
         &blocks,
         &Commit {
             generation: fs.superblock().generation + 1,
-            root: first,
+            // The tree root the volume already has: these blocks are
+            // placeholders, and a commit reads its backup roots out of the
+            // root tree it names, which has to parse (#78).
+            root: fs.superblock().root,
             ..Default::default()
         },
     )
@@ -245,7 +248,7 @@ fn both_mirrors_of_a_dup_block_are_written() {
         }],
         &Commit {
             generation: fs.superblock().generation + 1,
-            root: at,
+            root: fs.superblock().root,
             ..Default::default()
         },
     )
@@ -283,12 +286,11 @@ fn each_superblock_copy_records_where_it_belongs() {
         eprintln!("no fixture — skipping");
         return;
     };
-    let at = fs.find_metadata_block().expect("somewhere to put a block");
     fs.commit(
         &[],
         &Commit {
             generation: fs.superblock().generation + 1,
-            root: at,
+            root: fs.superblock().root,
             ..Default::default()
         },
     )
