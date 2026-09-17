@@ -535,31 +535,38 @@ jobs:
       - name: The fixtures the steps above were supposed to build
         run: cargo test --test fixtures_present -- --nocapture
 
-      # The targets this gate did not name.
+      # Every integration target a step above did not name, found rather
+      # than listed (#70).
       #
-      # It listed each suite individually and missed seven, while the
-      # other job runs everything with NO fixtures — so those seven
-      # found nothing, skipped, and reported success on every push.
-      # `compression_oracle` and `write_oracle` need fixtures only this
-      # job builds, which means they had never executed an assertion on
-      # a pull request at all. (compression_oracle has since moved to its
-      # own step, after the builder this job was in fact missing, #69.)
-      #
-      # One step rather than one per suite. THE LIST IS STILL A LIST: a
-      # new fixture-backed suite is NOT covered until its name is added
-      # here, and `dup_mirror_fallback` was written, committed and
-      # measured locally before anyone noticed CI had never run it with
-      # fixtures. The other job runs it with none, where it skips.
-      - name: The remaining fixture-backed suites
+      # This step was written so the next suite added would be covered by
+      # default, and was a hand-kept list: `read_path_cost` arrived after it
+      # and was never in it, so it ran only in the other job, with no
+      # fixtures, and never executed an assertion on a pull request.
+      # `dup_mirror_fallback` fell through the same way before it was
+      # noticed. So the list is gone. The targets are `tests/*.rs`; the ones
+      # this job already runs by name are the `cargo test --test <name>`
+      # lines in this file; the rest run here. A new suite is in the gate
+      # the moment its file is committed, and one given its own step above
+      # leaves this one by being named there.
+      - name: The remaining integration targets
         run: |
           set -euo pipefail
-          for t in bootstrap_chain btree_oracle capi \
-                   dup_mirror_fallback fs_oracle fstree_oracle write_oracle \
-                   xattr_oracle; do
+          named=$(grep -oE 'cargo test --test [a-z0-9_]+' .github/workflows/ci.yml \
+            | awk '{print $4}' | sort -u)
+          ran=0
+          for f in tests/*.rs; do
+            t=$(basename "$f" .rs)
+            if grep -qx "$t" <<<"$named"; then
+              continue
+            fi
             echo "::group::$t"
             cargo test --test "$t" -- --nocapture
             echo "::endgroup::"
+            ran=$((ran + 1))
           done
+          # Zero would mean the enumeration broke, not that nothing is left.
+          [ "$ran" -gt 0 ] || { echo "no integration target left to run: the enumeration is broken" >&2; exit 1; }
+          echo "ran $ran targets not named above"
 
       - name: Write both transactions and let the kernel judge them
         run: |
