@@ -112,10 +112,23 @@ impl Filesystem {
         // Resolve everything before writing anything.
         let plan = self.plan_nodatacow_write(ino, offset, data.len())?;
 
+        // EVERY MIRROR, AND EVERY SPAN CHECKED FIRST (#71). This wrote
+        // copy 0 only, so a `-d dup` or `raid1` file kept its old bytes in
+        // the other copy with no checksum to arbitrate -- the file is
+        // nodatasum by the check above -- and never checked a stripe
+        // against the device. Resolving every mirror of every piece
+        // before the first write keeps "nothing is written unless the
+        // whole range can be".
         let device = self.writable.as_ref().expect("checked above");
         let mut done = 0usize;
+        for &(logical, len) in &plan {
+            Self::mirror_spans(device, &self.map, logical, len)?;
+            done += len;
+        }
+        debug_assert_eq!(done, data.len());
+        done = 0;
         for (logical, len) in plan {
-            Self::write_logical(device, &self.map, logical, &data[done..done + len])?;
+            Self::write_logical_all_mirrors(device, &self.map, logical, &data[done..done + len])?;
             done += len;
         }
         device.flush()?;
