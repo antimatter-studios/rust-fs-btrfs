@@ -317,6 +317,16 @@ jobs:
           BTRFS_ORACLE_FIXTURES: required
         run: cargo test --test shared_tree_block_release -- --nocapture
 
+      # A metadata group whose free-space records span two leaves, which the
+      # kernel makes by fragmenting a 4 KiB-node volume. A transaction there
+      # must leave a free-space tree btrfs check accepts, or be refused (#177).
+      - name: Build the free-space straddle fixture
+        run: sudo bash scripts/build-fst-straddle-fixture.sh
+      - name: A transaction on a straddling group keeps the free-space tree valid
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test free_space_straddle -- --nocapture
+
       # mount_rw's compat_ro refusal is tested on images the test makes
       # itself with mkfs.btrfs, which only this job installs. `required`
       # turns a missing mkfs.btrfs into a failure instead of a skip that
