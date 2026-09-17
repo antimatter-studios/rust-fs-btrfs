@@ -522,6 +522,17 @@ impl Filesystem {
         }
         let fs = Self::open(device.clone(), Some(device))?;
         crate::superblock::refuse_unmaintained_compat_ro(fs.sb.compat_ro_flags)?;
+        // A SEED DEVICE IS READ-ONLY BY CONSTRUCTION (#76). Another
+        // filesystem is layered on it, and writes belong to that sprout;
+        // writing the seed changes blocks the sprout depends on being
+        // immutable. It still mounts read-only.
+        if fs.sb.is_seeding() {
+            return Err(Error::UnsupportedFeature(
+                "this device is a seed for another filesystem, which can be read but not \
+                 written; write to the filesystem sprouted from it"
+                    .into(),
+            ));
+        }
         Ok(fs)
     }
 
@@ -718,8 +729,20 @@ impl Filesystem {
             )));
         }
 
-        if sb.log_root != 0 {
+        if sb.has_dirty_log() {
             return Err(Error::DirtyLog);
+        }
+        // A METADATA-ONLY DUMP HAS NO DATA (#76). `btrfs-image` keeps
+        // every tree and none of the extents they point at, so listing and
+        // stat would work and every read would return whatever occupies
+        // those addresses -- a confident wrong answer. The kernel refuses
+        // to mount one, and so does this.
+        if sb.is_metadump() {
+            return Err(Error::UnsupportedFeature(
+                "this image is a metadata-only dump (btrfs-image): its data extents are \
+                 absent, so no file in it can be read"
+                    .into(),
+            ));
         }
 
         // Step 2: the bootstrap map, enough to reach the chunk tree.

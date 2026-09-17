@@ -286,6 +286,14 @@ jobs:
           BTRFS_ORACLE_FIXTURES: required
         run: cargo test --test compat_ro_write_refusal -- --nocapture
 
+      # A metadata-only dump is refused, and a seed device refuses a
+      # read-write mount. mkfs.btrfs images with superblock flags added;
+      # required here so a missing mkfs.btrfs fails rather than skips (#76).
+      - name: Superblock flags that gate a mount are acted on
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test super_flags_refusals -- --nocapture
+
       # Seven superblocks of one filesystem, six commits apart. Six
       # rather than one because the backup ring has four slots and the
       # index is (generation - 1) mod 4 — a single commit exercises one
