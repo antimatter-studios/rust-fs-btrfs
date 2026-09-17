@@ -672,6 +672,29 @@ impl Filesystem {
             // ever -- on a volume without SKINNY_METADATA, where the record
             // is an EXTENT_ITEM under another key, on every transaction
             // (#87).
+            // ONE REFERENCE, OR NOT OURS TO RELEASE (#178). Deleting the
+            // record is how a block with a single owner is freed. A block
+            // with more is shared, usually by a snapshot of a tree whose
+            // root is a node, and the other tree still points at it once
+            // this one has moved on. Releasing it means dropping one
+            // reference, and giving the block's children references of
+            // their own, which is not implemented.
+            if let Some(item) = out.iter().find(|i| i.key == key) {
+                let refs = item
+                    .data
+                    .get(..8)
+                    .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")));
+                if refs != Some(1) {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "the tree block at {} has {} references, so another tree -- most \
+                         likely a snapshot -- still points at it; moving it would free a \
+                         block that tree reads, and dropping one reference is not \
+                         implemented",
+                        rewrite.old,
+                        refs.map_or("an unreadable number of".to_string(), |r| r.to_string())
+                    )));
+                }
+            }
             out = delete(&out, &key)?;
         }
 
