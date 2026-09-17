@@ -41,8 +41,9 @@ use crate::chunk::{key_type, DiskKey};
 use crate::error::{Error, Result};
 use crate::superblock::Superblock;
 
-/// `BTRFS_FEATURE_INCOMPAT_SKINNY_METADATA`.
-pub const INCOMPAT_SKINNY_METADATA: u64 = 1 << 8;
+/// `BTRFS_FEATURE_INCOMPAT_SKINNY_METADATA`, re-exported under the name
+/// this module uses. The one copy is `superblock::incompat`.
+pub use crate::superblock::incompat::SKINNY_METADATA as INCOMPAT_SKINNY_METADATA;
 
 /// `BTRFS_EXTENT_FLAG_DATA` — the extent holds file data.
 pub const EXTENT_FLAG_DATA: u64 = 1 << 0;

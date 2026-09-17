@@ -206,8 +206,7 @@ pub fn apply(raw: &mut [u8], csum_type: ChecksumType, commit: &Commit) -> Result
     }
 
     if commit.invalidate_free_space_tree {
-        /// `BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID`.
-        const FREE_SPACE_TREE_VALID: u64 = 1 << 1;
+        use crate::superblock::compat_ro::FREE_SPACE_TREE_VALID;
         let flags = u64::from_le_bytes(
             raw[offsets::COMPAT_RO_FLAGS..offsets::COMPAT_RO_FLAGS + 8]
                 .try_into()
