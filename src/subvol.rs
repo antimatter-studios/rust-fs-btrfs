@@ -55,10 +55,10 @@ const ROOT_BACKREF_KEY: u8 = 144;
 
 /// `BTRFS_FS_TREE_OBJECTID` — the default subvolume, which every
 /// filesystem has and which has no name and no parent.
-pub const FS_TREE_OBJECTID: u64 = 5;
+pub use crate::chunk::objectid::FS_TREE as FS_TREE_OBJECTID;
 
 /// `BTRFS_FIRST_FREE_OBJECTID` — the lowest id a created subvolume gets.
-pub const FIRST_FREE_OBJECTID: u64 = 256;
+pub use crate::inode::FIRST_FREE_OBJECTID;
 
 /// `BTRFS_LAST_FREE_OBJECTID` — the highest, and the reason this range
 /// has two ends.
