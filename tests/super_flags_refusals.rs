@@ -26,11 +26,37 @@ impl Drop for Scratch {
     }
 }
 
+/// A scratch directory this process created, under a name nobody could
+/// have predicted.
+///
+/// `create_dir`, not `create_dir_all`: it fails when the path already
+/// exists -- a symlink planted there included -- so everything written
+/// below it is written into a directory this test made, on a shared host
+/// too. The name carries the time and a counter as well as the pid.
+fn unique_scratch(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "btrfs-{tag}-{}-{nanos}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return dir,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => panic!("cannot create a scratch directory: {e}"),
+        }
+    }
+}
+
 /// A fresh image with `bits` OR-ed into the superblock's `flags`, or
 /// `None` without `mkfs.btrfs`.
 fn image_with_flags(name: &str, bits: u64) -> Option<(Scratch, std::path::PathBuf)> {
-    let dir = std::env::temp_dir().join(format!("btrfs-sb-flags-{}-{name}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = unique_scratch(&format!("sb-flags-{name}"));
     let scratch = Scratch(dir.clone());
     let path = dir.join("img");
     std::fs::File::create(&path)
