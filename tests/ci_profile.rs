@@ -127,18 +127,18 @@ fn read_or_panic(path: &Path) -> String {
 ///   already fixed.
 ///
 /// `cargo build` lines are not `cargo test` and are not considered.
+///
+/// And before any of those: **the line must BE a `cargo test`**, not
+/// mention one (#118). See [`begins_with_cargo_test`].
 fn runs_covering_the_library_unit_tests(script: &str) -> Vec<String> {
     script
         .lines()
         .filter_map(|raw| {
+            if !begins_with_cargo_test(raw) {
+                return None;
+            }
             let line = raw.trim_start();
-            if line.starts_with('#') {
-                return None;
-            }
             let command = line.split(" #").next().unwrap_or(line).trim();
-            if !command.contains("cargo test") {
-                return None;
-            }
             if command.contains("--release") || command.contains("--profile") {
                 return None;
             }
@@ -166,6 +166,34 @@ fn runs_covering_the_library_unit_tests(script: &str) -> Vec<String> {
             Some(command.to_string())
         })
         .collect()
+}
+
+/// Whether `line` of a `run:` block starts a `cargo test` the shell runs
+/// unconditionally: at the block's own left margin, with nothing before
+/// `cargo test` but `NAME=value` assignments.
+///
+/// This does not interpret the shell, and says so. The text used to
+/// count wherever `cargo test` appeared in it, so `echo "cargo test
+/// --locked --lib"`, or the real command indented inside an `if false;
+/// then` branch, satisfied the guard with no debug run at all (#118).
+/// Requiring the command to begin an unindented line rejects both, and
+/// admits every real invocation in this workflow. A command in a
+/// conditional or loop written at the left margin would still count; a
+/// guard that parsed bash would acquire a new defeat for every way a
+/// block can be written, and this one only has to recognise the one way
+/// the gate's step is.
+fn begins_with_cargo_test(line: &str) -> bool {
+    if line.starts_with(char::is_whitespace) {
+        return false;
+    }
+    let mut words = line.split_whitespace().skip_while(|word| {
+        word.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+        })
+    });
+    words.next() == Some("cargo") && words.next() == Some("test")
 }
 
 /// WHAT ELSE DECIDES WHETHER A STEP GATES.
@@ -385,6 +413,34 @@ fn runs_on_pull_request(wf: &Workflow) -> bool {
     wf.triggers.iter().any(|t| t == "pull_request")
 }
 
+/// Why `workflow` gates no pull request at all, or `None` if it does.
+///
+/// The real-file assertions below ask this FIRST. Without it, a
+/// workflow whose `on:` block moved reported that no debug `cargo test`
+/// covers the library, which sends the reader to a step that is fine
+/// (#124). This names the triggers that were found instead, and says
+/// why `pull_request_target` alone does not count.
+fn not_a_pull_request_gate(workflow: &str) -> Option<String> {
+    let wf = parse_workflow(workflow);
+    if runs_on_pull_request(&wf) {
+        return None;
+    }
+    let mut why = format!(
+        "the workflow does not trigger on `pull_request` at all (its triggers: {:?}), so \
+         none of its steps gates a pull request however they are written. The steps are \
+         not the problem; the `on:` block is.",
+        wf.triggers
+    );
+    if wf.triggers.iter().any(|t| t == "pull_request_target") {
+        why.push_str(
+            " `pull_request_target` alone is refused on purpose: it runs against the base \
+             repository and may never build the contributor's code. See \
+             `runs_on_pull_request`; carry `pull_request:` beside it.",
+        );
+    }
+    Some(why)
+}
+
 /// Keys whose presence on a step or job means its result does not gate.
 const NON_GATING_KEYS: [&str; 2] = ["if", "continue-on-error"];
 
@@ -470,6 +526,9 @@ fn the_pr_gate_still_tests_the_library_in_a_profile_that_can_see_an_overflow() {
     let path = ci_yml();
     let workflow = read_or_panic(&path);
 
+    if let Some(why) = not_a_pull_request_gate(&workflow) {
+        panic!("{}: {why}", path.display());
+    }
     let covering = gating_runs_covering_the_library(&workflow);
     assert!(
         !covering.is_empty(),
@@ -509,6 +568,9 @@ fn the_debug_run_asks_the_build_to_prove_it_traps_overflows() {
     let path = ci_yml();
     let workflow = read_or_panic(&path);
 
+    if let Some(why) = not_a_pull_request_gate(&workflow) {
+        panic!("{}: {why}", path.display());
+    }
     let proving = gating_runs_that_prove_the_build_traps(&workflow);
     assert!(
         !proving.is_empty(),
@@ -578,6 +640,9 @@ jobs:
 
     // And the real guards must be reading ci.yml's own content.
     let scanned = read_or_panic(&ci_yml());
+    if let Some(why) = not_a_pull_request_gate(&scanned) {
+        panic!("{}: {why}", ci_yml().display());
+    }
     assert!(
         !gating_runs_that_prove_the_build_traps(&scanned).is_empty(),
         "the guards above must be satisfied by ci.yml's own content, not by \
@@ -815,6 +880,46 @@ cargo test --locked --release
             runs_covering_the_library_unit_tests(block),
             Vec::<String>::new(),
             "a debug command quoted inside a comment is documentation, not a run"
+        );
+    }
+
+    /// A COMMAND THAT IS ONLY MENTIONED IS NOT RUN (#118). Echoed, it
+    /// is text; indented inside a branch that never fires, it is never
+    /// reached. Each must leave the guard with nothing to count.
+    #[test]
+    fn a_debug_run_that_is_echoed_or_never_reached_does_not_count() {
+        for block in [
+            "echo \"EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\"\n",
+            "if false; then\n  EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\nfi\n",
+            "true && EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n",
+        ] {
+            assert_eq!(
+                runs_covering_the_library_unit_tests(block),
+                Vec::<String>::new(),
+                "{block:?} runs no debug cargo test"
+            );
+        }
+    }
+
+    /// The control for the rule above: assignments before the command
+    /// are still the command.
+    #[test]
+    fn assignments_before_the_command_are_still_the_command() {
+        for line in [
+            "cargo test --locked --lib",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib",
+            "A=1 B_2= cargo test --locked --lib",
+        ] {
+            assert_eq!(
+                runs_covering_the_library_unit_tests(line),
+                vec![line.to_string()],
+                "{line} is a debug run"
+            );
+        }
+        assert_eq!(
+            runs_covering_the_library_unit_tests("1A=x cargo test --locked --lib"),
+            Vec::<String>::new(),
+            "`1A=x` is not an assignment, so the line is a command named 1A=x"
         );
     }
 
@@ -1190,6 +1295,34 @@ jobs:
             1,
             "the control must be counted, or every test below passes for the wrong reason"
         );
+    }
+
+    /// THE MESSAGE NAMES THE CAUSE (#124). A workflow that stopped
+    /// triggering on pull requests is reported as that, with the
+    /// triggers it has, and not as a missing debug step. The control is
+    /// the gating shape, which has nothing to explain.
+    #[test]
+    fn a_workflow_off_pull_requests_is_reported_by_its_trigger() {
+        assert_eq!(super::not_a_pull_request_gate(GATING), None, "control");
+        for (trigger, names_target) in [
+            ("pull_request_target", true),
+            ("pull_request_review", false),
+            ("push", false),
+        ] {
+            let yaml = GATING.replace("  pull_request:\n", &format!("  {trigger}:\n"));
+            assert_ne!(yaml, GATING, "the mutation must actually apply");
+            let why = super::not_a_pull_request_gate(&yaml)
+                .unwrap_or_else(|| panic!("{trigger}: no reason given"));
+            assert!(
+                why.contains(&format!("{trigger:?}")) && why.contains("`on:` block"),
+                "{trigger}: the message must name the trigger found and the on: block: {why}"
+            );
+            assert_eq!(
+                why.contains("refused on purpose"),
+                names_target,
+                "{trigger}: only pull_request_target gets the refusal explained: {why}"
+            );
+        }
     }
 
     #[test]

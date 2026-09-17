@@ -702,10 +702,10 @@ impl Filesystem {
     }
 }
 
-/// `BTRFS_FREE_SPACE_INFO_KEY` / `..._EXTENT_KEY` / `..._BITMAP_KEY`.
-const FREE_SPACE_INFO_KEY: u8 = 198;
-const FREE_SPACE_EXTENT_KEY: u8 = 199;
-const FREE_SPACE_BITMAP_KEY: u8 = 200;
+use crate::chunk::key_type::{
+    FREE_SPACE_BITMAP as FREE_SPACE_BITMAP_KEY, FREE_SPACE_EXTENT as FREE_SPACE_EXTENT_KEY,
+    FREE_SPACE_INFO as FREE_SPACE_INFO_KEY,
+};
 
 impl Filesystem {
     /// The free-space tree leaves that describe any of `addresses`.

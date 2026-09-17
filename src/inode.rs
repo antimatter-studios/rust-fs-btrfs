@@ -80,6 +80,11 @@
 use crate::error::{Error, Result};
 use crate::superblock::{le32, le64};
 
+/// `BTRFS_INODE_NODATASUM` — this file's blocks carry no checksums.
+pub const INODE_NODATASUM: u64 = 1 << 0;
+/// `BTRFS_INODE_NODATACOW` — this file's blocks are written in place.
+pub const INODE_NODATACOW: u64 = 1 << 1;
+
 /// `BTRFS_INODE_ITEM_KEY` — the key type an inode item is filed under.
 pub const INODE_ITEM_KEY: u8 = 1;
 
@@ -281,11 +286,11 @@ pub struct Inode {
     pub rdev: u64,
     /// `BTRFS_INODE_*` flag bits, exactly as stored.
     ///
-    /// Deliberately left uninterpreted. None of the fixtures sets any of
-    /// them, so naming individual bits here would be recording something
-    /// this crate has not checked; and the read path does not need them
-    /// — whether a file's data is compressed, for instance, is decided
-    /// per extent rather than per inode.
+    /// The read path does not interpret them: whether a file's data is
+    /// compressed, for instance, is decided per extent rather than per
+    /// inode. The write path does -- a file is written in place only when
+    /// it carries [`INODE_NODATASUM`] and [`INODE_NODATACOW`], which are
+    /// defined here beside the field they decode.
     pub flags: u64,
     /// Modification sequence number, for NFS.
     pub sequence: u64,

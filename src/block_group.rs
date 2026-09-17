@@ -20,7 +20,7 @@
 //! implements both, which is deliberate: they are derived from different
 //! items written at different times, so requiring them to agree on a
 //! real filesystem is a check no single-source implementation can make
-//! of itself. [`tests/free_space_oracle.rs`] does exactly that.
+//! of itself. `tests/free_space_oracle.rs` does exactly that.
 //!
 //! The extent tree is the authority. The free-space tree is a cache with
 //! a validity bit, and a filesystem may not have one at all.

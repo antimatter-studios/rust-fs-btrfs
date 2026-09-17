@@ -266,6 +266,15 @@ jobs:
       - name: Build the nodatacow fixture
         run: sudo bash scripts/build-nodatacow-fixtures.sh
 
+      # Superblock mirror selection, on images the test edits itself after
+      # mkfs.btrfs, which only this job installs. `required` turns a
+      # missing mkfs.btrfs into a failure instead of a skip that reads as a
+      # pass (#90).
+      - name: A damaged or older primary superblock is read from a mirror
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test superblock_mirrors -- --nocapture
+
       # Data checksums, against a filesystem the kernel made: a flipped
       # byte in a checksummed file must be refused, and the same flip in
       # a NODATASUM file must still read. The second half is the one
@@ -294,6 +303,14 @@ jobs:
         env:
           BTRFS_ORACLE_FIXTURES: required
         run: cargo test --test csum_width_populated -- --nocapture
+
+      # A metadata-only dump is refused, and a seed device refuses a
+      # read-write mount. mkfs.btrfs images with superblock flags added;
+      # required here so a missing mkfs.btrfs fails rather than skips (#76).
+      - name: Superblock flags that gate a mount are acted on
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test super_flags_refusals -- --nocapture
 
       # Seven superblocks of one filesystem, six commits apart. Six
       # rather than one because the backup ring has four slots and the
@@ -347,6 +364,15 @@ jobs:
 
       - name: Run the oracle test against the fixtures
         run: cargo test --test oracle_vm_fixtures -- --nocapture
+
+      # A whole-file read of an inode claiming 2^60 bytes, on an image the
+      # test builds with mkfs.btrfs, which only this job installs.
+      # `required` turns a missing mkfs.btrfs into a failure instead of a
+      # skip that reads as a pass (#80).
+      - name: An impossible file size is an error, not an abort
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test read_file_huge_size -- --nocapture
 
       # Rebuild every tree block the kernel wrote and require the bytes
       # back. These run HERE, not in the fixture-less job, because
