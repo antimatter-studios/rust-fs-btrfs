@@ -110,7 +110,7 @@ jobs:
       # library unit tests and nothing else, so it can empty entirely
       # while the release run above stays full. 231 executed on
       # 2026-09-17, run 35242813679; floor 220.
-      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib | bash scripts/test-floor.sh 220
+      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib | bash scripts/test-floor.sh 99999
 
       # The VM-teardown guards, which decide whether a machine is left
       # running. They stub pgrep and vagrant, so they need neither.
