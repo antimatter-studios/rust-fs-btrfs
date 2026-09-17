@@ -266,6 +266,20 @@ jobs:
       - name: Build the nodatacow fixture
         run: sudo bash scripts/build-nodatacow-fixtures.sh
 
+      # One filesystem per compression algorithm, with the manifest the
+      # kernel wrote for it. build-fixtures-native.sh never made these,
+      # so compression_oracle found nothing on every pull request and
+      # reported success: the zlib, LZO and zstd decoders were checked on
+      # developers' machines only (#69). `required` makes a missing one a
+      # failure.
+      - name: Build the compression fixtures
+        run: sudo bash scripts/build-compression-fixtures.sh
+
+      - name: Compressed files read back as the kernel wrote them
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test compression_oracle -- --nocapture
+
       # Superblock mirror selection, on images the test edits itself after
       # mkfs.btrfs, which only this job installs. `required` turns a
       # missing mkfs.btrfs into a failure instead of a skip that reads as a
@@ -510,7 +524,8 @@ jobs:
       # found nothing, skipped, and reported success on every push.
       # `compression_oracle` and `write_oracle` need fixtures only this
       # job builds, which means they had never executed an assertion on
-      # a pull request at all.
+      # a pull request at all. (compression_oracle has since moved to its
+      # own step, after the builder this job was in fact missing, #69.)
       #
       # One step rather than one per suite. THE LIST IS STILL A LIST: a
       # new fixture-backed suite is NOT covered until its name is added
@@ -520,7 +535,7 @@ jobs:
       - name: The remaining fixture-backed suites
         run: |
           set -euo pipefail
-          for t in bootstrap_chain btree_oracle capi compression_oracle \
+          for t in bootstrap_chain btree_oracle capi \
                    dup_mirror_fallback fs_oracle fstree_oracle write_oracle \
                    xattr_oracle; do
             echo "::group::$t"
