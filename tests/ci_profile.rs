@@ -1127,6 +1127,50 @@ cargo test --locked --release
         );
     }
 
+    /// `-r` IS `--release`, IN EVERY SPELLING CLAP ACCEPTS (#136), and the
+    /// profile is read from the run's own words. Each line in the first list
+    /// builds the release profile; each in the second is a debug library run
+    /// whose `r`, or whose release run, belongs to something else.
+    #[test]
+    fn the_short_release_flag_is_read_from_the_runs_own_arguments() {
+        for line in [
+            "cargo test --locked -r --lib",
+            "cargo test --locked -qr --lib",
+            "cargo test --locked -rq --lib",
+            "cargo test --locked -j4 -r --lib",
+            "cargo test --locked -j 4 -r --lib",
+            "cargo test --locked --features x -r",
+            "cargo test --locked --features 'a;b' -r",
+            "cargo test --locked --target-dir \"build;\" -r",
+            "cargo test --locked '-r'",
+            "cargo test --locked --profile=release --lib",
+            "RUSTFLAGS=-Dwarnings cargo test --locked -r --lib",
+        ] {
+            assert_eq!(
+                runs_covering_the_library_unit_tests(&format!("{line}\n")),
+                Vec::<String>::new(),
+                "{line} builds the release profile"
+            );
+        }
+        for line in [
+            "cargo test --locked --lib -- -r",
+            "cargo test --locked --features r --lib",
+            "cargo test --locked -F r --lib",
+            "cargo test --locked -pr --lib",
+            "cargo test --locked --lib && rm -rf build",
+            "cargo test --locked --lib&&rm -rf build",
+            "cargo test --locked --lib; echo -r",
+            "cargo test --locked --lib && cargo test --locked -r",
+            "cargo test --locked --lib && cargo test --locked --release",
+        ] {
+            assert_eq!(
+                runs_covering_the_library_unit_tests(&format!("{line}\n")).len(),
+                1,
+                "{line}: the leading run is a debug library run"
+            );
+        }
+    }
+
     #[test]
     fn a_real_debug_run_counts() {
         let block = "\
