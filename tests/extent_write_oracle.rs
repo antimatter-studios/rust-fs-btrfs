@@ -242,7 +242,7 @@ fn recording_is_refused_without_the_feature_that_defines_the_shape() {
     };
 
     let mut sb = fs.superblock().clone();
-    sb.incompat_flags &= !fs_btrfs::extent_write::INCOMPAT_SKINNY_METADATA;
+    sb.incompat_flags &= !fs_btrfs::superblock::incompat::SKINNY_METADATA;
 
     let err = record_tree_block(
         &sb,

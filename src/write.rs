@@ -36,18 +36,13 @@
 //! extent item. This reads it, and refuses anything above one. That
 //! lookup is the reason this module is more than a byte copy.
 
-use crate::chunk::DiskKey;
+use crate::chunk::{key_type, objectid, DiskKey};
 use crate::error::{Error, Result};
 use crate::fs::Filesystem;
 
 /// The inode flags this module reads, defined beside `Inode::flags` and
 /// re-exported here where callers already name them.
 pub use crate::inode::{INODE_NODATACOW, INODE_NODATASUM};
-
-/// `BTRFS_EXTENT_TREE_OBJECTID` — the tree holding reference counts.
-const EXTENT_TREE_OBJECTID: u64 = 2;
-/// `BTRFS_EXTENT_ITEM_KEY`.
-const EXTENT_ITEM_KEY: u8 = 168;
 
 /// Offsets within `btrfs_extent_item`.
 mod extent_item {
@@ -229,7 +224,7 @@ impl Filesystem {
         let mut refs = None;
         tree.for_each(root, &mut |key: &DiskKey, data: &[u8]| {
             if key.objectid == bytenr
-                && key.key_type == EXTENT_ITEM_KEY
+                && key.key_type == key_type::EXTENT_ITEM
                 && data.len() >= extent_item::REFS + 8
             {
                 refs = Some(u64::from_le_bytes(
@@ -260,6 +255,6 @@ impl Filesystem {
     /// constant, and its bound disagreed with the general one. See
     /// [`crate::fs::root_item_target`].
     fn extent_tree_root(&self) -> Result<u64> {
-        self.tree_root(EXTENT_TREE_OBJECTID)
+        self.tree_root(objectid::EXTENT_TREE)
     }
 }
