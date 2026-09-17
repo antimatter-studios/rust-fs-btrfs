@@ -302,17 +302,3 @@ fn window_inside_extent(logical: u64, len: u64, extent_start: u64, extent_len: u
         _ => false,
     }
 }
-
-/// Whether a file piece's window, `[logical, logical + len)`, lies inside
-/// the extent the extent tree records at `extent_start` for `extent_len`
-/// bytes. Shared by the write and by `can_write_in_place`, so the two
-/// cannot disagree about which windows a write refuses.
-fn window_inside_extent(logical: u64, len: u64, extent_start: u64, extent_len: u64) -> bool {
-    match (
-        logical.checked_add(len),
-        extent_start.checked_add(extent_len),
-    ) {
-        (Some(piece_end), Some(extent_end)) => logical >= extent_start && piece_end <= extent_end,
-        _ => false,
-    }
-}
