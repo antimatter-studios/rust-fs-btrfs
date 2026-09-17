@@ -300,6 +300,15 @@ jobs:
           BTRFS_ORACLE_FIXTURES: required
         run: cargo test --test csum_oracle -- --nocapture
 
+      # A snapshot the kernel took leaves a data extent reading `refs 1`
+      # when the subvolume's tree is a node, so the count alone cannot say
+      # an extent is unshared. The in-place write must still refuse it
+      # (#63). `required` makes a missing snapshot image a failure.
+      - name: An in-place write refuses an extent a snapshot reads
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test snapshot_shared_write -- --nocapture
+
       # mount_rw's compat_ro refusal is tested on images the test makes
       # itself with mkfs.btrfs, which only this job installs. `required`
       # turns a missing mkfs.btrfs into a failure instead of a skip that
