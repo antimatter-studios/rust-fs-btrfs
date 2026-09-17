@@ -174,6 +174,12 @@ fn a_window_moved_past_its_extent_is_refused_before_anything_is_written() {
 
     let fs = mount_rw(&img);
     let before = std::fs::read(&img).unwrap();
+    // The question a caller asks first gets the same answer the write
+    // gives (Greptile on #156).
+    assert!(
+        !fs.can_write_in_place(ino).unwrap(),
+        "a file whose every write is refused was reported writable"
+    );
     match fs.write_at(ino, 0, &[0x55; 16]) {
         Err(e) => assert!(
             format!("{e}").contains("outside the"),

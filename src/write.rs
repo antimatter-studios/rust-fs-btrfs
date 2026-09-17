@@ -158,10 +158,20 @@ impl Filesystem {
             return Ok(false);
         }
         for piece in self.file_extents(ino)? {
-            if piece.compressed || piece.logical.is_none() {
+            let Some(logical) = piece.logical else {
+                return Ok(false);
+            };
+            if piece.compressed {
                 return Ok(false);
             }
-            if self.extent_item(piece.extent_start)?.0 != 1 {
+            // Both of the write's extent-tree checks, not only the
+            // reference count (Greptile on #156): a window outside the
+            // extent's recorded length is refused by every write, so a
+            // file holding one is not writable.
+            let (refs, extent_len) = self.extent_item(piece.extent_start)?;
+            if refs != 1
+                || !window_inside_extent(logical, piece.len, piece.extent_start, extent_len)
+            {
                 return Ok(false);
             }
         }
@@ -209,13 +219,7 @@ impl Filesystem {
             // below, keyed on the extent's start, still found one owner.
             // The EXTENT_ITEM's key offset is the length the allocator
             // recorded, and nothing in the file's item can change it.
-            let piece_end = logical.checked_add(piece.len);
-            let extent_end = piece.extent_start.checked_add(extent_len);
-            if logical < piece.extent_start
-                || piece_end.is_none()
-                || extent_end.is_none()
-                || piece_end > extent_end
-            {
+            if !window_inside_extent(logical, piece.len, piece.extent_start, extent_len) {
                 return Err(Error::UnsupportedFeature(format!(
                     "inode {ino}: offset {pos} maps to [{logical}, +{}), outside the \
                      {extent_len}-byte extent the extent tree records at {}",
@@ -288,5 +292,19 @@ impl Filesystem {
     /// [`crate::fs::root_item_target`].
     fn extent_tree_root(&self) -> Result<u64> {
         self.tree_root(EXTENT_TREE_OBJECTID)
+    }
+}
+
+/// Whether a file piece's window, `[logical, logical + len)`, lies inside
+/// the extent the extent tree records at `extent_start` for `extent_len`
+/// bytes. Shared by the write and by `can_write_in_place`, so the two
+/// cannot disagree about which windows a write refuses.
+fn window_inside_extent(logical: u64, len: u64, extent_start: u64, extent_len: u64) -> bool {
+    match (
+        logical.checked_add(len),
+        extent_start.checked_add(extent_len),
+    ) {
+        (Some(piece_end), Some(extent_end)) => logical >= extent_start && piece_end <= extent_end,
+        _ => false,
     }
 }
