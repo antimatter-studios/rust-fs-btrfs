@@ -8,6 +8,12 @@ never does.
 
 ### Fixed
 
+- **A new tree block is never placed on a superblock copy.** The extent
+  tree doesn't record the superblock copies, and the allocator took its
+  gaps as free. On a 256 MiB volume it handed out the block whose DUP copy
+  sits at 64 MiB, where a commit then writes the second superblock.
+  `plan_transaction` and `find_metadata_block` now skip the `stripe_len`
+  row holding each copy, as the kernel does (#175).
 - **A commit fills its backup-root slot.** The superblock keeps the roots of
   the last four commits for `btrfs rescue` and `usebackuproot`, and a commit
   by this driver left its slot describing an older commit the kernel made.

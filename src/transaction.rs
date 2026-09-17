@@ -204,7 +204,7 @@ impl Filesystem {
             for run in runs {
                 let mut at = run.start.next_multiple_of(nodesize);
                 while at + nodesize <= run.end() {
-                    if !taken.contains(&at) {
+                    if !taken.contains(&at) && !self.on_superblock_copy(at, nodesize)? {
                         return Ok(at);
                     }
                     at += nodesize;
