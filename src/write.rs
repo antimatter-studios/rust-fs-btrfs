@@ -40,10 +40,9 @@ use crate::chunk::{key_type, objectid, DiskKey};
 use crate::error::{Error, Result};
 use crate::fs::Filesystem;
 
-/// `BTRFS_INODE_NODATASUM` — this file's blocks carry no checksums.
-pub const INODE_NODATASUM: u64 = 1 << 0;
-/// `BTRFS_INODE_NODATACOW` — this file's blocks are written in place.
-pub const INODE_NODATACOW: u64 = 1 << 1;
+/// The inode flags this module reads, defined beside `Inode::flags` and
+/// re-exported here where callers already name them.
+pub use crate::inode::{INODE_NODATACOW, INODE_NODATASUM};
 
 /// Offsets within `btrfs_extent_item`.
 mod extent_item {

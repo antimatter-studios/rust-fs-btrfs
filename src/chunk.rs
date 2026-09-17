@@ -536,7 +536,7 @@ impl Chunk {
 
     /// Checks that need the superblock's geometry.
     ///
-    /// Kept separate from [`Chunk::validate`] so a chunk item can be
+    /// Kept separate from `Chunk::validate` so a chunk item can be
     /// parsed and inspected — by a repair tool, say — without a
     /// superblock in hand.
     pub fn validate_geometry(&self, sectorsize: u32) -> Result<()> {
