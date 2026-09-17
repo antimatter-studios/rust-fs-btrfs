@@ -88,5 +88,7 @@ becomes worth having and that constant should change with it.
 cargo test --release --test read_path_cost -- --nocapture
 ```
 
-It skips without fixtures. Build them with the scripts in
-`tests/scripts`.
+It measures every one of `btrfs-rich.img`, `btrfs-deep4k.img` and
+`btrfs-commit.img` present in `.vm-share`, one block of output each, so
+both tables above come from the one command. It skips without fixtures.
+Build them with the scripts in `tests/scripts`.
