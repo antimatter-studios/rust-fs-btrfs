@@ -488,7 +488,8 @@ impl Filesystem {
         // The sector size is not known until a superblock has been
         // parsed, and the superblock is at a fixed offset, so this one
         // read goes to the device directly.
-        let (sb, _) = crate::superblock::read_superblock(&*device)?;
+        let (sb, copy) = crate::superblock::read_superblock(&*device)?;
+        let sectorsize = u64::from(sb.sectorsize);
 
         // CACHED BY SECTOR RATHER THAN BY NODE. A node is `nodesize`,
         // typically 16 KiB, and caching whole nodes would make the unit
@@ -496,8 +497,13 @@ impl Filesystem {
         // the finer unit and a node is then four cached blocks, stitched
         // by the cache itself.
         let device: Arc<dyn BlockRead> =
-            fs_core::CachingDevice::read_only(device, u64::from(sb.sectorsize), blocks);
-        Self::open(device, None)
+            fs_core::CachingDevice::read_only(device, sectorsize, blocks);
+        // The selection just read is the one the mount uses. Reading it
+        // again through the cache fetched the superblocks twice, and
+        // `read_path_cost` -- which asserts a cache never fetches more bytes
+        // than the uncached mount -- failed on it once it ran against a
+        // fixture (#70).
+        Self::open_pool(device, BTreeMap::new(), None, Some((sb, copy)))
     }
 
     /// Open `device` for reading **and writing**.
@@ -638,7 +644,7 @@ impl Filesystem {
     }
 
     fn open(device: Arc<dyn BlockRead>, writable: Option<Arc<dyn BlockDevice>>) -> Result<Self> {
-        Self::open_pool(device, BTreeMap::new(), writable)
+        Self::open_pool(device, BTreeMap::new(), writable, None)
     }
 
     /// Open a filesystem that spans several devices.
@@ -697,15 +703,22 @@ impl Filesystem {
             .next()
             .expect("at least one device, checked above")
             .clone();
-        Self::open_pool(first, by_id, None)
+        Self::open_pool(first, by_id, None, None)
     }
 
+    /// `known` is a superblock selection already read from `device`'s
+    /// underlying disk, which a read-only mount may reuse rather than read
+    /// again.
     fn open_pool(
         device: Arc<dyn BlockRead>,
         devices: BTreeMap<u64, Arc<dyn BlockRead>>,
         writable: Option<Arc<dyn BlockDevice>>,
+        known: Option<(crate::superblock::Superblock, usize)>,
     ) -> Result<Self> {
-        let (sb, copy) = crate::superblock::read_superblock(&*device)?;
+        let (sb, copy) = match known {
+            Some(selection) if writable.is_none() => selection,
+            _ => crate::superblock::read_superblock(&*device)?,
+        };
         // ON THE SELECTION THIS MOUNT USES. Checked on a separate read
         // beforehand, a mirror that failed to read then and read now was
         // mounted writable from the mirror (Greptile on #146).
