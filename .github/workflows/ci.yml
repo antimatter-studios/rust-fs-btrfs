@@ -339,6 +339,15 @@ jobs:
       - name: Run the oracle test against the fixtures
         run: cargo test --test oracle_vm_fixtures -- --nocapture
 
+      # A whole-file read of an inode claiming 2^60 bytes, on an image the
+      # test builds with mkfs.btrfs, which only this job installs.
+      # `required` turns a missing mkfs.btrfs into a failure instead of a
+      # skip that reads as a pass (#80).
+      - name: An impossible file size is an error, not an abort
+        env:
+          BTRFS_ORACLE_FIXTURES: required
+        run: cargo test --test read_file_huge_size -- --nocapture
+
       # Rebuild every tree block the kernel wrote and require the bytes
       # back. These run HERE, not in the fixture-less job, because
       # without fixtures they find nothing and report success — which is
