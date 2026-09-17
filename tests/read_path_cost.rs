@@ -103,10 +103,16 @@ fn walk_paths(fs: &Filesystem, at: &str, depth: u32, out: &mut Vec<(String, bool
     if depth == 0 || out.len() > 400 {
         return;
     }
-    let Ok(dir) = fs.lookup_path(at) else { return };
-    let Ok(entries) = fs.read_dir(dir.ino) else {
-        return;
-    };
+    // A FAILURE IS A FAILURE, not a smaller tree (Greptile on #163). A
+    // lookup or listing that failed used to drop the path or its subtree
+    // silently, and the stat and read passes then did less work and still
+    // passed. The depth and count bounds are the only reasons to stop.
+    let dir = fs
+        .lookup_path(at)
+        .unwrap_or_else(|e| panic!("lookup_path({at}) failed during the walk: {e:?}"));
+    let entries = fs
+        .read_dir(dir.ino)
+        .unwrap_or_else(|e| panic!("read_dir({at}) failed during the walk: {e:?}"));
     for e in entries {
         if out.len() > 400 {
             return;
@@ -117,9 +123,9 @@ fn walk_paths(fs: &Filesystem, at: &str, depth: u32, out: &mut Vec<(String, bool
         } else {
             format!("{at}/{name}")
         };
-        let Ok(inode) = fs.lookup_path(&child) else {
-            continue;
-        };
+        let inode = fs
+            .lookup_path(&child)
+            .unwrap_or_else(|e| panic!("lookup_path({child}) failed during the walk: {e:?}"));
         let is_dir = inode.is_dir();
         out.push((child.clone(), is_dir));
         if is_dir {
