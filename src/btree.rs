@@ -678,6 +678,12 @@ fn leaf_slot(items: &[Item], key: &DiskKey) -> usize {
 /// closure rather than a device trait is deliberate — it lets the whole
 /// traversal be exercised against an in-memory byte slice, and it keeps
 /// this module from depending on the block-device layer.
+/// Look up a block this walker, or another over the same volume, already
+/// verified.
+pub type CacheGet<'a> = &'a dyn Fn(u64) -> Option<TreeBlock>;
+/// Record a block that has just verified.
+pub type CachePut<'a> = &'a dyn Fn(u64, &TreeBlock);
+
 pub type ReadBlock<'a> = &'a dyn Fn(u64, &mut [u8]) -> Result<()>;
 
 /// Read copy `mirror` of the block at a logical address.
@@ -715,6 +721,8 @@ pub struct Tree<'a> {
     /// "one copy, or the caller cannot reach the others", and is what
     /// every in-memory walker uses.
     redundancy: Option<(MirrorCount<'a>, ReadMirror<'a>)>,
+    /// Verified blocks kept between walks, where the caller keeps them.
+    cache: Option<(CacheGet<'a>, CachePut<'a>)>,
 }
 
 impl<'a> Tree<'a> {
@@ -727,6 +735,7 @@ impl<'a> Tree<'a> {
             geom,
             read,
             redundancy: None,
+            cache: None,
         }
     }
 
@@ -744,6 +753,15 @@ impl<'a> Tree<'a> {
     /// changes.
     pub fn with_redundancy(mut self, mirrors: MirrorCount<'a>, read: ReadMirror<'a>) -> Self {
         self.redundancy = Some((mirrors, read));
+        self
+    }
+
+    /// Serve blocks from, and record verified blocks in, a cache the
+    /// caller keeps across walks (#67). A cached block has already passed
+    /// [`TreeBlock::parse`], so a hit skips the read and the checksum; a
+    /// parent's generation is still compared against it.
+    pub fn with_cache(mut self, get: CacheGet<'a>, put: CachePut<'a>) -> Self {
+        self.cache = Some((get, put));
         self
     }
 
@@ -824,6 +842,21 @@ impl<'a> Tree<'a> {
     }
 
     fn read_verified(&self, logical: u64, generation: Option<u64>) -> Result<TreeBlock> {
+        if let Some((get, _)) = self.cache {
+            if let Some(block) = get(logical) {
+                if generation.is_none_or(|want| block.header.generation == want) {
+                    return Ok(block);
+                }
+            }
+        }
+        let block = self.read_uncached(logical, generation)?;
+        if let Some((_, put)) = self.cache {
+            put(logical, &block);
+        }
+        Ok(block)
+    }
+
+    fn read_uncached(&self, logical: u64, generation: Option<u64>) -> Result<TreeBlock> {
         let parse = |buf: Vec<u8>| {
             let block = TreeBlock::parse(buf, logical, &self.geom)?;
             match generation {

@@ -401,14 +401,68 @@ pub struct Filesystem {
     /// for it, which the kernel does not produce; the read path then
     /// verifies nothing, which is what it did everywhere before.
     csum_tree_root: Option<u64>,
-    /// Every item in the fs tree, keyed by its on-disk key.
+    /// Tree blocks this mount has read, by logical address.
     ///
-    /// Loaded once at mount. Btrfs answers even a single `stat` by
-    /// descending from the tree root, so a driver that re-descends per
-    /// call re-reads the same interior nodes constantly. Holding the
-    /// items costs memory proportional to the metadata rather than the
-    /// data, which for a read-only driver is the right trade.
-    items: BTreeMap<(u64, u8, u64), Vec<u8>>,
+    /// The fs tree was loaded whole at mount, every item into a map, so
+    /// that a `stat` would not re-read the interior nodes above it. That
+    /// made opening a volume cost what the volume held: 2573 device reads
+    /// and 417 ms for 20,000 files before a single question (#67). Items
+    /// are now found by descending the tree when asked, and the nodes a
+    /// descent reads are kept here, so the interior nodes every path
+    /// passes through are read, and verified, once. Bounded, least recently
+    /// used out.
+    nodes: std::sync::Mutex<NodeCache>,
+}
+
+/// Tree blocks a mount keeps: 1024, 16 MiB at the default 16 KiB node.
+pub const NODE_CACHE_BLOCKS: usize = 1024;
+
+/// A least-recently-used set of verified tree blocks by logical address.
+pub(crate) struct NodeCache {
+    capacity: usize,
+    blocks: std::collections::HashMap<u64, (crate::btree::TreeBlock, u64)>,
+    tick: u64,
+}
+
+impl NodeCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            blocks: std::collections::HashMap::new(),
+            tick: 0,
+        }
+    }
+
+    fn get(&mut self, logical: u64) -> Option<crate::btree::TreeBlock> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.blocks.get_mut(&logical).map(|(block, used)| {
+            *used = tick;
+            block.clone()
+        })
+    }
+
+    fn put(&mut self, logical: u64, block: &crate::btree::TreeBlock) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.blocks.len() >= self.capacity && !self.blocks.contains_key(&logical) {
+            if let Some(&victim) = self
+                .blocks
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| k)
+            {
+                self.blocks.remove(&victim);
+            }
+        }
+        self.tick += 1;
+        self.blocks.insert(logical, (block.clone(), self.tick));
+    }
+
+    fn clear(&mut self) {
+        self.blocks.clear();
+    }
 }
 
 /// The longest a symbolic link's target can be.
@@ -442,9 +496,9 @@ fn short_extent(ino: u64, kind: &str) -> Error {
 /// `docs/read-path-cost.md` — a block cache buys this driver nothing
 /// and costs it something:
 ///
-/// - Every item of the fs tree is loaded at mount, so a walk, a stat
-///   and a read make **zero** calls to the device afterwards. There are
-///   no repeat metadata reads left for a cache to serve.
+/// - Tree blocks are held whole, by logical address, in the mount's node
+///   cache (`NODE_CACHE_BLOCKS`), so the repeat metadata reads a sector
+///   cache would serve are already served above it.
 /// - Metadata is read a node at a time, and a node is `nodesize` —
 ///   typically four sectors. Caching by sector turns one call into
 ///   four, so on the `rich` fixture the cached mount asked the device
@@ -452,9 +506,7 @@ fn short_extent(ino: u64, kind: &str) -> Error {
 ///
 /// [`Filesystem::mount_with_cache`] still exists so the measurement can
 /// take both passes, and so the decision can be re-taken against a
-/// number if the eager load is ever replaced by lazy descent — at which
-/// point a cache becomes worth having and this constant should change
-/// with it.
+/// number.
 pub const DEFAULT_CACHE_BLOCKS: usize = 0;
 
 impl Filesystem {
@@ -835,7 +887,7 @@ impl Filesystem {
             fs_and_csum_tree_roots(&tree, sb.root)?
         };
 
-        let mut fs = Filesystem {
+        let fs = Filesystem {
             device,
             devices,
             writable,
@@ -843,9 +895,8 @@ impl Filesystem {
             map,
             fs_tree_root,
             csum_tree_root,
-            items: BTreeMap::new(),
+            nodes: std::sync::Mutex::new(NodeCache::new(NODE_CACHE_BLOCKS)),
         };
-        fs.load_fs_tree()?;
         Ok(fs)
     }
 
@@ -1025,7 +1076,7 @@ impl Filesystem {
     /// The write capability is deliberately not carried across; see the
     /// note on `open_subvolume`.
     pub(crate) fn reroot(&self, fs_tree_root: u64) -> Result<Self> {
-        let mut fs = Filesystem {
+        let fs = Filesystem {
             device: self.device.clone(),
             devices: self.devices.clone(),
             writable: None,
@@ -1035,47 +1086,73 @@ impl Filesystem {
             // A subvolume is another tree on the same volume, so its
             // data is checksummed by the same csum tree.
             csum_tree_root: self.csum_tree_root,
-            items: BTreeMap::new(),
+            nodes: std::sync::Mutex::new(NodeCache::new(NODE_CACHE_BLOCKS)),
         };
-        fs.load_fs_tree()?;
         Ok(fs)
     }
 
-    fn load_fs_tree(&mut self) -> Result<()> {
-        let device = self.device.clone();
-        let devices = self.devices.clone();
-        let map = self.map.clone();
-        // THE SAME DEFECT A THIRD TIME, and fixed here for consistency
-        // rather than because a test reaches it: both halves were the
-        // single-device form, so a POOL's fs tree was read entirely off
-        // the lowest devid. Leaving one of the three sites disagreeing
-        // with the other two is how the first two came to disagree with
-        // each other.
+    /// Run `f` over this mount's fs tree, its blocks read through the node
+    /// cache. The pool, mirror fallback and verification are as every other
+    /// tree walk here has them.
+    fn with_fs_tree<R>(&self, f: impl FnOnce(&Tree, u64) -> Result<R>) -> Result<R> {
         let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical_pool(&device, &devices, &map, logical, buf)
+            Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
         };
-        let mirrors = |logical: u64| -> Result<usize> { map.mirrors_at(logical) };
+        let mirrors = |logical: u64| -> Result<usize> { self.map.mirrors_at(logical) };
         let read_mirror = |logical: u64, mirror: usize, buf: &mut [u8]| -> Result<()> {
-            Self::read_logical_pool_mirror(&device, &devices, &map, mirror, logical, buf)
+            Self::read_logical_pool_mirror(
+                &self.device,
+                &self.devices,
+                &self.map,
+                mirror,
+                logical,
+                buf,
+            )
         };
-        // NOT WITNESSED, AND SAYING SO HERE RATHER THAN ONLY ON THE PR.
-        // tests/dup_mirror_fallback.rs covers the two opt-ins a MOUNT
-        // reaches -- the chunk-tree bootstrap walk and the root-tree
-        // walk. Removing this one alone leaves that suite green, because
-        // reaching it means damaging the fs tree's own root block and
-        // that address is not public: it is read out of the root tree
-        // during the mount and kept private here. A test for it wants
-        // that address exposed, or a fixture built with a known one.
+        let get = |logical: u64| self.nodes.lock().expect("node cache poisoned").get(logical);
+        let put = |logical: u64, block: &crate::btree::TreeBlock| {
+            self.nodes
+                .lock()
+                .expect("node cache poisoned")
+                .put(logical, block)
+        };
         let tree = Tree::new(TreeGeometry::from_superblock(&self.sb), &read)
-            .with_redundancy(&mirrors, &read_mirror);
+            .with_redundancy(&mirrors, &read_mirror)
+            .with_cache(&get, &put);
+        f(&tree, self.fs_tree_root)
+    }
 
-        let mut items = BTreeMap::new();
-        tree.for_each(self.fs_tree_root, &mut |key: &DiskKey, data: &[u8]| {
-            items.insert((key.objectid, key.key_type, key.offset), data.to_vec());
-            Ok(true)
-        })?;
-        self.items = items;
-        Ok(())
+    /// The fs tree item filed under exactly `key`.
+    fn item(&self, key: (u64, u8, u64)) -> Result<Option<Vec<u8>>> {
+        let key = DiskKey {
+            objectid: key.0,
+            key_type: key.1,
+            offset: key.2,
+        };
+        self.with_fs_tree(|tree, root| Ok(tree.search(root, &key)?.map(|item| item.data)))
+    }
+
+    /// Every fs tree item under `objectid` and `key_type`, in key order.
+    #[allow(clippy::type_complexity)]
+    fn item_run(&self, objectid: u64, key_type: u8) -> Result<Vec<((u64, u8, u64), Vec<u8>)>> {
+        self.with_fs_tree(|tree, root| {
+            Ok(tree
+                .find_all(root, objectid, key_type)?
+                .into_iter()
+                .map(|item| {
+                    (
+                        (item.key.objectid, item.key.key_type, item.key.offset),
+                        item.data,
+                    )
+                })
+                .collect())
+        })
+    }
+
+    /// Forget every cached tree block. A commit writes blocks at addresses
+    /// the tree may since have freed and reused.
+    pub(crate) fn forget_tree_blocks(&self) {
+        self.nodes.lock().expect("node cache poisoned").clear();
     }
 
     /// The parsed superblock.
@@ -1132,10 +1209,9 @@ impl Filesystem {
     /// Read one inode by objectid.
     pub fn read_inode(&self, ino: u64) -> Result<Inode> {
         let data = self
-            .items
-            .get(&(ino, INODE_ITEM_KEY, 0))
+            .item((ino, INODE_ITEM_KEY, 0))?
             .ok_or(Error::NotFound)?;
-        Inode::parse(data, ino)
+        Inode::parse(&data, ino)
     }
 
     /// The root directory's inode.
@@ -1158,10 +1234,7 @@ impl Filesystem {
             return Err(Error::NotADirectory);
         }
         let mut out = Vec::new();
-        for ((objectid, key_type, _), data) in self
-            .items
-            .range((ino, DIR_INDEX_KEY, 0)..=(ino, DIR_INDEX_KEY, u64::MAX))
-        {
+        for ((objectid, key_type, _), data) in &self.item_run(ino, DIR_INDEX_KEY)? {
             if *objectid != ino || *key_type != DIR_INDEX_KEY {
                 break;
             }
@@ -1193,10 +1266,9 @@ impl Filesystem {
             return Err(Error::NotFound);
         }
         let data = self
-            .items
-            .get(&(dir_ino, dir::DIR_ITEM_KEY, dir::name_hash(name)))
+            .item((dir_ino, dir::DIR_ITEM_KEY, dir::name_hash(name)))?
             .ok_or(Error::NotFound)?;
-        let hit = dir::parse_dir_items(data)?
+        let hit = dir::parse_dir_items(&data)?
             .into_iter()
             .find(|e| e.name == name)
             .ok_or(Error::NotFound)?;
@@ -1242,10 +1314,7 @@ impl Filesystem {
         // which a caller could not tell from a file with no attributes.
         self.read_inode(ino)?;
         let mut out = Vec::new();
-        for ((objectid, key_type, _), data) in self
-            .items
-            .range((ino, XATTR_ITEM_KEY, 0)..=(ino, XATTR_ITEM_KEY, u64::MAX))
-        {
+        for ((objectid, key_type, _), data) in &self.item_run(ino, XATTR_ITEM_KEY)? {
             if *objectid != ino || *key_type != XATTR_ITEM_KEY {
                 break;
             }
@@ -1273,10 +1342,10 @@ impl Filesystem {
     /// As [`list_xattrs`](Self::list_xattrs).
     pub fn get_xattr(&self, ino: u64, name: &[u8]) -> Result<Option<Vec<u8>>> {
         self.read_inode(ino)?;
-        let Some(data) = self.items.get(&(ino, XATTR_ITEM_KEY, dir::name_hash(name))) else {
+        let Some(data) = self.item((ino, XATTR_ITEM_KEY, dir::name_hash(name)))? else {
             return Ok(None);
         };
-        Ok(xattr::parse_xattr_items(data)?
+        Ok(xattr::parse_xattr_items(&data)?
             .into_iter()
             .find(|e| e.name == name)
             .map(|e| e.value))
@@ -1476,10 +1545,7 @@ impl Filesystem {
     /// file offsets attached.
     pub(crate) fn file_extents(&self, ino: u64) -> Result<Vec<FileExtent>> {
         let mut out = Vec::new();
-        for ((objectid, key_type, offset), data) in self
-            .items
-            .range((ino, EXTENT_DATA_KEY, 0)..=(ino, EXTENT_DATA_KEY, u64::MAX))
-        {
+        for ((objectid, key_type, offset), data) in &self.item_run(ino, EXTENT_DATA_KEY)? {
             if *objectid != ino || *key_type != EXTENT_DATA_KEY {
                 break;
             }
@@ -1676,10 +1742,7 @@ impl Filesystem {
             inode.flags & (crate::write::INODE_NODATASUM | crate::write::INODE_NODATACOW) == 0;
         let want_end = from.saturating_add(buf.len() as u64).min(inode.size);
 
-        for ((objectid, key_type, offset), data) in self
-            .items
-            .range((ino, EXTENT_DATA_KEY, 0)..=(ino, EXTENT_DATA_KEY, u64::MAX))
-        {
+        for ((objectid, key_type, offset), data) in &self.item_run(ino, EXTENT_DATA_KEY)? {
             if *objectid != ino || *key_type != EXTENT_DATA_KEY {
                 break;
             }
