@@ -46,13 +46,40 @@ fn content() -> Vec<u8> {
         .collect()
 }
 
+/// A scratch directory this process created, under a name nobody could
+/// have predicted.
+///
+/// `create_dir`, not `create_dir_all`: it fails when the path already
+/// exists -- a symlink planted there included -- so everything written
+/// below it is written into a directory this test made, on a shared host
+/// too. The name carries the time and a counter as well as the pid.
+fn unique_scratch(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "btrfs-{tag}-{}-{nanos}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return dir,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => panic!("cannot create a scratch directory: {e}"),
+        }
+    }
+}
+
 /// A populated image checksummed with `csum`, or `None` without
 /// `mkfs.btrfs`.
 fn image(csum: &str, data: &[u8]) -> Option<(Scratch, std::path::PathBuf)> {
-    let dir = std::env::temp_dir().join(format!("btrfs-csum-{csum}-{}", std::process::id()));
+    let dir = unique_scratch(&format!("csum-{csum}"));
     let scratch = Scratch(dir.clone());
     let root = dir.join("root");
-    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("data.bin"), data).unwrap();
     let img = dir.join("img");
     std::fs::File::create(&img)
