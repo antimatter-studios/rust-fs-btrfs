@@ -914,3 +914,87 @@ fn carve(
     }
     out
 }
+
+#[cfg(test)]
+mod superblock_mirror_tests {
+    use crate::fs::Filesystem;
+    use crate::superblock::SUPER_OFFSETS;
+    use fs_core::FileDevice;
+    use std::collections::BTreeSet;
+    use std::process::Command;
+    use std::sync::Arc;
+
+    /// A new tree block never lands on a superblock copy.
+    ///
+    /// The extent tree doesn't record the superblock copies, so the free
+    /// runs it implies include them. The kernel and btrfs-progs exclude
+    /// the `stripe_len` window holding each copy from every block group
+    /// (`exclude_super_stripes`, #175). A 256 MiB `mkfs.btrfs` image puts the
+    /// first copy of its DUP metadata chunk across 64 MiB, where
+    /// `Filesystem::commit` writes the second superblock after the tree
+    /// blocks. This allocates every block the group has and checks each
+    /// one's copies against that window. Skips without btrfs-progs.
+    #[test]
+    fn no_tree_block_is_allocated_over_a_superblock_copy() {
+        let dir = std::env::temp_dir().join(format!("btrfs-alloc-super-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("fs.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(256 * 1024 * 1024)
+            .unwrap();
+        let Ok(made) = Command::new("mkfs.btrfs")
+            .args(["-q", "-f", "-s", "4096", "-n", "16384"])
+            .arg(&img)
+            .output()
+        else {
+            eprintln!("skip: mkfs.btrfs not installed");
+            return;
+        };
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+
+        let fs = Filesystem::mount(Arc::new(FileDevice::open(&img).unwrap())).unwrap();
+        let nodesize = fs.sb.nodesize as u64;
+
+        // The windows, from the chunk items: for each stripe on a device
+        // that holds a copy, the stripe_len row the copy falls in.
+        let mut windows = Vec::new();
+        for chunk in fs.map.chunks().iter().filter(|c| c.is_metadata()) {
+            for stripe in &chunk.stripes {
+                let per_stripe = chunk.length; // DUP and single: one stripe is the chunk
+                for &off in &SUPER_OFFSETS[1..] {
+                    if off >= stripe.offset && off < stripe.offset + per_stripe {
+                        let row = (off - stripe.offset) / chunk.stripe_len * chunk.stripe_len;
+                        windows.push((stripe.offset + row, chunk.stripe_len));
+                    }
+                }
+            }
+        }
+        assert!(
+            !windows.is_empty(),
+            "the fixture no longer puts a metadata stripe across a superblock copy"
+        );
+
+        let mut taken = BTreeSet::new();
+        while let Ok(at) = fs.next_free_block(&taken) {
+            taken.insert(at);
+            for mirror in 0..fs.map.mirrors_at(at).unwrap() {
+                let m = fs.map.map_mirror(at, mirror).unwrap();
+                for &(start, len) in &windows {
+                    assert!(
+                        m.physical + nodesize <= start || m.physical >= start + len,
+                        "the block at {at} has a copy at {}, inside the superblock \
+                         window [{start}, +{len})",
+                        m.physical
+                    );
+                }
+            }
+        }
+        assert!(taken.len() > 1000, "allocated only {} blocks", taken.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
