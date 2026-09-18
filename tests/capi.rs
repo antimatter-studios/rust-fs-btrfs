@@ -325,7 +325,7 @@ fn readlink_refuses_a_buffer_too_small_for_the_target() {
         last_errno_erange()
     );
     assert!(
-        buf.iter().all(|&c| c as u8 == 0x7F),
+        buf.iter().all(|&c| c == 0x7F as c_char),
         "a refused readlink must not have written into the buffer"
     );
     unsafe { fs_btrfs_umount(fs) };
