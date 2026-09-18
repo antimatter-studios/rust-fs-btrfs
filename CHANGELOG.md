@@ -65,6 +65,15 @@ never does.
   since #156; the read path does now too. `extent_item` seeks to its key
   instead of walking the whole extent tree, because a read does this per
   extent where a write did it once (#188).
+- **A compressed stream that decodes short is refused anywhere but the
+  file's last extent.** `decompress` padded a short decode with zeros up to
+  `ram_bytes`, which is right for the last extent — the tail of the final
+  sector holds nothing — and wrong everywhere else, where it turned a
+  truncated or damaged stream into a run of zeros a caller cannot tell from
+  data. The caller now says which case it has through
+  `compression::ShortDecode`: the read path pads only the extent that
+  reaches the end of the file, and an inline extent, which is the whole of a
+  small file (#189).
 - **A new tree block is never placed on a superblock copy.** The extent
   tree doesn't record the superblock copies, and the allocator took its
   gaps as free. On a 256 MiB volume it handed out the block whose DUP copy

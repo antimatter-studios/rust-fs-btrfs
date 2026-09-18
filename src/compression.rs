@@ -33,16 +33,15 @@
 //! framing, and that framing is this module's real work. See
 //! `decompress_lzo`.
 //!
-//! # A short decode is padded with zeros
+//! # A short decode is padded only on the file's last extent
 //!
 //! A decoder may stop early on a file's last extent, where the tail of
 //! the final sector holds nothing, so [`decompress`] pads a short result
-//! to `ram_bytes` rather than refusing it. That also means a truncated
-//! stream in any OTHER extent reads as trailing zeros instead of an
-//! error. Telling the two apart needs the caller to say whether this is
-//! the file's last extent, which this function is not told; until it is,
-//! this is a known place where damaged data can read as plausible zeros
-//! (#91).
+//! to `ram_bytes` there. Anywhere else it refuses: a stream that stops
+//! early in an interior extent is truncated or damaged, and zeros are
+//! legitimate file content, so padding one would hand a caller plausible
+//! bytes with no way to tell. The caller says which case it has through
+//! [`ShortDecode`] (#189).
 
 use crate::error::{Error, Result};
 
@@ -109,11 +108,27 @@ pub const MAX_COMPRESSED: u64 = 128 * 1024;
 /// The decoded length is checked rather than trusted. Every caller then
 /// slices this by an offset the item supplied, and a short result would
 /// otherwise turn a corrupt extent into a panic or a silent hole.
+/// What a decode that comes up short of `ram_bytes` means.
+///
+/// A decoder may legitimately stop early on the file's LAST extent, where
+/// the tail of the final sector holds nothing. Anywhere else a short decode
+/// is a truncated or damaged stream, and padding it with zeros hands back
+/// plausible file content with no error — which is the one decode failure
+/// this module used not to report (#189).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortDecode {
+    /// The file's last extent: pad to `ram_bytes`.
+    Pad,
+    /// Any other extent: refuse.
+    Refuse,
+}
+
 pub fn decompress(
     algo: Compression,
     input: &[u8],
     ram_bytes: usize,
     sectorsize: usize,
+    short: ShortDecode,
 ) -> Result<Vec<u8>> {
     // `ram_bytes` IS THE ALLOCATION, and it comes off the disk.
     //
@@ -149,6 +164,13 @@ pub fn decompress(
     if out.len() > ram_bytes {
         return Err(Error::BadSuperblock(format!(
             "{algo:?} extent decoded to {} bytes, more than the {ram_bytes} it records",
+            out.len()
+        )));
+    }
+    if out.len() < ram_bytes && short == ShortDecode::Refuse {
+        return Err(Error::BadSuperblock(format!(
+            "{algo:?} extent decoded to {} bytes where it records {ram_bytes}, and it is not \
+             the file's last extent, so the rest is missing rather than absent",
             out.len()
         )));
     }
@@ -305,7 +327,13 @@ mod tests {
     #[test]
     fn an_extent_decoding_to_more_than_a_compression_unit_is_refused() {
         for algo in [Compression::Zlib, Compression::Lzo, Compression::Zstd] {
-            let outcome = decompress(algo, &[0u8; 4], MAX_UNCOMPRESSED + 1, 4096);
+            let outcome = decompress(
+                algo,
+                &[0u8; 4],
+                MAX_UNCOMPRESSED + 1,
+                4096,
+                ShortDecode::Pad,
+            );
             let why = format!("{outcome:?}");
             assert!(
                 why.contains("more than the"),
@@ -314,7 +342,7 @@ mod tests {
             );
             // The shape that reached the abort: an inline extent
             // claiming a size no allocator will satisfy.
-            assert!(decompress(algo, &[0u8; 4], 1 << 55, 4096).is_err());
+            assert!(decompress(algo, &[0u8; 4], 1 << 55, 4096, ShortDecode::Pad).is_err());
         }
     }
 
@@ -336,7 +364,7 @@ mod tests {
 
     #[test]
     fn none_passes_bytes_through() {
-        let got = decompress(Compression::None, b"hello", 5, 4096).unwrap();
+        let got = decompress(Compression::None, b"hello", 5, 4096, ShortDecode::Pad).unwrap();
         assert_eq!(got, b"hello");
     }
 
@@ -344,7 +372,14 @@ mod tests {
     fn zlib_round_trips() {
         let plain: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
         let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
-        let got = decompress(Compression::Zlib, &packed, plain.len(), 4096).unwrap();
+        let got = decompress(
+            Compression::Zlib,
+            &packed,
+            plain.len(),
+            4096,
+            ShortDecode::Pad,
+        )
+        .unwrap();
         assert_eq!(got, plain);
     }
 
@@ -357,7 +392,7 @@ mod tests {
         let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
         // miniz stops at the limit, so this surfaces as a decode failure
         // rather than an over-long buffer; either way it must not pass.
-        assert!(decompress(Compression::Zlib, &packed, 100, 4096).is_err());
+        assert!(decompress(Compression::Zlib, &packed, 100, 4096, ShortDecode::Pad).is_err());
     }
 
     /// A short decode is padded rather than refused — the tail of a
@@ -366,7 +401,7 @@ mod tests {
     fn a_short_decode_is_zero_padded_to_the_recorded_length() {
         let plain = b"abc".to_vec();
         let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
-        let got = decompress(Compression::Zlib, &packed, 16, 4096).unwrap();
+        let got = decompress(Compression::Zlib, &packed, 16, 4096, ShortDecode::Pad).unwrap();
         assert_eq!(&got[..3], b"abc");
         assert_eq!(&got[3..], &[0u8; 13]);
     }
@@ -392,20 +427,20 @@ mod tests {
     fn lzo_declaring_more_than_it_holds_is_refused() {
         let mut framed = vec![0u8; 8];
         framed[0..4].copy_from_slice(&999u32.to_le_bytes());
-        let err = decompress(Compression::Lzo, &framed, 4096, 4096).unwrap_err();
+        let err = decompress(Compression::Lzo, &framed, 4096, 4096, ShortDecode::Pad).unwrap_err();
         assert!(format!("{err}").contains("only 8 are present"), "got {err}");
     }
 
     #[test]
     fn lzo_shorter_than_its_header_is_refused() {
-        let err = decompress(Compression::Lzo, &[1, 2], 4096, 4096).unwrap_err();
+        let err = decompress(Compression::Lzo, &[1, 2], 4096, 4096, ShortDecode::Pad).unwrap_err();
         assert!(format!("{err}").contains("too short"), "got {err}");
     }
 
     #[test]
     fn lzo_with_a_zero_length_segment_is_refused() {
         let framed = lzo_frame(&[vec![]], 4096);
-        let err = decompress(Compression::Lzo, &framed, 4096, 4096).unwrap_err();
+        let err = decompress(Compression::Lzo, &framed, 4096, 4096, ShortDecode::Pad).unwrap_err();
         assert!(format!("{err}").contains("zero-length"), "got {err}");
     }
 
@@ -416,7 +451,7 @@ mod tests {
         let mut framed = vec![0u8; 12];
         framed[0..4].copy_from_slice(&12u32.to_le_bytes());
         framed[4..8].copy_from_slice(&9999u32.to_le_bytes());
-        let err = decompress(Compression::Lzo, &framed, 4096, 4096).unwrap_err();
+        let err = decompress(Compression::Lzo, &framed, 4096, 4096, ShortDecode::Pad).unwrap_err();
         assert!(format!("{err}").contains("past the end"), "got {err}");
     }
 
@@ -455,8 +490,14 @@ mod tests {
         let framed = lzo_frame(&[first, second], sectorsize);
         assert_eq!(read_u32(&framed, 56).unwrap(), 14, "fixture: header at 56");
 
-        let got = decompress(Compression::Lzo, &framed, a.len() + b.len(), sectorsize)
-            .expect("a payload crossing a sector is legal");
+        let got = decompress(
+            Compression::Lzo,
+            &framed,
+            a.len() + b.len(),
+            sectorsize,
+            ShortDecode::Pad,
+        )
+        .expect("a payload crossing a sector is legal");
         assert_eq!(&got[..a.len()], &a[..]);
         assert_eq!(&got[a.len()..], &b[..]);
     }
