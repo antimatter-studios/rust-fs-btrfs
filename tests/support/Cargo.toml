@@ -1,0 +1,15 @@
+[package]
+name = "fs-btrfs-test-support"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The same SHA-256 the driver uses for csum_type 2, so a hash computed
+# here and one computed by the crate under test cannot disagree about
+# what SHA-256 is. Already in Cargo.lock; no new dependency enters the
+# tree.
+sha2 = "0.10"

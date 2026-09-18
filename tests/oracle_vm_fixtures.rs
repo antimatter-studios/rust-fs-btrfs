@@ -6,9 +6,11 @@
 //! the on-disk format is baked into both the fixture and the parser and
 //! they agree with each other while disagreeing with reality.
 //!
-//! These tests close that gap. `mkfs.btrfs` builds the filesystems,
-//! `btrfs inspect-internal dump-super` reports what the reference tooling
-//! believes each field to be, and this driver must agree field by field.
+//! These tests close that gap. `mkfs.btrfs` builds the filesystems and
+//! `btrfs inspect-internal dump-super` reports what the reference
+//! tooling believes each field to be — both in the fs-linux-test-harness
+//! VM, when `chore fixtures` builds them — and this driver must agree
+//! field by field.
 //!
 //! This is not a theoretical concern. In the sibling XFS crate three bugs
 //! survived a fully green unit suite — a transposed magic constant, a
@@ -16,18 +18,17 @@
 //! format, and a checksum covering a whole sector rather than a struct.
 //! All three died on the first comparison against the reference debugger.
 //!
-//! Fixtures live in `.vm-share/` as `btrfs-<name>.img` paired with
-//! `btrfs-<name>.superdump`. They are gitignored, so these tests skip on
-//! a fresh clone rather than failing. Generate them with:
-//!
-//! ```sh
-//! ./scripts/vm.sh up
-//! ./scripts/vm-build-fixtures.sh
-//! ```
+//! THE COMPARISON NEEDS NO VM, and that is deliberate: the dump-super
+//! report travels with the image it describes, as
+//! `test-disks/btrfs-<name>.superdump` beside `btrfs-<name>.img`, so a
+//! host with no KVM still runs the whole of this file. Both halves are
+//! fixtures, both come from `chore fixtures`, and a missing one fails
+//! here naming the task that builds it.
 
 use fs_btrfs::superblock::{Superblock, SUPER_INFO_OFFSET};
+use fs_btrfs_test_support::fixtures_matching;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// `BTRFS_FEATURE_INCOMPAT_METADATA_UUID`. When clear, the on-disk
 /// metadata_uuid field is unused and the effective value is the fsid.
@@ -83,25 +84,36 @@ impl Dump {
     }
 }
 
-/// Locate every `.img` with a matching `.superdump`.
+/// Every fixture image paired with the dump-super report taken from it,
+/// in the sorted order `fixtures_matching` returns.
+///
+/// A handful of images are built without a report — the before/after
+/// pairs and the two halves of the pool, which exist to be compared with
+/// each other rather than with the reference tooling — so they are named
+/// rather than quietly dropped, and an empty pairing is a failure.
 fn fixtures() -> Vec<(String, PathBuf, PathBuf)> {
-    let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
-    let Ok(entries) = std::fs::read_dir(&share) else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("img") {
-            continue;
-        }
-        let dump = p.with_extension("superdump");
-        if dump.exists() {
-            let name = p.file_stem().unwrap().to_string_lossy().into_owned();
-            out.push((name, p, dump));
+    let mut undumped = Vec::new();
+    for img in fixtures_matching("btrfs-") {
+        let name = img.file_stem().unwrap().to_string_lossy().into_owned();
+        let dump = img.with_extension("superdump");
+        if dump.is_file() {
+            out.push((name, img, dump));
+        } else {
+            undumped.push(name);
         }
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
+    if !undumped.is_empty() {
+        eprintln!(
+            "  {} image(s) carry no dump-super report: {undumped:?}",
+            undumped.len()
+        );
+    }
+    assert!(
+        !out.is_empty(),
+        "no btrfs-*.superdump reports in test-disks/, so there is nothing to compare \
+         this driver against. `chore fixtures` builds them beside the images."
+    );
     out
 }
 
@@ -128,13 +140,16 @@ fn uuid_string(u: &[u8; 16]) -> String {
     )
 }
 
+/// Named for the report rather than for the tool, and deliberately not
+/// spelled the way the helper is called: `scripts/test-targets.sh` sorts
+/// the suite by grepping for that call, so a name matching it would put
+/// this file in the tier that needs a VM. It does not need one — it
+/// compares against the transcript the fixture build recorded beside
+/// each image, which is what keeps this cross-validation running on a
+/// machine with no KVM.
 #[test]
-fn superblock_agrees_with_dump_super() {
+fn superblock_agrees_with_the_dump_super_report() {
     let fixtures = fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no fixtures in .vm-share — run ./scripts/vm-build-fixtures.sh; skipping");
-        return;
-    }
 
     let mut total = 0usize;
     for (label, img, dump_path) in &fixtures {
@@ -277,10 +292,6 @@ fn superblock_agrees_with_dump_super() {
 #[test]
 fn every_checksum_algorithm_verifies_on_real_media() {
     let fixtures = fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no fixtures — skipping");
-        return;
-    }
     let mut seen = Vec::new();
     for (label, img, dump_path) in &fixtures {
         let bytes = std::fs::read(img).expect("read image");
@@ -319,10 +330,6 @@ fn every_checksum_algorithm_verifies_on_real_media() {
 #[test]
 fn chunk_bootstrap_maps_chunk_root_on_real_media() {
     let fixtures = fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no fixtures — skipping");
-        return;
-    }
     for (label, img, _) in &fixtures {
         let bytes = std::fs::read(img).expect("read image");
         let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)

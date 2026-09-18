@@ -11,39 +11,37 @@
 //! rebuild them through [`fs_btrfs::tree_write::build_node`], and
 //! require the bytes back.
 //!
-//! Fixtures are gitignored. Build them with `chore fixtures`.
+//! The fixtures are gitignored and built by `chore fixtures`, in the
+//! fs-linux-test-harness VM — the nodes rebuilt here are that kernel's.
+//! A missing fixture fails the test that wanted it rather than emptying
+//! it: the leaf oracle beside this one spent a release returning early
+//! on fixtures it never found, and reported green throughout.
 
 use fs_btrfs::btree::{header_offsets as o, KeyPtr, HEADER_SIZE, KEY_PTR_SIZE};
 use fs_btrfs::chunk::DiskKey;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::superblock::Superblock;
 use fs_btrfs::tree_write::{build_node, chunk_tree_uuid_of, key_ptr_capacity, BlockIdentity};
+use fs_btrfs_test_support::{fixture, fixtures_matching, le32, le64, spans_several_devices};
 use fs_core::FileDevice;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-mod common;
-use common::{le32, le64};
-
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
-
+/// Every fixture whose nodes can be scanned out of the image.
 fn images() -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(share()) else {
-        return Vec::new();
-    };
-    let mut out: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "img"))
-        .filter(|p| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("btrfs-"))
-        })
+    let images: Vec<PathBuf> = fixtures_matching("btrfs-")
+        .into_iter()
+        // One member of a multi-device filesystem is refused a mount on
+        // purpose, and its filesystem's blocks are not all on this
+        // disk. `tests/pool_oracle.rs` is where such an image belongs.
+        .filter(|p| !spans_several_devices(p))
         .collect();
-    out.sort();
-    out
+    assert!(
+        !images.is_empty(),
+        "every fixture belongs to a multi-device filesystem, so there is no image here \
+         to scan for nodes"
+    );
+    images
 }
 
 /// Take a node apart into its key pointers.
@@ -76,12 +74,10 @@ fn ptrs_of(block: &[u8]) -> Vec<KeyPtr> {
 /// current root would — older generations still on disk, and the trees
 /// this crate has no walker for. The checksum is what makes that safe:
 /// a run of file data cannot fake a digest of itself.
-fn nodes(img: &Path) -> Option<(Superblock, Vec<Vec<u8>>)> {
-    let dev = Arc::new(FileDevice::open(img).ok()?);
-    let fs = Filesystem::mount(dev).ok()?;
-    let sb = fs.superblock().clone();
+fn nodes(img: &Path) -> (Superblock, Vec<Vec<u8>>) {
+    let sb = superblock(img);
 
-    let bytes = std::fs::read(img).ok()?;
+    let bytes = std::fs::read(img).unwrap_or_else(|e| panic!("reading {}: {e}", img.display()));
     let nodesize = sb.nodesize as usize;
     let mut blocks = Vec::new();
     let mut at = 0usize;
@@ -103,27 +99,35 @@ fn nodes(img: &Path) -> Option<(Superblock, Vec<Vec<u8>>)> {
         }
         blocks.push(block.to_vec());
     }
-    Some((sb, blocks))
+    (sb, blocks)
+}
+
+/// A fixture's superblock, read the way a mount reads it.
+///
+/// The refusal tests below need one real superblock and no nodes at
+/// all, and scanning a 400 MiB image for blocks they will not look at
+/// is work for nothing.
+fn superblock(img: &Path) -> Superblock {
+    let dev = Arc::new(
+        FileDevice::open(img).unwrap_or_else(|e| panic!("opening {}: {e}", img.display())),
+    );
+    Filesystem::mount(dev)
+        .unwrap_or_else(|e| panic!("mounting {}: {e}", img.display()))
+        .superblock()
+        .clone()
 }
 
 /// Rebuilding a node gives back exactly what the kernel wrote.
 #[test]
 fn every_node_re_encodes_identically() {
-    let images = images();
-    if images.is_empty() {
-        eprintln!("no fixtures; build them with `chore fixtures`");
-        return;
-    }
-
     let mut total = 0usize;
     let mut exact = 0usize;
     let mut images_with_nodes = 0usize;
     let mut deepest = 0u8;
 
+    let images = images();
     for img in &images {
-        let Some((sb, blocks)) = nodes(img) else {
-            continue;
-        };
+        let (sb, blocks) = nodes(img);
         if blocks.is_empty() {
             continue;
         }
@@ -203,8 +207,8 @@ fn every_node_re_encodes_identically() {
     assert!(
         images_with_nodes > 0,
         "{} fixtures were read and not one had a tree above level 0, so this test \
-         exercised nothing. The deep geometries in scripts/fixture-geometries.sh are \
-         what produce nodes.",
+         exercised nothing. The deep fixtures — the `populated` target of \
+         `chore fixtures` — are what produce nodes.",
         images.len()
     );
     eprintln!(
@@ -226,23 +230,14 @@ fn every_node_re_encodes_identically() {
 /// against the kernel's own trees rather than asserted in prose.
 #[test]
 fn each_pointer_key_is_the_first_key_of_the_child_it_names() {
-    let images = images();
-    if images.is_empty() {
-        eprintln!("no fixtures — skipping");
-        return;
-    }
-
     let mut checked = 0usize;
+    let images = images();
     for img in &images {
-        let Some((sb, blocks)) = nodes(img) else {
-            continue;
-        };
+        let (sb, blocks) = nodes(img);
         if blocks.is_empty() {
             continue;
         }
-        let Ok(bytes) = std::fs::read(img) else {
-            continue;
-        };
+        let bytes = std::fs::read(img).unwrap_or_else(|e| panic!("reading {}: {e}", img.display()));
 
         // Address every block by its own recorded bytenr, so a child can
         // be found without resolving logical addresses through the chunk
@@ -307,17 +302,9 @@ fn each_pointer_key_is_the_first_key_of_the_child_it_names() {
 /// both is one a reader walks off the bottom of.
 #[test]
 fn a_node_cannot_claim_to_be_a_leaf() {
-    let Some(img) = images().into_iter().next() else {
-        eprintln!("no fixtures — skipping");
-        return;
-    };
-    let Some((sb, _)) = nodes(&img).or_else(|| {
-        // Any fixture will do — this needs a superblock, not a node.
-        images().iter().find_map(|p| nodes(p))
-    }) else {
-        eprintln!("no readable fixture — skipping");
-        return;
-    };
+    // Any fixture would do — this needs a superblock, not a node — so
+    // it names the plainest one.
+    let sb = superblock(&fixture("btrfs-default.img"));
 
     let ptr = KeyPtr {
         key: DiskKey {
@@ -350,10 +337,7 @@ fn a_node_cannot_claim_to_be_a_leaf() {
 /// More pointers than fit are refused rather than truncated.
 #[test]
 fn an_overfull_node_is_refused() {
-    let Some((sb, _)) = images().iter().find_map(|p| nodes(p)) else {
-        eprintln!("no fixtures — skipping");
-        return;
-    };
+    let sb = superblock(&fixture("btrfs-default.img"));
 
     let capacity = key_ptr_capacity(&sb);
     let ptrs: Vec<KeyPtr> = (0..capacity as u64 + 1)

@@ -10,28 +10,35 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CHORE_VERSION: "0.11.0"
   # Pinned tag of the sibling am-fs-core repo used to satisfy the path dep
-  # during local build/verify. Bump in lockstep with the am-fs-core version
-  # constraint in Cargo.toml when releasing a new fs-btrfs minor.
+  # during local build/verify. `chore siblings` is the copy that matters
+  # (chores.yml pins FS_CORE_REF there, and CI reads it through the task);
+  # this one is for the publish job below, which clones by hand because it
+  # needs nothing else chore provides. Bump the two in lockstep with the
+  # am-fs-core version constraint in Cargo.toml.
   FS_CORE_REF: v0.2.10
 
 jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v5
 
-      # The crate has a path dep on am-fs-core (../rust-fs-core). Clone the
-      # sibling repo alongside, pinned to FS_CORE_REF, so cargo resolves it.
-      # Anonymous HTTPS clone — rust-fs-core is public.
-      - name: clone am-fs-core sibling
-        shell: bash
-        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - name: install chore
+        run: scripts/ci-install-chore.sh
+
+      - name: chore siblings
+        run: chore siblings
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
@@ -44,29 +51,42 @@ jobs:
             exit 1
           fi
 
-      # btrfs-progs provides mkfs.btrfs, `btrfs inspect-internal` and
-      # `btrfs check` — the oracle tooling the cross-validation fixtures
-      # are built and described with. Same install as ci.yml so the
-      # release-time gate exercises the same path as PR CI.
-      - name: install btrfs-progs
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq btrfs-progs
-          btrfs --version
-          mkfs.btrfs --version
+      # THE RELEASE GATE IS THE SAME GATE, through the same tasks. It
+      # used to install btrfs-progs on the runner and build the fixtures
+      # there; both now happen inside the fs-linux-test-harness VM, so a
+      # tag is checked against exactly the tooling a pull request was,
+      # rather than against whatever this runner image ships. See the
+      # test contract at the top of chores.yml.
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
 
-      # Build the same geometry matrix ci.yml builds, into .vm-share,
-      # so the oracle test has real filesystems to compare against.
-      # Without this the oracle test finds nothing and skips, and a tag
-      # would ship on the strength of self-consistency alone.
-      - name: build the fixture matrix
-        run: bash scripts/build-fixtures-native.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
 
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
-      # The canonical "do we read what the reference tooling emits" gate,
-      # named explicitly so its output is readable in the release log.
-      - run: cargo test --test oracle_vm_fixtures -- --nocapture
+      # What the HOST needs, which is NOT btrfs-progs: ripgrep for the
+      # script tests, and the VM the oracle tools live in.
+      - name: chore tools
+        run: chore tools
+
+      # Without the fixtures the oracles have nothing to compare against,
+      # and they FAIL rather than skip — so a tag cannot ship on the
+      # strength of self-consistency alone, which is what the old
+      # arrangement allowed.
+      - name: chore fixtures
+        run: chore fixtures
+
+      - name: chore lint
+        run: chore lint
+
+      - name: chore test
+        run: chore test
+
+      - name: chore vm:status (the VM is down again)
+        run: '! chore vm:status'
 
   publish:
     name: publish to crates.io

@@ -14,19 +14,18 @@
 //! and says which are snapshots — and it is what a user would compare
 //! against.
 //!
-//! Fixtures are gitignored. Build them with
-//! `./scripts/vm-build-subvol-fixtures.sh`.
+//! The fixture and its manifest are gitignored and built by `chore
+//! fixtures`, which mounts the filesystem in the fs-linux-test-harness
+//! VM and records what btrfs-progs says about it. A missing one fails
+//! here rather than skipping: this suite skipped on the run that added
+//! it, and the CI workflow carried a note saying so for months.
 
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::subvol::FS_TREE_OBJECTID;
+use fs_btrfs_test_support::fixture;
 use fs_core::FileDevice;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
 
 /// One line of `btrfs subvolume list -pcgu`, reduced to what is being
 /// compared.
@@ -44,37 +43,52 @@ struct Reported {
 /// ```text
 /// ID 256 gen 12 cgen 7 parent 5 top level 5 uuid ... path sub
 /// ```
-fn reference() -> Option<Vec<Reported>> {
-    let text = std::fs::read_to_string(share().join("btrfs-subvol.manifest")).ok()?;
+fn reference() -> Vec<Reported> {
+    let text = manifest();
     let mut out = Vec::new();
     for line in text.lines() {
         if !line.starts_with("ID ") {
             continue;
         }
         let f: Vec<&str> = line.split_whitespace().collect();
-        let field = |name: &str| -> Option<String> {
+        // A line that starts `ID ` and then lacks a field is a manifest
+        // btrfs-progs did not write, which is a broken fixture rather
+        // than a line to pass over.
+        let field = |name: &str| -> String {
             f.iter()
                 .position(|w| *w == name)
                 .and_then(|i| f.get(i + 1))
-                .map(|s| (*s).to_string())
+                .unwrap_or_else(|| panic!("the manifest line {line:?} has no {name} field"))
+                .to_string()
+        };
+        let number = |name: &str| -> u64 {
+            field(name)
+                .parse()
+                .unwrap_or_else(|e| panic!("{name} in the manifest line {line:?}: {e}"))
         };
         out.push(Reported {
-            id: field("ID")?.parse().ok()?,
-            parent: field("parent")?.parse().ok()?,
+            id: number("ID"),
+            parent: number("parent"),
             // `path` is the last field, and a path may contain no spaces
             // in any filesystem this builds.
-            path: field("path")?,
+            path: field("path"),
         });
     }
-    Some(out)
+    out
+}
+
+/// The manifest btrfs-progs wrote beside the image.
+fn manifest() -> String {
+    std::fs::read_to_string(fixture("btrfs-subvol.manifest")).expect("read the manifest")
 }
 
 /// Which files each subvolume holds, as the manifest recorded them.
+///
+/// Never empty: a manifest with no `contains` lines used to leave two
+/// tests below printing a note and returning, which reads as a pass.
 fn contents() -> BTreeMap<String, Vec<String>> {
     let mut out = BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string(share().join("btrfs-subvol.manifest")) else {
-        return out;
-    };
+    let text = manifest();
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("contains ") else {
             continue;
@@ -87,24 +101,24 @@ fn contents() -> BTreeMap<String, Vec<String>> {
             files.split_whitespace().map(str::to_string).collect(),
         );
     }
+    assert!(
+        !out.is_empty(),
+        "the manifest records no subvolume contents, so there is nothing to \
+         compare the subvolumes against"
+    );
     out
 }
 
-fn mount() -> Option<Filesystem> {
-    let img = share().join("btrfs-subvol.img");
-    if !img.exists() {
-        return None;
-    }
-    Some(Filesystem::mount(Arc::new(FileDevice::open(&img).ok()?)).expect("mount"))
+fn mount() -> Filesystem {
+    let img = fixture("btrfs-subvol.img");
+    let dev = FileDevice::open(&img).expect("open the subvolume fixture");
+    Filesystem::mount(Arc::new(dev)).expect("mount the subvolume fixture")
 }
 
 /// Every subvolume btrfs-progs reported, and no others.
 #[test]
 fn the_listing_matches_btrfs_progs() {
-    let (Some(fs), Some(expected)) = (mount(), reference()) else {
-        eprintln!("no subvolume fixture; build it with ./scripts/vm-build-subvol-fixtures.sh");
-        return;
-    };
+    let (fs, expected) = (mount(), reference());
     assert!(
         expected.len() >= 4,
         "the fixture should hold several subvolumes, not {}",
@@ -162,10 +176,7 @@ fn the_listing_matches_btrfs_progs() {
 /// non-existent path.
 #[test]
 fn a_nested_subvolume_carries_its_parents_path() {
-    let Some(fs) = mount() else {
-        eprintln!("no subvolume fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let subs = fs.subvolumes().expect("list");
 
     let inner = subs
@@ -193,10 +204,7 @@ fn a_nested_subvolume_carries_its_parents_path() {
 /// neighbour rather than against something obviously different.
 #[test]
 fn snapshots_and_read_only_are_told_apart() {
-    let Some(fs) = mount() else {
-        eprintln!("no subvolume fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let subs = fs.subvolumes().expect("list");
     let by_name = |n: &[u8]| {
         subs.iter()
@@ -243,10 +251,7 @@ fn snapshots_and_read_only_are_told_apart() {
 /// subvolume.
 #[test]
 fn internal_trees_stay_out_of_the_listing() {
-    let Some(fs) = mount() else {
-        eprintln!("no subvolume fixture — skipping");
-        return;
-    };
+    let fs = mount();
 
     let all = fs.root_tree_items().expect("walk the root tree");
     let root_items = all.iter().filter(|(_, t, _, _)| *t == 132).count();
@@ -283,16 +288,9 @@ fn internal_trees_stay_out_of_the_listing() {
 /// precondition for that being worth doing at all.
 #[test]
 fn every_subvolume_has_a_root_of_its_own() {
-    let Some(fs) = mount() else {
-        eprintln!("no subvolume fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let subs = fs.subvolumes().expect("list");
     let expected = contents();
-    if expected.is_empty() {
-        eprintln!("the manifest recorded no contents — skipping");
-        return;
-    }
 
     let mut seen: BTreeMap<u64, u64> = BTreeMap::new();
     for s in &subs {
@@ -329,15 +327,8 @@ fn every_subvolume_has_a_root_of_its_own() {
 /// Counting names would not catch that. Comparing them does.
 #[test]
 fn each_subvolume_reads_its_own_contents() {
-    let Some(fs) = mount() else {
-        eprintln!("no subvolume fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let expected = contents();
-    if expected.is_empty() {
-        eprintln!("the manifest recorded no contents — skipping");
-        return;
-    }
 
     let subs = fs.subvolumes().expect("list");
     let mut checked = 0usize;
@@ -416,10 +407,7 @@ fn each_subvolume_reads_its_own_contents() {
 /// up wrongly when a handle is re-rooted.
 #[test]
 fn a_file_inside_a_subvolume_reads_back() {
-    let Some(fs) = mount() else {
-        eprintln!("no subvolume fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let subs = fs.subvolumes().expect("list");
     let sub = subs.iter().find(|s| s.name == b"sub").expect("sub");
 
@@ -461,10 +449,7 @@ fn a_file_inside_a_subvolume_reads_back() {
 /// (Linux 6.12).
 #[test]
 fn a_path_crosses_into_subvolumes() {
-    let Some(fs) = mount() else {
-        eprintln!("no subvolume fixture — skipping");
-        return;
-    };
+    let fs = mount();
     for (path, want) in [
         ("/top/a.txt", "in the default subvolume\n"),
         ("/sub/b.txt", "in sub\n"),

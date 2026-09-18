@@ -9,7 +9,8 @@ extent tree, and the extent tree lives in blocks that must themselves be allocat
 Reasoning about how the kernel breaks that cycle is how a writer ends up implementing
 something plausible and wrong. So it was measured.
 
-`scripts/build-cow-fixtures.sh` captures three whole images of one filesystem:
+The `cow` recipe in `test-disks/guest-build-images.sh` (`chore fixtures cow`)
+captures three whole images of one filesystem:
 
 | image | what happened |
 |---|---|
@@ -122,12 +123,13 @@ looks like evidence against halving. **That was wrong.** Mostly-full leaves are 
 halving *produces*, once each resulting half is filled up again by later inserts. Reading
 a rule off a steady state was the mistake.
 
-So the event was captured. `scripts/build-split-fixtures.sh` adds files one at a time,
-committing each, and watches the fs tree's leaf count in btrfs-progs' own dump; when it
-goes up, the previous image is the before and the current one the after. At the smallest
-nodesize the first split arrives at file 8. `BTRFS_SPLIT_VARY=1` builds a second pair
-whose items run from 12 to 232 bytes, because with items of equal size *half the count*
-and *half the bytes* give the same boundary and a measurement says nothing.
+So the event was captured. The `split` recipe in `test-disks/guest-build-images.sh`
+adds files one at a time, committing each, and watches the fs tree's leaf count in
+btrfs-progs' own dump; when it goes up, the previous image is the before and the current
+one the after. At the smallest nodesize the first split arrives at file 8. The recipe
+builds a second pair (`btrfs-split-vary-*`) whose items run from 12 to 232 bytes, because
+with items of equal size *half the count* and *half the bytes* give the same boundary and
+a measurement says nothing.
 
 Three real splits, read from the **live** tree either side:
 

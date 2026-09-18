@@ -13,35 +13,48 @@
 //! shipping a manifest, and it is enough files to push the fs tree to
 //! level 2, so reads go through real multi-level descent.
 //!
-//! Fixtures are gitignored, so these skip cleanly on a fresh clone.
+//! The fixtures are gitignored and built by `chore fixtures`, inside
+//! the fs-linux-test-harness VM — the kernel that wrote `/many/` is the
+//! guest's. A fixture that is not there fails the test that asked for
+//! it rather than excusing it: a test that printed "skipping" and
+//! returned read exactly like one that passed.
 
 use fs_btrfs::Filesystem;
+use fs_btrfs_test_support::{fixture, fixtures_matching, spans_several_devices};
 use fs_core::FileDevice;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-mod common;
-
+/// Every fixture, with the label a failure names it by.
 fn fixtures() -> Vec<(String, PathBuf)> {
-    let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
-    let Ok(entries) = std::fs::read_dir(&share) else {
-        return Vec::new();
-    };
-    let mut out: Vec<_> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("img"))
+    let images: Vec<PathBuf> = fixtures_matching("btrfs-")
+        .into_iter()
         // A pool member is not a fixture for this file. These tests
         // require every image to MOUNT, and a filesystem spanning two
         // devices opened with one is refused on purpose — reading it
         // would return the wrong data rather than fail. Asserting that
         // every image mounts would turn that correct refusal into a
         // failure.
-        .filter(|p| !common::spans_several_devices(p))
-        .map(|p| (p.file_stem().unwrap().to_string_lossy().into_owned(), p))
+        .filter(|p| !spans_several_devices(p))
         .collect();
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+    assert!(
+        !images.is_empty(),
+        "every fixture belongs to a multi-device filesystem, so not one of them is an \
+         image this file is allowed to mount"
+    );
+    images
+        .into_iter()
+        .map(|p| (p.file_stem().unwrap().to_string_lossy().into_owned(), p))
+        .collect()
+}
+
+/// The populated fixtures, whose `/many/` holds files whose contents
+/// are known from their names.
+fn deep_fixtures() -> Vec<(String, PathBuf)> {
+    fixtures_matching("btrfs-deep")
+        .into_iter()
+        .map(|p| (p.file_stem().unwrap().to_string_lossy().into_owned(), p))
+        .collect()
 }
 
 fn mount(img: &Path, label: &str) -> Filesystem {
@@ -52,12 +65,7 @@ fn mount(img: &Path, label: &str) -> Filesystem {
 /// Every fixture must mount and expose a root directory.
 #[test]
 fn every_fixture_mounts_and_has_a_root() {
-    let fixtures = fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no fixtures in .vm-share — skipping");
-        return;
-    }
-    for (label, img) in &fixtures {
+    for (label, img) in &fixtures() {
         let fs = mount(img, label);
         let root = fs
             .root_inode()
@@ -80,16 +88,7 @@ fn every_fixture_mounts_and_has_a_root() {
 /// exactly, so this is a content check rather than a smoke test.
 #[test]
 fn reads_back_the_files_the_kernel_wrote() {
-    let deep: Vec<_> = fixtures()
-        .into_iter()
-        .filter(|(name, _)| name.contains("deep"))
-        .collect();
-    if deep.is_empty() {
-        eprintln!("no populated fixtures — skipping");
-        return;
-    }
-
-    for (label, img) in &deep {
+    for (label, img) in &deep_fixtures() {
         let fs = mount(img, label);
 
         let many = fs
@@ -137,12 +136,7 @@ fn reads_back_the_files_the_kernel_wrote() {
 /// worse than an empty one.
 #[test]
 fn every_listed_name_resolves_to_the_inode_it_named() {
-    let fixtures = fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no fixtures — skipping");
-        return;
-    }
-    for (label, img) in &fixtures {
+    for (label, img) in &fixtures() {
         let fs = mount(img, label);
         let root = fs.root_inode().expect("root");
         for e in fs.read_dir(root.ino).expect("listing") {
@@ -181,14 +175,9 @@ fn every_listed_name_resolves_to_the_inode_it_named() {
 /// silently wrong data with no way to detect it.
 #[test]
 fn refuses_what_it_cannot_answer() {
-    let deep: Vec<_> = fixtures()
-        .into_iter()
-        .filter(|(name, _)| name.contains("deep"))
-        .collect();
-    let Some((label, img)) = deep.first() else {
-        eprintln!("no populated fixture — skipping");
-        return;
-    };
+    // `deep_fixtures` has already refused an empty list.
+    let deep = deep_fixtures();
+    let (label, img) = &deep[0];
     let fs = mount(img, label);
 
     assert!(
@@ -230,14 +219,8 @@ fn refuses_what_it_cannot_answer() {
 /// reachable by each of its spellings.
 #[test]
 fn path_spellings_are_tolerated() {
-    let deep: Vec<_> = fixtures()
-        .into_iter()
-        .filter(|(name, _)| name.contains("deep"))
-        .collect();
-    let Some((label, img)) = deep.first() else {
-        eprintln!("no populated fixture — skipping");
-        return;
-    };
+    let deep = deep_fixtures();
+    let (label, img) = &deep[0];
     let fs = mount(img, label);
 
     let direct = fs.lookup_path("/many/f1.txt").expect("direct");
@@ -264,11 +247,8 @@ fn path_spellings_are_tolerated() {
 // plain mkfs image never reaches.
 // ---------------------------------------------------------------------
 
-fn rich() -> Option<Filesystem> {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".vm-share")
-        .join("btrfs-rich.img");
-    p.exists().then(|| mount(&p, "btrfs-rich"))
+fn rich() -> Filesystem {
+    mount(&fixture("btrfs-rich.img"), "btrfs-rich")
 }
 
 /// A compressed extent must come back as the file the kernel wrote.
@@ -283,10 +263,7 @@ fn rich() -> Option<Filesystem> {
 /// algorithms. This keeps a direct check on the original fixture.
 #[test]
 fn reads_a_compressed_file_written_by_the_kernel() {
-    let Some(fs) = rich() else {
-        eprintln!("no rich fixture — skipping");
-        return;
-    };
+    let fs = rich();
     let f = fs
         .lookup_path("/compressed.txt")
         .expect("compressed.txt should exist");
@@ -317,10 +294,7 @@ fn reads_a_compressed_file_written_by_the_kernel() {
 /// everything.
 #[test]
 fn still_reads_uncompressed_files_from_a_compressing_mount() {
-    let Some(fs) = rich() else {
-        eprintln!("no rich fixture — skipping");
-        return;
-    };
+    let fs = rich();
     let f = fs.lookup_path("/plain.bin").expect("plain.bin");
     let data = fs.read_file(f.ino).expect("plain.bin must still read");
     assert_eq!(data.len() as u64, f.size, "short read of an ordinary file");
@@ -333,10 +307,7 @@ fn still_reads_uncompressed_files_from_a_compressing_mount() {
 /// A small file lives inline in its item rather than in an extent.
 #[test]
 fn reads_an_inline_file() {
-    let Some(fs) = rich() else {
-        eprintln!("no rich fixture — skipping");
-        return;
-    };
+    let fs = rich();
     let data = fs.read_path("/inline.txt").expect("inline.txt");
     assert_eq!(String::from_utf8_lossy(&data), "small inline\n");
 }
@@ -345,10 +316,7 @@ fn reads_an_inline_file() {
 /// rather than as whatever previously occupied those blocks.
 #[test]
 fn sparse_regions_read_as_zeros() {
-    let Some(fs) = rich() else {
-        eprintln!("no rich fixture — skipping");
-        return;
-    };
+    let fs = rich();
     let f = fs.lookup_path("/sparse.bin").expect("sparse.bin");
     let data = fs.read_file(f.ino).expect("sparse read");
     assert_eq!(data.len(), 8 * 1024 * 1024);
@@ -360,10 +328,7 @@ fn sparse_regions_read_as_zeros() {
 
 #[test]
 fn resolves_a_symlink_target() {
-    let Some(fs) = rich() else {
-        eprintln!("no rich fixture — skipping");
-        return;
-    };
+    let fs = rich();
     let l = fs.lookup_path("/link-short").expect("link-short");
     assert!(l.is_symlink(), "link-short should be a symlink");
     let target = fs.read_link(l.ino).expect("readlink");
@@ -381,10 +346,7 @@ fn resolves_a_symlink_target() {
 /// slicing, which catches an offset mishandled in the extent walk.
 #[test]
 fn partial_reads_agree_with_whole_file_reads() {
-    let Some(fs) = rich() else {
-        eprintln!("no rich fixture — skipping");
-        return;
-    };
+    let fs = rich();
     let f = fs.lookup_path("/plain.bin").expect("plain.bin");
     let whole = fs.read_file(f.ino).expect("whole");
     for &(off, len) in &[
@@ -408,10 +370,7 @@ fn partial_reads_agree_with_whole_file_reads() {
 /// through path resolution.
 #[test]
 fn walks_nested_directories() {
-    let Some(fs) = rich() else {
-        eprintln!("no rich fixture — skipping");
-        return;
-    };
+    let fs = rich();
     let data = fs.read_path("/sub/nested/file.txt").expect("nested file");
     assert_eq!(String::from_utf8_lossy(&data), "nested\n");
 
@@ -424,10 +383,7 @@ fn walks_nested_directories() {
 /// panic or an empty success.
 #[test]
 fn an_unknown_inode_is_not_found() {
-    let Some(fs) = rich() else {
-        eprintln!("no rich fixture — skipping");
-        return;
-    };
+    let fs = rich();
     assert!(matches!(
         fs.read_inode(999_999_999),
         Err(fs_btrfs::Error::NotFound)

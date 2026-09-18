@@ -34,10 +34,23 @@
 # 131072 and 536870912 — so a write to sector 128 is the primary
 # superblock and is expected LAST, after a flush.
 #
-#   ./scripts/trace-commit.sh
+# # Where to run it
+#
+# In the fs-linux-test-harness guest, like every other thing here that
+# needs a kernel and a loop device:
+#
+#   chore vm:up
+#   chore vm:run -- bash /repo/scripts/trace-commit.sh
+#   chore vm:down
+#
+# It is a diagnostic rather than a test — nothing in `chore test` calls
+# it — but it obeys the same rule as the tests do, and for the same
+# reason: `blktrace` needs a kernel, and the answer must not depend on
+# which laptop asked. Its output lands in `tmp/`, which the guest and
+# the host both see (the repository is mounted at `/repo`).
 set -euo pipefail
 
-OUT="${BTRFS_FIXTURE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.vm-share}"
+OUT="${BTRFS_TRACE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/tmp}"
 SIZE="${BTRFS_FIXTURE_SIZE:-512M}"
 
 SUDO=""

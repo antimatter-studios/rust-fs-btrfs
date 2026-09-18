@@ -18,12 +18,15 @@
 //!
 //! The fixture is `btrfs-rich`, written through a compressing mount and
 //! holding a compressible file, an incompressible one, an inline file, a
-//! sparse file, a symlink and a nested directory. Fixtures are
-//! gitignored, so these skip cleanly on a fresh clone.
+//! sparse file, a symlink and a nested directory. It is gitignored and
+//! built by `chore fixtures`; a missing one fails the test that wanted
+//! it, because a C-ABI suite that never mounted anything reports the
+//! same `ok` as one that exercised every entry point.
 
 use fs_btrfs::capi::*;
+use fs_btrfs_test_support::{fixture, temp_path};
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Errno values the header documents. Spelled out rather than imported,
 /// so the test asserts the contract rather than mirroring the source.
@@ -33,11 +36,8 @@ const ENOTDIR: i32 = 20;
 const EISDIR: i32 = 21;
 const ERANGE: i32 = 34;
 
-fn fixture() -> Option<PathBuf> {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".vm-share")
-        .join("btrfs-rich.img");
-    p.exists().then_some(p)
+fn rich_image() -> PathBuf {
+    fixture("btrfs-rich.img")
 }
 
 fn cstr(s: &str) -> CString {
@@ -50,8 +50,8 @@ fn last_error() -> String {
         .into_owned()
 }
 
-fn mount() -> Option<*mut fs_btrfs_fs> {
-    let path = fixture()?;
+fn mount() -> *mut fs_btrfs_fs {
+    let path = rich_image();
     let c = cstr(path.to_str().unwrap());
     let fs = unsafe { fs_btrfs_mount(c.as_ptr()) };
     assert!(
@@ -59,7 +59,7 @@ fn mount() -> Option<*mut fs_btrfs_fs> {
         "mounting the fixture failed: {}",
         last_error()
     );
-    Some(fs)
+    fs
 }
 
 fn last_errno_erange() -> i32 {
@@ -76,10 +76,7 @@ fn zeroed_attr() -> fs_btrfs_attr_t {
 
 #[test]
 fn mounts_and_reports_volume_info() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let mut info: fs_btrfs_volume_info_t = unsafe { std::mem::zeroed() };
     assert_eq!(unsafe { fs_btrfs_get_volume_info(fs, &mut info) }, 0);
 
@@ -110,10 +107,7 @@ fn mounts_and_reports_volume_info() {
 
 #[test]
 fn stats_a_file_a_directory_and_a_symlink() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
 
     let mut f = zeroed_attr();
     assert_eq!(
@@ -152,10 +146,7 @@ fn stats_a_file_a_directory_and_a_symlink() {
 
 #[test]
 fn iterates_a_directory_to_completion() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let iter = unsafe { fs_btrfs_dir_open(fs, cstr("/").as_ptr()) };
     assert!(!iter.is_null(), "opening the root failed: {}", last_error());
 
@@ -203,10 +194,7 @@ fn iterates_a_directory_to_completion() {
 
 #[test]
 fn reads_file_contents() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let mut buf = [0u8; 64];
     let n = unsafe {
         fs_btrfs_read_file(
@@ -252,10 +240,7 @@ fn reads_file_contents() {
 /// those blocks.
 #[test]
 fn sparse_regions_read_as_zeros() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let mut buf = vec![0xAAu8; 65536];
     let n = unsafe {
         fs_btrfs_read_file(
@@ -276,10 +261,7 @@ fn sparse_regions_read_as_zeros() {
 
 #[test]
 fn reads_a_symlink_target() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let mut buf = [0 as c_char; 512];
     let n = unsafe {
         fs_btrfs_readlink(
@@ -304,11 +286,15 @@ fn reads_a_symlink_target() {
 /// EROFS driver, so the family agrees.
 #[test]
 fn readlink_refuses_a_buffer_too_small_for_the_target() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
-    let mut buf = [0x7F as c_char; 5];
+    let fs = mount();
+    // FILLED WITH A BYTE NOTHING WRITES, so "untouched" is checkable.
+    // Spelled once and compared against itself below: `c_char` is
+    // SIGNED on x86_64 and UNSIGNED on aarch64, so `c as u8` is a real
+    // conversion on one and a no-op clippy refuses on the other — and
+    // `chore lint` runs on both. Comparing `c_char` to `c_char` is the
+    // same check on either.
+    const UNTOUCHED: c_char = 0x7F;
+    let mut buf = [UNTOUCHED; 5];
     let n = unsafe {
         fs_btrfs_readlink(
             fs,
@@ -325,7 +311,7 @@ fn readlink_refuses_a_buffer_too_small_for_the_target() {
         last_errno_erange()
     );
     assert!(
-        buf.iter().all(|&c| c == 0x7F as c_char),
+        buf.iter().all(|&c| c == UNTOUCHED),
         "a refused readlink must not have written into the buffer"
     );
     unsafe { fs_btrfs_umount(fs) };
@@ -345,10 +331,7 @@ fn readlink_refuses_a_buffer_too_small_for_the_target() {
 /// be the file's.
 #[test]
 fn a_compressed_file_is_decoded_through_the_abi() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let mut buf = vec![0u8; 4096];
     let n = unsafe {
         fs_btrfs_read_file(
@@ -380,10 +363,7 @@ fn a_compressed_file_is_decoded_through_the_abi() {
 /// test above would pass on a driver that refused everything.
 #[test]
 fn an_uncompressed_file_on_the_same_volume_still_reads() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let mut buf = vec![0u8; 4096];
     let n = unsafe {
         fs_btrfs_read_file(
@@ -401,10 +381,7 @@ fn an_uncompressed_file_on_the_same_volume_still_reads() {
 
 #[test]
 fn a_missing_path_reports_enoent_not_eio() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let mut a = zeroed_attr();
     assert_eq!(
         unsafe { fs_btrfs_stat(fs, cstr("/no-such-file").as_ptr(), &mut a) },
@@ -417,10 +394,7 @@ fn a_missing_path_reports_enoent_not_eio() {
 
 #[test]
 fn listing_a_file_reports_enotdir() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let iter = unsafe { fs_btrfs_dir_open(fs, cstr("/inline.txt").as_ptr()) };
     assert!(
         iter.is_null(),
@@ -432,10 +406,7 @@ fn listing_a_file_reports_enotdir() {
 
 #[test]
 fn reading_a_directory_as_a_file_reports_eisdir() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let mut buf = [0u8; 16];
     let n = unsafe {
         fs_btrfs_read_file(
@@ -453,7 +424,7 @@ fn reading_a_directory_as_a_file_reports_eisdir() {
 
 #[test]
 fn mounting_a_non_btrfs_file_fails_with_a_message() {
-    let tmp = std::env::temp_dir().join(format!("capi-notbtrfs-{}.img", std::process::id()));
+    let tmp = PathBuf::from(temp_path!("capi-notbtrfs-{}.img", std::process::id()));
     std::fs::write(&tmp, vec![0x5Au8; 256 * 1024]).unwrap();
     let c = cstr(tmp.to_str().unwrap());
     let fs = unsafe { fs_btrfs_mount(c.as_ptr()) };
@@ -536,10 +507,7 @@ fn null_pointers_fail_instead_of_crashing() {
 
 #[test]
 fn null_output_pointers_fail_instead_of_crashing() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     unsafe {
         assert_eq!(fs_btrfs_get_volume_info(fs, std::ptr::null_mut()), -1);
         assert_eq!(
@@ -571,10 +539,7 @@ fn null_output_pointers_fail_instead_of_crashing() {
 /// A non-UTF-8 path is rejected rather than misinterpreted.
 #[test]
 fn a_non_utf8_path_is_rejected() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let bad = [b'/' as c_char, 0xFFu8 as c_char, 0];
     let mut attr = zeroed_attr();
     assert_eq!(unsafe { fs_btrfs_stat(fs, bad.as_ptr(), &mut attr) }, -1);
@@ -619,10 +584,7 @@ unsafe extern "C" fn ctx_read(
 
 #[test]
 fn mounts_over_a_caller_supplied_reader() {
-    let Some(img) = fixture() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let img = rich_image();
     let ctx = Box::new(FileContext {
         bytes: std::fs::read(&img).unwrap(),
         fail: false,
@@ -698,9 +660,10 @@ fn last_error_is_never_null() {
 // Writing
 //
 // These work on a copy of the nodatacow fixture, because they change it.
-// The copy is removed when the guard drops, including on a panic: every
-// other suite here treats each `.img` in `.vm-share` as a fixture, so
-// one left behind fails unrelated tests.
+// The copy is written to the scratch directory rather than beside the
+// fixture: a suite that walks `test-disks/` for images would take a
+// half-written copy for a fixture. It is removed when the guard drops,
+// including on a panic.
 // ---------------------------------------------------------------------
 
 const EROFS: i32 = 30;
@@ -713,16 +676,12 @@ const COW_PATH: &str = "/cow.bin";
 struct WritableCopy(PathBuf);
 
 impl WritableCopy {
-    fn new(name: &str) -> Option<Self> {
-        let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(".vm-share")
-            .join("btrfs-nodatacow.img");
-        if !src.exists() {
-            return None;
-        }
-        let dst = src.with_file_name(name);
-        std::fs::copy(&src, &dst).ok()?;
-        Some(WritableCopy(dst))
+    fn new(name: &str) -> Self {
+        let src = fixture("btrfs-nodatacow.img");
+        let dst = PathBuf::from(temp_path!("{name}"));
+        std::fs::copy(&src, &dst)
+            .unwrap_or_else(|e| panic!("copy {} to {}: {e}", src.display(), dst.display()));
+        WritableCopy(dst)
     }
     fn open_rw(&self) -> *mut fs_btrfs_fs {
         let c = cstr(self.0.to_str().unwrap());
@@ -747,10 +706,7 @@ impl Drop for WritableCopy {
 /// A read-only handle must say it cannot write, and must refuse.
 #[test]
 fn a_read_only_handle_says_so_and_refuses() {
-    let Some(copy) = WritableCopy::new("btrfscapi-ro.img") else {
-        eprintln!("no nodatacow fixture — skipping");
-        return;
-    };
+    let copy = WritableCopy::new("btrfscapi-ro.img");
     let fs = copy.open_ro();
     assert_eq!(unsafe { fs_btrfs_is_writable(fs) }, 0);
 
@@ -774,10 +730,7 @@ fn a_read_only_handle_says_so_and_refuses() {
 /// in either direction.
 #[test]
 fn can_write_in_place_agrees_with_the_write() {
-    let Some(copy) = WritableCopy::new("btrfscapi-agree.img") else {
-        eprintln!("no nodatacow fixture — skipping");
-        return;
-    };
+    let copy = WritableCopy::new("btrfscapi-agree.img");
     let fs = copy.open_rw();
     assert_eq!(unsafe { fs_btrfs_is_writable(fs) }, 1);
 
@@ -824,10 +777,7 @@ fn can_write_in_place_agrees_with_the_write() {
 /// A write must be readable back through the ABI.
 #[test]
 fn a_write_round_trips_through_the_abi() {
-    let Some(copy) = WritableCopy::new("btrfscapi-roundtrip.img") else {
-        eprintln!("no nodatacow fixture — skipping");
-        return;
-    };
+    let copy = WritableCopy::new("btrfscapi-roundtrip.img");
     let fs = copy.open_rw();
     let path = cstr(INPLACE_PATH);
     let payload = b"round trip through the ABI";
@@ -865,10 +815,7 @@ fn a_write_round_trips_through_the_abi() {
 /// unsupported rather than as a bad argument.
 #[test]
 fn writing_past_the_end_is_enotsup() {
-    let Some(copy) = WritableCopy::new("btrfscapi-pastend.img") else {
-        eprintln!("no nodatacow fixture — skipping");
-        return;
-    };
+    let copy = WritableCopy::new("btrfscapi-pastend.img");
     let fs = copy.open_rw();
     let data = b"beyond";
     let n = unsafe {
@@ -888,23 +835,17 @@ fn writing_past_the_end_is_enotsup() {
 // ---------------------------------------------------------------------
 // Extended attributes
 //
-// A different fixture from the one above: `btrfs-xattr`, built by
-// scripts/build-xattr-fixtures.sh, because `rich` carries no attributes
-// and adding some to it would change a filesystem several other tests
-// already assert against.
+// A different fixture from the one above: `btrfs-xattr`, because `rich`
+// carries no attributes and adding some to it would change a filesystem
+// several other tests already assert against.
 // ---------------------------------------------------------------------
 
-fn xattr_fixture() -> Option<*mut fs_btrfs_fs> {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".vm-share")
-        .join("btrfs-xattr.img");
-    if !p.exists() {
-        return None;
-    }
+fn xattr_fixture() -> *mut fs_btrfs_fs {
+    let p = fixture("btrfs-xattr.img");
     let c = cstr(p.to_str().unwrap());
     let fs = unsafe { fs_btrfs_mount(c.as_ptr()) };
     assert!(!fs.is_null(), "mounting failed: {}", last_error());
-    Some(fs)
+    fs
 }
 
 /// Names come back NUL-separated, and the probe form (NULL buffer)
@@ -912,10 +853,7 @@ fn xattr_fixture() -> Option<*mut fs_btrfs_fs> {
 /// strength of that number, so the two must agree exactly.
 #[test]
 fn listxattr_names_are_nul_separated_and_the_probe_agrees() {
-    let Some(fs) = xattr_fixture() else {
-        eprintln!("no xattr fixture — skipping");
-        return;
-    };
+    let fs = xattr_fixture();
     let path = cstr("/plain.txt");
     let needed = unsafe { fs_btrfs_listxattr(fs, path.as_ptr(), std::ptr::null_mut(), 0) };
     assert!(needed > 0, "{}", last_error());
@@ -953,10 +891,7 @@ fn listxattr_names_are_nul_separated_and_the_probe_agrees() {
 /// parsed one would act on a name that does not exist.
 #[test]
 fn listxattr_into_a_short_buffer_writes_whole_names_only() {
-    let Some(fs) = xattr_fixture() else {
-        eprintln!("no xattr fixture — skipping");
-        return;
-    };
+    let fs = xattr_fixture();
     let path = cstr("/plain.txt");
     let needed = unsafe { fs_btrfs_listxattr(fs, path.as_ptr(), std::ptr::null_mut(), 0) };
     let mut buf = vec![0xAAu8; 16];
@@ -979,10 +914,7 @@ fn listxattr_into_a_short_buffer_writes_whole_names_only() {
 /// form reports its length without writing.
 #[test]
 fn getxattr_returns_the_value_and_its_length() {
-    let Some(fs) = xattr_fixture() else {
-        eprintln!("no xattr fixture — skipping");
-        return;
-    };
+    let fs = xattr_fixture();
     let path = cstr("/plain.txt");
     let name = cstr("user.binary");
     let want = [0x00u8, 0x01, 0x02, 0xff, 0x7f, 0x0a, 0x00];
@@ -1011,10 +943,7 @@ fn getxattr_returns_the_value_and_its_length() {
 /// returns -1 with ENOENT. A caller testing `<= 0` would merge them.
 #[test]
 fn getxattr_distinguishes_an_empty_value_from_a_missing_one() {
-    let Some(fs) = xattr_fixture() else {
-        eprintln!("no xattr fixture — skipping");
-        return;
-    };
+    let fs = xattr_fixture();
     let path = cstr("/plain.txt");
     let mut buf = [0u8; 8];
 
@@ -1057,10 +986,7 @@ fn getxattr_distinguishes_an_empty_value_from_a_missing_one() {
 /// carrying `user.caf\xe9` fails the first half before the fix.
 #[test]
 fn getxattr_accepts_every_name_listxattr_returns_and_takes_names_as_bytes() {
-    let Some(fs) = xattr_fixture() else {
-        eprintln!("no xattr fixture — skipping");
-        return;
-    };
+    let fs = xattr_fixture();
     let path = cstr("/plain.txt");
     let needed = unsafe { fs_btrfs_listxattr(fs, path.as_ptr(), std::ptr::null_mut(), 0) };
     assert!(needed > 0, "{}", last_error());
@@ -1105,10 +1031,7 @@ fn getxattr_accepts_every_name_listxattr_returns_and_takes_names_as_bytes() {
 /// zero rather than a failure.
 #[test]
 fn listxattr_on_a_file_without_attributes_is_zero_not_an_error() {
-    let Some(fs) = xattr_fixture() else {
-        eprintln!("no xattr fixture — skipping");
-        return;
-    };
+    let fs = xattr_fixture();
     let n = unsafe { fs_btrfs_listxattr(fs, cstr("/bare.txt").as_ptr(), std::ptr::null_mut(), 0) };
     assert_eq!(n, 0, "{}", last_error());
     unsafe { fs_btrfs_umount(fs) };
@@ -1142,10 +1065,7 @@ fn the_xattr_entry_points_tolerate_nulls() {
         -1
     );
 
-    let Some(fs) = xattr_fixture() else {
-        eprintln!("no xattr fixture — skipping the rest");
-        return;
-    };
+    let fs = xattr_fixture();
     assert_eq!(
         unsafe { fs_btrfs_listxattr(fs, std::ptr::null(), std::ptr::null_mut(), 0) },
         -1

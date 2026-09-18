@@ -1,0 +1,31 @@
+# test-floors.txt — one floor per integration target, checked by
+# scripts/test-floor.sh against the whole-suite tier log:
+#
+#   bash scripts/test-floor.sh --targets .github/test-floors.txt --log tmp/logs/suite.log
+#
+# A FLOOR, BECAUSE THE FAILURE MODE HERE IS AN ABSENCE. `cargo test`
+# exits 0 on "0 passed; 0 failed", so a target that selected nothing
+# looks exactly like a target that passed everything. A suite emptied
+# from the inside — every test renamed, feature-gated out, or moved to
+# another file — reports green having stopped checking that this driver
+# reads Btrfs. A target missing from the log counts as zero, so a suite
+# that stopped being BUILT fails here too.
+#
+# WHERE THESE NUMBERS LIVED BEFORE. In .github/workflows/ci.yml, one per
+# `cargo test --test <name>` step, across a job of fifty-odd steps. That
+# arrangement had the guard and the hazard in one place: a suite absent
+# from the list executed nowhere at all, and two of them were (#70). The
+# tiers are derived from the tests now, so the workflow no longer names
+# suites — and the floors moved here rather than being lost, which is
+# the point of this file.
+#
+# THE NUMBERS ARE MEASURED, not guessed: each is what that target
+# executed on a known-good run of `chore test` (the whole suite, release
+# profile). They move UP with the suite and never down: raising one when
+# tests are added is bookkeeping, lowering one is a decision someone has
+# to write down in a diff.
+#
+# `lib` is the library's own unit tests, which `cargo test` reports as
+# `Running unittests src/lib.rs`.
+#
+# <target> <floor>

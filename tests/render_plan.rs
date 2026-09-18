@@ -11,30 +11,44 @@
 //! disk: the rendered blocks are held in memory and read back from
 //! there, which is the same tree the commit sequencer would produce.
 //!
-//! Fixtures are gitignored. Build them with `chore fixtures`.
+//! The fixtures are gitignored and built by `chore fixtures`. A missing
+//! one fails here: a relocation checked against no tree at all reads
+//! exactly like one that preserved every item.
 
 use fs_btrfs::btree::{header_offsets as o, HEADER_SIZE};
 use fs_btrfs::chunk::{objectid, DiskKey};
 use fs_btrfs::fs::Filesystem;
+use fs_btrfs_test_support::{fixture, le32, le64};
 use fs_core::FileDevice;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-mod common;
-use common::{le32, le64};
-
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
+/// A fixture, mounted. An image that will not open or will not mount is
+/// a failure rather than a test that quietly does nothing.
+fn mounted(name: &str) -> Filesystem {
+    let path = fixture(name);
+    let dev = Arc::new(
+        FileDevice::open(&path)
+            .unwrap_or_else(|error| panic!("opening {}: {error}", path.display())),
+    );
+    Filesystem::mount(dev).unwrap_or_else(|error| panic!("mounting {}: {error}", path.display()))
 }
 
-fn fixture(name: &str) -> Option<Filesystem> {
-    let p = share().join(name);
-    if !p.exists() {
-        return None;
-    }
-    let dev = Arc::new(FileDevice::open(&p).ok()?);
-    Filesystem::mount(dev).ok()
+/// The fs tree's root, from the root tree that names it.
+fn fs_tree_root(fs: &Filesystem) -> u64 {
+    /// `BTRFS_ROOT_ITEM_KEY`, and `btrfs_root_item.bytenr` within it.
+    const ROOT_ITEM_KEY: u8 = 132;
+    const ROOT_ITEM_BYTENR: usize = 176;
+    fs.root_tree_items()
+        .expect("reading the root tree")
+        .into_iter()
+        .find_map(|(objid, ty, _, data)| {
+            (objid == objectid::FS_TREE
+                && ty == ROOT_ITEM_KEY
+                && data.len() >= ROOT_ITEM_BYTENR + 8)
+                .then(|| le64(&data, ROOT_ITEM_BYTENR))
+        })
+        .expect("the root tree holds a ROOT_ITEM naming the fs tree's root")
 }
 
 /// The items of a leaf, as (key, bytes).
@@ -86,15 +100,20 @@ fn contents(root: u64, get: &dyn Fn(u64) -> Option<Vec<u8>>) -> Vec<(DiskKey, Ve
 }
 
 /// A rendered plan produces a tree with the same contents.
+///
+/// Both geometries, rather than whichever image was found first: a
+/// 16 KiB node holds its items differently from a 4 KiB one, and a
+/// relocation that preserved only the shape it was tried on would have
+/// passed.
 #[test]
 fn a_relocated_tree_holds_exactly_what_the_original_held() {
-    let Some(fs) = ["btrfs-deep16k.img", "btrfs-default.img"]
-        .iter()
-        .find_map(|n| fixture(n))
-    else {
-        eprintln!("no fixtures; build them with `chore fixtures`");
-        return;
-    };
+    for name in ["btrfs-deep16k.img", "btrfs-default.img"] {
+        a_relocated_tree_holds_what_it_held(name);
+    }
+}
+
+fn a_relocated_tree_holds_what_it_held(name: &str) {
+    let fs = mounted(name);
     let sb_root = fs.superblock().root;
     let generation = fs.superblock().generation + 1;
 
@@ -105,7 +124,7 @@ fn a_relocated_tree_holds_exactly_what_the_original_held() {
     assert_eq!(
         blocks.len(),
         plan.rewrites.len(),
-        "every rewrite in the plan should produce a block"
+        "{name}: every rewrite in the plan should produce a block"
     );
 
     let rendered: BTreeMap<u64, Vec<u8>> = blocks
@@ -128,25 +147,28 @@ fn a_relocated_tree_holds_exactly_what_the_original_held() {
     let new_root = fs
         .planned_root(&plan)
         .expect("the plan moves the root tree");
-    assert_ne!(new_root, sb_root, "the root tree did not actually move");
+    assert_ne!(
+        new_root, sb_root,
+        "{name}: the root tree did not actually move"
+    );
 
     let was = contents(sb_root, &before);
     let now = contents(new_root, &after);
 
-    assert!(!was.is_empty(), "the original tree read as empty");
+    assert!(!was.is_empty(), "{name}: the original tree read as empty");
     assert_eq!(
         now.len(),
         was.len(),
-        "the relocated root tree holds {} items and the original held {}",
+        "{name}: the relocated root tree holds {} items and the original held {}",
         now.len(),
         was.len()
     );
     assert_eq!(
         now, was,
-        "the relocated root tree holds different items from the original"
+        "{name}: the relocated root tree holds different items from the original"
     );
     eprintln!(
-        "{} items preserved across a relocation of the root tree",
+        "{name}: {} items preserved across a relocation of the root tree",
         was.len()
     );
 }
@@ -158,10 +180,7 @@ fn a_relocated_tree_holds_exactly_what_the_original_held() {
 /// that catches a copy-on-write writer that forgot the block moved.
 #[test]
 fn every_rendered_block_is_stamped_with_its_new_address() {
-    let Some(fs) = fixture("btrfs-default.img") else {
-        eprintln!("no fixtures — skipping");
-        return;
-    };
+    let fs = mounted("btrfs-default.img");
     let generation = fs.superblock().generation + 1;
     let plan = fs
         .plan_transaction(&[fs.superblock().root])
@@ -203,22 +222,12 @@ fn every_rendered_block_is_stamped_with_its_new_address() {
 /// and still reads — from the tree as it was before the change.
 #[test]
 fn a_root_item_for_a_tree_that_moved_names_the_new_address() {
-    let Some(fs) = fixture("btrfs-deep16k.img") else {
-        eprintln!("no deep fixture — skipping");
-        return;
-    };
+    let fs = mounted("btrfs-deep16k.img");
     const ROOT_ITEM_BYTENR: usize = 176;
     let generation = fs.superblock().generation + 1;
 
     // The fs tree's root, which the plan will move.
-    let Some(fs_root) = fs.root_tree_items().ok().and_then(|items| {
-        items.into_iter().find_map(|(objid, ty, _, data)| {
-            (objid == objectid::FS_TREE && ty == 132 && data.len() >= ROOT_ITEM_BYTENR + 8)
-                .then(|| le64(&data, ROOT_ITEM_BYTENR))
-        })
-    }) else {
-        return;
-    };
+    let fs_root = fs_tree_root(&fs);
 
     let plan = fs.plan_transaction(&[fs_root]).expect("planning");
     let moved_to = plan
@@ -265,21 +274,9 @@ fn a_root_item_for_a_tree_that_moved_names_the_new_address() {
 /// everything.
 #[test]
 fn a_node_follows_a_child_that_moved() {
-    let Some(fs) = fixture("btrfs-deep16k.img") else {
-        eprintln!("no deep fixture — skipping");
-        return;
-    };
-    const ROOT_ITEM_BYTENR: usize = 176;
+    let fs = mounted("btrfs-deep16k.img");
     let generation = fs.superblock().generation + 1;
-
-    let Some(fs_root) = fs.root_tree_items().ok().and_then(|items| {
-        items.into_iter().find_map(|(objid, ty, _, data)| {
-            (objid == objectid::FS_TREE && ty == 132 && data.len() >= ROOT_ITEM_BYTENR + 8)
-                .then(|| le64(&data, ROOT_ITEM_BYTENR))
-        })
-    }) else {
-        return;
-    };
+    let fs_root = fs_tree_root(&fs);
 
     // Descend to a leaf, remembering the path, so there is a real
     // parent/child pair to move.
@@ -290,10 +287,15 @@ fn a_node_follows_a_child_that_moved() {
         };
         path.push(first.blockptr);
     }
-    if path.len() < 2 {
-        eprintln!("the fs tree is a single block — no parent to check");
-        return;
-    }
+    // `deep16k` holds 60,000 files, so its fs tree has nodes above its
+    // leaves. One that came back a single block would mean the fixture
+    // is not the one this test needs, and this test would otherwise
+    // pass by checking nothing.
+    assert!(
+        path.len() >= 2,
+        "the fs tree in btrfs-deep16k.img is a single block, so there is no parent to \
+         follow a moved child"
+    );
 
     let leaf = *path.last().unwrap();
     let parent = path[path.len() - 2];

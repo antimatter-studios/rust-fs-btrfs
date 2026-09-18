@@ -10,22 +10,23 @@
 //!
 //! The image is `mkfs.btrfs --rootdir` of one small file, with the inode
 //! item patched in every copy of its leaf and the primary superblock
-//! patched, all restamped. Skips without btrfs-progs, unless
-//! `BTRFS_ORACLE_FIXTURES=required`.
+//! patched, all restamped. `mkfs.btrfs` runs in the harness VM, which is
+//! the one place the btrfs-progs tools live, so it is always there and
+//! nothing here skips.
 
 use fs_btrfs::btree::{header_offsets, HEADER_SIZE, ITEM_SIZE};
 use fs_btrfs::chunk::objectid;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::superblock::{offsets, Superblock};
+use fs_btrfs_test_support::{le64, oracle, temp_path};
 use fs_core::{BlockRead, FileDevice};
-use std::process::Command;
 use std::sync::Arc;
 
 const SUPERBLOCK: usize = 0x1_0000;
 /// `btrfs_inode_item.size`.
 const INODE_SIZE: usize = 16;
-/// Removes the scratch directory on every exit path, including a skip
-/// and a failed assertion.
+/// Removes the scratch directory on every exit path, a failed assertion
+/// included.
 struct Scratch(std::path::PathBuf);
 
 impl Drop for Scratch {
@@ -34,8 +35,13 @@ impl Drop for Scratch {
     }
 }
 
-fn image(tag: &str) -> Option<(Scratch, std::path::PathBuf)> {
-    let dir = std::env::temp_dir().join(format!("btrfs-huge-size-{tag}-{}", std::process::id()));
+/// One small file, made into an image by `mkfs.btrfs --rootdir`.
+///
+/// The scratch tree lives inside this repository, because the guest that
+/// runs `mkfs.btrfs` sees this repository and nothing else of the host:
+/// an image under the host's `/tmp` is a path the tool cannot open.
+fn image(tag: &str) -> (Scratch, std::path::PathBuf) {
+    let dir = std::path::PathBuf::from(temp_path!("huge-size-{tag}"));
     let scratch = Scratch(dir.clone());
     let root = dir.join("root");
     std::fs::create_dir_all(&root).unwrap();
@@ -45,32 +51,17 @@ fn image(tag: &str) -> Option<(Scratch, std::path::PathBuf)> {
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
-    let made = match Command::new("mkfs.btrfs")
-        .arg("-f")
-        .arg("--rootdir")
+    let made = oracle("mkfs.btrfs")
+        .args(["-f", "--rootdir"])
         .arg(&root)
         .arg(&img)
-        .output()
-    {
-        Ok(made) => made,
-        Err(e) => {
-            assert!(
-                std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() != Ok("required"),
-                "BTRFS_ORACLE_FIXTURES=required, but mkfs.btrfs is not runnable: {e}"
-            );
-            return None;
-        }
-    };
+        .output();
     assert!(
         made.status.success(),
         "{}",
         String::from_utf8_lossy(&made.stderr)
     );
-    Some((scratch, img))
-}
-
-fn le64(b: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+    (scratch, img)
 }
 
 /// 2^60 bytes, past any allocator; and one byte past the ceiling, well
@@ -84,10 +75,7 @@ fn an_impossible_file_size_is_an_error_not_an_abort() {
 }
 
 fn refuses(claimed: u64) {
-    let Some((_scratch, img)) = image(&claimed.to_string()) else {
-        eprintln!("no mkfs.btrfs -- skipping");
-        return;
-    };
+    let (_scratch, img) = image(&claimed.to_string());
     let ino = {
         let fs = Filesystem::mount(Arc::new(FileDevice::open(&img).unwrap()) as Arc<dyn BlockRead>)
             .unwrap();

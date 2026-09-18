@@ -33,9 +33,13 @@
 //! not at all: the interior nodes every path descends were read by the
 //! walk.
 //!
-//! Fixtures are gitignored, so this skips on a fresh clone.
+//! The fixtures are gitignored and built by `chore fixtures`. A missing
+//! one fails here rather than quietly measuring nothing: a cost test
+//! that skipped is a cost test that reported no regression because it
+//! read no image.
 
 use fs_btrfs::Filesystem;
+use fs_btrfs_test_support::fixture;
 use fs_core::{CountingDevice, FileDevice};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -61,7 +65,7 @@ struct Pass {
     read: Cost,
 }
 
-/// Every fixture present, each measured on its own.
+/// The three fixtures this measures, each on its own.
 ///
 /// `docs/read-path-cost.md` publishes a table for `rich` and one for
 /// `deep4k`, because they cost differently: a varied tree is a descent,
@@ -69,12 +73,14 @@ struct Pass {
 /// return the first image found, from a list whose order contradicted
 /// its own comment, so with the full matrix present only `deep4k` was
 /// ever measured and the `rich` table could not be regenerated (#107).
+///
+/// All three are required. One that is absent takes a published table
+/// with it, and a list that quietly shrank to what happened to be on
+/// disk is how that went unnoticed the first time.
 fn fixtures() -> Vec<PathBuf> {
-    let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
     ["btrfs-rich.img", "btrfs-deep4k.img", "btrfs-commit.img"]
         .into_iter()
-        .map(|name| share.join(name))
-        .filter(|p| p.exists())
+        .map(fixture)
         .collect()
 }
 
@@ -169,10 +175,6 @@ fn report(what: &str, c: &Cost) {
 #[test]
 fn what_a_read_costs_in_calls_to_the_device() {
     let images = fixtures();
-    if images.is_empty() {
-        eprintln!("no fixture to measure — skipping");
-        return;
-    }
     for img in &images {
         measure_fixture(img);
     }

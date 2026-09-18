@@ -39,42 +39,32 @@
 //! actually saw, so the gap stays visible rather than being quietly
 //! assumed away.
 //!
-//! Fixtures live in `.vm-share/` as `btrfs-<name>.img`. They are
-//! gitignored, so these tests skip on a fresh clone rather than failing.
-//! Generate them with:
-//!
-//! ```sh
-//! ./scripts/vm.sh up
-//! ./scripts/vm-build-fixtures.sh
-//! ```
+//! Fixtures live in `test-disks/` as `btrfs-<name>.img`. They are
+//! gitignored and built by `chore fixtures`, which makes them with the
+//! real tooling inside the fs-linux-test-harness VM. A checkout without
+//! them fails here naming that task: these tests read the images
+//! directly, so a missing one is nothing to run against, not a reason to
+//! pass quietly.
 
 use fs_btrfs::btree::{Tree, TreeBlock, TreeGeometry, HEADER_SIZE, ITEM_SIZE};
 use fs_btrfs::chunk::{key_type, objectid, Chunk, ChunkMap, DiskKey};
 use fs_btrfs::superblock::{Superblock, SUPER_INFO_OFFSET};
 use fs_btrfs::{Error, Result};
+use fs_btrfs_test_support::{fixtures_matching, spans_several_devices};
 use std::path::{Path, PathBuf};
-
-mod common;
 
 /// `BTRFS_ROOT_ITEM_KEY`. `chunk::key_type` names only the two types the
 /// chunk bootstrap needs, so this one is spelled out here rather than
 /// added to a module this test is not allowed to touch.
 const ROOT_ITEM_KEY: u8 = 132;
 
-/// Locate every fixture image.
+/// Every fixture image this file can read, with the multi-device ones
+/// set aside.
 fn fixtures() -> Vec<(String, PathBuf)> {
-    let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
-    let Ok(entries) = std::fs::read_dir(&share) else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    let mut skipped = Vec::new();
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("img") {
-            continue;
-        }
-        let name = p.file_stem().unwrap().to_string_lossy().into_owned();
+    let mut apart = Vec::new();
+    for img in fixtures_matching("btrfs-") {
+        let name = img.file_stem().unwrap().to_string_lossy().into_owned();
 
         // Multi-device filesystems are not fixtures for this file.
         // Everything here reads a logical address straight out of a
@@ -82,19 +72,23 @@ fn fixtures() -> Vec<(String, PathBuf)> {
         // on the device being read. One disk of a pool holds chunks
         // belonging to the other, and the bytes at those offsets are
         // something else entirely.
-        if common::spans_several_devices(&p) {
-            skipped.push(name);
+        if spans_several_devices(&img) {
+            apart.push(name);
             continue;
         }
-        out.push((name, p));
+        out.push((name, img));
     }
-    if !skipped.is_empty() {
+    if !apart.is_empty() {
         eprintln!(
-            "skipping {} multi-device image(s): {skipped:?}",
-            skipped.len()
+            "  {} multi-device image(s) read elsewhere: {apart:?}",
+            apart.len()
         );
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
+    assert!(
+        !out.is_empty(),
+        "every fixture in test-disks/ spans several devices, so there is no flat \
+         image here to read. `chore fixtures` builds the single-device matrix."
+    );
     out
 }
 
@@ -235,10 +229,6 @@ fn full_map(bytes: &[u8], sb: &Superblock, label: &str) -> (ChunkMap, Vec<(DiskK
 #[test]
 fn chunk_tree_root_block_verifies_on_real_media() {
     let fixtures = fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no fixtures in .vm-share — run ./scripts/vm-build-fixtures.sh; skipping");
-        return;
-    }
     for (label, img) in &fixtures {
         let (bytes, sb) = open(img, label);
         let map = ChunkMap::bootstrap(&sb)
@@ -275,10 +265,6 @@ fn chunk_tree_root_block_verifies_on_real_media() {
 #[test]
 fn walking_the_chunk_tree_makes_the_root_tree_reachable() {
     let fixtures = fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no fixtures — skipping");
-        return;
-    }
     let mut tallest = 0u8;
     for (label, img) in &fixtures {
         let (bytes, sb) = open(img, label);
@@ -337,10 +323,6 @@ fn walking_the_chunk_tree_makes_the_root_tree_reachable() {
 #[test]
 fn searching_finds_the_same_items_the_walk_found() {
     let fixtures = fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no fixtures — skipping");
-        return;
-    }
     for (label, img) in &fixtures {
         let (bytes, sb) = open(img, label);
         let boot = ChunkMap::bootstrap(&sb).unwrap();
@@ -426,10 +408,6 @@ fn searching_finds_the_same_items_the_walk_found() {
 #[test]
 fn the_root_tree_names_the_top_level_file_tree() {
     let fixtures = fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no fixtures — skipping");
-        return;
-    }
     for (label, img) in &fixtures {
         let (bytes, sb) = open(img, label);
         let (map, _) = full_map(&bytes, &sb, label);

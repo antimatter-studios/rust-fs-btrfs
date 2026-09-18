@@ -38,33 +38,37 @@
 //! # Why it is cheap, having been called expensive
 //!
 //! The first reading of this gap was that it needed a Linux-only image
-//! builder. It does not: `.vm-share/btrfs-dup.img` already ships. It is
-//! gitignored, so a fresh worktree lacks it and a symlink is enough —
-//! which is worth remembering before the next "no fixture available".
-//! Public API only, no `mkfs.btrfs`, no VM.
+//! builder of its own. It does not: `test-disks/btrfs-dup.img` is one of
+//! the fixtures `chore fixtures` already builds, and everything below
+//! works from it through the public API — no `mkfs.btrfs`, nothing this
+//! file has to provision.
 //!
 //! # Vacuity
 //!
-//! Without `.vm-share` this suite reports `ok` having done nothing —
-//! the shape of every oracle suite here, and the shape that makes
-//! `13 passed in 0.00s` and `13 passed in 33.61s` look identical. So it
-//! prints what it did and how long the image was, and the assertions
-//! below check the fixture is a DUP one before believing any pass:
-//! a chunk with one copy has nothing to fall back to, and a test that
-//! "passed" on it would mean nothing at all.
+//! This suite used to report `ok` having done nothing when the fixture
+//! was absent — the shape of every oracle suite here, and the shape that
+//! makes `13 passed in 0.00s` and `13 passed in 33.61s` look identical
+//! in a log. THAT IS NOW IMPOSSIBLE RATHER THAN MERELY DOCUMENTED: every
+//! image below comes from `fs_btrfs_test_support::fixture`, which fails
+//! the test and names the task that builds the image instead of handing
+//! back a `None` for the test to skip on.
+//!
+//! The other half of vacuity is still this file's own to hold, because
+//! no helper can: it prints what it did and how long the image was, and
+//! the assertions below check the fixture is a DUP one before believing
+//! any pass — a chunk with one copy has nothing to fall back to, and a
+//! test that "passed" on it would mean nothing at all.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fs_btrfs::superblock::SUPER_INFO_OFFSET;
 use fs_btrfs::{ChunkMap, Superblock};
+use fs_btrfs_test_support::{fixture, temp_path};
 use fs_core::FileDevice;
 
-fn dup_image() -> Option<PathBuf> {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".vm-share")
-        .join("btrfs-dup.img");
-    p.exists().then_some(p)
+fn dup_image() -> PathBuf {
+    fixture("btrfs-dup.img")
 }
 
 /// Write `bytes` somewhere unique to this process and hand back a guard
@@ -73,7 +77,11 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(tag: &str, bytes: &[u8]) -> Self {
-        let path = std::env::temp_dir().join(format!(
+        // In the repository's own scratch directory, not the system
+        // one: these images are what the oracle tools would be pointed
+        // at, and the harness VM sees this repository and nothing else
+        // of the host.
+        let path = PathBuf::from(temp_path!(
             "btrfs-dup-{tag}-{}-{:?}.img",
             std::process::id(),
             std::thread::current().id()
@@ -91,13 +99,7 @@ impl Drop for Scratch {
 
 #[test]
 fn a_damaged_first_copy_of_the_chunk_root_does_not_stop_the_mount() {
-    let Some(src) = dup_image() else {
-        eprintln!(
-            "no .vm-share/btrfs-dup.img — run ./scripts/vm-build-fixtures.sh; \
-             skipping, and this suite proved nothing"
-        );
-        return;
-    };
+    let src = dup_image();
     let bytes = std::fs::read(&src).expect("read fixture");
     eprintln!(
         "dup_mirror_fallback: {} ({} bytes)",
@@ -171,10 +173,7 @@ fn a_damaged_first_copy_of_the_chunk_root_does_not_stop_the_mount() {
 /// passing.
 #[test]
 fn a_damaged_first_copy_of_any_named_root_does_not_stop_the_mount() {
-    let Some(src) = dup_image() else {
-        eprintln!("no .vm-share/btrfs-dup.img; skipping, and this suite proved nothing");
-        return;
-    };
+    let src = dup_image();
     let bytes = std::fs::read(&src).expect("read fixture");
     let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
         .expect("superblock");
@@ -238,7 +237,7 @@ fn a_damaged_first_copy_of_any_named_root_does_not_stop_the_mount() {
 /// does reach, whose mirror read must be `read_logical_pool_mirror`
 /// rather than the single-device form: reverting either one alone fails
 /// this test and nothing else. It is served by a different fixture:
-/// `.vm-share/btrfs-pool-{a,b}.img`, a real two-device filesystem whose
+/// `test-disks/btrfs-pool-{a,b}.img`, a real two-device filesystem whose
 /// metadata mkfs put in RAID1 — so a tree block's two copies are on
 /// DIFFERENT devices, and damaging one means writing to one image and
 /// leaving the other alone.
@@ -250,18 +249,9 @@ fn a_damaged_first_copy_of_any_named_root_does_not_stop_the_mount() {
 /// Establish the wall by trying.
 #[test]
 fn a_damaged_copy_on_one_pool_device_does_not_stop_the_pool_reading() {
-    let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
-    let (a, b) = (
-        share.join("btrfs-pool-a.img"),
-        share.join("btrfs-pool-b.img"),
-    );
-    if !a.exists() || !b.exists() {
-        eprintln!(
-            "no .vm-share/btrfs-pool-{{a,b}}.img — run ./scripts/vm-build-pool-fixtures.sh; \
-             skipping, and this suite proved nothing"
-        );
-        return;
-    }
+    // Both halves, or neither: one member of a two-device filesystem is
+    // not a pool, and a missing one fails here naming `chore fixtures`.
+    let (a, b) = (fixture("btrfs-pool-a.img"), fixture("btrfs-pool-b.img"));
     let bytes_a = std::fs::read(&a).expect("read pool a");
     let bytes_b = std::fs::read(&b).expect("read pool b");
 
@@ -368,10 +358,7 @@ fn a_damaged_copy_on_one_pool_device_does_not_stop_the_pool_reading() {
 /// over-correction, which no defeat case here can see.
 #[test]
 fn a_damaged_second_copy_is_not_noticed_at_all() {
-    let Some(src) = dup_image() else {
-        eprintln!("no .vm-share/btrfs-dup.img; skipping, and this suite proved nothing");
-        return;
-    };
+    let src = dup_image();
     let bytes = std::fs::read(&src).expect("read fixture");
     let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
         .expect("superblock");
@@ -423,10 +410,7 @@ fn a_damaged_second_copy_is_not_noticed_at_all() {
 /// satisfy the fallback assertion.
 #[test]
 fn damaging_every_copy_is_still_refused() {
-    let Some(src) = dup_image() else {
-        eprintln!("no .vm-share/btrfs-dup.img; skipping, and this suite proved nothing");
-        return;
-    };
+    let src = dup_image();
     let bytes = std::fs::read(&src).expect("read fixture");
     let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
         .expect("superblock");
@@ -498,10 +482,7 @@ impl fs_core::BlockRead for Unreadable {
 
 #[test]
 fn an_unreadable_first_copy_does_not_stop_the_mount() {
-    let Some(src) = dup_image() else {
-        eprintln!("no .vm-share/btrfs-dup.img; skipping, and this suite proved nothing");
-        return;
-    };
+    let src = dup_image();
     let bytes = std::fs::read(&src).expect("read fixture");
     let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
         .expect("superblock");
@@ -583,10 +564,7 @@ fn an_unreadable_first_copy_does_not_stop_the_mount() {
 /// the error must still be the read's.
 #[test]
 fn an_unreadable_first_copy_reports_the_io_error_not_a_checksum() {
-    let Some(src) = dup_image() else {
-        eprintln!("no .vm-share/btrfs-dup.img; skipping, and this suite proved nothing");
-        return;
-    };
+    let src = dup_image();
     let bytes = std::fs::read(&src).expect("read fixture");
     let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
         .expect("superblock");

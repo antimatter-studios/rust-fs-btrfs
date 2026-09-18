@@ -11,8 +11,9 @@
 //! The image is `mkfs.btrfs --rootdir` of one 64 KiB file, marked nodatacow
 //! and nodatasum (the only files this driver writes), with its extent item's
 //! `offset` moved to 64 KiB and `ram_bytes` raised to 2^40, in every copy of
-//! its leaf, restamped. Skips without btrfs-progs, unless
-//! `BTRFS_ORACLE_FIXTURES=required`.
+//! its leaf, restamped. `mkfs.btrfs` runs in the harness VM, which is the one
+//! place the btrfs-progs tools live, so it is always there and nothing here
+//! skips.
 
 use fs_btrfs::btree::{header_offsets, HEADER_SIZE, ITEM_SIZE};
 use fs_btrfs::chunk::objectid;
@@ -20,8 +21,8 @@ use fs_btrfs::fs::Filesystem;
 use fs_btrfs::superblock::Superblock;
 use fs_btrfs::tree_write::stamp_checksum;
 use fs_btrfs::write::{INODE_NODATACOW, INODE_NODATASUM};
+use fs_btrfs_test_support::{le64, oracle, temp_path};
 use fs_core::{BlockDevice, BlockRead, FileDevice};
-use std::process::Command;
 use std::sync::Arc;
 
 const SUPERBLOCK: usize = 0x1_0000;
@@ -32,13 +33,13 @@ const OFFSET: usize = 37;
 const INODE_ITEM_KEY: u8 = 1;
 const EXTENT_DATA_KEY: u8 = 108;
 
-fn le64(b: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
-}
-
-fn image(name: &str) -> Option<std::path::PathBuf> {
-    let dir =
-        std::env::temp_dir().join(format!("btrfs-extent-window-{}-{name}", std::process::id()));
+/// One 64 KiB file, made into an image by `mkfs.btrfs --rootdir`.
+///
+/// The scratch tree lives inside this repository, because the guest that
+/// runs `mkfs.btrfs` sees this repository and nothing else of the host:
+/// an image under the host's `/tmp` is a path the tool cannot open.
+fn image(name: &str) -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(temp_path!("extent-window-{name}"));
     let root = dir.join("root");
     std::fs::create_dir_all(&root).unwrap();
     let body: Vec<u8> = (0..LEN).map(|i| (i % 253) as u8).collect();
@@ -48,28 +49,17 @@ fn image(name: &str) -> Option<std::path::PathBuf> {
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
-    let made = match Command::new("mkfs.btrfs")
-        .arg("-f")
-        .arg("--rootdir")
+    let made = oracle("mkfs.btrfs")
+        .args(["-f", "--rootdir"])
         .arg(&root)
         .arg(&img)
-        .output()
-    {
-        Ok(made) => made,
-        Err(e) => {
-            assert!(
-                std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() != Ok("required"),
-                "BTRFS_ORACLE_FIXTURES=required, but mkfs.btrfs is not runnable: {e}"
-            );
-            return None;
-        }
-    };
+        .output();
     assert!(
         made.status.success(),
         "{}",
         String::from_utf8_lossy(&made.stderr)
     );
-    Some(img)
+    img
 }
 
 /// Apply `edit(key_type, body)` to `ino`'s items in every fs-tree leaf copy.
@@ -136,10 +126,7 @@ fn mount_rw(img: &std::path::Path) -> Filesystem {
 /// write -- so the refusal below is the window, not the fixture.
 #[test]
 fn the_file_as_made_is_written_in_place() {
-    let Some(img) = image("control") else {
-        eprintln!("no mkfs.btrfs -- skipping");
-        return;
-    };
+    let img = image("control");
     let ino = ino_of(&img);
     let patched = edit_items(&img, ino, |key_type, body| {
         if key_type == INODE_ITEM_KEY {
@@ -157,10 +144,7 @@ fn the_file_as_made_is_written_in_place() {
 
 #[test]
 fn a_window_moved_past_its_extent_is_refused_before_anything_is_written() {
-    let Some(img) = image("moved") else {
-        eprintln!("no mkfs.btrfs -- skipping");
-        return;
-    };
+    let img = image("moved");
     let ino = ino_of(&img);
     let patched = edit_items(&img, ino, |key_type, body| match key_type {
         INODE_ITEM_KEY => mark_nodatacow(body),
@@ -199,10 +183,7 @@ fn a_window_moved_past_its_extent_is_refused_before_anything_is_written() {
 /// tree checker requires; a read through an item that is not refuses.
 #[test]
 fn an_extent_field_off_a_sector_boundary_is_refused_on_read() {
-    let Some(img) = image("aligned") else {
-        eprintln!("no mkfs.btrfs -- skipping");
-        return;
-    };
+    let img = image("aligned");
     let ino = ino_of(&img);
     let patched = edit_items(&img, ino, |key_type, body| {
         if key_type == EXTENT_DATA_KEY {

@@ -18,40 +18,24 @@
 //! device registered first, and that is a different thing from opening
 //! a filesystem.
 //!
-//! Fixtures are gitignored. Build them with
-//! `./scripts/vm-build-pool-fixtures.sh`.
+//! The two images and the manifest beside them are built by `chore
+//! fixtures`, which makes the pool with the kernel in the harness VM.
+//! A missing one fails here, naming that task: a pool test that steps
+//! around its own fixture is a pool test that never opened a pool.
 
 use fs_btrfs::fs::Filesystem;
+use fs_btrfs_test_support::{fixture, sha256_hex};
 use fs_core::FileDevice;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
-
-fn pool_member(name: &str) -> Option<PathBuf> {
-    let p = share().join(name);
-    p.exists().then_some(p)
-}
 
 /// Opening one device of a two-device filesystem is refused.
 #[test]
 fn one_device_of_a_pool_is_refused_rather_than_half_read() {
     let members: Vec<PathBuf> = ["btrfs-pool-a.img", "btrfs-pool-b.img"]
         .iter()
-        .filter_map(|n| pool_member(n))
+        .map(|n| fixture(n))
         .collect();
-    if members.is_empty() {
-        eprintln!("no pool fixture; build it with ./scripts/vm-build-pool-fixtures.sh");
-        return;
-    }
-    assert_eq!(
-        members.len(),
-        2,
-        "a pool fixture needs both halves; found {}",
-        members.len()
-    );
 
     for path in &members {
         let dev = Arc::new(FileDevice::open(path).expect("opening a pool member"));
@@ -85,13 +69,7 @@ fn one_device_of_a_pool_is_refused_rather_than_half_read() {
 /// a pool.
 #[test]
 fn the_fixture_really_is_one_filesystem_on_two_devices() {
-    let (Some(a), Some(b)) = (
-        pool_member("btrfs-pool-a.img"),
-        pool_member("btrfs-pool-b.img"),
-    ) else {
-        eprintln!("no pool fixture — skipping");
-        return;
-    };
+    let (a, b) = (fixture("btrfs-pool-a.img"), fixture("btrfs-pool-b.img"));
 
     let read = |p: &Path| -> ([u8; 16], u64, u64) {
         let raw = std::fs::read(p).expect("reading a pool member");
@@ -126,18 +104,10 @@ fn the_fixture_really_is_one_filesystem_on_two_devices() {
 /// actually exercises the chunk mapping across two devices.
 #[test]
 fn a_pool_opened_with_every_device_reads_what_the_kernel_wrote() {
-    let (Some(a), Some(b)) = (
-        pool_member("btrfs-pool-a.img"),
-        pool_member("btrfs-pool-b.img"),
-    ) else {
-        eprintln!("no pool fixture; build it with ./scripts/vm-build-pool-fixtures.sh");
-        return;
-    };
-    let manifest = share().join("btrfs-pool.manifest");
-    let Ok(expected) = std::fs::read_to_string(&manifest) else {
-        eprintln!("no manifest — skipping");
-        return;
-    };
+    let (a, b) = (fixture("btrfs-pool-a.img"), fixture("btrfs-pool-b.img"));
+    let manifest = fixture("btrfs-pool.manifest");
+    let expected = std::fs::read_to_string(&manifest)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", manifest.display()));
 
     let devices: Vec<Arc<dyn fs_core::BlockRead>> = [a, b]
         .iter()
@@ -198,13 +168,7 @@ fn a_pool_opened_with_every_device_reads_what_the_kernel_wrote() {
 /// A pool given devices from two different filesystems is refused.
 #[test]
 fn devices_from_different_filesystems_are_refused() {
-    let (Some(a), Some(other)) = (
-        pool_member("btrfs-pool-a.img"),
-        pool_member("btrfs-default.img"),
-    ) else {
-        eprintln!("no fixtures — skipping");
-        return;
-    };
+    let (a, other) = (fixture("btrfs-pool-a.img"), fixture("btrfs-default.img"));
 
     let devices: Vec<Arc<dyn fs_core::BlockRead>> = [a, other]
         .iter()
@@ -226,13 +190,4 @@ fn devices_from_different_filesystems_are_refused() {
             eprintln!("mixed devices refused — {msg}");
         }
     }
-}
-
-/// SHA-256 of `data`, lower-case hex — matching `sha256sum` in the
-/// manifest.
-fn sha256_hex(data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(data);
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }

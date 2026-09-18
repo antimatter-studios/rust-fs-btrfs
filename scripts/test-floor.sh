@@ -3,9 +3,28 @@
 # test-floor.sh — pass a test run's output through, and refuse a run that
 # executed fewer tests than it is supposed to.
 #
-# Usage, from a workflow step:
+# Three ways to use it:
 #
-#   cargo test --test csum_oracle -- --nocapture | bash scripts/test-floor.sh 6
+#   <command> | bash scripts/test-floor.sh 6
+#       the run's output on stdin, passed through unchanged, and the
+#       total refused if it is below the floor
+#
+#   bash scripts/test-floor.sh --log tmp/logs/oracle.log 120
+#       the same, against a tier log a chore task already wrote. Every
+#       job runs chore tasks now, and a chore task's output is a verdict
+#       plus a log (see the budget table in chores.yml) -- so there is
+#       nothing on the step's stdout left to count, and the numbers live
+#       where the whole run does.
+#
+#   bash scripts/test-floor.sh --targets .github/test-floors.txt --log tmp/logs/suite.log
+#       PER-TARGET floors: one number per integration target, from the
+#       file, checked against that target's own `test result:` line. The
+#       total is the weaker check -- a suite that empties from the inside
+#       hides inside a total that other suites kept above the floor --
+#       and this is what the old workflow's thirty-odd `cargo test --test
+#       <name> | test-floor.sh <n>` steps were really for. Keeping it
+#       means keeping that guard while the workflow stops naming suites
+#       by hand, which is what let two of them run nowhere at all (#70).
 #
 # A FLOOR, BECAUSE THE FAILURE MODE HERE IS AN ABSENCE.
 #
@@ -40,6 +59,85 @@
 # gets from `defaults: run: shell: bash` — a real test failure still
 # fails the step whatever the count says.
 set -uo pipefail
+
+# --targets FLOORS --log LOG: one floor per integration target.
+if [ "${1:-}" = "--targets" ]; then
+    floors="${2:-}"
+    [ "${3:-}" = "--log" ] || {
+        echo "test-floor.sh: usage: --targets <floors-file> --log <log>" >&2
+        exit 2
+    }
+    log="${4:-}"
+    [ -f "$floors" ] || { echo "test-floor.sh: no floors file at $floors" >&2; exit 2; }
+    [ -f "$log" ] || {
+        echo "test-floor.sh: no log at $log -- the tier that writes it did not run." >&2
+        exit 1
+    }
+
+    # cargo prints `Running tests/<name>.rs (target/.../deps/<name>-<hash>)`
+    # or `Running unittests src/lib.rs (...)` before each binary, and
+    # libtest prints `test result: ok. N passed` after it. Pairing the two
+    # is what gives a count per target.
+    counts=$(awk '
+        /^[[:space:]]*Running unittests/ { target = "lib"; next }
+        /^[[:space:]]*Running tests\// {
+            target = $2
+            sub(/^tests\//, "", target)
+            sub(/\.rs$/, "", target)
+            next
+        }
+        /^test result: ok\. [0-9]+ passed/ { if (target != "") seen[target] += $4 }
+        END { for (t in seen) printf "%s %d\n", t, seen[t] }
+    ' "$log")
+
+    bad=0
+    checked=0
+    while read -r target floor; do
+        case "$target" in ''|\#*) continue ;; esac
+        case "$floor" in '' | *[!0-9]*)
+            echo "test-floor.sh: $floors: '$target' has a non-numeric floor '${floor:-(none)}'" >&2
+            exit 2
+            ;;
+        esac
+        executed=$(echo "$counts" | awk -v t="$target" '$1 == t { print $2 }')
+        executed=${executed:-0}
+        checked=$((checked + 1))
+        if [ "$executed" -lt "$floor" ]; then
+            echo "::error::$target executed $executed tests, floor is $floor -- a target that executes fewer than its floor emptied from the inside rather than passed. If it legitimately shrank, lower its floor in $floors in the same commit." >&2
+            bad=1
+        fi
+    done < "$floors"
+
+    [ "$checked" -gt 0 ] || {
+        echo "::error::$floors named no targets, so this checked nothing" >&2
+        exit 1
+    }
+    echo "per-target floors: $checked target(s) checked against $log"
+    exit "$bad"
+fi
+
+# --log LOG FLOOR: the total, from a log a chore task wrote.
+if [ "${1:-}" = "--log" ]; then
+    log="${2:-}"
+    [ -f "$log" ] || {
+        echo "test-floor.sh: no log at $log -- the tier that writes it did not run." >&2
+        exit 1
+    }
+    floor="${3:-}"
+    case "$floor" in
+        '' | *[!0-9]*)
+            echo "test-floor.sh: usage: --log <log> <floor>" >&2
+            exit 2
+            ;;
+    esac
+    executed=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
+    echo "tests executed: $executed (floor $floor, from $log)"
+    if [ "$executed" -lt "$floor" ]; then
+        echo "::error::only $executed tests executed, floor is $floor -- a run that executes fewer tests than the floor stopped early rather than passed. If the suite legitimately shrank, lower the floor in .github/workflows/ci.yml in the same commit that shrank it, so the number stays something someone decided." >&2
+        exit 1
+    fi
+    exit 0
+fi
 
 floor=${1:-}
 case "$floor" in
