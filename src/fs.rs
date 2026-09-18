@@ -1461,11 +1461,14 @@ impl Filesystem {
                 // An inline extent may be compressed too, and there is no
                 // offset to apply: the item holds the whole thing.
                 Ok(Piece::Inline(if algo.is_compressed() {
+                    // An inline extent is the whole of a small file, so it
+                    // is the file's last extent by definition (#189).
                     std::borrow::Cow::Owned(compression::decompress(
                         algo,
                         raw,
                         ram_bytes as usize,
                         self.sb.sectorsize as usize,
+                        compression::ShortDecode::Pad,
                     )?)
                 } else {
                     std::borrow::Cow::Borrowed(raw)
@@ -1864,11 +1867,22 @@ impl Filesystem {
                     // this is the read to verify — and it is the whole
                     // extent, so it is sector-aligned already.
                     self.read_data_verified(logical, &mut packed, verify)?;
+                    // A DECODE MAY ONLY COME UP SHORT ON THE LAST EXTENT
+                    // (#189), where the tail of the final sector holds
+                    // nothing. Anywhere else the stream is truncated, and
+                    // padding it would answer with zeros a caller cannot
+                    // tell from data.
+                    let short = if at.saturating_add(ram_len) >= inode.size {
+                        compression::ShortDecode::Pad
+                    } else {
+                        compression::ShortDecode::Refuse
+                    };
                     let decoded = compression::decompress(
                         algo,
                         &packed,
                         ram_len as usize,
                         self.sb.sectorsize as usize,
+                        short,
                     )?;
                     // `within` indexes the decoded bytes, which is the
                     // whole reason this is not a Regular read.
