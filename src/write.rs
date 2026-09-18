@@ -160,7 +160,17 @@ impl Filesystem {
             return Ok(false);
         }
         let last_snapshot = self.fs_tree_last_snapshot()?;
-        for piece in self.file_extents(ino)? {
+        // A FILE WHOSE EXTENTS DO NOT DECODE IS NOT WRITABLE, and that is
+        // the answer to give rather than the error. Reading them refuses a
+        // window that leaves its extent (#188), which is one of the very
+        // conditions this loop is here to report — so a caller asking "can
+        // I edit this?" gets "no", and learns why from the write itself.
+        let pieces = match self.file_extents(ino) {
+            Ok(pieces) => pieces,
+            Err(Error::BadSuperblock(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        for piece in pieces {
             let Some(logical) = piece.logical else {
                 return Ok(false);
             };
@@ -268,28 +278,30 @@ impl Filesystem {
     /// means a snapshot or a reflink is also pointing at it, and writing
     /// in place would change what that other reader sees. The length is
     /// the `EXTENT_ITEM`'s key offset: what the allocator reserved.
-    fn extent_item(&self, bytenr: u64) -> Result<(u64, u64, u64)> {
+    pub(crate) fn extent_item(&self, bytenr: u64) -> Result<(u64, u64, u64)> {
         let root = self.extent_tree_root()?;
         let reader = self.pool_reader();
         let tree = reader.tree();
 
+        // SOUGHT, NOT WALKED. This read every item in the extent tree until
+        // it met the one it wanted, which is the whole tree for an extent
+        // near the end. A write does it once and could afford that; a read
+        // does it per extent (#188), and a file of a thousand extents would
+        // have walked the tree a thousand times.
         let mut refs = None;
-        tree.for_each(root, &mut |key: &DiskKey, data: &[u8]| {
-            if key.objectid == bytenr
-                && key.key_type == key_type::EXTENT_ITEM
-                && data.len() >= extent_item::GENERATION + 8
-            {
+        for item in tree.find_all(root, bytenr, key_type::EXTENT_ITEM)? {
+            if item.data.len() >= extent_item::GENERATION + 8 {
+                let data = &item.data;
                 let le64 =
                     |at: usize| u64::from_le_bytes(data[at..at + 8].try_into().expect("8 bytes"));
                 refs = Some((
                     le64(extent_item::REFS),
-                    key.offset,
+                    item.key.offset,
                     le64(extent_item::GENERATION),
                 ));
-                return Ok(false);
+                break;
             }
-            Ok(true)
-        })?;
+        }
 
         // An extent with no item is not "unreferenced" — it is an extent
         // this driver failed to find, and treating the two the same
@@ -350,7 +362,12 @@ impl Filesystem {
 /// the extent the extent tree records at `extent_start` for `extent_len`
 /// bytes. Shared by the write and by `can_write_in_place`, so the two
 /// cannot disagree about which windows a write refuses.
-fn window_inside_extent(logical: u64, len: u64, extent_start: u64, extent_len: u64) -> bool {
+pub(crate) fn window_inside_extent(
+    logical: u64,
+    len: u64,
+    extent_start: u64,
+    extent_len: u64,
+) -> bool {
     match (
         logical.checked_add(len),
         extent_start.checked_add(extent_len),

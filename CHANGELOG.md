@@ -57,6 +57,14 @@ never does.
 
 ### Fixed
 
+- **A read cannot follow an extent item's window outside its extent.** The
+  window was bounded by `ram_bytes`, a field of the same item, so an item
+  that raised both passed and the read answered with whatever occupied the
+  addresses past the extent — another file's data, or a tree block, with no
+  error. The write path has checked against the extent tree's own record
+  since #156; the read path does now too. `extent_item` seeks to its key
+  instead of walking the whole extent tree, because a read does this per
+  extent where a write did it once (#188).
 - **A new tree block is never placed on a superblock copy.** The extent
   tree doesn't record the superblock copies, and the allocator took its
   gaps as free. On a 256 MiB volume it handed out the block whose DUP copy

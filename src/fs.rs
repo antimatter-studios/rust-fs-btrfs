@@ -1385,6 +1385,47 @@ impl Filesystem {
         Ok(inode)
     }
 
+    /// Refuse a reference whose window leaves the extent the extent tree
+    /// records for it (#188).
+    ///
+    /// `offset` and `len` are the reference's window within the extent that
+    /// starts at `disk_bytenr`. The extent tree's item for that address
+    /// carries the extent's length in its key, which is the one bound that
+    /// does not come from the item being checked.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadSuperblock`] when the window leaves the extent, and
+    /// whatever the extent-tree lookup returns — including an extent with
+    /// no item at all, which is a reference to something nothing records.
+    fn refuse_window_outside_extent(
+        &self,
+        ino: u64,
+        disk_bytenr: u64,
+        offset: u64,
+        len: u64,
+    ) -> Result<()> {
+        // A reference with no address behind it: a hole or inline data,
+        // which the caller has already dealt with.
+        if disk_bytenr == 0 {
+            return Ok(());
+        }
+        let (_, extent_len, _) = self.extent_item(disk_bytenr)?;
+        let start = disk_bytenr.checked_add(offset).ok_or_else(|| {
+            Error::BadSuperblock(format!(
+                "inode {ino}: an extent item at {disk_bytenr} has an offset of {offset}, \
+                 which is past the end of the address space"
+            ))
+        })?;
+        if !crate::write::window_inside_extent(start, len, disk_bytenr, extent_len) {
+            return Err(Error::BadSuperblock(format!(
+                "inode {ino}: an extent item covers [{start}, +{len}), which is outside the \
+                 extent at {disk_bytenr} that the extent tree records as {extent_len} bytes"
+            )));
+        }
+        Ok(())
+    }
+
     /// Decode one `EXTENT_DATA` item into the piece of file it describes.
     fn decode_extent<'a>(&self, data: &'a [u8], ino: u64) -> Result<Piece<'a>> {
         if data.len() < file_extent::TYPE + 1 {
@@ -1520,6 +1561,11 @@ impl Filesystem {
                             compression::MAX_COMPRESSED
                         )));
                     }
+                    // The compressed run is read whole from `disk_bytenr`,
+                    // so that is the range which has to be inside the
+                    // extent; `offset` indexes the decoded bytes and is
+                    // bounded by `ram_bytes` above (#188).
+                    self.refuse_window_outside_extent(ino, disk_bytenr, 0, disk_len)?;
                     return Ok(Piece::Compressed {
                         logical: disk_bytenr,
                         disk_len,
@@ -1529,6 +1575,16 @@ impl Filesystem {
                         algo,
                     });
                 }
+                // THE WINDOW IS INSIDE THE EXTENT THE EXTENT TREE RECORDS
+                // (#188). The check above bounds it by `ram_bytes`, which
+                // is a field of this same item, so an item that raises both
+                // passes — and a read then answered with whatever occupies
+                // the addresses past the extent: another file's data, or a
+                // tree block, with no error to tell a caller. The write
+                // path has checked against the extent tree since #156; the
+                // length there is the extent's own record, from a tree this
+                // item cannot forge.
+                self.refuse_window_outside_extent(ino, disk_bytenr, offset, num_bytes)?;
                 Ok(Piece::Regular {
                     // Both halves are raw le64s. In release, where this
                     // crate ships with overflow-checks off, the sum
