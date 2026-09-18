@@ -37,10 +37,13 @@
 # `name:` values, not the job ids, and the matrix leg is spelled
 # `test-ubuntu-latest` (this workflow interpolates the os into the name
 # itself, so there is no `test / ubuntu-latest` job-matrix spelling here).
-# Verified against both main's check-runs and the latest pull_request
-# check-suite on 2026-09-17: run 35242813679 on 28f8ee6 produced exactly these
-# two, both success, and check-suite 95446651348 (PR branch
-# feat/62-cross-subvolume) produced the same two and nothing else.
+# ONE NAME, AND IT IS THE AGGREGATE. `ci-ok` needs every other job in
+# ci.yml and fails unless each concluded success, so a job renamed, split
+# into a matrix leg or added is gated the moment it is in the workflow --
+# without anyone editing this file. Naming the jobs here instead is what
+# left new work required by nobody in five repositories (#197), and
+# tests/ci_aggregate_gate.rs is what keeps the aggregate honest: it fails
+# if a job is missing from ci-ok's needs, if ci-ok loses `if: always()`,
+# or if this list names anything else (#187).
 [checks]
-	required = test-ubuntu-latest
-	required = validate against kernel btrfs driver
+	required = ci-ok
