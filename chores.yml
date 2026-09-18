@@ -89,21 +89,24 @@ chore_min_version: 0.10.0
 #   on this arm64 KVM host:
 #
 #     tier      measured          budget            headroom, and why
-#     unit        305 /  15,922      400 /  21,000   ~30%: tests get added
-#     images      584 /  27,780      760 /  36,000   ~30%
-#     oracle    1,204 /  74,318    1,560 /  97,000   ~30%. --show-output is
+#     unit        352 /  23,372      460 /  30,000   ~30%: tests get added
+#     images    PROVISIONAL        1,200 /  70,000   see below
+#     oracle      382 /  18,372      500 /  24,000   ~30%. --show-output is
 #                                                    most of it, and it is
 #                                                    the evidence, so it
 #                                                    stays -- in the log
-#     kernel      118 /   7,104      160 /  10,000   ~35%: few tests, so
-#                                                    one more is a big step
-#     suite     1,498 /  71,430    1,950 /  93,000   ~30%
-#     scripts      41 /   2,118       70 /   4,000   ~70%: three tests
-#     vm        2,200 / 104,000    2,860 / 136,000   ~30%. Measured in CI
-#                                                    (suite-in-vm), which is
-#                                                    a FIRST run: the guest
-#                                                    build's per-crate lines
-#                                                    are already in it
+#     kernel    PROVISIONAL          160 /  12,000   see below
+#     suite     PROVISIONAL        2,600 / 150,000   see below
+#     scripts      53 /   2,418       70 /   4,000   ~70%: three tests
+#     vm        PROVISIONAL        3,400 / 200,000   see below
+#
+#   PROVISIONAL means the number was not measured on this host and is set
+#   wide on purpose. A budget above what a tier prints still fails the
+#   run that starts printing thousands of lines, which is the failure it
+#   is for; what it does not do is fail the FIRST honest run, and a guard
+#   that goes red before anyone has seen the real figure teaches people
+#   to raise it without looking. Each is replaced by a measured number
+#   and its headroom the first time the tier is run to completion here.
 #
 #   Raise one DELIBERATELY when a tier grows, the way the executed-test
 #   floors are raised. A budget nobody can breach measures nothing, and
@@ -291,7 +294,7 @@ tasks:
     # rather than listed here. CI runs this job with no fixtures present,
     # which is what proves the split.
     cmds:
-      - 'EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 400 21000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
+      - 'EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 460 30000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
 
   test:images:
     desc: 'The tests that read a fixture but need no VM — what a host without KVM can still run'
@@ -301,7 +304,7 @@ tasks:
     # rather than skipped inside the tests, so what does not run there is
     # visible in the workflow rather than hidden in a green log.
     cmds:
-      - 'scripts/tier.sh test:images images 760 36000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh images)'
+      - 'scripts/tier.sh test:images images 1200 70000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh images)'
 
   test:oracle:
     desc: 'The driver writes, btrfs-progs reads back — every tool call made inside the harness VM'
@@ -321,7 +324,7 @@ tasks:
     cmds:
       - scripts/tools.sh --check
       - test-disks/build-fixtures.sh --check
-      - 'scripts/tier.sh test:oracle oracle 1560 97000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
+      - 'scripts/tier.sh test:oracle oracle 500 24000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
 
   test:kernel:
     desc: 'The driver writes, THE KERNEL reads back: our images loop-mounted by Linux in the guest'
@@ -334,7 +337,7 @@ tasks:
     # not a pass.
     cmds:
       - test-disks/build-fixtures.sh --check
-      - 'scripts/tier.sh test:kernel kernel 160 10000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - 'scripts/tier.sh test:kernel kernel 160 12000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
@@ -378,7 +381,7 @@ tasks:
           guest_args="$guest_args $arg"
         done
         # shellcheck disable=SC2086  # the words are the point
-        scripts/tier.sh test:vm vm 2860 136000 -- \
+        scripts/tier.sh test:vm vm 3400 200000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
 
   test:
@@ -418,7 +421,7 @@ tasks:
       - test-disks/build-fixtures.sh --check
       - task: test:oracle
       - task: test:kernel
-      - 'scripts/tier.sh "test:native (whole suite, release)" suite 1950 93000 -- scripts/test.sh --locked --release'
+      - 'scripts/tier.sh "test:native (whole suite, release)" suite 2600 150000 -- scripts/test.sh --locked --release'
       - task: test:scripts
       # THE LAST LINE: one number across the tiers, and where the detail is.
       - scripts/test-verdict.sh unit oracle kernel suite
