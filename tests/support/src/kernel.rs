@@ -80,6 +80,17 @@ enum Mount {
 
 #[track_caller]
 fn run(image: &str, script: &str, mount: Mount) -> Output {
+    let _bracket = GUEST_MOUNT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    run_locked(image, script, mount, false)
+}
+
+/// [`run`] for a caller that already holds [`GUEST_MOUNT`].
+///
+/// `clear_log` empties the guest's ring buffer immediately before the
+/// mount, so what the probe reads afterwards is what THIS mount said and
+/// nothing older.
+#[track_caller]
+fn run_locked(image: &str, script: &str, mount: Mount, clear_log: bool) -> Output {
     session();
     assert!(
         std::path::Path::new(image).starts_with(repo()),
@@ -89,7 +100,7 @@ fn run(image: &str, script: &str, mount: Mount) -> Output {
     );
 
     let run = Run::new();
-    let guest = guest_script(image, script, mount, &run);
+    let guest = guest_script(image, script, mount, &run, clear_log);
     let out = guest_shell(&guest)
         .unwrap_or_else(|error| panic!("cannot run the kernel oracle in the guest: {error}"));
     let Some(code) = run.code() else {
@@ -122,8 +133,14 @@ fn run(image: &str, script: &str, mount: Mount) -> Output {
 /// Every step is checked, and the unmount happens on every path — a
 /// loop device left attached to an image the next test rewrites is a
 /// failure that lands somewhere else entirely.
-fn guest_script(image: &str, script: &str, mount: Mount, run: &Run) -> String {
+fn guest_script(image: &str, script: &str, mount: Mount, run: &Run, clear_log: bool) -> String {
     let options = if mount == Mount::ReadOnly { "ro" } else { "rw" };
+    // BEFORE the mount, not after it. The kernel does most of its
+    // complaining while mounting — "free space tree is invalid" is
+    // logged there and nowhere else — so a probe that cleared the buffer
+    // from inside its own script cleared the evidence it was about to go
+    // looking for, and reported whatever arrived late.
+    let clear = if clear_log { "dmesg -C" } else { "true" };
     let losetup = if mount == Mount::ReadOnly { "--read-only" } else { "" };
     let copy_back = if mount == Mount::ReadWrite {
         "cp --sparse=always \"$work/image\" $IMG"
@@ -144,6 +161,7 @@ cleanup() {{
     losetup -d "$loop" 2>/dev/null || true
 }}
 trap cleanup EXIT
+{clear}
 mount -t btrfs -o {options} "$loop" "$mnt"
 status=0
 MNT="$mnt" IMG="$IMG" bash -euo pipefail -c {script} > {stdout} 2> {stderr} || status=$?
@@ -157,6 +175,7 @@ if [ "$status" = 0 ]; then
 fi
 printf %s "$status" > {status}
 rm -rf "$work""#,
+        clear = clear,
         dir = guest_quote(&run.dir.to_string_lossy()),
         image = guest_quote(image),
         script = guest_quote(script),
@@ -262,15 +281,27 @@ pub struct KernelProbe {
     pub complaints: Vec<String>,
 }
 
-/// Serialises the kernel-log bracket.
+/// One guest mount at a time, across every helper in this module.
 ///
-/// The ring buffer is one buffer for the whole guest, so two probes
-/// running at once would each clear the other's evidence and attribute
-/// the remainder to the wrong image. Test binaries run one at a time,
-/// so a lock inside the process is enough — and the alternative, telling
-/// every caller to pass `--test-threads=1`, is a rule nobody can see
-/// from the test that depends on it.
-static KERNEL_LOG: Mutex<()> = Mutex::new(());
+/// THE KERNEL LOG IS ONE BUFFER FOR THE WHOLE GUEST, and that makes a
+/// concurrent mount somebody else's evidence. It is not hypothetical:
+/// `tests/kernel_readback.rs` has two tests, and libtest ran them at
+/// once. One mounts every fixture and fails if the kernel says anything
+/// above info level; the other mounts an image THIS CRATE wrote, with
+/// the free space tree deliberately marked invalid — so the kernel says
+/// "free space tree is invalid", correctly, and the first test read it
+/// out of the buffer and blamed whichever fixture it was on. Which
+/// fixture that was depended on timing, so the suite failed on a
+/// different image each run and passed outright when the two tests
+/// happened not to overlap.
+///
+/// So every mount this module makes holds this lock for as long as it
+/// needs the buffer — the probe keeps it across the mount AND the
+/// reading afterwards. Test binaries run one at a time, so a lock inside
+/// the process is enough; the alternative, telling every caller to pass
+/// `--test-threads=1`, is a rule nobody can see from the test that
+/// depends on it.
+static GUEST_MOUNT: Mutex<()> = Mutex::new(());
 
 /// MOUNT THE IMAGE READ-WRITE, WRITE A FILE, READ IT BACK, and report
 /// what the kernel said about it while doing so.
@@ -291,18 +322,18 @@ static KERNEL_LOG: Mutex<()> = Mutex::new(());
 /// report.
 #[track_caller]
 pub fn guest_kernel_probe(image: &str, payload: &str) -> KernelProbe {
-    let _bracket = KERNEL_LOG.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _bracket = GUEST_MOUNT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let script = format!(
-        "dmesg -C\n\
-         printf %s {payload} > \"$MNT/probe.txt\"\n\
+        "printf %s {payload} > \"$MNT/probe.txt\"\n\
          sync\n\
          printf 'readback\\t%s\\n' \"$(cat \"$MNT/probe.txt\")\"",
         payload = guest_quote(payload)
     );
-    // The complaints have to be read AFTER the unmount, which happens
-    // outside the script above, so this is a second call — still inside
-    // the lock, so nothing else has touched the buffer in between.
-    let out = run(image, &script, Mount::Scratch);
+    // The buffer is cleared by the wrapper, immediately before the
+    // mount. The complaints are read AFTER the unmount, which happens
+    // outside the script, so that is a second call — still inside the
+    // lock, so nothing else has mounted anything in between.
+    let out = run_locked(image, &script, Mount::Scratch, true);
     assert!(
         out.status.success(),
         "the in-kernel btrfs driver REFUSED {image} ({:?}):\n{}{}",
