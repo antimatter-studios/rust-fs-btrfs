@@ -50,7 +50,7 @@ use fs_btrfs::btree::{Tree, TreeBlock, TreeGeometry, HEADER_SIZE, ITEM_SIZE};
 use fs_btrfs::chunk::{key_type, objectid, Chunk, ChunkMap, DiskKey};
 use fs_btrfs::superblock::{Superblock, SUPER_INFO_OFFSET};
 use fs_btrfs::{Error, Result};
-use fs_btrfs_test_support::{fixtures_matching, spans_several_devices};
+use fs_btrfs_test_support::{fixtures_matching, spans_several_devices, Image};
 use std::path::{Path, PathBuf};
 
 /// `BTRFS_ROOT_ITEM_KEY`. `chunk::key_type` names only the two types the
@@ -92,18 +92,23 @@ fn fixtures() -> Vec<(String, PathBuf)> {
     out
 }
 
-/// Read an image and parse its primary superblock.
-fn open(img: &Path, label: &str) -> (Vec<u8>, Superblock) {
-    let bytes = std::fs::read(img).expect("read image");
-    let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
+/// Open an image and parse its primary superblock.
+///
+/// The image is read a window at a time (see [`Image`]) rather than
+/// loaded whole: the populated fixtures are 2 GiB each, and four test
+/// threads holding one apiece is more memory than the harness guest has.
+fn open(img: &Path, label: &str) -> (Image, Superblock) {
+    let image = Image::open(img);
+    let head = image.read_at(SUPER_INFO_OFFSET, 4096);
+    let sb = Superblock::parse_at(&head, SUPER_INFO_OFFSET)
         .unwrap_or_else(|e| panic!("{label}: failed to parse a real superblock: {e}"));
-    (bytes, sb)
+    (image, sb)
 }
 
 /// Translate a logical address through `map` and copy the bytes out of
 /// the flat image. Every fixture is single-device, so the mapping's
 /// `devid` always names the one device the image is.
-fn read_from(bytes: &[u8], map: &ChunkMap, logical: u64, buf: &mut [u8]) -> Result<()> {
+fn read_from(image: &Image, map: &ChunkMap, logical: u64, buf: &mut [u8]) -> Result<()> {
     let m = map.map(logical)?;
     if m.len < buf.len() as u64 {
         return Err(Error::Io(format!(
@@ -112,22 +117,21 @@ fn read_from(bytes: &[u8], map: &ChunkMap, logical: u64, buf: &mut [u8]) -> Resu
             buf.len()
         )));
     }
-    let start = m.physical as usize;
-    let end = start + buf.len();
-    if end > bytes.len() {
+    if !image.try_read_at(m.physical, buf) {
         return Err(Error::Io(format!(
-            "physical {start}..{end} is past the {}-byte image",
-            bytes.len()
+            "physical {}..{} is past the {}-byte image",
+            m.physical,
+            m.physical + buf.len() as u64,
+            image.len()
         )));
     }
-    buf.copy_from_slice(&bytes[start..end]);
     Ok(())
 }
 
 /// Read one tree block through `map` and verify it.
-fn block_at(bytes: &[u8], map: &ChunkMap, sb: &Superblock, logical: u64) -> Result<TreeBlock> {
+fn block_at(image: &Image, map: &ChunkMap, sb: &Superblock, logical: u64) -> Result<TreeBlock> {
     let mut buf = vec![0u8; sb.nodesize as usize];
-    read_from(bytes, map, logical, &mut buf)?;
+    read_from(image, map, logical, &mut buf)?;
     TreeBlock::parse(buf, logical, &TreeGeometry::from_superblock(sb))
 }
 
@@ -178,11 +182,11 @@ fn check_header(block: &TreeBlock, logical: u64, owner: u64, sb: &Superblock, la
 /// reachable.
 ///
 /// Returns the extended map and the chunk items the walk found.
-fn full_map(bytes: &[u8], sb: &Superblock, label: &str) -> (ChunkMap, Vec<(DiskKey, Vec<u8>)>) {
+fn full_map(image: &Image, sb: &Superblock, label: &str) -> (ChunkMap, Vec<(DiskKey, Vec<u8>)>) {
     let boot = ChunkMap::bootstrap(sb)
         .unwrap_or_else(|e| panic!("{label}: chunk bootstrap failed on real media: {e}"));
 
-    let read = |logical: u64, buf: &mut [u8]| read_from(bytes, &boot, logical, buf);
+    let read = |logical: u64, buf: &mut [u8]| read_from(image, &boot, logical, buf);
     let tree = Tree::from_superblock(sb, &read);
 
     let mut found = Vec::new();
@@ -230,14 +234,14 @@ fn full_map(bytes: &[u8], sb: &Superblock, label: &str) -> (ChunkMap, Vec<(DiskK
 fn chunk_tree_root_block_verifies_on_real_media() {
     let fixtures = fixtures();
     for (label, img) in &fixtures {
-        let (bytes, sb) = open(img, label);
+        let (image, sb) = open(img, label);
         let map = ChunkMap::bootstrap(&sb)
             .unwrap_or_else(|e| panic!("{label}: chunk bootstrap failed: {e}"));
 
         // Parsing at all means the checksum verified and both identity
         // fields agreed — on a block written by mkfs.btrfs, with
         // whichever of the four hash algorithms this fixture uses.
-        let block = block_at(&bytes, &map, &sb, sb.chunk_root)
+        let block = block_at(&image, &map, &sb, sb.chunk_root)
             .unwrap_or_else(|e| panic!("{label}: chunk tree root did not verify: {e}"));
 
         check_header(&block, sb.chunk_root, objectid::CHUNK_TREE, &sb, label);
@@ -267,7 +271,7 @@ fn walking_the_chunk_tree_makes_the_root_tree_reachable() {
     let fixtures = fixtures();
     let mut tallest = 0u8;
     for (label, img) in &fixtures {
-        let (bytes, sb) = open(img, label);
+        let (image, sb) = open(img, label);
 
         // Before the walk, the root tree is out of reach: it lives in a
         // METADATA chunk, and the bootstrap array describes only SYSTEM
@@ -280,7 +284,7 @@ fn walking_the_chunk_tree_makes_the_root_tree_reachable() {
              walking the chunk tree is no longer what makes it reachable"
         );
 
-        let (map, chunk_items) = full_map(&bytes, &sb, label);
+        let (map, chunk_items) = full_map(&image, &sb, label);
         tallest = tallest.max(sb.chunk_root_level).max(sb.root_level);
         assert!(
             !chunk_items.is_empty(),
@@ -291,7 +295,7 @@ fn walking_the_chunk_tree_makes_the_root_tree_reachable() {
             "{label}: the walk added no chunks to the bootstrap map"
         );
 
-        let block = block_at(&bytes, &map, &sb, sb.root)
+        let block = block_at(&image, &map, &sb, sb.root)
             .unwrap_or_else(|e| panic!("{label}: root tree block did not verify: {e}"));
         check_header(&block, sb.root, objectid::ROOT_TREE, &sb, label);
         assert_eq!(
@@ -324,9 +328,9 @@ fn walking_the_chunk_tree_makes_the_root_tree_reachable() {
 fn searching_finds_the_same_items_the_walk_found() {
     let fixtures = fixtures();
     for (label, img) in &fixtures {
-        let (bytes, sb) = open(img, label);
+        let (image, sb) = open(img, label);
         let boot = ChunkMap::bootstrap(&sb).unwrap();
-        let read = |logical: u64, buf: &mut [u8]| read_from(&bytes, &boot, logical, buf);
+        let read = |logical: u64, buf: &mut [u8]| read_from(&image, &boot, logical, buf);
         let tree = Tree::from_superblock(&sb, &read);
 
         // Sequential iteration and keyed descent are two different code
@@ -409,9 +413,9 @@ fn searching_finds_the_same_items_the_walk_found() {
 fn the_root_tree_names_the_top_level_file_tree() {
     let fixtures = fixtures();
     for (label, img) in &fixtures {
-        let (bytes, sb) = open(img, label);
-        let (map, _) = full_map(&bytes, &sb, label);
-        let read = |logical: u64, buf: &mut [u8]| read_from(&bytes, &map, logical, buf);
+        let (image, sb) = open(img, label);
+        let (map, _) = full_map(&image, &sb, label);
+        let read = |logical: u64, buf: &mut [u8]| read_from(&image, &map, logical, buf);
         let tree = Tree::from_superblock(&sb, &read);
 
         // Every Btrfs volume has a root item for the top-level file tree

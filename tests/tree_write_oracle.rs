@@ -26,7 +26,7 @@ use fs_btrfs::superblock::Superblock;
 use fs_btrfs::tree_write::{
     build_leaf, chunk_tree_uuid_of, stamp_checksum, BlockIdentity, LeafItem,
 };
-use fs_btrfs_test_support::{fixture, fixtures_matching, le32, le64, spans_several_devices};
+use fs_btrfs_test_support::{fixture, fixtures_matching, le32, le64, spans_several_devices, Image};
 use fs_core::FileDevice;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -103,13 +103,16 @@ fn leaves(img: &Path) -> (Superblock, Vec<Vec<u8>>) {
     // Read directly: any block whose header says it is a
     // leaf of this filesystem is a candidate, and scanning is how they
     // are found without a second walker.
-    let bytes =
-        std::fs::read(img).unwrap_or_else(|error| panic!("reading {}: {error}", img.display()));
+    //
+    // A BLOCK AT A TIME, not the whole image: these fixtures are up to
+    // 2 GiB and only the tree blocks are wanted. See `Image`.
+    let image = Image::open(img);
     let nodesize = sb.nodesize as usize;
-    let mut at = 0usize;
-    while at + nodesize <= bytes.len() {
-        let block = &bytes[at..at + nodesize];
-        at += nodesize;
+    let mut block = vec![0u8; nodesize];
+    let mut at = 0u64;
+    while image.try_read_at(at, &mut block) {
+        let block = &block[..];
+        at += nodesize as u64;
 
         // A leaf of this filesystem: right UUID, level zero, a plausible
         // item count, and a checksum that verifies. The checksum is what

@@ -26,7 +26,7 @@
 //! here naming the task that builds it.
 
 use fs_btrfs::superblock::{Superblock, SUPER_INFO_OFFSET};
-use fs_btrfs_test_support::fixtures_matching;
+use fs_btrfs_test_support::{fixtures_matching, Image};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -153,12 +153,12 @@ fn superblock_agrees_with_the_dump_super_report() {
 
     let mut total = 0usize;
     for (label, img, dump_path) in &fixtures {
-        let bytes = std::fs::read(img).expect("read image");
         // The primary superblock lives at 64 KiB, not at offset 0.
         // parse_at additionally requires the copy to agree it belongs
         // there, which catches a stale-but-intact superblock left by an
         // earlier filesystem at a different mirror offset.
-        let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
+        let head = Image::open(img).read_at(SUPER_INFO_OFFSET, 4096);
+        let sb = Superblock::parse_at(&head, SUPER_INFO_OFFSET)
             .unwrap_or_else(|e| panic!("{label}: failed to parse a real filesystem: {e}"));
         let d = Dump::parse(&std::fs::read_to_string(dump_path).expect("read superdump"));
         assert!(!d.nums.is_empty(), "{label}: superdump held no fields");
@@ -294,10 +294,10 @@ fn every_checksum_algorithm_verifies_on_real_media() {
     let fixtures = fixtures();
     let mut seen = Vec::new();
     for (label, img, dump_path) in &fixtures {
-        let bytes = std::fs::read(img).expect("read image");
         // Parsing succeeding IS the checksum check: the parser verifies
         // the superblock checksum and refuses a mismatch.
-        let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
+        let head = Image::open(img).read_at(SUPER_INFO_OFFSET, 4096);
+        let sb = Superblock::parse_at(&head, SUPER_INFO_OFFSET)
             .unwrap_or_else(|e| panic!("{label}: checksum verification failed: {e}"));
         let d = Dump::parse(&std::fs::read_to_string(dump_path).unwrap());
         if let Some(theirs) = d.nums.get("csum_type") {
@@ -331,9 +331,9 @@ fn every_checksum_algorithm_verifies_on_real_media() {
 fn chunk_bootstrap_maps_chunk_root_on_real_media() {
     let fixtures = fixtures();
     for (label, img, _) in &fixtures {
-        let bytes = std::fs::read(img).expect("read image");
-        let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
-            .expect("parse superblock");
+        let image = Image::open(img);
+        let head = image.read_at(SUPER_INFO_OFFSET, 4096);
+        let sb = Superblock::parse_at(&head, SUPER_INFO_OFFSET).expect("parse superblock");
         let map = fs_btrfs::chunk::ChunkMap::bootstrap(&sb)
             .unwrap_or_else(|e| panic!("{label}: chunk bootstrap failed on real media: {e}"));
 
@@ -351,13 +351,12 @@ fn chunk_bootstrap_maps_chunk_root_on_real_media() {
         // The block the mapping lands on must actually be a node header
         // carrying this filesystem's identity. A mapping that is merely
         // in range proves nothing.
-        let start = phys as usize;
-        let end = start + sb.nodesize as usize;
+        let mut node = vec![0u8; sb.nodesize as usize];
         assert!(
-            end <= bytes.len(),
+            image.try_read_at(phys, &mut node),
             "{label}: chunk_root node is off the end"
         );
-        let node_fsid = &bytes[start + 32..start + 48];
+        let node_fsid = &node[32..48];
         assert_eq!(
             node_fsid,
             &sb.fsid[..],

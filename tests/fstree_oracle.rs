@@ -28,7 +28,21 @@
 use fs_btrfs::btree::{Tree, TreeGeometry};
 use fs_btrfs::chunk::{ChunkMap, DiskKey};
 use fs_btrfs::superblock::{Superblock, SUPER_INFO_OFFSET};
-use fs_btrfs_test_support::{fixtures_matching, spans_several_devices};
+use fs_btrfs_test_support::{fixtures_matching, spans_several_devices, Image};
+
+/// One window of the image, as the tree reader wants it: an error rather
+/// than a panic, because a chunk map that points past the end of the
+/// device is exactly what these oracles are here to catch.
+fn read_window(image: &Image, physical: u64, buf: &mut [u8]) -> fs_btrfs::Result<()> {
+    if image.try_read_at(physical, buf) {
+        return Ok(());
+    }
+    Err(fs_btrfs::Error::Io(format!(
+        "physical {physical}..{} is past the {}-byte image",
+        physical + buf.len() as u64,
+        image.len()
+    )))
+}
 use std::path::PathBuf;
 
 /// `BTRFS_FS_TREE_OBJECTID` — the subvolume holding the default
@@ -83,7 +97,7 @@ fn deep_fixtures() -> Vec<(String, PathBuf)> {
 
 /// Complete the address map by walking the chunk tree, then locate the
 /// fs tree root and its level.
-fn fs_tree_root(bytes: &[u8], sb: &Superblock, label: &str) -> Option<(ChunkMap, u64, u8)> {
+fn fs_tree_root(image: &Image, sb: &Superblock, label: &str) -> Option<(ChunkMap, u64, u8)> {
     let boot =
         ChunkMap::bootstrap(sb).unwrap_or_else(|e| panic!("{label}: chunk bootstrap failed: {e}"));
 
@@ -91,9 +105,7 @@ fn fs_tree_root(bytes: &[u8], sb: &Superblock, label: &str) -> Option<(ChunkMap,
     // chunk tree holds into a complete map.
     let read = |logical: u64, buf: &mut [u8]| -> fs_btrfs::Result<()> {
         let m = boot.map(logical)?;
-        let start = m.physical as usize;
-        buf.copy_from_slice(&bytes[start..start + buf.len()]);
-        Ok(())
+        read_window(image, m.physical, buf)
     };
     let mut map = boot.clone();
     let tree = Tree::from_superblock(sb, &read);
@@ -108,9 +120,7 @@ fn fs_tree_root(bytes: &[u8], sb: &Superblock, label: &str) -> Option<(ChunkMap,
     // Now the root tree is reachable. Find the fs tree's ROOT_ITEM.
     let read_full = |logical: u64, buf: &mut [u8]| -> fs_btrfs::Result<()> {
         let m = map.map(logical)?;
-        let start = m.physical as usize;
-        buf.copy_from_slice(&bytes[start..start + buf.len()]);
-        Ok(())
+        read_window(image, m.physical, buf)
     };
     let root_tree = Tree::from_superblock(sb, &read_full);
 
@@ -143,18 +153,16 @@ fn fs_tree_root(bytes: &[u8], sb: &Superblock, label: &str) -> Option<(ChunkMap,
 fn fs_tree_is_reachable_and_walkable() {
     let mut deepest = 0u8;
     for (label, img) in &fixtures() {
-        let bytes = std::fs::read(img).expect("read image");
-        let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
-            .expect("parse superblock");
-        let Some((map, root, level)) = fs_tree_root(&bytes, &sb, label) else {
+        let image = Image::open(img);
+        let head = image.read_at(SUPER_INFO_OFFSET, 4096);
+        let sb = Superblock::parse_at(&head, SUPER_INFO_OFFSET).expect("parse superblock");
+        let Some((map, root, level)) = fs_tree_root(&image, &sb, label) else {
             panic!("{label}: no ROOT_ITEM for the fs tree — the root tree walk is wrong");
         };
 
         let read = |logical: u64, buf: &mut [u8]| -> fs_btrfs::Result<()> {
             let m = map.map(logical)?;
-            let start = m.physical as usize;
-            buf.copy_from_slice(&bytes[start..start + buf.len()]);
-            Ok(())
+            read_window(&image, m.physical, buf)
         };
         let tree = Tree::new(TreeGeometry::from_superblock(&sb), &read);
 
@@ -207,10 +215,10 @@ fn fs_tree_is_reachable_and_walkable() {
 #[test]
 fn keyed_search_agrees_with_the_walk_on_a_multi_level_tree() {
     for (label, img) in &deep_fixtures() {
-        let bytes = std::fs::read(img).expect("read image");
-        let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
-            .expect("parse superblock");
-        let (map, root, level) = fs_tree_root(&bytes, &sb, label).expect("fs tree root");
+        let image = Image::open(img);
+        let head = image.read_at(SUPER_INFO_OFFSET, 4096);
+        let sb = Superblock::parse_at(&head, SUPER_INFO_OFFSET).expect("parse superblock");
+        let (map, root, level) = fs_tree_root(&image, &sb, label).expect("fs tree root");
         assert!(
             level > 0,
             "{label} is meant to be a multi-level fixture but its fs tree is level {level}"
@@ -218,9 +226,7 @@ fn keyed_search_agrees_with_the_walk_on_a_multi_level_tree() {
 
         let read = |logical: u64, buf: &mut [u8]| -> fs_btrfs::Result<()> {
             let m = map.map(logical)?;
-            let start = m.physical as usize;
-            buf.copy_from_slice(&bytes[start..start + buf.len()]);
-            Ok(())
+            read_window(&image, m.physical, buf)
         };
         let tree = Tree::new(TreeGeometry::from_superblock(&sb), &read);
 

@@ -28,7 +28,7 @@
 
 use fs_btrfs::chunk::objectid;
 use fs_btrfs::fs::Filesystem;
-use fs_btrfs_test_support::fixture;
+use fs_btrfs_test_support::{fixture, Image};
 use fs_core::FileDevice;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -134,14 +134,16 @@ fn the_plan_touches_no_tree_the_kernel_left_alone() {
         // Which trees the kernel rewrote: any block in the after image
         // newer than the before image belongs to one.
         let old_gen = before.superblock().generation;
-        let image = std::fs::read(&path).expect("reading the after image");
+        // A block at a time rather than the whole image: see `Image`.
+        let image = Image::open(&path);
         let sb = after.superblock();
         let n = sb.nodesize as usize;
         let mut kernel: BTreeSet<u64> = BTreeSet::new();
-        let mut at = 0usize;
-        while at + n <= image.len() {
-            let b = &image[at..at + n];
-            at += n;
+        let mut buf = vec![0u8; n];
+        let mut at = 0u64;
+        while image.try_read_at(at, &mut buf) {
+            let b = &buf[..];
+            at += n as u64;
             if b[0x20..0x30] != sb.fsid[..] {
                 continue;
             }

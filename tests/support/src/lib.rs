@@ -299,12 +299,100 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// point is to decide whether to involve the parser at all.
 pub fn spans_several_devices(image: &Path) -> bool {
     /// `num_devices`, at 0x88 within the superblock at 64 KiB.
-    const NUM_DEVICES: usize = 0x1_0000 + 0x88;
-    fs::read(image)
-        .ok()
-        .filter(|b| b.len() >= NUM_DEVICES + 8)
-        .map(|b| u64::from_le_bytes(b[NUM_DEVICES..NUM_DEVICES + 8].try_into().unwrap()))
-        .is_some_and(|devices| devices > 1)
+    const NUM_DEVICES: u64 = 0x1_0000 + 0x88;
+    let mut field = [0u8; 8];
+    Image::open(image).try_read_at(NUM_DEVICES, &mut field) && u64::from_le_bytes(field) > 1
+}
+
+/// A fixture image, read a window at a time rather than loaded whole.
+///
+/// EIGHT BYTES SHOULD NOT COST TWO GIGABYTES, and until this existed
+/// they did. Every suite that walks the fixtures used `std::fs::read`,
+/// which allocates the file's whole apparent length: the two populated
+/// images are 2 GiB of mostly hole, so reading one to look at a 16 KiB
+/// tree block was 2 GiB of zeroes in memory and 2 GiB off the disk.
+///
+/// That is a waste on a workstation and a wall in the harness guest,
+/// which has 4 GiB. `cargo test` runs one test binary at a time but four
+/// threads inside it, and four threads each holding one of those images
+/// is eight gigabytes: the guest's kernel killed `btree_oracle` outright
+/// (SIGKILL), so `chore test:vm` — the whole macOS path — could not get
+/// past the fourth suite. Reading windows instead keeps a walker's
+/// resident set at one tree block, and takes the 9p traffic with it.
+///
+/// Not memory-mapped, deliberately: in the guest these images are on a
+/// 9p mount, where mmap is at the mercy of the cache mode, and the
+/// failure would be a SIGBUS in the one place this most needs to work.
+pub struct Image {
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl Image {
+    /// Open `path` for reading, or panic naming it and the task that
+    /// builds it. Fixtures never skip.
+    #[track_caller]
+    pub fn open(path: &Path) -> Self {
+        let file = fs::File::open(path).unwrap_or_else(|error| {
+            panic!(
+                "cannot open {}: {error}. The fixtures are built by `chore fixtures`.",
+                path.display()
+            )
+        });
+        Image {
+            file,
+            path: path.to_path_buf(),
+        }
+    }
+
+    /// The image's length in bytes.
+    #[track_caller]
+    pub fn len(&self) -> u64 {
+        self.file
+            .metadata()
+            .unwrap_or_else(|error| panic!("cannot stat {}: {error}", self.path.display()))
+            .len()
+    }
+
+    /// Whether the image is empty — there to satisfy clippy beside
+    /// [`Image::len`], and true only of a fixture that failed to build.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Fill `buf` from `offset`, or `false` if the image does not reach
+    /// that far. A short read inside the image is an error, not a
+    /// `false`: the file is a fixed-size disk image, so a window that
+    /// starts inside it and ends inside it is always there.
+    #[track_caller]
+    pub fn try_read_at(&self, offset: u64, buf: &mut [u8]) -> bool {
+        use std::os::unix::fs::FileExt;
+        if offset.saturating_add(buf.len() as u64) > self.len() {
+            return false;
+        }
+        self.file.read_exact_at(buf, offset).unwrap_or_else(|error| {
+            panic!(
+                "cannot read {} bytes at {offset} of {}: {error}",
+                buf.len(),
+                self.path.display()
+            )
+        });
+        true
+    }
+
+    /// `len` bytes at `offset`, or a panic naming the image: a window
+    /// past the end of a fixture is a broken test, not a case to handle.
+    #[track_caller]
+    pub fn read_at(&self, offset: u64, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        assert!(
+            self.try_read_at(offset, &mut buf),
+            "{}: {len} bytes at {offset} run past the {}-byte image",
+            self.path.display(),
+            self.len()
+        );
+        buf
+    }
 }
 
 /// Little-endian `u32` at `at`.

@@ -22,7 +22,7 @@ use fs_btrfs::chunk::DiskKey;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::superblock::Superblock;
 use fs_btrfs::tree_write::{build_node, chunk_tree_uuid_of, key_ptr_capacity, BlockIdentity};
-use fs_btrfs_test_support::{fixture, fixtures_matching, le32, le64, spans_several_devices};
+use fs_btrfs_test_support::{fixture, fixtures_matching, le32, le64, spans_several_devices, Image};
 use fs_core::FileDevice;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -88,13 +88,16 @@ fn ptrs_of(block: &[u8]) -> Vec<KeyPtr> {
 fn nodes(img: &Path) -> (Superblock, Vec<Vec<u8>>) {
     let sb = superblock(img);
 
-    let bytes = std::fs::read(img).unwrap_or_else(|e| panic!("reading {}: {e}", img.display()));
+    // A BLOCK AT A TIME, not the whole image: these fixtures are up to
+    // 2 GiB and only the tree blocks are wanted. See `Image`.
+    let image = Image::open(img);
     let nodesize = sb.nodesize as usize;
     let mut blocks = Vec::new();
-    let mut at = 0usize;
-    while at + nodesize <= bytes.len() {
-        let block = &bytes[at..at + nodesize];
-        at += nodesize;
+    let mut buf = vec![0u8; nodesize];
+    let mut at = 0u64;
+    while image.try_read_at(at, &mut buf) {
+        let block = &buf[..];
+        at += nodesize as u64;
 
         // A node of this filesystem: right UUID, level above zero, an
         // item count that fits, and a checksum that verifies.
@@ -246,13 +249,14 @@ fn every_node_re_encodes_identically() {
 /// freed in one transaction and handed out again in a later one leaves
 /// the older block on disk as well; the live one is the later
 /// generation, and the stale one is not part of any tree.
-fn blocks_by_bytenr(bytes: &[u8], sb: &Superblock) -> HashMap<u64, Vec<u8>> {
+fn blocks_by_bytenr(image: &Image, sb: &Superblock) -> HashMap<u64, Vec<u8>> {
     let nodesize = sb.nodesize as usize;
     let mut index: HashMap<u64, Vec<u8>> = HashMap::new();
-    let mut at = 0usize;
-    while at + nodesize <= bytes.len() {
-        let block = &bytes[at..at + nodesize];
-        at += nodesize;
+    let mut buf = vec![0u8; nodesize];
+    let mut at = 0u64;
+    while image.try_read_at(at, &mut buf) {
+        let block = &buf[..];
+        at += nodesize as u64;
         if block[o::FSID..o::FSID + 16] != sb.fsid[..] {
             continue;
         }
@@ -366,8 +370,7 @@ fn each_pointer_key_is_the_first_key_of_the_child_it_names() {
     let images = images();
     for img in &images {
         let sb = superblock(img);
-        let bytes = std::fs::read(img).unwrap_or_else(|e| panic!("reading {}: {e}", img.display()));
-        let index = blocks_by_bytenr(&bytes, &sb);
+        let index = blocks_by_bytenr(&Image::open(img), &sb);
         let nodes = live_nodes(&index, &sb);
         walked += nodes.len();
 

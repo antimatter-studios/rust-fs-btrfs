@@ -23,7 +23,7 @@ use fs_btrfs::fs::Filesystem;
 use fs_btrfs::leaf_edit::{delete, fits, insert, OwnedItem};
 use fs_btrfs::superblock::Superblock;
 use fs_btrfs::tree_write::{build_leaf, chunk_tree_uuid_of, BlockIdentity};
-use fs_btrfs_test_support::{fixture, fixtures_matching, le32, le64, spans_several_devices};
+use fs_btrfs_test_support::{fixture, fixtures_matching, le32, le64, spans_several_devices, Image};
 use fs_core::FileDevice;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -78,13 +78,16 @@ fn leaves(img: &Path) -> (Superblock, Vec<Vec<u8>>) {
     );
     let fs = Filesystem::mount(dev).unwrap_or_else(|e| panic!("mounting {}: {e}", img.display()));
     let sb = fs.superblock().clone();
-    let bytes = std::fs::read(img).unwrap_or_else(|e| panic!("reading {}: {e}", img.display()));
+    // A BLOCK AT A TIME, not the whole image: these fixtures are up to
+    // 2 GiB and only the tree blocks are wanted. See `Image`.
+    let image = Image::open(img);
     let n = sb.nodesize as usize;
     let mut out = Vec::new();
-    let mut at = 0usize;
-    while at + n <= bytes.len() {
-        let b = &bytes[at..at + n];
-        at += n;
+    let mut buf = vec![0u8; n];
+    let mut at = 0u64;
+    while image.try_read_at(at, &mut buf) {
+        let b = &buf[..];
+        at += n as u64;
         if b[o::FSID..o::FSID + 16] != sb.fsid[..] || b[o::LEVEL] != 0 {
             continue;
         }
