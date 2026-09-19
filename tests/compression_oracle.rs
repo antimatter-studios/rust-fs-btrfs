@@ -17,15 +17,17 @@
 //! hand-written test is likely to build — so the fixture deliberately
 //! includes one large enough to need several.
 //!
-//! Fixtures are gitignored, so this skips on a fresh clone. Generate
-//! them with `./scripts/build-compression-fixtures.sh` (Linux) or
-//! `./scripts/vm-build-fixtures.sh`. The CI job that builds them sets
-//! `BTRFS_ORACLE_FIXTURES=required`, and then a missing one fails (#69).
+//! The fixtures are gitignored and generated: `chore fixtures` builds
+//! them inside the fs-linux-test-harness VM, where the kernel's own
+//! compressors write them. Nothing here skips — a missing image fails
+//! the test that wanted it, naming the task that builds it, because a
+//! decoder suite that ran against no fixture reports `ok` exactly like
+//! one that decoded everything correctly.
 
 use fs_btrfs::Filesystem;
+use fs_btrfs_test_support::{fixture, sha256_hex};
 use fs_core::FileDevice;
-use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// One manifest line: what the kernel says a file holds.
@@ -35,33 +37,23 @@ struct Expected {
     sha256: String,
 }
 
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
-
-/// The per-algorithm fixtures present, as (algorithm, image, manifest).
+/// Every algorithm's fixture, as (algorithm, image, manifest).
 ///
-/// Under `BTRFS_ORACLE_FIXTURES=required` every algorithm's fixture must
-/// be there: the job that sets it built them, so one missing is a broken
-/// build, and skipping it would read as the decoder passing.
+/// Named one by one rather than walked as `btrfs-comp-*`, because the
+/// three decoders share no code: a run that found only zstd built would
+/// prove nothing about LZO and still be a full list. All three are
+/// required, and `fixture` is what enforces it.
 fn fixtures() -> Vec<(String, PathBuf, PathBuf)> {
-    let required = std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() == Ok("required");
-    let mut out = Vec::new();
-    for algo in ["zlib", "lzo", "zstd"] {
-        let img = share().join(format!("btrfs-comp-{algo}.img"));
-        let manifest = share().join(format!("btrfs-comp-{algo}.manifest"));
-        if img.exists() && manifest.exists() {
-            out.push((algo.to_string(), img, manifest));
-        } else {
-            assert!(
-                !required,
-                "BTRFS_ORACLE_FIXTURES=required, but {} or its manifest is not there. \
-                 The job that sets it runs scripts/build-compression-fixtures.sh first.",
-                img.display()
-            );
-        }
-    }
-    out
+    ["zlib", "lzo", "zstd"]
+        .into_iter()
+        .map(|algo| {
+            (
+                algo.to_string(),
+                fixture(&format!("btrfs-comp-{algo}.img")),
+                fixture(&format!("btrfs-comp-{algo}.manifest")),
+            )
+        })
+        .collect()
 }
 
 fn parse_manifest(text: &str) -> Vec<Expected> {
@@ -77,21 +69,11 @@ fn parse_manifest(text: &str) -> Vec<Expected> {
         .collect()
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Every file in every per-algorithm fixture must read back byte for
 /// byte, judged by the hash the kernel computed for it.
 #[test]
 fn compressed_files_match_what_the_kernel_wrote() {
     let fixtures = fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no btrfs-comp-* fixtures in .vm-share — skipping");
-        return;
-    }
 
     let mut checked = 0usize;
     for (algo, img, manifest_path) in &fixtures {
@@ -140,15 +122,11 @@ fn compressed_files_match_what_the_kernel_wrote() {
 #[test]
 fn each_fixture_really_uses_its_algorithm() {
     let fixtures = fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no btrfs-comp-* fixtures in .vm-share — skipping");
-        return;
-    }
     for (algo, img, _) in &fixtures {
         let record = img.with_extension("compression");
         let text = std::fs::read_to_string(&record).unwrap_or_else(|_| {
             panic!(
-                "{algo}: no {} — regenerate with ./scripts/build-compression-fixtures.sh",
+                "{algo}: no {} — rebuild the fixtures with `chore fixtures`",
                 record.display()
             )
         });
@@ -174,10 +152,6 @@ fn each_fixture_really_uses_its_algorithm() {
 #[test]
 fn the_large_fixture_spans_several_sectors() {
     let fixtures = fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no btrfs-comp-* fixtures in .vm-share — skipping");
-        return;
-    }
     for (algo, _, manifest_path) in &fixtures {
         let expected = parse_manifest(&std::fs::read_to_string(manifest_path).expect("manifest"));
         let big = expected

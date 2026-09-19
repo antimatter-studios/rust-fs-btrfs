@@ -9,8 +9,9 @@
 //! fixture makes one: `mkfs.btrfs --rootdir` of one 64 KiB file, the inode
 //! marked nodatacow and nodatasum (the only files this driver writes) and
 //! its extent item's type changed from regular to prealloc, in every copy
-//! of its fs-tree leaf, restamped. Skips without btrfs-progs, unless
-//! `BTRFS_ORACLE_FIXTURES=required`.
+//! of its fs-tree leaf, restamped. `mkfs.btrfs` runs in the harness VM,
+//! which is the one place the btrfs-progs tools live, so it is always
+//! there and nothing here skips.
 
 use fs_btrfs::btree::{header_offsets, HEADER_SIZE, ITEM_SIZE};
 use fs_btrfs::chunk::objectid;
@@ -18,8 +19,8 @@ use fs_btrfs::fs::Filesystem;
 use fs_btrfs::superblock::Superblock;
 use fs_btrfs::tree_write::stamp_checksum;
 use fs_btrfs::write::{INODE_NODATACOW, INODE_NODATASUM};
+use fs_btrfs_test_support::{le64, oracle, temp_path};
 use fs_core::{BlockDevice, BlockRead, FileDevice};
-use std::process::Command;
 use std::sync::Arc;
 
 const SUPERBLOCK: usize = 0x1_0000;
@@ -32,12 +33,13 @@ const EXTENT_PREALLOC: u8 = 2;
 const INODE_ITEM_KEY: u8 = 1;
 const EXTENT_DATA_KEY: u8 = 108;
 
-fn le64(b: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
-}
-
-fn image() -> Option<std::path::PathBuf> {
-    let dir = std::env::temp_dir().join(format!("btrfs-prealloc-{}", std::process::id()));
+/// One 64 KiB file, made into an image by `mkfs.btrfs --rootdir`.
+///
+/// The scratch tree lives inside this repository, because the guest that
+/// runs `mkfs.btrfs` sees this repository and nothing else of the host:
+/// an image under the host's `/tmp` is a path the tool cannot open.
+fn image() -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(temp_path!("prealloc"));
     let root = dir.join("root");
     std::fs::create_dir_all(&root).unwrap();
     let body: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
@@ -47,28 +49,17 @@ fn image() -> Option<std::path::PathBuf> {
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
-    let made = match Command::new("mkfs.btrfs")
-        .arg("-f")
-        .arg("--rootdir")
+    let made = oracle("mkfs.btrfs")
+        .args(["-f", "--rootdir"])
         .arg(&root)
         .arg(&img)
-        .output()
-    {
-        Ok(made) => made,
-        Err(e) => {
-            assert!(
-                std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() != Ok("required"),
-                "BTRFS_ORACLE_FIXTURES=required, but mkfs.btrfs is not runnable: {e}"
-            );
-            return None;
-        }
-    };
+        .output();
     assert!(
         made.status.success(),
         "{}",
         String::from_utf8_lossy(&made.stderr)
     );
-    Some(img)
+    img
 }
 
 /// Apply `edit(key_type, item_body)` to every item of `ino` in every copy
@@ -116,10 +107,7 @@ fn edit_items(img: &std::path::Path, ino: u64, edit: impl Fn(u8, &mut [u8])) -> 
 
 #[test]
 fn a_preallocated_extent_is_refused_as_preallocated() {
-    let Some(img) = image() else {
-        eprintln!("no mkfs.btrfs -- skipping");
-        return;
-    };
+    let img = image();
     let ino = Filesystem::mount(Arc::new(FileDevice::open(&img).unwrap()) as Arc<dyn BlockRead>)
         .unwrap()
         .lookup_path("/file.bin")

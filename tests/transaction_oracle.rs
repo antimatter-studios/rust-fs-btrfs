@@ -17,34 +17,30 @@
 //! free-space and dev trees, four blocks in and four out — and a `touch`
 //! costs that floor plus two fs-tree blocks.
 //!
-//! Fixtures are gitignored. Build them with
-//! `./scripts/vm-build-cow-fixtures.sh`.
+//! # Both geometries, every run
+//!
+//! The pairs exist twice: on a default `mkfs.btrfs`, and on a volume
+//! made with `--csum sha256 -d dup -m dup`, which is a wider checksum
+//! and a duplicated allocation profile. Which of the two was checked
+//! used to depend on `BTRFS_COW_SUFFIX` being set by the workflow that
+//! ran the suite, so the DUP geometry was covered only where somebody
+//! had remembered to ask for it. Both are required here and both are
+//! checked, and every failure says which one it came from.
+//!
+//! The fixtures are gitignored and built by `chore fixtures`.
 
 use fs_btrfs::btree::{header_offsets as o, HEADER_SIZE};
 use fs_btrfs::chunk::{key_type, DiskKey};
 use fs_btrfs::fs::Filesystem;
+use fs_btrfs_test_support::{fixture, le16, le64, temp_path};
 use fs_core::FileDevice;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-mod common;
-use common::{le16, le64};
-
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
-
-fn image(name: &str) -> Option<PathBuf> {
-    let p = share().join(name);
-    p.exists().then_some(p)
-}
-
-fn cow_image(name: &str) -> Option<PathBuf> {
-    let suffix = std::env::var("BTRFS_COW_SUFFIX").unwrap_or_default();
-    let stem = name.strip_suffix(".img").unwrap_or(name);
-    image(&format!("{stem}{suffix}.img"))
-}
+/// The two geometries the COW fixtures are built on: how a failure names
+/// one, and the suffix its images carry.
+const GEOMETRIES: [(&str, &str); 2] = [("default geometry", ""), ("sha256+dup", "-sha256-dup")];
 
 fn mount(p: &Path) -> Filesystem {
     let dev = Arc::new(FileDevice::open(p).expect("opening a fixture"));
@@ -108,26 +104,23 @@ fn present_blocks(fs: &Filesystem, path: &Path) -> BTreeSet<(u64, u64, u64)> {
 /// unmoved. Which is fair: there was nothing to write.
 ///
 /// So a pair with no transaction in it is not a failure, it is a pair
-/// with nothing to check. The tests below skip those and require that
-/// something, somewhere, did commit — otherwise a fixture builder that
-/// silently stopped producing transactions would read as a pass.
+/// with nothing to check. The test below passes over those AND requires
+/// that something, somewhere, did commit — otherwise a fixture builder
+/// that silently stopped producing transactions would read as a pass.
 fn committed(before: &Path, after: &Path) -> bool {
     mount(after).superblock().generation > mount(before).superblock().generation
 }
 
-fn pairs() -> Vec<(&'static str, PathBuf, PathBuf)> {
+/// Every pair, on every geometry: the empty commit and the one touch,
+/// each named so a failure says which volume it happened on.
+fn pairs() -> Vec<(String, PathBuf, PathBuf)> {
     let mut out = Vec::new();
-    if let (Some(b), Some(c)) = (
-        cow_image("btrfs-cow-before.img"),
-        cow_image("btrfs-cow-control.img"),
-    ) {
-        out.push(("an empty commit", b, c));
-    }
-    if let (Some(b), Some(a)) = (
-        cow_image("btrfs-cow-before.img"),
-        cow_image("btrfs-cow-after.img"),
-    ) {
-        out.push(("one touch", b, a));
+    for (label, suffix) in GEOMETRIES {
+        let before = fixture(&format!("btrfs-cow-before{suffix}.img"));
+        let control = fixture(&format!("btrfs-cow-control{suffix}.img"));
+        let after = fixture(&format!("btrfs-cow-after{suffix}.img"));
+        out.push((format!("an empty commit, {label}"), before.clone(), control));
+        out.push((format!("one touch, {label}"), before, after));
     }
     out
 }
@@ -218,10 +211,6 @@ fn reachable(fs: &Filesystem, image: &[u8]) -> BTreeSet<u64> {
 #[test]
 fn every_reachable_block_is_recorded_as_allocated() {
     let pairs = pairs();
-    if pairs.is_empty() {
-        eprintln!("no fixtures; build them with ./scripts/vm-build-cow-fixtures.sh");
-        return;
-    }
 
     let mut checked = 0usize;
     for (what, before, after) in &pairs {
@@ -262,10 +251,6 @@ fn every_reachable_block_is_recorded_as_allocated() {
 #[test]
 fn usage_adds_up_on_both_sides_of_every_transaction() {
     let pairs = pairs();
-    if pairs.is_empty() {
-        eprintln!("no fixtures — skipping");
-        return;
-    }
 
     let mut checked = 0usize;
     for (what, before, after) in &pairs {
@@ -297,11 +282,8 @@ fn usage_adds_up_on_both_sides_of_every_transaction() {
 #[test]
 fn the_change_in_usage_is_the_change_in_recorded_blocks() {
     let pairs = pairs();
-    if pairs.is_empty() {
-        eprintln!("no fixtures — skipping");
-        return;
-    }
 
+    let mut committed_any = false;
     for (what, before, after) in &pairs {
         let fs_before = mount(before);
         let fs_after = mount(after);
@@ -316,6 +298,7 @@ fn the_change_in_usage_is_the_change_in_recorded_blocks() {
             eprintln!("{what}: no commit happened on this run — nothing to check");
             continue;
         }
+        committed_any = true;
         let used_delta =
             fs_after.superblock().bytes_used as i128 - fs_before.superblock().bytes_used as i128;
         let record_delta = (added - removed) * nodesize;
@@ -328,6 +311,13 @@ fn the_change_in_usage_is_the_change_in_recorded_blocks() {
         );
         eprintln!("{what}: {added} recorded, {removed} released, bytes_used {used_delta:+}");
     }
+
+    assert!(
+        committed_any,
+        "not one of the {} pairs holds a transaction, so this compared nothing. A fixture \
+         builder that stopped producing commits looks exactly like this.",
+        pairs.len()
+    );
 }
 
 /// Every block recorded as allocated is really there.
@@ -344,10 +334,6 @@ fn the_change_in_usage_is_the_change_in_recorded_blocks() {
 #[test]
 fn every_block_recorded_as_allocated_is_really_on_the_disk() {
     let pairs = pairs();
-    if pairs.is_empty() {
-        eprintln!("no fixtures — skipping");
-        return;
-    }
 
     let mut checked = 0usize;
     for (what, before, after) in &pairs {
@@ -385,10 +371,13 @@ fn every_block_recorded_as_allocated_is_really_on_the_disk() {
 /// If this does not fail, the sum check is decoration.
 #[test]
 fn an_image_whose_accounts_disagree_is_caught() {
-    let Some(path) = cow_image("btrfs-cow-before.img") else {
-        eprintln!("no fixtures — skipping");
-        return;
-    };
+    for (label, suffix) in GEOMETRIES {
+        accounts_that_disagree_are_caught(label, suffix);
+    }
+}
+
+fn accounts_that_disagree_are_caught(label: &str, suffix: &str) {
+    let path = fixture(&format!("btrfs-cow-before{suffix}.img"));
 
     let mut bytes = std::fs::read(&path).expect("reading a fixture");
     let sb_at = fs_btrfs::superblock::SUPER_OFFSETS[0] as usize;
@@ -413,14 +402,17 @@ fn an_image_whose_accounts_disagree_is_caught() {
     fs_btrfs::super_write::stamp_checksum(&mut raw, csum_type);
     bytes[sb_at..sb_at + 4096].copy_from_slice(&raw);
 
-    let broken = std::env::temp_dir().join("btrfs-cow-accounts-disagree.img");
+    // Inside the repository, like every scratch file this suite writes:
+    // the guest that runs the oracle tools sees this tree and nothing
+    // else of the host.
+    let broken = PathBuf::from(temp_path!("cow-accounts-disagree{suffix}.img"));
     std::fs::write(&broken, &bytes).expect("writing the broken copy");
 
     let fs = mount(&broken);
     assert_eq!(
         fs.superblock().bytes_used,
         was + nodesize,
-        "the edit did not take, so nothing was tested"
+        "[{label}] the edit did not take, so nothing was tested"
     );
 
     let groups = fs.block_groups().expect("reading block groups");
@@ -428,13 +420,14 @@ fn an_image_whose_accounts_disagree_is_caught() {
     assert_ne!(
         total,
         fs.superblock().bytes_used,
-        "an image edited to disagree with itself still adds up, so the check that \
-         compares them cannot fail"
+        "[{label}] an image edited to disagree with itself still adds up, so the check \
+         that compares them cannot fail"
     );
 
     let _ = std::fs::remove_file(&broken);
     eprintln!(
-        "a superblock claiming {} against block groups summing to {total} is detectable",
+        "[{label}] a superblock claiming {} against block groups summing to {total} is \
+         detectable",
         fs.superblock().bytes_used
     );
 }

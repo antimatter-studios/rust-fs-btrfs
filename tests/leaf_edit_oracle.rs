@@ -11,7 +11,11 @@
 //! covers the positions an edit written as "find the gap" gets wrong —
 //! the first, the last, and between two items sharing an objectid.
 //!
-//! Fixtures are gitignored. Build them with `chore fixtures`.
+//! The fixtures are gitignored and built by `chore fixtures`, in the
+//! fs-linux-test-harness VM. THIS FILE IS WHY NOTHING SKIPS ANY MORE:
+//! it used to print "no fixtures" and return, and it did that for a
+//! whole release while reporting green, so the round trip below was
+//! never run on a single kernel leaf. A missing fixture now fails.
 
 use fs_btrfs::btree::{header_offsets as o, HEADER_SIZE};
 use fs_btrfs::chunk::DiskKey;
@@ -19,32 +23,26 @@ use fs_btrfs::fs::Filesystem;
 use fs_btrfs::leaf_edit::{delete, fits, insert, OwnedItem};
 use fs_btrfs::superblock::Superblock;
 use fs_btrfs::tree_write::{build_leaf, chunk_tree_uuid_of, BlockIdentity};
+use fs_btrfs_test_support::{fixture, fixtures_matching, le32, le64, spans_several_devices, Image};
 use fs_core::FileDevice;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-mod common;
-use common::{le32, le64};
-
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
-
+/// Every fixture whose leaves can be scanned out of the image.
 fn images() -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(share()) else {
-        return Vec::new();
-    };
-    let mut out: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "img"))
-        .filter(|p| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("btrfs-"))
-        })
+    let images: Vec<PathBuf> = fixtures_matching("btrfs-")
+        .into_iter()
+        // One member of a multi-device filesystem is refused a mount on
+        // purpose, and the blocks of its filesystem are not all on this
+        // disk. `tests/pool_oracle.rs` is where such an image belongs.
+        .filter(|p| !spans_several_devices(p))
         .collect();
-    out.sort();
-    out
+    assert!(
+        !images.is_empty(),
+        "every fixture belongs to a multi-device filesystem, so there is no image here \
+         to scan for leaves"
+    );
+    images
 }
 
 /// The items of a leaf, owning their bytes.
@@ -74,17 +72,22 @@ fn items_of(block: &[u8]) -> Option<Vec<OwnedItem>> {
 }
 
 /// Every leaf of a filesystem, found by scanning.
-fn leaves(img: &Path) -> Option<(Superblock, Vec<Vec<u8>>)> {
-    let dev = Arc::new(FileDevice::open(img).ok()?);
-    let fs = Filesystem::mount(dev).ok()?;
+fn leaves(img: &Path) -> (Superblock, Vec<Vec<u8>>) {
+    let dev = Arc::new(
+        FileDevice::open(img).unwrap_or_else(|e| panic!("opening {}: {e}", img.display())),
+    );
+    let fs = Filesystem::mount(dev).unwrap_or_else(|e| panic!("mounting {}: {e}", img.display()));
     let sb = fs.superblock().clone();
-    let bytes = std::fs::read(img).ok()?;
+    // A BLOCK AT A TIME, not the whole image: these fixtures are up to
+    // 2 GiB and only the tree blocks are wanted. See `Image`.
+    let image = Image::open(img);
     let n = sb.nodesize as usize;
     let mut out = Vec::new();
-    let mut at = 0usize;
-    while at + n <= bytes.len() {
-        let b = &bytes[at..at + n];
-        at += n;
+    let mut buf = vec![0u8; n];
+    let mut at = 0u64;
+    while image.try_read_at(at, &mut buf) {
+        let b = &buf[..];
+        at += n as u64;
         if b[o::FSID..o::FSID + 16] != sb.fsid[..] || b[o::LEVEL] != 0 {
             continue;
         }
@@ -93,25 +96,17 @@ fn leaves(img: &Path) -> Option<(Superblock, Vec<Vec<u8>>)> {
         }
         out.push(b.to_vec());
     }
-    Some((sb, out))
+    (sb, out)
 }
 
 /// Taking an item out and putting it back gives the leaf back.
 #[test]
 fn every_item_of_every_leaf_survives_a_round_trip() {
-    let images = images();
-    if images.is_empty() {
-        eprintln!("no fixtures; build them with `chore fixtures`");
-        return;
-    }
-
     let mut round_trips = 0usize;
     let mut leaves_seen = 0usize;
 
-    for img in &images {
-        let Some((sb, blocks)) = leaves(img) else {
-            continue;
-        };
+    for img in &images() {
+        let (sb, blocks) = leaves(img);
         let name = img.file_name().unwrap().to_string_lossy().into_owned();
 
         // A sample per image: the round trip is per ITEM, so a handful
@@ -153,10 +148,11 @@ fn every_item_of_every_leaf_survives_a_round_trip() {
         }
     }
 
-    if leaves_seen == 0 {
-        eprintln!("no readable leaf — skipping");
-        return;
-    }
+    assert!(
+        leaves_seen > 0,
+        "the fixtures were read and not one leaf with two items came out of them, so not \
+         one round trip above ran and this test proved nothing"
+    );
     assert!(
         round_trips > 100,
         "only {round_trips} round trips, which is too few to have covered the first, \
@@ -172,13 +168,9 @@ fn every_item_of_every_leaf_survives_a_round_trip() {
 /// is still a leaf the kernel would not have written.
 #[test]
 fn a_round_tripped_leaf_encodes_to_the_same_bytes() {
-    let Some(img) = images().into_iter().next() else {
-        eprintln!("no fixtures — skipping");
-        return;
-    };
-    let Some((sb, blocks)) = leaves(&img) else {
-        return;
-    };
+    // The plainest geometry, named rather than "whichever sorts first",
+    // so a failure is always about the same leaves.
+    let (sb, blocks) = leaves(&fixture("btrfs-default.img"));
 
     let mut checked = 0usize;
     for block in blocks.iter().take(20) {
@@ -224,15 +216,11 @@ fn a_round_tripped_leaf_encodes_to_the_same_bytes() {
 /// An item that will not fit is refused rather than silently dropped.
 #[test]
 fn an_item_that_needs_a_split_is_refused() {
-    let Some(img) = images().into_iter().next() else {
-        eprintln!("no fixtures — skipping");
-        return;
-    };
-    let Some((sb, blocks)) = leaves(&img) else {
-        return;
-    };
-    let Some(block) = blocks.first() else { return };
-    let Some(items) = items_of(block) else { return };
+    let (sb, blocks) = leaves(&fixture("btrfs-default.img"));
+    let block = blocks
+        .first()
+        .expect("btrfs-default.img has leaves: its own trees are made of them");
+    let items = items_of(block).expect("the first leaf's item array is within the block");
 
     // An item as big as the whole block cannot fit alongside anything.
     let huge = OwnedItem {

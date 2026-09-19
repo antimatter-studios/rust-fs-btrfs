@@ -1,8 +1,35 @@
 //! The debug run that lets the PR gate see an overflow guards itself.
 //!
-//! `overflow-checks` is on in debug and off in release, so a defect
-//! whose only symptom is an arithmetic overflow panic cannot be
-//! observed by a release-only test run.
+//! `overflow-checks` is on in the debug profile and off in release, so a
+//! defect whose only symptom is an arithmetic overflow panic cannot be
+//! observed by a release-only test run. Everything below exists to keep
+//! one sentence true:
+//!
+//! > the pull-request gate still builds the library's own unit tests in
+//! > the debug profile, with `EXPECT_OVERFLOW_CHECKS=1` set, on a job
+//! > that actually gates the merge.
+//!
+//! # The sentence now has three links, and each breaks on its own
+//!
+//! `ci.yml` used to run `cargo test` itself. It does not any more:
+//! every job in it runs chore tasks and nothing else, and the cargo
+//! invocations live in `chores.yml`, wrapped in `scripts/tier.sh` (the
+//! output budget) around `scripts/test.sh` (the scratch directory),
+//! with the target list produced by `scripts/test-targets.sh`. So the
+//! one step this guard used to read has become a chain, and a chain is
+//! only as good as the link nobody checked:
+//!
+//! | link | what it rules out | pinned by |
+//! |---|---|---|
+//! | `ci.yml` still runs `chore test:unit` on a gating job | the task being perfect and nothing calling it | [`the_pr_gate_still_tests_the_library_in_a_profile_that_can_see_an_overflow`] |
+//! | `chores.yml`'s `test:unit` is the debug run it says it is | the job running a task that has quietly gained `--release`, or lost the handshake | [`the_debug_run_asks_the_build_to_prove_it_traps_overflows`] |
+//! | `scripts/test-targets.sh unit` still names `--lib` | the workflow and the task both being right while the list they agree on stopped containing the library | [`the_unit_tier_target_list_still_names_the_library`] |
+//!
+//! The third link is the one a comment cannot replace. The task body
+//! says `$(scripts/test-targets.sh unit)`: read as text it proves
+//! nothing about what that command prints, so the script is RUN. It is
+//! cheap, it needs no fixture, no tool and no VM -- which is what lets
+//! this file sit in the `unit` tier it is guarding.
 //!
 //! # This repository is not in the same position as its siblings
 //!
@@ -10,42 +37,39 @@
 //! is shaped the way it is, and a guard ported from a sibling would be
 //! satisfied here while the defect was still live.
 //!
-//! `ci.yml` **does** run tests in the debug profile on a pull request.
-//! The `kernel-gate` job runs eighteen `cargo test --test <name>`
-//! invocations, unguarded by any `if:`, on every pull request. So "does
-//! any debug `cargo test` run on this trigger" is the wrong question
-//! here: the answer is yes, and has been all along.
+//! `ci.yml` **does** run tests in the debug profile on a pull request,
+//! and always did. What matters is which *targets* those runs build.
+//! Three of the four tiers -- `test:images`, `test:oracle`,
+//! `test:kernel` -- take their targets from
+//! `scripts/test-targets.sh <tier>`, which emits nothing but
+//! `--test <name>` arguments, and `cargo test --test <name>` selects one
+//! integration target and never builds the library's own unit tests.
+//! The whole-suite run in `test:native` does build them, and is
+//! `--release`. So "does any debug `cargo test` run on this trigger" is
+//! the wrong question here: the answer is yes, and it was yes on the
+//! tree where the library's arithmetic -- the largest body of it in the
+//! crate -- was compiled with the checks on nowhere but a version tag.
 //!
-//! The right question is which *targets* those runs build.
-//! `cargo test --test <name>` selects one integration target and never
-//! builds the library's own unit tests. So the crate's library unit
-//! tests -- the largest body of arithmetic in it -- were compiled once
-//! on this trigger, by `cargo test --release`, in the profile that
-//! wraps.
+//! That is why the scan refuses a run whose targets come from a tier
+//! other than `unit`, and why it refuses `--test <name>` however the
+//! line is spelled. Drop either and the guard passes on the tree as it
+//! stood before this change, which is the precise definition of a check
+//! that cannot fail for the reason it exists.
 //!
-//! `release.yml:66`, `cargo test --all-targets`, does cover them in
-//! debug. It triggers on a version tag, after the change has merged, so
-//! a wrapping bug merges green here and surfaces only when someone else
-//! cuts the next release, detached from the change and from the person
-//! who could have caught it.
-//!
-//! So the guard has to be scoped twice over, and both scopings are
-//! load-bearing:
-//!
-//! | scoping | what it rules out | pinned by |
-//! |---|---|---|
-//! | this file, `ci.yml` only | `release.yml`'s debug run satisfying a gate it does not run on | [`a_debug_run_outside_ci_yml_does_not_satisfy_this_guard`] |
-//! | not `--test <name>` | the kernel-gate's eighteen debug runs satisfying a claim about the library | [`the_kernel_gates_per_target_debug_runs_do_not_satisfy_this_guard`] |
-//!
-//! Drop either and the guard passes on the tree as it stood before this
-//! change, which is the precise definition of a check that cannot fail
-//! for the reason it exists.
+//! The file scoping is load-bearing for the same reason it always was.
+//! `release.yml` runs `chore test` -- the whole gate, `test:unit`
+//! included -- on a version tag, after the change has merged, detached
+//! from the change and from the person who could have caught it. A scan
+//! widened across every workflow would find the unit task running there
+//! and report this repository as covered while the pull-request gate had
+//! lost it, so the guard opens `ci.yml` and only `ci.yml`
+//! ([`a_debug_run_outside_ci_yml_does_not_satisfy_this_guard`]).
 //!
 //! # Two halves, neither redundant
 //!
 //! | half | asks | cannot answer |
 //! |---|---|---|
-//! | the scans here | is the step still in `ci.yml`, covering the library, asked to check, and not disabled from the manifest | whether the build it produces actually traps |
+//! | the scans here | is the task still run by a gating job, still covering the library, still asked to check, and not disabled from the manifest | whether the build it produces actually traps |
 //! | `overflow_checks` in `src/lib.rs` | does this build trap a real `u64::MAX + 1` | whether it was supposed to; it cannot notice its own absence |
 //!
 //! Delete the step and the runtime probe never runs at all. Keep the
@@ -68,11 +92,19 @@
 //!
 //! The runtime probe in `src/lib.rs` is the deliberate exception, and
 //! is inline in `lib.rs` for the same reason: it must be part of the
-//! library target the debug step builds, and inline there is no
+//! library target the `unit` tier builds, and inline there is no
 //! declaration to lose.
 
 use saphyr::{LoadableYamlNode, Yaml};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// The chore task whose body is the debug run this file is about.
+const UNIT_TASK: &str = "test:unit";
+
+/// The tier of `scripts/test-targets.sh` whose target list contains the
+/// library. The other three emit nothing but `--test <name>`.
+const TIER_COVERING_THE_LIBRARY: &str = "unit";
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -83,6 +115,10 @@ fn ci_yml() -> PathBuf {
         .join(".github")
         .join("workflows")
         .join("ci.yml")
+}
+
+fn chores_yml() -> PathBuf {
+    manifest_dir().join("chores.yml")
 }
 
 /// Read a file the guards depend on, or fail.
@@ -103,80 +139,67 @@ fn read_or_panic(path: &Path) -> String {
     })
 }
 
-/// Every `cargo test` invocation in a workflow that would compile the
-/// **library unit tests** with overflow checks on.
+/// Every test run in `script` that would compile the **library unit
+/// tests** with overflow checks on.
 ///
 /// Five things disqualify a line, and each one is a way the guard could
 /// otherwise be satisfied by something that does not actually build the
 /// library in debug:
 ///
-/// - it is a YAML comment. This is not defensive here, it is load
-///   bearing: `ci.yml` quotes `cargo test --locked --lib` verbatim
-///   inside the comment block that explains the step, so a scan that
-///   ignored comments would still find it after the step itself had
-///   been deleted, and would pass;
+/// - it is a comment. This is not defensive here, it is load bearing:
+///   `chores.yml` and `ci.yml` both explain this tier in comment blocks
+///   that quote what it does, so a scan that ignored comments would
+///   still find it after the command itself had been deleted, and would
+///   pass;
 /// - it is an inline trailing comment on an otherwise-`--release` line;
 /// - it passes `--release`, or names a profile explicitly;
 /// - it sets a `CARGO_PROFILE_*` variable, which can turn overflow
 ///   checks off for the dev or test profile from outside the manifest;
-/// - **it selects a single integration target with `--test <name>`.**
-///   This is the rule this repository needs and its siblings do not.
-///   `cargo test --test csum_oracle` is a genuine debug run and builds
-///   no library unit test whatsoever, and there are eighteen of them in
-///   the `kernel-gate` job. Counting them would report the defect as
-///   already fixed.
+/// - **its target selection does not include the library.** This is the
+///   rule this repository needs and its siblings do not, and it has two
+///   spellings now. `cargo test --test csum_oracle` is a genuine debug
+///   run that builds no library unit test whatsoever; so is
+///   `scripts/test.sh $(scripts/test-targets.sh oracle)`, because that
+///   tier prints one `--test <name>` per file and nothing else.
+///   Counting either would report the defect as already fixed. See
+///   [`selects_the_library_unit_tests`].
 ///
-/// `cargo build` lines are not `cargo test` and are not considered.
+/// `cargo build` lines are not test runs and are not considered.
 ///
-/// And before any of those: **the line must BE a `cargo test`**, not
-/// mention one (#118). See [`begins_with_cargo_test`].
+/// And before any of those: **the line must BE a test run**, not
+/// mention one (#118). See [`begins_with_a_test_run`].
 fn runs_covering_the_library_unit_tests(script: &str) -> Vec<String> {
     script
         .lines()
         .filter_map(|raw| {
-            if !begins_with_cargo_test(raw) {
+            if !begins_with_a_test_run(raw) {
                 return None;
             }
-            let line = raw.trim_start();
-            let command = line.split(" #").next().unwrap_or(line).trim();
+            let command = raw.split(" #").next().unwrap_or(raw).trim();
             if command.contains("CARGO_PROFILE_") {
                 return None;
             }
             // THE RUN'S OWN WORDS, NOT THE LINE'S (#136). `cargo test -r` is
             // `--release`, and a text scan does not see it. The profile flags
-            // are read from the leading `cargo test`'s arguments, up to the
+            // are read from the arguments that reach `cargo test`, up to the
             // first control operator outside quotes: in `cargo test --lib &&
             // cargo test --release` the debug run still counts, and in
             // `--target-dir "build;" -r` the `-r` is still this run's.
-            let words = leading_cargo_test_arguments(command);
+            let words = cargo_test_arguments(command)?;
             let arguments: Vec<&str> = words.iter().map(String::as_str).collect();
-            if arguments
+            // Everything past a bare `--` belongs to libtest rather than
+            // to cargo, and the unit tier really does end `-- --skip
+            // needs_host::`. A `--test` there is a name filter and says
+            // nothing about which targets are built.
+            let selection = before_the_double_dash(&arguments);
+            if selection
                 .iter()
                 .any(|a| *a == "--release" || *a == "--profile" || a.starts_with("--profile="))
                 || release_in(&arguments)
             {
                 return None;
             }
-            // `--test <name>` builds one integration target and no
-            // library unit tests.
-            //
-            // THE TRAILING SPACE PROTECTS `--tests`, NOT `--all-targets`.
-            // An earlier version of this comment named `--all-targets`,
-            // and the test written to pin it could not fail: the
-            // substring `--test` does not appear in `--all-targets` at
-            // all, so the space made no difference to it. `--tests` is
-            // the spelling that matters -- cargo accepts it, it DOES
-            // build the library unit tests, and it contains `--test`
-            // but not `--test `. Dropping the space would exclude a run
-            // that genuinely satisfies this guard.
-            //   "--test " in "--all-targets"  -> false
-            //   "--test " in "--tests"        -> false   (so it counts)
-            //   "--test"  in "--tests"        -> true    (so it would not)
-            if command.contains("--test ")
-                || arguments
-                    .iter()
-                    .any(|a| a.starts_with("--test=") || *a == "--test")
-            {
+            if !selects_the_library_unit_tests(selection) {
                 return None;
             }
             Some(command.to_string())
@@ -184,30 +207,141 @@ fn runs_covering_the_library_unit_tests(script: &str) -> Vec<String> {
         .collect()
 }
 
-/// The arguments of the `cargo test` a line begins with: the words after
-/// `cargo test`, past any leading `NAME=value` assignments, up to the first
-/// shell control operator. Empty when the line does not begin with one,
-/// which [`begins_with_cargo_test`] has already ruled out for every caller.
-fn leading_cargo_test_arguments(command: &str) -> Vec<String> {
-    let Some(first) = shell_commands(command).into_iter().next() else {
-        return Vec::new();
-    };
-    let at = first
-        .iter()
-        .position(|w| {
-            !w.split_once('=').is_some_and(|(name, _)| {
-                !name.is_empty()
-                    && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
-                    && !name.starts_with(|c: char| c.is_ascii_digit())
-            })
-        })
-        .unwrap_or(first.len());
-    if first.get(at).map(String::as_str) != Some("cargo")
-        || first.get(at + 1).map(String::as_str) != Some("test")
-    {
-        return Vec::new();
+/// Flags that make cargo build the library target's own unit tests
+/// whatever else is selected alongside them.
+const LIBRARY_COVERING_FLAGS: [&str; 3] = ["--lib", "--tests", "--all-targets"];
+
+/// Does this run's target selection build the library's own unit tests?
+///
+/// Three questions in order, because a later one would give the wrong
+/// answer about a run an earlier one has already settled:
+///
+/// 1. an explicit library-covering flag settles it. `--lib`, `--tests`
+///    and `--all-targets` all build the library unit tests, and they do
+///    so even beside a `--test <name>`;
+/// 2. otherwise, a run taking its targets from
+///    `$(scripts/test-targets.sh <tier>)` is covered exactly when that
+///    tier is `unit` -- the only one whose output begins `--lib`, which
+///    [`the_unit_tier_target_list_still_names_the_library`] is what
+///    proves. The others print `--test <name>` per file, so a run using
+///    one builds no library unit test at all, and the substitution hides
+///    from this scan what the flags would not;
+/// 3. otherwise a `--test <name>` restricts the build to one integration
+///    target, and anything else (a bare `cargo test`) builds everything.
+///
+/// WHOLE ARGUMENTS, NOT SUBSTRINGS. The version this replaces searched
+/// for the text `--test ` -- with a trailing space, because `--tests`
+/// DOES build the library unit tests and contains `--test`, and
+/// swallowing it would have made the guard refuse a run that genuinely
+/// satisfies it. That space was a fact about the spelling which had to
+/// be remembered and could be lost in an edit; comparing whole
+/// arguments is the same rule with nothing to remember, and `--test`,
+/// `--tests` and `--all-targets` are simply three different arguments.
+fn selects_the_library_unit_tests(selection: &[&str]) -> bool {
+    if selection.iter().any(|a| LIBRARY_COVERING_FLAGS.contains(a)) {
+        return true;
     }
-    first[at + 2..].to_vec()
+    let tiers = target_list_tiers(selection);
+    if !tiers.is_empty() {
+        return tiers.iter().any(|tier| tier == TIER_COVERING_THE_LIBRARY);
+    }
+    !selection
+        .iter()
+        .any(|a| *a == "--test" || a.starts_with("--test="))
+}
+
+/// The tiers a run takes its target list from: `unit` in
+/// `$(scripts/test-targets.sh unit)`.
+///
+/// The words are searched rather than the substitution parsed, so that
+/// `$(...)`, `"$(...)"` and a backticked spelling all answer the same.
+/// Nothing here evaluates the substitution -- the guard treats the
+/// script as opaque on purpose and asks it directly instead, which is
+/// the third link of the chain.
+fn target_list_tiers(selection: &[&str]) -> Vec<String> {
+    const SCRIPT: &str = "test-targets.sh";
+    let joined = selection.join(" ");
+    joined
+        .match_indices(SCRIPT)
+        .filter_map(|(at, _)| {
+            let tier = joined[at + SCRIPT.len()..].split_whitespace().next()?;
+            let tier = tier.trim_matches(|c| c == ')' || c == '"' || c == '\'' || c == '`');
+            (!tier.is_empty()).then(|| tier.to_string())
+        })
+        .collect()
+}
+
+/// The arguments before a bare `--`, which is where cargo's own
+/// arguments stop and libtest's begin.
+fn before_the_double_dash<'a>(arguments: &'a [&'a str]) -> &'a [&'a str] {
+    match arguments.iter().position(|a| *a == "--") {
+        Some(at) => &arguments[..at],
+        None => arguments,
+    }
+}
+
+/// The arguments that reach `cargo test` when `command` runs, or `None`
+/// when it runs no test suite at all.
+///
+/// THE WRAPPERS ARE PART OF THE COMMAND NOW. A tier in `chores.yml` is
+/// spelled
+///
+/// ```text
+///   EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 400 21000 \
+///       -- scripts/test.sh --locked $(scripts/test-targets.sh unit)
+/// ```
+///
+/// and every word that decides the profile is on the far side of two
+/// scripts. `tier.sh` runs what follows its `--` under an output budget;
+/// `test.sh` makes a scratch directory inside the repository and ends in
+/// `cargo test "$@"`. Both pass their arguments through unchanged, so
+/// what reaches cargo is recoverable by walking the chain -- and a scan
+/// that knew only the words `cargo test` would read that line and find
+/// nothing at all.
+///
+/// Anything else -- `cargo build`, `vm.sh guest-test`, a bare script --
+/// is not a cargo test run *here*, and says so by answering `None`.
+/// `test:vm`'s in-guest run is the notable one: its cargo invocation
+/// lives in the harness sibling's own guest script, which this
+/// repository does not read.
+fn cargo_test_arguments(command: &str) -> Option<Vec<String>> {
+    fn walk(words: &[String]) -> Option<Vec<String>> {
+        let at = words.iter().position(|w| !is_an_assignment(w))?;
+        let rest = &words[at..];
+        let program = rest[0].rsplit('/').next().unwrap_or(&rest[0]);
+        match program {
+            "cargo" => (rest.get(1).map(String::as_str) == Some("test"))
+                .then(|| rest.get(2..).unwrap_or_default().to_vec()),
+            // tier.sh LABEL LOG MAX-LINES MAX-BYTES -- COMMAND...
+            "tier.sh" => {
+                let at = rest.iter().position(|w| w == "--")?;
+                walk(rest.get(at + 1..)?)
+            }
+            // test.sh's last line is `cargo test "$@"`.
+            "test.sh" => Some(rest.get(1..).unwrap_or_default().to_vec()),
+            _ => None,
+        }
+    }
+    walk(&first_command_words(command))
+}
+
+/// Whether `word` is a `NAME=value` assignment, which the shell applies
+/// to one command's environment rather than treating as the command.
+fn is_an_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+    })
+}
+
+/// The words of the first command on a line, quotes removed as the
+/// shell removes them.
+fn first_command_words(command: &str) -> Vec<String> {
+    shell_commands(command)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
 }
 
 /// `command` split into the commands the shell's control operators --
@@ -310,32 +444,85 @@ fn release_in(arguments: &[&str]) -> bool {
     false
 }
 
-/// Whether `line` of a `run:` block starts a `cargo test` the shell runs
-/// unconditionally: at the block's own left margin, with nothing before
-/// `cargo test` but `NAME=value` assignments.
+/// Whether `line` starts a test run the shell performs unconditionally:
+/// at the block's own left margin, with nothing before the command but
+/// `NAME=value` assignments.
 ///
 /// This does not interpret the shell, and says so. The text used to
 /// count wherever `cargo test` appeared in it, so `echo "cargo test
 /// --locked --lib"`, or the real command indented inside an `if false;
 /// then` branch, satisfied the guard with no debug run at all (#118).
 /// Requiring the command to begin an unindented line rejects both, and
-/// admits every real invocation in this workflow. A command in a
-/// conditional or loop written at the left margin would still count; a
-/// guard that parsed bash would acquire a new defeat for every way a
-/// block can be written, and this one only has to recognise the one way
-/// the gate's step is.
-fn begins_with_cargo_test(line: &str) -> bool {
-    if line.starts_with(char::is_whitespace) {
-        return false;
-    }
-    let mut words = line.split_whitespace().skip_while(|word| {
-        word.split_once('=').is_some_and(|(name, _)| {
-            !name.is_empty()
-                && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
-                && !name.starts_with(|c: char| c.is_ascii_digit())
+/// admits every real invocation in this repository's tasks. A command
+/// in a conditional or loop written at the left margin would still
+/// count; a guard that parsed bash would acquire a new defeat for every
+/// way a block can be written, and this one only has to recognise the
+/// one way the gate's tier is written.
+fn begins_with_a_test_run(line: &str) -> bool {
+    !line.starts_with(char::is_whitespace) && cargo_test_arguments(line).is_some()
+}
+
+/// Whether this command arms the handshake for the run it performs.
+///
+/// A leading `NAME=value`, which is how the shell puts a variable into
+/// one command's environment and is how the tier sets it. Matched on
+/// the name with a non-empty value, exactly as `src/lib.rs` reads it:
+/// `EXPECT_OVERFLOW_CHECKS=` sets the variable to nothing and the probe
+/// returns without asserting, so a tier spelled that way would look
+/// armed here and prove nothing there.
+fn sets_the_handshake(command: &str) -> bool {
+    first_command_words(command)
+        .iter()
+        .take_while(|word| is_an_assignment(word))
+        .any(|word| {
+            word.split_once('=')
+                .is_some_and(|(name, value)| name == "EXPECT_OVERFLOW_CHECKS" && !value.is_empty())
         })
-    });
-    words.next() == Some("cargo") && words.next() == Some("test")
+}
+
+/// The runs that additionally ask the build to prove it traps.
+///
+/// A subset of [`runs_covering_the_library_unit_tests`]: those which
+/// also set the `EXPECT_OVERFLOW_CHECKS` handshake, so that
+/// `overflow_checks::the_build_the_gate_asked_to_check_does_check`
+/// performs an overflow and fails if the build let it through.
+///
+/// A run carrying the handshake but also `--release` is not counted,
+/// because the function above has already excluded it. Such a tier is a
+/// misconfiguration and it fails loudly rather than quietly: the checks
+/// are legitimately off in release, so the assertion the handshake arms
+/// would fire there every time.
+fn debug_runs_that_prove_the_build_traps(script: &str) -> Vec<String> {
+    runs_covering_the_library_unit_tests(script)
+        .into_iter()
+        .filter(|command| sets_the_handshake(command))
+        .collect()
+}
+
+/// Every line of `script` that runs `chore <task>` unconditionally.
+///
+/// The link between the workflow and the tasks, and deliberately a
+/// literal one: a job that reaches `test:unit` indirectly, the way
+/// `chore test` does through `test:native`, is not accepted. Following
+/// that would mean modelling chore's own task graph -- a second parser,
+/// with a second set of defeats -- to establish something the workflow
+/// can state in three words. `ci.yml` names the task, and this reads
+/// the name.
+fn runs_of_the_chore_task(script: &str, task: &str) -> Vec<String> {
+    script
+        .lines()
+        .filter_map(|raw| {
+            if raw.starts_with(char::is_whitespace) {
+                return None;
+            }
+            let command = raw.split(" #").next().unwrap_or(raw).trim();
+            let words = first_command_words(command);
+            let at = words.iter().position(|w| !is_an_assignment(w))?;
+            (words.get(at).map(String::as_str) == Some("chore")
+                && words.get(at + 1).map(String::as_str) == Some(task))
+            .then(|| command.to_string())
+        })
+        .collect()
 }
 
 /// WHAT ELSE DECIDES WHETHER A STEP GATES.
@@ -371,6 +558,10 @@ fn begins_with_cargo_test(line: &str) -> bool {
 /// them is the losing game. A step that genuinely needs a condition
 /// can be split out; a guard that tries to interpret conditions is a
 /// guard with a new defeat every time GitHub adds syntax.
+///
+/// `ci-ok` carries `if: always()` and is therefore not counted. That
+/// costs nothing and is right: it aggregates the other jobs' results
+/// and runs no test. The jobs that run tests carry no condition at all.
 ///
 /// # Why this is parsed and no longer scanned
 ///
@@ -415,7 +606,7 @@ struct Step {
 
 #[derive(Debug)]
 struct Job {
-    /// The job's key under `jobs:`, such as `kernel-gate`.
+    /// The job's key under `jobs:`, such as `unit`.
     id: String,
     keys: Vec<String>,
     steps: Vec<Step>,
@@ -459,7 +650,7 @@ fn keys_of(node: &Yaml) -> Vec<String> {
 ///
 /// Panics on a workflow it cannot parse, deliberately. A guard that
 /// returned an empty `Workflow` for a file it did not understand would
-/// report "no debug run gates this" -- which is a failure, so that
+/// report "no gating job runs this task" -- which is a failure, so that
 /// direction is safe -- but a guard that returned early with a PASS
 /// would be the blindness this module exists to prevent. Failing on the
 /// parse error names the real problem instead of a consequence of it.
@@ -561,10 +752,10 @@ fn runs_on_pull_request(wf: &Workflow) -> bool {
 /// Why `workflow` gates no pull request at all, or `None` if it does.
 ///
 /// The real-file assertions below ask this FIRST. Without it, a
-/// workflow whose `on:` block moved reported that no debug `cargo test`
-/// covers the library, which sends the reader to a step that is fine
-/// (#124). This names the triggers that were found instead, and says
-/// why `pull_request_target` alone does not count.
+/// workflow whose `on:` block moved reported that no gating job runs
+/// the task, which sends the reader to a job that is fine (#124). This
+/// names the triggers that were found instead, and says why
+/// `pull_request_target` alone does not count.
 fn not_a_pull_request_gate(workflow: &str) -> Option<String> {
     let wf = parse_workflow(workflow);
     if runs_on_pull_request(&wf) {
@@ -606,9 +797,7 @@ const NON_GATING_KEYS: [&str; 2] = ["if", "continue-on-error"];
 /// than a hole -- but it left the "runs without --release" property
 /// verified line-based, and defeatable if the handshake assertion were
 /// ever weakened. Both halves share this walk now and cannot drift
-/// apart again. Found on the sibling `rust-fs-btrfs` copy of this
-/// guard; this repository's copy was merged before the correction
-/// existed, which is what rust-fs-erofs#76 tracked.
+/// apart again.
 fn scan_steps(workflow: &str, gating: bool, select: fn(&str) -> Vec<String>) -> Vec<String> {
     let wf = parse_workflow(workflow);
     if gating && !runs_on_pull_request(&wf) {
@@ -632,39 +821,106 @@ fn scan_steps(workflow: &str, gating: bool, select: fn(&str) -> Vec<String>) -> 
     out
 }
 
-/// The run commands of steps that cover the library in debug AND
-/// actually gate a pull request -- without requiring the handshake.
-fn gating_runs_covering_the_library(workflow: &str) -> Vec<String> {
-    scan_steps(workflow, true, runs_covering_the_library_unit_tests)
+/// The `chore test:unit` invocations whose result the pull-request gate
+/// actually reads.
+fn gating_runs_of_the_unit_task(workflow: &str) -> Vec<String> {
+    scan_steps(workflow, true, |script| {
+        runs_of_the_chore_task(script, UNIT_TASK)
+    })
 }
 
-/// The run commands of steps that both cover the library in debug with
-/// the handshake AND actually gate a pull request.
-fn gating_runs_that_prove_the_build_traps(workflow: &str) -> Vec<String> {
-    scan_steps(workflow, true, debug_runs_that_prove_the_build_traps)
-}
-
-/// The runs that additionally ask the build to prove it traps.
+/// The ids of the jobs whose results the pull-request gate reads.
 ///
-/// A subset of [`runs_covering_the_library_unit_tests`]: those which
-/// also set the `EXPECT_OVERFLOW_CHECKS` handshake, so that
-/// `overflow_checks::the_build_the_gate_asked_to_check_does_check`
-/// performs an overflow and fails if the build let it through.
-///
-/// A run carrying the handshake but also `--release` is not counted,
-/// because the function above has already excluded it. Such a step is a
-/// misconfiguration and it fails loudly rather than quietly: the checks
-/// are legitimately off in release, so the assertion the handshake arms
-/// would fire there every time.
-fn debug_runs_that_prove_the_build_traps(script: &str) -> Vec<String> {
-    runs_covering_the_library_unit_tests(script)
-        .into_iter()
-        .filter(|command| command.contains("EXPECT_OVERFLOW_CHECKS=1"))
+/// For the failure message of the first link: "none of these jobs runs
+/// the task" is a diagnosis, while "the task is not run" leaves the
+/// reader to work out where to look.
+fn gating_jobs(workflow: &str) -> Vec<String> {
+    let wf = parse_workflow(workflow);
+    if !runs_on_pull_request(&wf) {
+        return Vec::new();
+    }
+    wf.jobs
+        .iter()
+        .filter(|job| {
+            !job.keys
+                .iter()
+                .any(|k| NON_GATING_KEYS.contains(&k.as_str()))
+        })
+        .map(|job| job.id.clone())
         .collect()
 }
 
-/// The guard. Reads the workflow this repository's pull requests are
-/// gated by and refuses if nothing in it compiles the library unit
+/// Every task in `chores.yml`, as its id and the commands of its
+/// `cmds:`.
+///
+/// A `cmds:` entry comes in three shapes and all three are ordinary
+/// chore: a plain string, a mapping with a `cmd:` key (which is how
+/// `on_timeout:` writes one), and a mapping with a `task:` key naming
+/// another task. The third carries no command of its own and is
+/// skipped -- the task it names is walked in its own right, so nothing
+/// is missed by not following it.
+///
+/// Panics on a manifest it cannot parse, for the reason
+/// [`parse_workflow`] does.
+fn task_bodies(manifest: &str) -> Vec<(String, Vec<String>)> {
+    let documents = Yaml::load_from_str(manifest).unwrap_or_else(|e| {
+        panic!(
+            "chores.yml is not valid YAML: {e}. This guard reads the manifest \
+             rather than scanning its text, so a file it cannot parse is a \
+             failure and never a pass."
+        )
+    });
+    let Some(document) = documents.first() else {
+        return Vec::new();
+    };
+    let Some(tasks) = field(document, "tasks").and_then(Yaml::as_mapping) else {
+        return Vec::new();
+    };
+    tasks
+        .iter()
+        .map(|(id, body)| {
+            let commands = match field(body, "cmds") {
+                Some(cmds) if cmds.as_str().is_some() => {
+                    vec![cmds.as_str().unwrap_or_default().to_string()]
+                }
+                Some(cmds) => cmds
+                    .as_sequence()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| {
+                        item.as_str()
+                            .or_else(|| field(item, "cmd").and_then(Yaml::as_str))
+                            .map(str::to_string)
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            (id.as_str().unwrap_or_default().to_string(), commands)
+        })
+        .collect()
+}
+
+/// One task's commands as a single script, or a failure naming the
+/// tasks that do exist.
+///
+/// A missing task is a finding, not a skip: the workflow runs it by
+/// name, so a `chores.yml` without it is a gate that dies at the runner
+/// rather than a gate that is fine.
+fn task_script_or_panic(manifest: &str, task: &str) -> String {
+    let bodies = task_bodies(manifest);
+    match bodies.iter().find(|(id, _)| id == task) {
+        Some((_, commands)) => commands.join("\n"),
+        None => panic!(
+            "chores.yml has no `{task}` task, and ci.yml runs it by name. The tasks it \
+             does have: {:?}",
+            bodies.into_iter().map(|(id, _)| id).collect::<Vec<_>>()
+        ),
+    }
+}
+
+/// THE FIRST TWO LINKS. Reads the workflow this repository's pull
+/// requests are gated by, and the task that workflow runs, and refuses
+/// if the chain from one to the other stops compiling the library unit
 /// tests with the overflow checks on.
 #[test]
 fn the_pr_gate_still_tests_the_library_in_a_profile_that_can_see_an_overflow() {
@@ -674,23 +930,37 @@ fn the_pr_gate_still_tests_the_library_in_a_profile_that_can_see_an_overflow() {
     if let Some(why) = not_a_pull_request_gate(&workflow) {
         panic!("{}: {why}", path.display());
     }
-    let covering = gating_runs_covering_the_library(&workflow);
     assert!(
-        !covering.is_empty(),
-        "no `cargo test` in {} builds the library unit tests without \
-         `--release`, so a defect whose only symptom is an arithmetic \
-         overflow panic can merge without the PR gate ever seeing it. The \
-         kernel-gate job's `cargo test --test <name>` runs do not count: \
-         they are debug runs, but `--test <name>` builds one integration \
-         target and no library unit tests at all. release.yml's \
-         `--all-targets` run does cover them, and does not help either -- \
-         it triggers on a version tag, after the change has merged.",
-        path.display()
+        !gating_runs_of_the_unit_task(&workflow).is_empty(),
+        "no job in {} that gates a pull request runs `chore {UNIT_TASK}`, so the debug \
+         profile -- the only one with overflow checks on -- is built nowhere the gate can \
+         see. The jobs whose results the gate reads are {:?}. Every job in this workflow \
+         runs chore tasks and nothing else, so this is the link between the workflow and \
+         the run: the task can be perfect and buy nothing while no job calls it. `chore \
+         test` reaches it through `test:native` and is deliberately not accepted here -- \
+         see `runs_of_the_chore_task`.",
+        path.display(),
+        gating_jobs(&workflow),
+    );
+
+    let chores = chores_yml();
+    let script = task_script_or_panic(&read_or_panic(&chores), UNIT_TASK);
+    assert!(
+        !runs_covering_the_library_unit_tests(&script).is_empty(),
+        "the `{UNIT_TASK}` task in {} runs no test that builds the library unit tests \
+         without `--release`, so a defect whose only symptom is an arithmetic overflow \
+         panic can merge without the PR gate ever seeing it. A tier taking its targets \
+         from `scripts/test-targets.sh` with any tier but `{TIER_COVERING_THE_LIBRARY}` \
+         does not count: those lists are `--test <name>` per file, which builds one \
+         integration target and no library unit tests at all. The whole-suite run does \
+         cover them, and does not help either -- it is `--release`, where the checks are \
+         off by design.",
+        chores.display(),
     );
 }
 
-/// The other half of the workflow scan: the step covers the library,
-/// but does it ask the build anything?
+/// The other half of the task scan: the tier covers the library, but
+/// does it ask the build anything?
 ///
 /// # Why a handshake rather than more spellings
 ///
@@ -698,10 +968,9 @@ fn the_pr_gate_still_tests_the_library_in_a_profile_that_can_see_an_overflow() {
 /// spelling of "overflow checks are off" is present. Several spellings
 /// of the key were needed before it was right, and then routes turned
 /// up that are not in that file at all: a
-/// `CARGO_PROFILE_TEST_OVERFLOW_CHECKS` variable set at step or job
-/// level in the workflow, and a `.cargo/config.toml`, which nothing
-/// here reads. All of them leave the debug step present, running, green
-/// and blind.
+/// `CARGO_PROFILE_TEST_OVERFLOW_CHECKS` variable set anywhere along the
+/// chain, and a `.cargo/config.toml`, which nothing here reads. All of
+/// them leave the debug tier present, running, green and blind.
 ///
 /// They are all the same shape: a scanner enumerating the ways a thing
 /// can be disabled, in the places it happens to look. Another pass buys
@@ -710,43 +979,117 @@ fn the_pr_gate_still_tests_the_library_in_a_profile_that_can_see_an_overflow() {
 /// shrinks to making sure the gate still asks it.
 #[test]
 fn the_debug_run_asks_the_build_to_prove_it_traps_overflows() {
-    let path = ci_yml();
-    let workflow = read_or_panic(&path);
+    let path = chores_yml();
+    let script = task_script_or_panic(&read_or_panic(&path), UNIT_TASK);
 
-    if let Some(why) = not_a_pull_request_gate(&workflow) {
-        panic!("{}: {why}", path.display());
-    }
-    let proving = gating_runs_that_prove_the_build_traps(&workflow);
     assert!(
-        !proving.is_empty(),
-        "no `cargo test` in {} covers the library unit tests without \
-         `--release` while setting EXPECT_OVERFLOW_CHECKS=1, so nothing \
-         checks whether the profile the gate builds actually traps an \
-         arithmetic overflow. Reading Cargo.toml is not enough: the checks \
-         can also be turned off by a CARGO_PROFILE_TEST_OVERFLOW_CHECKS \
-         variable at step or job level, or by a .cargo/config.toml, \
-         neither of which is in any file this test reads. The handshake is \
-         what arms the one check that cannot be fooled by where the \
-         setting lives.",
-        path.display()
+        !debug_runs_that_prove_the_build_traps(&script).is_empty(),
+        "no command in the `{UNIT_TASK}` task of {} covers the library unit tests without \
+         `--release` while setting EXPECT_OVERFLOW_CHECKS to a non-empty value, so \
+         nothing checks whether the profile the gate builds actually traps an arithmetic \
+         overflow. Reading Cargo.toml is not enough: the checks can also be turned off by \
+         a CARGO_PROFILE_TEST_OVERFLOW_CHECKS variable anywhere along the chain, or by a \
+         .cargo/config.toml, neither of which is in any file this test reads. The \
+         handshake is what arms the one check that cannot be fooled by where the setting \
+         lives -- see `overflow_checks` in src/lib.rs.",
+        path.display(),
     );
+}
+
+/// THE THIRD LINK, AND THE ONE NO COMMENT CAN REPLACE.
+///
+/// The task body says `$(scripts/test-targets.sh unit)`. Read as text
+/// that is a promise; the scans above treat it as opaque, and this test
+/// is what makes the script keep it. Workflow and task could both be
+/// perfect while the script had stopped emitting `--lib`, and the
+/// failure would be silent in the worst way: the tier would still run,
+/// still pass, and still build not one line of the library's arithmetic
+/// with the checks on.
+///
+/// So the script is executed. It is cheap, it reads nothing but
+/// `tests/*.rs`, and it needs no tool, no fixture and no VM -- which is
+/// what lets this file live in the `unit` tier it is guarding.
+///
+/// `--skip needs_host::` in that output is expected and is not a
+/// reduction of this run: library tests that need a fixture or the VM
+/// live in a module of that name, and the whole-suite release run is
+/// what executes them, with the VM up.
+#[test]
+fn the_unit_tier_target_list_still_names_the_library() {
+    let targets = |tier: &str| -> Vec<String> {
+        let script = manifest_dir().join("scripts").join("test-targets.sh");
+        let output = Command::new("bash")
+            .arg(&script)
+            .arg(tier)
+            .output()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "cannot run {} {tier}: {e}. This guard must fail rather than skip: the \
+                     script is what decides whether the gate builds the library at all.",
+                    script.display()
+                )
+            });
+        assert!(
+            output.status.success(),
+            "{} {tier} exited {:?}: {}",
+            script.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    };
+
+    let unit = targets(TIER_COVERING_THE_LIBRARY);
+    assert_eq!(
+        unit.first().map(String::as_str),
+        Some("--lib"),
+        "scripts/test-targets.sh {TIER_COVERING_THE_LIBRARY} no longer begins its target \
+         list with `--lib`, so `chore {UNIT_TASK}` builds no library unit test and the \
+         debug profile is compiled for the integration targets alone. The task body and \
+         the workflow can both be correct while this is false -- which is why it is run \
+         rather than read. It printed: {unit:?}",
+    );
+
+    // AND THE TIERS THAT DO NOT, which is what makes the tier NAME
+    // load-bearing in `selects_the_library_unit_tests` rather than a
+    // detail of it. A tier swapped for one of these in the task body is
+    // the same defect as a `--test <name>` written by hand, one
+    // substitution further from the reader.
+    for tier in ["images", "oracle", "kernel"] {
+        let list = targets(tier);
+        assert!(
+            !list
+                .iter()
+                .any(|a| LIBRARY_COVERING_FLAGS.contains(&a.as_str())),
+            "scripts/test-targets.sh {tier} now names the library, so `unit` is no longer \
+             the only tier that covers it and `selects_the_library_unit_tests` is refusing \
+             a run that would satisfy this guard. It printed: {list:?}",
+        );
+    }
 }
 
 /// THE DISTINCTION THIS REPOSITORY NEEDS AND ITS SIBLINGS DO NOT.
 ///
-/// The `kernel-gate` job's per-target debug runs must not satisfy the
-/// guard. They are real `cargo test` invocations, they carry no
+/// A run that selects integration targets by name must not satisfy the
+/// guard. Such runs are real `cargo test` invocations, they carry no
 /// `--release`, they run on every pull request, and they build not one
-/// library unit test between them -- `--test <name>` selects a single
-/// integration target.
+/// library unit test between them.
 ///
-/// Pinned with the job's actual step shapes, including the loop form,
-/// so that a future edit widening the parser to count them would fail
-/// here rather than quietly reporting this repository's defect as
-/// fixed.
+/// The `kernel-gate` job that made this urgent is gone -- it was fifty
+/// steps of `cargo test --test <name>` on the runner -- and its shape is
+/// pinned below anyway, because the parser must go on refusing it. The
+/// shape did not leave with the job: `chore test:images`, `test:oracle`
+/// and `test:kernel` are the same runs one substitution away, since
+/// `scripts/test-targets.sh <tier>` prints `--test <name>` per file for
+/// all three. Both spellings are asserted here, so a future edit
+/// widening the parser to count either fails rather than quietly
+/// reporting this repository's defect as fixed.
 #[test]
-fn the_kernel_gates_per_target_debug_runs_do_not_satisfy_this_guard() {
-    let kernel_gate_shapes = "\
+fn a_run_that_names_its_integration_targets_does_not_satisfy_this_guard() {
+    let the_old_kernel_gate = "\
 jobs:
   kernel-gate:
     steps:
@@ -761,153 +1104,197 @@ jobs:
 ";
     assert!(
         scan_steps(
-            kernel_gate_shapes,
+            the_old_kernel_gate,
             false,
             runs_covering_the_library_unit_tests
         )
         .is_empty(),
-        "the kernel-gate's `--test <name>` runs are debug runs, but they \
-         build no library unit tests -- counting them would report this \
-         repository's defect as already fixed"
+        "the old kernel-gate's `--test <name>` runs were debug runs that built no library \
+         unit tests -- counting them would have reported this repository's defect as \
+         already fixed, and counting them now would do it again"
     );
 
-    // And the near miss that proves the exclusion is about `--test
-    // <name>` specifically and not about the word "test": an
-    // `--all-targets` debug run DOES build the library unit tests and
-    // must be counted.
-    let all_targets = "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --all-targets\n";
+    // THE SAME DEFECT IN THE SHAPE IT WOULD ARRIVE IN TODAY: a tier
+    // whose targets come from a list that names integration targets and
+    // nothing else. No `--release`, the handshake set, and still not one
+    // library unit test built.
+    let another_tiers_target_list = "\
+EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 400 21000 -- \
+scripts/test.sh --locked $(scripts/test-targets.sh oracle)
+";
+    assert!(
+        runs_covering_the_library_unit_tests(another_tiers_target_list).is_empty(),
+        "`$(scripts/test-targets.sh oracle)` expands to `--test <name>` per file, so this \
+         builds one integration target per suite and no library unit test; the \
+         substitution must not hide from the guard what the flags would not"
+    );
+
+    // And the control, so the exclusion is about the target list rather
+    // than about the wrapper chain the tier is written in.
+    let the_real_tier = "\
+EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 400 21000 -- \
+scripts/test.sh --locked $(scripts/test-targets.sh unit)
+";
     assert_eq!(
-        debug_runs_that_prove_the_build_traps(all_targets),
-        vec!["EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --all-targets".to_string()],
-        "--all-targets builds the library unit tests; the `--test ` exclusion \
-         must not swallow it"
+        debug_runs_that_prove_the_build_traps(the_real_tier).len(),
+        1,
+        "the unit tier's own shape must be counted, or every assertion above passes for \
+         the wrong reason"
     );
 
-    // And the real guards must be reading ci.yml's own content.
-    let scanned = read_or_panic(&ci_yml());
-    if let Some(why) = not_a_pull_request_gate(&scanned) {
+    // And the real guards must be reading the real files' content.
+    let workflow = read_or_panic(&ci_yml());
+    if let Some(why) = not_a_pull_request_gate(&workflow) {
         panic!("{}: {why}", ci_yml().display());
     }
     assert!(
-        !gating_runs_that_prove_the_build_traps(&scanned).is_empty(),
-        "the guards above must be satisfied by ci.yml's own content, not by \
-         any of the strings in this test"
+        !gating_runs_of_the_unit_task(&workflow).is_empty(),
+        "the guards above must be satisfied by ci.yml's own content, not by any of the \
+         strings in this test"
+    );
+    assert!(
+        !debug_runs_that_prove_the_build_traps(&task_script_or_panic(
+            &read_or_panic(&chores_yml()),
+            UNIT_TASK
+        ))
+        .is_empty(),
+        "and by chores.yml's own content"
     );
 }
 
-/// The file scoping, which matters here for the same reason it does in
-/// the sibling repositories.
+/// The file scoping, which matters here for the same reason it always
+/// did, with a different file on the other side of it.
 ///
-/// `release.yml:66` runs `cargo test --all-targets` in debug, which
-/// genuinely does cover the library unit tests. It triggers on a
-/// version tag, so it gates a publish and not a merge. A scan widened
-/// across every workflow would therefore report this repository's
-/// defect as already fixed, and the guard's correctness comes from
-/// which file it opens -- not from the parser refusing that shape,
-/// which it does not.
+/// `release.yml` runs `chore test` on a version tag. That reaches
+/// `test:unit` through `test:native`, so the library's unit tests ARE
+/// compiled in debug with the handshake set -- after the change has
+/// merged, detached from the change and from the person who could have
+/// caught it. A scan widened across every workflow would find it and
+/// report this repository as covered.
+///
+/// Two things keep that out, and this pins both: the guard opens
+/// `ci.yml` and nothing else, and a workflow that does not trigger on
+/// `pull_request` gates nothing whatever its steps say.
 #[test]
 fn a_debug_run_outside_ci_yml_does_not_satisfy_this_guard() {
     let release_yml_as_it_is = "\
+on:
+  push:
+    tags:
+      - 'v*.*.*'
 jobs:
   test:
     steps:
-      - run: cargo test --all-targets
-      - run: cargo test --test oracle_vm_fixtures -- --nocapture
+      - run: chore lint
+      - run: chore test
+      - run: chore test:unit
 ";
     assert_eq!(
-        scan_steps(
-            release_yml_as_it_is,
-            false,
-            runs_covering_the_library_unit_tests
-        ),
-        vec!["cargo test --all-targets".to_string()],
-        "release.yml's --all-targets run IS a library-covering debug run -- \
-         the parser counts it, and the only reason it does not satisfy the \
-         guard is that the guard never opens that file"
+        scan_steps(release_yml_as_it_is, false, |script| {
+            runs_of_the_chore_task(script, UNIT_TASK)
+        }),
+        vec![format!("chore {UNIT_TASK}")],
+        "release.yml's tag-triggered run IS the same task -- the parser counts it, and one \
+         of the two reasons it does not satisfy the guard is that the guard never opens \
+         that file"
     );
     assert!(
-        scan_steps(
-            release_yml_as_it_is,
-            false,
-            debug_runs_that_prove_the_build_traps
-        )
-        .is_empty(),
-        "release.yml carries no handshake, and is not asked to"
+        gating_runs_of_the_unit_task(release_yml_as_it_is).is_empty(),
+        "and the other: a workflow triggered by a tag push gates no pull request, so even \
+         read from the right file it would establish nothing about a merge"
     );
 }
 
-/// Every `cargo test` in `ci.yml` pins `--locked`.
+/// Every cargo test run in `chores.yml` pins `--locked`.
 ///
-/// `ci.yml`'s release run was the one `cargo test` in this constellation
-/// that did not, so a drifting `Cargo.lock` was silently resolved past
-/// instead of failing the gate. Fixed alongside the profile change and
-/// guarded here so it does not come back.
+/// `--locked` makes the build fail rather than silently resolve a
+/// drifting `Cargo.lock` past, which is what keeps the gate and a
+/// developer's machine checking the same dependency versions -- and it
+/// is what the release process relies on. `ci.yml`'s release run was
+/// the one `cargo test` in this constellation that did not pin it, and
+/// this guard exists so that does not come back.
 ///
-/// The kernel-gate's per-target runs are deliberately exempt: they are
-/// invoked from shell bodies, several inside loops, and pinning them is
-/// a larger change than this one is scoped to. The exemption is by job,
-/// in [`LOCKED_EXEMPT_JOBS`], so adding a new unpinned step to any other
-/// job fails here.
+/// IT READS THE MANIFEST NOW, because that is where the runs went. The
+/// workflow calls `chore <task>` and nothing else, so a scan of
+/// `ci.yml` would find no cargo invocation at all and pass while
+/// asserting nothing -- the failure mode this file is named for.
+/// Reading `chores.yml` instead gains something the old scoping could
+/// not have: these are the same commands a developer runs locally, so
+/// pinning them here pins both.
 ///
-/// The runs are read from the parsed workflow, every `run:` of every
-/// step (#123). The scan this replaces matched lines starting `- run: `,
-/// so a `cargo test` inside a `run: |` block was never checked, and the
-/// kernel-gate was exempt only because its steps spell `run:` on a line
-/// of its own.
+/// The runs are read from the parsed manifest, every command of every
+/// task, through the same wrapper chain the rest of this file walks
+/// ([`cargo_test_arguments`]) -- so `scripts/test.sh --locked` is
+/// recognised as the cargo invocation it ends in, while `cargo build`
+/// and `vm.sh guest-test` are not test runs and are not asked.
 #[test]
 fn the_gates_own_cargo_test_runs_pin_locked() {
-    let path = ci_yml();
-    let workflow = read_or_panic(&path);
+    let path = chores_yml();
+    let manifest = read_or_panic(&path);
 
-    let steps = cargo_test_runs_outside(&workflow, LOCKED_EXEMPT_JOBS);
+    let runs = cargo_test_runs_outside(&manifest, LOCKED_EXEMPT_TASKS);
 
     // Non-emptiness first: `all()` over nothing is true, and a rewritten
-    // workflow with no cargo test runs outside the exempt jobs would
+    // manifest with no cargo test runs outside the exempt tasks would
     // satisfy the loop below while establishing nothing at all.
     assert!(
-        !steps.is_empty(),
-        "{} has no `cargo test` run outside {LOCKED_EXEMPT_JOBS:?}, so this guard is \
-         asserting nothing. Re-read it before changing the workflow's step \
-         layout.",
+        !runs.is_empty(),
+        "{} has no cargo test run outside {LOCKED_EXEMPT_TASKS:?}, so this guard is \
+         asserting nothing. Re-read it before changing how the tiers invoke cargo.",
         path.display()
     );
 
-    for step in &steps {
+    for run in &runs {
+        let arguments = cargo_test_arguments(run).unwrap_or_default();
         assert!(
-            step.contains("--locked"),
-            "{}: `{step}` does not pin `--locked`, so a drifting Cargo.lock \
-             is resolved past instead of failing the gate.",
+            arguments.iter().any(|a| a == "--locked"),
+            "{}: `{run}` does not pin `--locked`, so a drifting Cargo.lock is resolved \
+             past instead of failing the gate.",
             path.display()
         );
     }
 }
 
-/// Jobs whose `cargo test` runs need not pin `--locked`; see
+/// Tasks whose cargo test runs need not pin `--locked`. EMPTY, and the
+/// migration is what emptied it; see
 /// [`the_gates_own_cargo_test_runs_pin_locked`].
-const LOCKED_EXEMPT_JOBS: &[&str] = &["kernel-gate"];
+///
+/// It named `kernel-gate`, the workflow job that invoked thirty-odd
+/// suites by hand from shell bodies, several of them inside loops:
+/// pinning those was a larger change than the one that introduced this
+/// guard, so they were exempted by job. That job no longer exists, and
+/// every test run in this repository now reaches cargo through
+/// `scripts/test.sh`, which every tier calls with `--locked`. There is
+/// nothing left to exempt.
+///
+/// The one test run this guard does not reach is `test:vm`'s, and it is
+/// deliberately NOT listed: its command is `vm.sh guest-test`, the
+/// harness sibling's, whose cargo invocation lives in that repository's
+/// guest script and not in this file at all. Naming it here would make
+/// the list look load-bearing when nothing would ever consult it.
+const LOCKED_EXEMPT_TASKS: &[&str] = &[];
 
-/// Every `cargo test` command in `workflow`'s steps, except in the jobs
-/// named in `exempt`: each non-comment line of each step's `run:`, with
-/// any trailing ` #` comment cut off.
-fn cargo_test_runs_outside(workflow: &str, exempt: &[&str]) -> Vec<String> {
-    parse_workflow(workflow)
-        .jobs
-        .iter()
-        .filter(|job| !exempt.contains(&job.id.as_str()))
-        .flat_map(|job| &job.steps)
-        .flat_map(|step| logical_lines(&step.run))
+/// Every cargo test command in `manifest`'s tasks, except in the tasks
+/// named in `exempt`: each non-comment line of each command, with any
+/// trailing ` #` comment cut off.
+fn cargo_test_runs_outside(manifest: &str, exempt: &[&str]) -> Vec<String> {
+    task_bodies(manifest)
+        .into_iter()
+        .filter(|(id, _)| !exempt.contains(&id.as_str()))
+        .flat_map(|(_, commands)| commands)
+        .flat_map(|command| logical_lines(&command))
         .filter(|line| !line.trim_start().starts_with('#'))
         .flat_map(|line| {
             let line = line.split(" #").next().unwrap_or(&line).to_string();
             shell_commands_of(&line)
         })
-        .filter(|command| command.contains("cargo test"))
+        .filter(|command| cargo_test_arguments(command).is_some())
         .collect()
 }
 
-/// A `run:` block's lines with backslash continuations joined, so
-/// `cargo test \` followed by `--locked` is one command (Greptile on
-/// #159).
+/// A command's lines with backslash continuations joined, so
+/// `scripts/tier.sh ... \` followed by what it wraps is one command
+/// (Greptile on #159). `chores.yml` writes the `test:vm` tier that way.
 fn logical_lines(run: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut pending = String::new();
@@ -962,122 +1349,188 @@ fn shell_commands_of(line: &str) -> Vec<String> {
         .collect()
 }
 
-/// The pieces of the `--locked` guard, against workflows whose answers
+/// The pieces of the `--locked` guard, against manifests whose answers
 /// are known.
 mod locked {
-    use super::{cargo_test_runs_outside, parse_workflow, LOCKED_EXEMPT_JOBS};
+    use super::{cargo_test_runs_outside, task_bodies, LOCKED_EXEMPT_TASKS};
 
-    const WORKFLOW: &str = "\
-on:
-  pull_request:
-jobs:
-  test:
-    steps:
-      - run: cargo test --locked --release
-  kernel-gate:
-    steps:
-      - name: per target
-        run: cargo test --test pool_oracle
+    const MANIFEST: &str = "\
+tasks:
+  test:unit:
+    cmds:
+      - 'scripts/tier.sh test:unit unit 400 21000 -- scripts/test.sh --locked --lib'
+  test:images:
+    cmds:
+      - cmd: 'scripts/test.sh --locked --release --test fixtures_present'
 ";
 
+    const UNIT_CMD: &str =
+        "      - 'scripts/tier.sh test:unit unit 400 21000 -- scripts/test.sh --locked --lib'\n";
+
     #[test]
-    fn the_control_finds_the_pinned_run_and_exempts_the_kernel_gate() {
+    fn the_control_finds_both_runs_through_their_wrappers() {
         assert_eq!(
-            cargo_test_runs_outside(WORKFLOW, LOCKED_EXEMPT_JOBS),
-            vec!["cargo test --locked --release".to_string()]
+            cargo_test_runs_outside(MANIFEST, LOCKED_EXEMPT_TASKS),
+            vec![
+                "scripts/tier.sh test:unit unit 400 21000 -- scripts/test.sh --locked --lib"
+                    .to_string(),
+                "scripts/test.sh --locked --release --test fixtures_present".to_string(),
+            ],
+            "a `cmds:` entry is a string or a `cmd:` mapping, and both are commands"
         );
     }
 
-    /// THE HOLE (#123). A `cargo test` inside a block scalar is on a
-    /// line of its own, which a `- run: ` line scan never collected.
+    /// THE HOLE (#123), in its new home. A cargo invocation inside a
+    /// block scalar is on a line of its own, which a scan of the
+    /// single-line `cmds:` entries would never collect.
+    ///
+    /// The folding style gets a one-line body on purpose. `>` joins the
+    /// block's lines into one, so a two-line script cannot be written in
+    /// it at all -- `set -e` and the command become a single command
+    /// named `set`, which no shell runs as a test. Asserting that such a
+    /// thing is collected would be asserting about a command that cannot
+    /// exist; what is worth pinning for `>` is that the entry's value is
+    /// still read from the line below it.
     #[test]
     fn a_run_inside_a_block_scalar_is_checked() {
-        for style in ["|", "|-", ">"] {
-            let yaml = WORKFLOW.replace(
-                "      - run: cargo test --locked --release\n",
-                &format!(
-                    "      - run: cargo test --locked --release\n      - run: {style}\n          set -e\n          cargo test --lib  # unpinned\n"
-                ),
-            );
-            assert_ne!(yaml, WORKFLOW, "the mutation must actually apply");
-            let runs = cargo_test_runs_outside(&yaml, LOCKED_EXEMPT_JOBS);
+        for (style, body) in [
+            (
+                "|",
+                "          set -e\n          scripts/test.sh --lib  # unpinned\n",
+            ),
+            (
+                "|-",
+                "          set -e\n          scripts/test.sh --lib  # unpinned\n",
+            ),
+            (">", "          scripts/test.sh --lib  # unpinned\n"),
+        ] {
+            let yaml = MANIFEST.replace(UNIT_CMD, &format!("      - {style}\n{body}"));
+            assert_ne!(yaml, MANIFEST, "the mutation must actually apply");
+            let runs = cargo_test_runs_outside(&yaml, LOCKED_EXEMPT_TASKS);
             assert!(
-                // `>` folds the block onto one line; the run is still
-                // collected, and still lacks `--locked`.
                 runs.iter()
-                    .any(|r| r.contains("cargo test --lib") && !r.contains("--locked")),
-                "run: {style}: the unpinned run inside the block was not collected: {runs:?}"
+                    .any(|r| r.contains("scripts/test.sh --lib") && !r.contains("--locked")),
+                "cmds: {style}: the unpinned run inside the block was not collected: {runs:?}"
             );
         }
     }
 
-    /// The exemption is by job, so the same unpinned run in any other job
-    /// is still checked, whatever the step looks like.
+    /// The exemption is by task, so the same unpinned run in any other
+    /// task is still checked, whatever its entry looks like.
     #[test]
-    fn the_exemption_covers_only_the_named_job() {
-        let yaml = WORKFLOW.replace("  kernel-gate:\n", "  another-gate:\n");
-        assert_ne!(yaml, WORKFLOW, "the mutation must actually apply");
-        assert!(cargo_test_runs_outside(&yaml, LOCKED_EXEMPT_JOBS)
-            .contains(&"cargo test --test pool_oracle".to_string()));
+    fn the_exemption_covers_only_the_named_task() {
+        let yaml = MANIFEST.replace(UNIT_CMD, "      - 'scripts/test.sh --lib'\n");
+        assert_ne!(yaml, MANIFEST, "the mutation must actually apply");
+        assert!(
+            cargo_test_runs_outside(&yaml, &["test:unit"])
+                .iter()
+                .all(|r| r != "scripts/test.sh --lib"),
+            "the exempt task's unpinned run is not collected"
+        );
+        assert!(
+            cargo_test_runs_outside(&yaml, &["test:images"])
+                .iter()
+                .any(|r| r == "scripts/test.sh --lib"),
+            "exempting a different task leaves it collected"
+        );
     }
 
     /// A LINE IS NOT A COMMAND (Greptile on #159). Two runs on one line
-    /// are checked one at a time, so the unpinned one is found; and a run
-    /// continued onto the next line with a backslash is one run, so its
-    /// `--locked` counts.
+    /// are checked one at a time, so the unpinned one is found; and a
+    /// run continued onto the next line with a backslash is one run, so
+    /// its `--locked` counts. `chores.yml` writes the `test:vm` tier
+    /// with exactly that continuation.
     #[test]
     fn runs_are_split_at_separators_and_joined_across_continuations() {
-        let yaml = WORKFLOW.replace(
-            "      - run: cargo test --locked --release\n",
-            "      - run: |\n          cargo test --lib && cargo test --locked --release\n          cargo test \\\n            --locked --lib\n",
+        let yaml = MANIFEST.replace(
+            UNIT_CMD,
+            "      - |\n          scripts/test.sh --lib && cargo test --locked --release\n          scripts/tier.sh t u 1 1 -- \\\n            scripts/test.sh --locked --lib\n",
         );
-        assert_ne!(yaml, WORKFLOW, "the mutation must actually apply");
-        let runs = cargo_test_runs_outside(&yaml, LOCKED_EXEMPT_JOBS);
+        assert_ne!(yaml, MANIFEST, "the mutation must actually apply");
+        let runs = cargo_test_runs_outside(&yaml, LOCKED_EXEMPT_TASKS);
         assert_eq!(
             runs,
             vec![
-                "cargo test --lib".to_string(),
+                "scripts/test.sh --lib".to_string(),
                 "cargo test --locked --release".to_string(),
-                "cargo test --locked --lib".to_string(),
+                "scripts/tier.sh t u 1 1 -- scripts/test.sh --locked --lib".to_string(),
+                "scripts/test.sh --locked --release --test fixtures_present".to_string(),
             ],
             "each run on its own, the continued one whole"
         );
         assert!(
-            runs.iter().any(|r| !r.contains("--locked")),
+            runs.iter().any(|r| !cargo_test_arguments_contain_locked(r)),
             "the unpinned first run must be visible to the guard"
         );
     }
 
+    fn cargo_test_arguments_contain_locked(run: &str) -> bool {
+        super::cargo_test_arguments(run)
+            .unwrap_or_default()
+            .iter()
+            .any(|a| a == "--locked")
+    }
+
     /// A commented-out command is not a run.
     #[test]
-    fn a_comment_inside_a_run_block_is_not_a_run() {
-        let yaml = WORKFLOW.replace(
-            "      - run: cargo test --locked --release\n",
-            "      - run: |\n          # cargo test --lib\n          cargo test --locked --release\n",
+    fn a_comment_inside_a_cmds_block_is_not_a_run() {
+        let yaml = MANIFEST.replace(
+            UNIT_CMD,
+            "      - |\n          # scripts/test.sh --lib\n          scripts/test.sh --locked --lib\n",
         );
         assert_eq!(
-            cargo_test_runs_outside(&yaml, LOCKED_EXEMPT_JOBS),
-            vec!["cargo test --locked --release".to_string()]
+            cargo_test_runs_outside(&yaml, LOCKED_EXEMPT_TASKS),
+            vec![
+                "scripts/test.sh --locked --lib".to_string(),
+                "scripts/test.sh --locked --release --test fixtures_present".to_string(),
+            ]
         );
     }
 
-    /// Every exempt job exists in the real `ci.yml`. A renamed job would
-    /// otherwise leave the exemption naming nothing, and the renamed
-    /// job's unpinned runs would fail the guard with no pointer to why.
+    /// A manifest the parser cannot read is a failure, never a pass --
+    /// the same direction as the workflow parser's, in the other file
+    /// this module reads.
     #[test]
-    fn every_exempt_job_exists_in_ci_yml() {
-        let workflow = super::read_or_panic(&super::ci_yml());
-        let ids: Vec<String> = parse_workflow(&workflow)
-            .jobs
+    #[should_panic(expected = "not valid YAML")]
+    fn a_manifest_that_does_not_parse_is_a_failure() {
+        task_bodies("tasks:\n  test:\n   - broken: [unclosed\n");
+    }
+
+    /// THE LIST IS NOT STALE, in both directions it can be.
+    ///
+    /// A renamed task would leave an exemption naming nothing, and that
+    /// task's unpinned runs would then fail the guard with no pointer to
+    /// why. And an exemption is a hole in the `--locked` guard, so the
+    /// list being empty is asserted rather than assumed: with nothing in
+    /// it the loop below examines nothing, and a test that passes by
+    /// looking at nothing is this repository's own named defect.
+    #[test]
+    fn every_exempt_task_exists_in_chores_yml() {
+        let manifest = super::read_or_panic(&super::chores_yml());
+        let ids: Vec<String> = task_bodies(&manifest)
             .into_iter()
-            .map(|job| job.id)
+            .map(|(id, _)| id)
             .collect();
-        for exempt in LOCKED_EXEMPT_JOBS {
+
+        // The control: the lookup must be reading the real manifest, or
+        // both assertions below are about nothing.
+        assert!(
+            ids.iter().any(|id| id == super::UNIT_TASK),
+            "chores.yml's tasks did not parse into anything this guard recognises: {ids:?}"
+        );
+        for exempt in LOCKED_EXEMPT_TASKS {
             assert!(
                 ids.iter().any(|id| id == exempt),
-                "LOCKED_EXEMPT_JOBS names `{exempt}`, which ci.yml does not have: {ids:?}"
+                "LOCKED_EXEMPT_TASKS names `{exempt}`, which chores.yml does not have: {ids:?}"
             );
         }
+        assert!(
+            LOCKED_EXEMPT_TASKS.is_empty(),
+            "LOCKED_EXEMPT_TASKS has grown to {LOCKED_EXEMPT_TASKS:?}. Every test run in \
+             this repository reaches cargo through scripts/test.sh, which every tier calls \
+             with --locked, so an exemption is a hole rather than a convenience: write its \
+             justification on the constant, and change this assertion with it."
+        );
     }
 }
 
@@ -1106,8 +1559,8 @@ jobs:
 /// A bare key, a basic string, a literal string, and a dotted key that
 /// puts the profile name on the key side where a section-matching scan
 /// never looks. Four of those five defeated the first version, and each
-/// leaves the debug step in `ci.yml` present, running, green and blind
-/// -- the exact state the guard exists to refuse.
+/// leaves the debug tier present, running, green and blind -- the exact
+/// state the guard exists to refuse.
 ///
 /// So the section and the key are joined into one path and normalised
 /// per segment, and the comparison is against the whole thing. That
@@ -1166,16 +1619,15 @@ fn profiles_disabling_overflow_checks(manifest: &str) -> Vec<String> {
     found
 }
 
-/// The half of the property the workflow scans cannot see.
+/// The half of the property the workflow and task scans cannot see.
 ///
-/// A debug step in `ci.yml` only buys anything while the profile it
-/// builds actually checks. One line -- `overflow-checks = false` under
-/// `[profile.test]`, or under this repository's existing
-/// `[profile.dev]`, a plausible way to make a slow suite faster --
-/// would leave that step present, running, green, and no longer able to
-/// observe an overflow, with every workflow assertion above still
-/// passing. A guard for half a condition is the defect it was written
-/// to prevent.
+/// A debug tier only buys anything while the profile it builds actually
+/// checks. One line -- `overflow-checks = false` under `[profile.test]`,
+/// or under this repository's existing `[profile.dev]`, a plausible way
+/// to make a slow suite faster -- would leave that tier present,
+/// running, green, and no longer able to observe an overflow, with every
+/// assertion above still passing. A guard for half a condition is the
+/// defect it was written to prevent.
 ///
 /// The runtime probe in `src/lib.rs` would also catch this. This scan
 /// is kept as defence in depth: it fails earlier in the gate and names
@@ -1191,9 +1643,9 @@ fn the_profile_that_cargo_test_builds_still_checks_for_overflow() {
         disabled.is_empty(),
         "{} sets `overflow-checks = false` under {disabled:?}. `cargo test` \
          builds the `test` profile, which inherits from `dev`, so this \
-         switches off the check that the debug step in ci.yml exists to run \
-         -- leaving that step present, green, and blind. Put it back, or the \
-         debug step is costing a compile and buying nothing.",
+         switches off the check the unit tier exists to run -- leaving that \
+         tier present, green, and blind. Put it back, or the debug tier is \
+         costing a compile and buying nothing.",
         path.display()
     );
 }
@@ -1201,25 +1653,69 @@ fn the_profile_that_cargo_test_builds_still_checks_for_overflow() {
 /// The shell scanner is the part of this that can rot, so it is checked
 /// against each shape it has to tell apart.
 ///
-/// Its argument is the shell text of one step's `run:`, not YAML. What
-/// used to be tested here as YAML -- a debug command quoted in a `#`
-/// line of the workflow -- moved to `gating`, because the parser now
-/// answers it by construction and this function never sees it.
+/// Its argument is the shell text of one task's commands, not YAML.
+/// What used to be tested here as YAML -- a command quoted in a `#`
+/// line -- moved to `gating`, because the parser now answers it by
+/// construction and this function never sees it.
 mod shell_scan {
     use super::runs_covering_the_library_unit_tests;
 
+    /// THE SHAPE THE TIER ACTUALLY HAS, and the wrappers it is written
+    /// through. A scanner that knew only the words `cargo test` would
+    /// find nothing in this line, and the guard would then refuse a
+    /// correct tree -- the fastest way to get a guard deleted.
+    #[test]
+    fn the_tier_shape_this_repository_uses_counts() {
+        let tier = "EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 400 21000 -- \
+                    scripts/test.sh --locked $(scripts/test-targets.sh unit)\n";
+        assert_eq!(
+            runs_covering_the_library_unit_tests(tier).len(),
+            1,
+            "tier.sh runs what follows its `--`, and test.sh ends in `cargo test \"$@\"`; \
+             the arguments that reach cargo are what decides the profile"
+        );
+    }
+
+    /// The same chain carrying `--release`, which is what the other
+    /// tiers are and what must never satisfy this guard.
+    #[test]
+    fn the_same_chain_with_release_does_not_count() {
+        let tier = "scripts/tier.sh test:images images 760 36000 -- \
+                    scripts/test.sh --locked --release $(scripts/test-targets.sh images)\n";
+        assert_eq!(
+            runs_covering_the_library_unit_tests(tier),
+            Vec::<String>::new(),
+            "overflow checks are off in release; a release tier proves nothing about them"
+        );
+    }
+
+    /// A tier that wraps something else entirely. `test:vm` hands the
+    /// whole suite to the harness, whose cargo invocation is in the
+    /// sibling repository -- not a cargo test run this file can read the
+    /// arguments of, and so not this repository's debug run.
+    #[test]
+    fn a_tier_wrapping_something_that_is_not_cargo_does_not_count() {
+        let tier = "scripts/tier.sh test:vm vm 2860 136000 -- \
+                    ../fs-linux-test-harness/scripts/vm.sh guest-test\n";
+        assert_eq!(
+            runs_covering_the_library_unit_tests(tier),
+            Vec::<String>::new(),
+            "vm.sh guest-test is not a cargo test whose profile this scan can see"
+        );
+    }
+
     /// The trap this repository actually contains, in the form that
-    /// still reaches this function. `ci.yml` documents the debug step
-    /// by quoting the command, and a `run: |` block can carry the same
-    /// habit in shell comments, where the text survives the command's
-    /// deletion.
+    /// still reaches this function. `chores.yml` documents the tier by
+    /// quoting what it does, and a block-scalar command can carry the
+    /// same habit in shell comments, where the text survives the
+    /// command's deletion.
     #[test]
     fn a_debug_run_quoted_in_a_shell_comment_does_not_count() {
         let block = "\
 set -euo pipefail
 # Measured on this branch:
-#     cargo test --locked --release --lib   ->  EXIT=0
-#     EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib   ->  EXIT=101
+#     scripts/test.sh --locked --release --lib   ->  EXIT=0
+#     EXPECT_OVERFLOW_CHECKS=1 scripts/test.sh --locked --lib   ->  EXIT=101
 cargo test --locked --release
 ";
         assert_eq!(
@@ -1238,6 +1734,7 @@ cargo test --locked --release
             "echo \"EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\"\n",
             "if false; then\n  EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\nfi\n",
             "true && EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n",
+            "echo \"EXPECT_OVERFLOW_CHECKS=1 scripts/test.sh --locked --lib\"\n",
         ] {
             assert_eq!(
                 runs_covering_the_library_unit_tests(block),
@@ -1255,6 +1752,7 @@ cargo test --locked --release
             "cargo test --locked --lib",
             "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib",
             "A=1 B_2= cargo test --locked --lib",
+            "EXPECT_OVERFLOW_CHECKS=1 scripts/test.sh --locked --lib",
         ] {
             assert_eq!(
                 runs_covering_the_library_unit_tests(line),
@@ -1287,6 +1785,7 @@ cargo test --locked --release
             "cargo test --locked '-r'",
             "cargo test --locked --profile=release --lib",
             "RUSTFLAGS=-Dwarnings cargo test --locked -r --lib",
+            "scripts/test.sh --locked -r --lib",
         ] {
             assert_eq!(
                 runs_covering_the_library_unit_tests(&format!("{line}\n")),
@@ -1360,6 +1859,7 @@ EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
             "cargo test --locked --profile release-with-debug --lib",
             "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=false cargo test --locked --lib",
             "CARGO_PROFILE_DEV_OVERFLOW_CHECKS=false cargo test --locked --lib",
+            "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=false scripts/test.sh --locked --lib",
         ];
         for line in lines {
             assert_eq!(
@@ -1370,7 +1870,7 @@ EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
         }
         assert_eq!(
             lines.len(),
-            3,
+            4,
             "the loop above must have examined every shape"
         );
     }
@@ -1384,6 +1884,7 @@ EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
             "cargo test --test csum_oracle -- --nocapture",
             "cargo test --locked --test transaction_oracle",
             "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --test capi",
+            "EXPECT_OVERFLOW_CHECKS=1 scripts/test.sh --locked --test=capi",
         ];
         for line in lines {
             assert_eq!(
@@ -1394,45 +1895,72 @@ EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
         }
         assert_eq!(
             lines.len(),
-            3,
+            4,
             "the loop above must have examined every shape"
         );
     }
 
-    /// `--all-targets` does build the library unit tests, so the
-    /// `--test ` exclusion must be about `--test <name>` and not about
-    /// the substring. Without the trailing space in that check this
-    /// would be excluded and the guard would refuse a workflow that
-    /// satisfies it.
+    /// THE TIER NAME IS PART OF THE TARGET LIST. A run whose targets
+    /// come from a substitution is covered exactly when that
+    /// substitution is the `unit` tier; the others print `--test <name>`
+    /// per file, which is the test above with the flags out of sight.
     #[test]
-    fn a_tests_flag_run_counts_which_is_what_the_trailing_space_protects() {
-        // `--tests` builds the library unit tests, so a run using it
-        // satisfies this guard and must be counted. It contains the
-        // substring `--test` but NOT `--test `, which is precisely
-        // what the trailing space in the exclusion is for.
-        //
-        // THIS REPLACES A TEST THAT COULD NOT FAIL. Its predecessor
-        // asserted `--all-targets` was not excluded, and `--all-targets`
-        // does not contain `--test` in any spelling -- so removing the
-        // space left it green. Measured: with the space removed this
-        // test fails, and the old one did not.
-        let script = "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --tests\n";
+    fn the_tier_a_target_list_comes_from_decides_whether_it_counts() {
+        for tier in ["images", "oracle", "kernel"] {
+            let line = format!("scripts/test.sh --locked $(scripts/test-targets.sh {tier})\n");
+            assert_eq!(
+                runs_covering_the_library_unit_tests(&line),
+                Vec::<String>::new(),
+                "the {tier} tier's target list is `--test <name>` per file and builds no \
+                 library unit test"
+            );
+        }
+        let unit = "scripts/test.sh --locked $(scripts/test-targets.sh unit)\n";
         assert_eq!(
-            runs_covering_the_library_unit_tests(script),
-            vec!["EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --tests".to_string()],
-            "`--tests` builds the library unit tests; excluding it would refuse a workflow \
-             that genuinely satisfies this guard"
+            runs_covering_the_library_unit_tests(unit).len(),
+            1,
+            "the unit tier's list begins `--lib`, which the guard proves by running the \
+             script rather than by trusting this"
         );
 
-        // And `--all-targets` too, for the same reason -- kept because
-        // it is a real spelling a workflow might use, but it is NOT
-        // what the trailing space protects.
-        let all_targets = "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --all-targets\n";
+        // An explicit library flag settles it whatever list is beside
+        // it: cargo builds the library unit tests as well as the named
+        // targets, and refusing that would be the guard turning down a
+        // run that genuinely satisfies it.
+        let both = "scripts/test.sh --locked --lib $(scripts/test-targets.sh oracle)\n";
         assert_eq!(
-            runs_covering_the_library_unit_tests(all_targets).len(),
+            runs_covering_the_library_unit_tests(both).len(),
             1,
-            "`--all-targets` builds the library too"
+            "`--lib` beside another list still builds the library unit tests"
         );
+    }
+
+    /// `--tests` and `--all-targets` build the library unit tests, so
+    /// neither may be mistaken for a `--test <name>` run.
+    ///
+    /// THIS REPLACES A TEST THAT COULD NOT FAIL, and then the mechanism
+    /// that one pinned. The first version asserted `--all-targets` was
+    /// not excluded by a `--test` substring search -- and `--all-targets`
+    /// does not contain `--test` in any spelling, so the assertion held
+    /// however the search was written. The second pinned the trailing
+    /// space in `"--test "`, which was what kept `--tests` from being
+    /// swallowed. The exclusion compares whole arguments now, so there
+    /// is no space to lose and nothing mechanical left to pin; what is
+    /// worth asserting is the behaviour itself, which is what this does.
+    #[test]
+    fn the_flags_that_build_the_library_are_not_single_target_runs() {
+        for line in [
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --tests",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --all-targets",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --tests --test capi",
+        ] {
+            assert_eq!(
+                runs_covering_the_library_unit_tests(&format!("{line}\n")),
+                vec![line.to_string()],
+                "{line} builds the library unit tests; excluding it would refuse a run \
+                 that genuinely satisfies this guard"
+            );
+        }
     }
 
     /// `cargo build` is not `cargo test`.
@@ -1468,7 +1996,33 @@ mod handshake {
         assert_eq!(
             debug_runs_that_prove_the_build_traps(script),
             Vec::<String>::new(),
-            "the step is there but nothing checks the build it produced"
+            "the tier is there but nothing checks the build it produced"
+        );
+    }
+
+    /// AN EMPTY VALUE IS NOT THE HANDSHAKE, because `src/lib.rs` reads
+    /// it that way -- `Ok(value) if !value.is_empty()`, and anything
+    /// else returns without asserting. A tier spelled this way would
+    /// look armed in the manifest and prove nothing at runtime.
+    #[test]
+    fn an_empty_handshake_value_does_not_count() {
+        let script = "EXPECT_OVERFLOW_CHECKS= cargo test --locked --lib\n";
+        assert_eq!(
+            debug_runs_that_prove_the_build_traps(script),
+            Vec::<String>::new(),
+        );
+    }
+
+    /// The variable must reach the command, not merely appear in it. An
+    /// assignment written after the command name is an argument -- here
+    /// a test-name filter -- and the environment the build sees is
+    /// unchanged.
+    #[test]
+    fn the_variable_must_be_set_on_the_command() {
+        let script = "cargo test --locked --lib EXPECT_OVERFLOW_CHECKS=1\n";
+        assert_eq!(
+            debug_runs_that_prove_the_build_traps(script),
+            Vec::<String>::new(),
         );
     }
 
@@ -1483,8 +2037,8 @@ mod handshake {
         );
     }
 
-    /// And quoted inside a shell comment, which is where a `run: |`
-    /// block would explain it.
+    /// And quoted inside a shell comment, which is where a block-scalar
+    /// command would explain it.
     #[test]
     fn the_handshake_quoted_in_a_comment_does_not_count() {
         let script = "#     EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n";
@@ -1662,8 +2216,13 @@ overflow-checks = false
 /// isolation. Measured against this repository's own workflow, `if:
 /// false` and `continue-on-error: true` each left all 31 of its tests
 /// green while the gate stopped gating.
+///
+/// The step they are asserted against is `run: chore test:unit`, which
+/// is what `ci.yml` now contains: the workflow's half of the chain is
+/// the task being invoked, so that is the thing whose gating has to be
+/// established.
 mod gating {
-    use super::gating_runs_that_prove_the_build_traps;
+    use super::gating_runs_of_the_unit_task;
 
     /// The shape that does gate, as a control. Every test below is this
     /// with one thing added, so a failure here would mean the fixture
@@ -1673,15 +2232,17 @@ on:
   pull_request:
     branches: [main]
 jobs:
-  test:
+  unit:
     steps:
-      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
+      - run: chore test:unit
 ";
+
+    const STEP: &str = "      - run: chore test:unit\n";
 
     #[test]
     fn the_control_shape_gates() {
         assert_eq!(
-            gating_runs_that_prove_the_build_traps(GATING).len(),
+            gating_runs_of_the_unit_task(GATING).len(),
             1,
             "the control must be counted, or every test below passes for the wrong reason"
         );
@@ -1689,8 +2250,8 @@ jobs:
 
     /// THE MESSAGE NAMES THE CAUSE (#124). A workflow that stopped
     /// triggering on pull requests is reported as that, with the
-    /// triggers it has, and not as a missing debug step. The control is
-    /// the gating shape, which has nothing to explain.
+    /// triggers it has, and not as a missing step. The control is the
+    /// gating shape, which has nothing to explain.
     #[test]
     fn a_workflow_off_pull_requests_is_reported_by_its_trigger() {
         assert_eq!(super::not_a_pull_request_gate(GATING), None, "control");
@@ -1723,14 +2284,9 @@ jobs:
             "if: github.event_name == 'push'",
             "if: ${{ env.SOMETHING == 'yes' }}",
         ] {
-            let yaml = GATING.replace(
-                "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n",
-                &format!(
-                    "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n        {condition}\n"
-                ),
-            );
+            let yaml = GATING.replace(STEP, &format!("{STEP}        {condition}\n"));
             assert!(
-                gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+                gating_runs_of_the_unit_task(&yaml).is_empty(),
                 "a step carrying `{condition}` may or may not run, so it cannot be what \
                  makes the gate able to see an overflow. Rejected on the key's presence \
                  rather than by evaluating it -- the spellings are open-ended."
@@ -1740,12 +2296,9 @@ jobs:
 
     #[test]
     fn a_step_carrying_continue_on_error_does_not_gate() {
-        let yaml = GATING.replace(
-            "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n",
-            "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n        continue-on-error: true\n",
-        );
+        let yaml = GATING.replace(STEP, &format!("{STEP}        continue-on-error: true\n"));
         assert!(
-            gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+            gating_runs_of_the_unit_task(&yaml).is_empty(),
             "the step runs and its failure is discarded, which is the project's own named \
              defect: a step that runs and whose result nothing reads"
         );
@@ -1753,18 +2306,18 @@ jobs:
 
     #[test]
     fn a_job_carrying_if_does_not_gate() {
-        let yaml = GATING.replace("  test:\n", "  test:\n    if: false\n");
+        let yaml = GATING.replace("  unit:\n", "  unit:\n    if: false\n");
         assert!(
-            gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+            gating_runs_of_the_unit_task(&yaml).is_empty(),
             "the same reasoning one level up: a job that may not run cannot gate"
         );
     }
 
     #[test]
     fn a_job_carrying_continue_on_error_does_not_gate() {
-        let yaml = GATING.replace("  test:\n", "  test:\n    continue-on-error: true\n");
+        let yaml = GATING.replace("  unit:\n", "  unit:\n    continue-on-error: true\n");
         assert!(
-            gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+            gating_runs_of_the_unit_task(&yaml).is_empty(),
             "a job whose failure is discarded cannot gate, however sound its steps"
         );
     }
@@ -1778,15 +2331,14 @@ jobs:
             "  push:\n    branches: [main]\n",
         );
         assert!(
-            gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+            gating_runs_of_the_unit_task(&yaml).is_empty(),
             "scoping the scan to ci.yml assumes ci.yml is what runs on a pull request; if its \
              triggers stop including pull_request, the step gates nothing no matter how it looks"
         );
     }
 
-    /// A `run: |` block is read whole, so a command inside a loop is
-    /// visible. This repository has TWO such loops in kernel-gate, and
-    /// a line-range extraction drops the second.
+    /// A `run: |` block is read whole, so a command below a `set -e`
+    /// line is seen rather than lost with the fragment before it.
     #[test]
     fn a_run_block_is_read_whole() {
         let yaml = "\
@@ -1794,20 +2346,21 @@ on:
   pull_request:
     branches: [main]
 jobs:
-  test:
+  unit:
     steps:
       - name: a block
         run: |
           set -euo pipefail
-          EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
+          chore test:unit
 ";
         assert_eq!(
-            gating_runs_that_prove_the_build_traps(yaml).len(),
+            gating_runs_of_the_unit_task(yaml).len(),
             1,
-            "a command inside a `run: |` block must be seen; the kernel-gate loops live in \
-             blocks like this one"
+            "a command inside a `run: |` block must be seen; several of this workflow's \
+             steps are written that way"
         );
     }
+
     /// THE QUOTED SPELLINGS, WHICH WERE SILENT DEFEATS. Measured on
     /// `main` at `57cf1b6`: `if: false` correctly turned the suite red,
     /// and `"if": false` -- the same key, quoted -- left all 34 tests
@@ -1826,14 +2379,9 @@ jobs:
             "\"continue-on-error\": true",
             "'continue-on-error': true",
         ] {
-            let yaml = GATING.replace(
-                "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n",
-                &format!(
-                    "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n        {spelling}\n"
-                ),
-            );
+            let yaml = GATING.replace(STEP, &format!("{STEP}        {spelling}\n"));
             assert!(
-                gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+                gating_runs_of_the_unit_task(&yaml).is_empty(),
                 "`{spelling}` is the same key as its bare spelling; quoting it must not \
                  make a skipped step count as the thing gating the merge"
             );
@@ -1844,9 +2392,9 @@ jobs:
     #[test]
     fn a_quoted_key_on_the_job_is_the_same_key() {
         for spelling in ["\"if\": false", "\"continue-on-error\": true"] {
-            let yaml = GATING.replace("  test:\n", &format!("  test:\n    {spelling}\n"));
+            let yaml = GATING.replace("  unit:\n", &format!("  unit:\n    {spelling}\n"));
             assert!(
-                gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+                gating_runs_of_the_unit_task(&yaml).is_empty(),
                 "`{spelling}` on the job is the same key as its bare spelling"
             );
         }
@@ -1873,7 +2421,7 @@ jobs:
             &only_a_comment_naming_it,
         ] {
             assert!(
-                gating_runs_that_prove_the_build_traps(yaml).is_empty(),
+                gating_runs_of_the_unit_task(yaml).is_empty(),
                 "a trigger named only in a comment is not a trigger; the parser drops \
                  comments before anything compares a name, so there is no `#` to strip \
                  and none to forget:\n{yaml}"
@@ -1892,7 +2440,7 @@ jobs:
             "  pull_request_review:\n    types: [submitted]\n",
         );
         assert!(
-            gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+            gating_runs_of_the_unit_task(&yaml).is_empty(),
             "pull_request_review is not pull_request; a substring match cannot tell \
              them apart and this comparison must"
         );
@@ -1916,7 +2464,7 @@ jobs:
             "  pull_request_target:\n    branches: [main]\n",
         );
         assert!(
-            gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+            gating_runs_of_the_unit_task(&yaml).is_empty(),
             "pull_request_target runs with the base repository's token and secrets \
              and checks out the base ref; it is not proof that the merge is gated"
         );
@@ -1933,7 +2481,7 @@ jobs:
         ] {
             let yaml = GATING.replace("on:\n  pull_request:\n    branches: [main]\n", spelling);
             assert_eq!(
-                gating_runs_that_prove_the_build_traps(&yaml).len(),
+                gating_runs_of_the_unit_task(&yaml).len(),
                 1,
                 "this workflow triggers on a pull request as surely as the mapping \
                  spelling does:\n{yaml}"
@@ -1958,13 +2506,13 @@ jobs:
     fn every_block_scalar_style_is_read_whole() {
         for style in ["|", "|-", "|+", ">", ">-", "|2"] {
             let yaml = GATING.replace(
-                "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n",
+                STEP,
                 &format!(
-                    "      - name: a block\n        run: {style}\n          EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n"
+                    "      - name: a block\n        run: {style}\n          chore test:unit\n"
                 ),
             );
             assert_eq!(
-                gating_runs_that_prove_the_build_traps(&yaml).len(),
+                gating_runs_of_the_unit_task(&yaml).len(),
                 1,
                 "`run: {style}` is a legal block scalar carrying the gating command; \
                  failing here is the guard refusing a correct workflow:\n{yaml}"
@@ -1976,9 +2524,9 @@ jobs:
     /// the shell scanner's job and is the parser's now: comments do not
     /// survive parsing, so there is no `#` handling here to get wrong.
     /// It is asserted at this level because that is where the property
-    /// now lives -- `ci.yml` really does quote the gating command
-    /// verbatim in the comment block above it, so a scan that missed
-    /// this would stay green after the step itself was deleted.
+    /// now lives -- `ci.yml` really does explain the unit job in a
+    /// comment block above it, so a scan that missed this would stay
+    /// green after the step itself was deleted.
     #[test]
     fn a_debug_run_quoted_in_a_yaml_comment_does_not_gate() {
         let yaml = "\
@@ -1988,20 +2536,20 @@ on:
 jobs:
   test:
     steps:
-      # Do not remove this as a duplicate of the runs above it:
-      #     - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
-      - run: cargo test --locked --release
+      # Do not remove this as a duplicate of the run below it:
+      #     - run: chore test:unit
+      - run: chore test:images
 ";
         assert!(
-            gating_runs_that_prove_the_build_traps(yaml).is_empty(),
+            gating_runs_of_the_unit_task(yaml).is_empty(),
             "the gating command appears only inside a comment, and the step that \
-             remains is a release run"
+             remains runs a different tier"
         );
     }
 
     /// A workflow the parser cannot read is a failure, never a pass.
     /// The direction matters: a guard that swallowed the error and
-    /// returned an empty structure would report "no debug run gates
+    /// returned an empty structure would report "no gating job runs
     /// this", which is also a failure and therefore safe -- but one
     /// that returned early with a pass would be the blindness this
     /// whole module exists to refuse.
@@ -2040,10 +2588,28 @@ jobs:
         );
         assert_ne!(yaml, GATING, "the mutation must actually apply");
         assert_eq!(
-            gating_runs_that_prove_the_build_traps(&yaml).len(),
+            gating_runs_of_the_unit_task(&yaml).len(),
             1,
             "the workflow still triggers on pull_request, so it still gates; refusing it \
              because pull_request_target is also present would be the over-correction"
         );
+    }
+
+    /// AND A TASK NAME IS A TASK NAME. `chore test` reaches `test:unit`
+    /// through `test:native` and `chore test:images` does not reach it
+    /// at all; neither is what this guard follows, because the task
+    /// whose body it checked is `test:unit`'s. Following chore's task
+    /// graph would be a second parser with its own defeats, to
+    /// establish what the workflow already states in three words.
+    #[test]
+    fn another_task_is_not_this_task() {
+        for task in ["chore test", "chore test:images", "chore test:vm"] {
+            let yaml = GATING.replace(STEP, &format!("      - run: {task}\n"));
+            assert_ne!(yaml, GATING, "the mutation must actually apply");
+            assert!(
+                gating_runs_of_the_unit_task(&yaml).is_empty(),
+                "`{task}` is not `chore test:unit`"
+            );
+        }
     }
 }

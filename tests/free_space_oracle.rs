@@ -15,38 +15,57 @@
 //! out the address of the root tree. Against the kernel's own free-space
 //! tree that is not a subtle discrepancy; it is thousands of them.
 //!
-//! Fixtures are gitignored. Build them with `chore fixtures`.
+//! The fixtures are gitignored and built by `chore fixtures`, in the
+//! fs-linux-test-harness VM — the free-space tree compared against here
+//! is one the kernel maintained. A fixture that is not there fails the
+//! test that wanted it; nothing below returns early.
 
 use fs_btrfs::block_group::{BlockGroup, FreeExtent};
 use fs_btrfs::fs::Filesystem;
+use fs_btrfs_test_support::{fixtures_matching, spans_several_devices};
 use fs_core::FileDevice;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
-
+/// Every fixture this file compares, which is every one that mounts.
 fn images() -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(share()) else {
-        return Vec::new();
-    };
-    let mut out: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "img"))
-        .filter(|p| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("btrfs-"))
-        })
+    let images: Vec<PathBuf> = fixtures_matching("btrfs-")
+        .into_iter()
+        // One member of a multi-device filesystem is refused a mount on
+        // purpose: its block groups describe space on the other disk.
+        // The pool is `tests/pool_oracle.rs`'s subject, not this file's.
+        .filter(|p| !spans_several_devices(p))
         .collect();
-    out.sort();
-    out
+    assert!(
+        !images.is_empty(),
+        "every fixture belongs to a multi-device filesystem, so there is nothing here \
+         this file can mount and account for"
+    );
+    images
 }
 
-fn open(img: &Path) -> Option<Filesystem> {
-    let dev = Arc::new(FileDevice::open(img).ok()?);
-    Filesystem::mount(dev).ok()
+fn open(img: &Path) -> Filesystem {
+    let dev = Arc::new(
+        FileDevice::open(img).unwrap_or_else(|e| panic!("opening {}: {e}", img.display())),
+    );
+    Filesystem::mount(dev).unwrap_or_else(|e| panic!("mounting {}: {e}", img.display()))
+}
+
+/// Every block group of an image, or a failure naming the image.
+///
+/// A filesystem's own root tree has to live in a block group, so a read
+/// that comes back empty or in error is this crate's failure rather
+/// than a quiet reason to move to the next fixture.
+fn block_groups(fs: &Filesystem, name: &str) -> Vec<BlockGroup> {
+    let groups = fs
+        .block_groups()
+        .unwrap_or_else(|e| panic!("{name}: reading the block groups: {e}"));
+    assert!(
+        !groups.is_empty(),
+        "{name}: no block group at all — the filesystem's own root tree has to live \
+         somewhere, so this is a read failure, not an empty filesystem"
+    );
+    groups
 }
 
 /// A short description of where two free-space lists first diverge.
@@ -91,26 +110,15 @@ fn first_difference(ours: &[FreeExtent], theirs: &[FreeExtent]) -> Option<String
 #[test]
 fn free_space_derived_from_the_extent_tree_matches_the_kernels_cache() {
     let images = images();
-    if images.is_empty() {
-        eprintln!("no fixtures; build them with `chore fixtures`");
-        return;
-    }
 
     let mut groups_checked = 0usize;
     let mut images_with_cache = 0usize;
     let mut runs = 0usize;
 
     for img in &images {
-        let Some(fs) = open(img) else { continue };
         let name = img.file_name().unwrap().to_string_lossy().into_owned();
-        let Ok(groups) = fs.block_groups() else {
-            continue;
-        };
-        assert!(
-            !groups.is_empty(),
-            "{name}: no block group at all — the filesystem's own root tree has to live \
-             somewhere, so this is a read failure, not an empty filesystem"
-        );
+        let fs = open(img);
+        let groups = block_groups(&fs, &name);
 
         let mut had_cache = false;
         // One traversal for every group, not one per group.
@@ -165,24 +173,15 @@ fn free_space_derived_from_the_extent_tree_matches_the_kernels_cache() {
 /// block group item.
 #[test]
 fn each_groups_used_count_matches_what_is_allocated_in_it() {
-    let images = images();
-    if images.is_empty() {
-        eprintln!("no fixtures — skipping");
-        return;
-    }
-
     let mut checked = 0usize;
-    for img in &images {
-        let Some(fs) = open(img) else { continue };
+    for img in &images() {
         let name = img.file_name().unwrap().to_string_lossy().into_owned();
-        let Ok(groups) = fs.block_groups() else {
-            continue;
-        };
+        let fs = open(img);
 
-        for group in &groups {
-            let Ok(free) = fs.free_extents(group) else {
-                continue;
-            };
+        for group in &block_groups(&fs, &name) {
+            let free = fs.free_extents(group).unwrap_or_else(|e| {
+                panic!("{name}: deriving the free space at {}: {e}", group.start)
+            });
             let free_bytes: u64 = free.iter().map(|r| r.len).sum();
             let allocated = group.length - free_bytes;
 
@@ -207,19 +206,11 @@ fn each_groups_used_count_matches_what_is_allocated_in_it() {
 /// this is where the rule it documents gets checked.
 #[test]
 fn the_superblock_total_is_the_sum_of_every_group() {
-    let images = images();
-    if images.is_empty() {
-        eprintln!("no fixtures — skipping");
-        return;
-    }
-
     let mut checked = 0usize;
-    for img in &images {
-        let Some(fs) = open(img) else { continue };
+    for img in &images() {
         let name = img.file_name().unwrap().to_string_lossy().into_owned();
-        let Ok(groups) = fs.block_groups() else {
-            continue;
-        };
+        let fs = open(img);
+        let groups = block_groups(&fs, &name);
         let total: u64 = groups.iter().map(|g| g.used).sum();
         assert_eq!(
             total,
@@ -243,21 +234,20 @@ fn the_superblock_total_is_the_sum_of_every_group() {
 /// own answer.
 #[test]
 fn the_address_the_allocator_picks_is_free_in_the_kernels_own_record() {
-    let images = images();
-    if images.is_empty() {
-        eprintln!("no fixtures — skipping");
-        return;
-    }
-
     let mut checked = 0usize;
-    for img in &images {
-        let Some(fs) = open(img) else { continue };
+    for img in &images() {
         let name = img.file_name().unwrap().to_string_lossy().into_owned();
+        let fs = open(img);
         let nodesize = fs.superblock().nodesize as u64;
 
-        let Ok(at) = fs.find_metadata_block() else {
-            continue;
-        };
+        // Every fixture has room for one more tree block, so a refusal
+        // here is either a full image — a fixture the builder should
+        // not have produced — or the allocator failing to see space
+        // that is there. Both are findings; neither is a reason to move
+        // on to the next image.
+        let at = fs
+            .find_metadata_block()
+            .unwrap_or_else(|e| panic!("{name}: the allocator found nowhere to put a block: {e}"));
 
         assert_eq!(
             at % nodesize,
@@ -265,9 +255,7 @@ fn the_address_the_allocator_picks_is_free_in_the_kernels_own_record() {
             "{name}: {at} is not aligned to a {nodesize}-byte tree block"
         );
 
-        let Ok(groups) = fs.block_groups() else {
-            continue;
-        };
+        let groups = block_groups(&fs, &name);
         let group: &BlockGroup = groups
             .iter()
             .find(|g| at >= g.start && at < g.end())
@@ -281,8 +269,17 @@ fn the_address_the_allocator_picks_is_free_in_the_kernels_own_record() {
             group.flags
         );
 
-        let Ok(Some(cached)) = fs.cached_free_extents(group) else {
-            continue;
+        // A filesystem without a free-space tree has no second record
+        // to check the pick against, which is a property of the image
+        // rather than a result. The count below is what keeps that from
+        // silently emptying the test.
+        let cached = match fs.cached_free_extents(group) {
+            Ok(Some(cached)) => cached,
+            Ok(None) => continue,
+            Err(e) => panic!(
+                "{name}: reading the free-space tree at {}: {e}",
+                group.start
+            ),
         };
         let covered = cached
             .iter()
@@ -298,7 +295,8 @@ fn the_address_the_allocator_picks_is_free_in_the_kernels_own_record() {
 
     assert!(
         checked > 0,
-        "the allocator found nowhere to put a block on any fixture"
+        "not one fixture had a free-space tree covering the address the allocator picked, \
+         so the pick was never confirmed against the kernel's own record"
     );
     eprintln!("{checked} allocations land on space the kernel also considers free");
 }

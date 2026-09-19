@@ -14,7 +14,10 @@
 //! That is a stronger claim than a round trip through this crate's own
 //! parser, which would pass even if both halves shared a misreading.
 //!
-//! Fixtures are gitignored. Build them with `chore fixtures`.
+//! The fixtures are gitignored and built by `chore fixtures`. A sweep
+//! over "every fixture" that found none used to print a line and pass,
+//! which is how this repository's leaf oracle ran against nothing at
+//! all; there is now no list to be empty and no image to be skipped.
 
 use fs_btrfs::btree::{header_offsets as o, TreeBlock, TreeGeometry, HEADER_SIZE};
 use fs_btrfs::chunk::DiskKey;
@@ -23,31 +26,27 @@ use fs_btrfs::superblock::Superblock;
 use fs_btrfs::tree_write::{
     build_leaf, chunk_tree_uuid_of, stamp_checksum, BlockIdentity, LeafItem,
 };
+use fs_btrfs_test_support::{fixture, fixtures_matching, le32, le64, spans_several_devices, Image};
 use fs_core::FileDevice;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-mod common;
-use common::{le32, le64};
-
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
-
+/// Every fixture image, minus the members of a multi-device filesystem.
+///
+/// A pool member does not mount on its own, on purpose: its chunks may
+/// live on the other disk. That is the one exclusion, and what is left
+/// still has to be a list, or this sweep would re-encode nothing and
+/// say so in the past tense.
 fn images() -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(share()) else {
-        return Vec::new();
-    };
-    let mut out: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "img"))
-        .filter(|p| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("btrfs-"))
-        })
+    let out: Vec<PathBuf> = fixtures_matching("btrfs-")
+        .into_iter()
+        .filter(|p| !spans_several_devices(p))
         .collect();
-    out.sort();
+    assert!(
+        !out.is_empty(),
+        "every fixture belongs to a multi-device filesystem, so there is no leaf here to \
+         rebuild"
+    );
     out
 }
 
@@ -80,9 +79,17 @@ fn items_of(block: &[u8]) -> Vec<(DiskKey, std::ops::Range<usize>)> {
 /// Walking is done through the crate's own `Tree`, which is fine — what
 /// is being validated is the *encoder*, and how the blocks were reached
 /// does not affect whether the bytes match.
-fn leaves(img: &Path) -> Option<(Superblock, Vec<Vec<u8>>)> {
-    let dev = Arc::new(FileDevice::open(img).ok()?);
-    let fs = Filesystem::mount(dev).ok()?;
+///
+/// An image that will not open or will not mount is a failure here. It
+/// used to be dropped from the sweep, and a driver that had stopped
+/// mounting a whole geometry would have shown up as nothing worse than
+/// a smaller count nobody reads.
+fn leaves(img: &Path) -> (Superblock, Vec<Vec<u8>>) {
+    let dev = Arc::new(
+        FileDevice::open(img).unwrap_or_else(|error| panic!("opening {}: {error}", img.display())),
+    );
+    let fs = Filesystem::mount(dev)
+        .unwrap_or_else(|error| panic!("mounting {}: {error}", img.display()));
     let sb = fs.superblock().clone();
 
     let mut blocks = Vec::new();
@@ -96,12 +103,16 @@ fn leaves(img: &Path) -> Option<(Superblock, Vec<Vec<u8>>)> {
     // Read directly: any block whose header says it is a
     // leaf of this filesystem is a candidate, and scanning is how they
     // are found without a second walker.
-    let bytes = std::fs::read(img).ok()?;
+    //
+    // A BLOCK AT A TIME, not the whole image: these fixtures are up to
+    // 2 GiB and only the tree blocks are wanted. See `Image`.
+    let image = Image::open(img);
     let nodesize = sb.nodesize as usize;
-    let mut at = 0usize;
-    while at + nodesize <= bytes.len() {
-        let block = &bytes[at..at + nodesize];
-        at += nodesize;
+    let mut block = vec![0u8; nodesize];
+    let mut at = 0u64;
+    while image.try_read_at(at, &mut block) {
+        let block = &block[..];
+        at += nodesize as u64;
 
         // A leaf of this filesystem: right UUID, level zero, a plausible
         // item count, and a checksum that verifies. The checksum is what
@@ -118,7 +129,7 @@ fn leaves(img: &Path) -> Option<(Superblock, Vec<Vec<u8>>)> {
         }
         blocks.push(block.to_vec());
     }
-    Some((sb, blocks))
+    (sb, blocks)
 }
 
 /// Rebuilding a leaf gives back exactly what the kernel wrote.
@@ -144,24 +155,20 @@ fn leaves(img: &Path) -> Option<(Superblock, Vec<Vec<u8>>)> {
 #[test]
 fn every_leaf_re_encodes_identically() {
     let images = images();
-    if images.is_empty() {
-        eprintln!("no fixtures; build them with `chore fixtures`");
-        return;
-    }
 
     let mut total = 0usize;
     let mut with_dirty_slack = 0usize;
-    let mut images_read = 0usize;
 
     for img in &images {
-        let Some((sb, blocks)) = leaves(img) else {
-            continue;
-        };
-        if blocks.is_empty() {
-            continue;
-        }
-        images_read += 1;
+        let (sb, blocks) = leaves(img);
         let name = img.file_name().unwrap().to_string_lossy().into_owned();
+        // Every btrfs filesystem has leaves, so an image with none is one
+        // whose blocks this scan cannot recognise — a finding, not a
+        // fixture to pass over.
+        assert!(
+            !blocks.is_empty(),
+            "{name}: not one leaf of this filesystem was found on the disk"
+        );
 
         for theirs in &blocks {
             let parsed = items_of(theirs);
@@ -239,18 +246,16 @@ fn every_leaf_re_encodes_identically() {
         }
     }
 
-    if images_read == 0 {
-        eprintln!("no readable fixtures — skipping");
-        return;
-    }
     assert!(
         total > 20,
-        "only {total} leaves were rebuilt across {images_read} images, which is too few \
-         to have exercised the encoder"
+        "only {total} leaves were rebuilt across {} images, which is too few to have \
+         exercised the encoder",
+        images.len()
     );
     eprintln!(
-        "{total} kernel leaves rebuilt byte for byte across {images_read} images, checksum \
-         included; {with_dirty_slack} of them had slack the kernel never cleared"
+        "{total} kernel leaves rebuilt byte for byte across {} images, checksum included; \
+         {with_dirty_slack} of them had slack the kernel never cleared",
+        images.len()
     );
 }
 
@@ -308,16 +313,10 @@ fn where_in_leaf(at: usize, items_end: usize, data_start: usize, nritems: usize)
 #[test]
 fn a_leaf_built_with_an_item_removed_reads_back_correctly() {
     let images = images();
-    if images.is_empty() {
-        eprintln!("no fixtures — skipping");
-        return;
-    }
 
     let mut checked = 0usize;
     for img in &images {
-        let Some((sb, blocks)) = leaves(img) else {
-            continue;
-        };
+        let (sb, blocks) = leaves(img);
         let name = img.file_name().unwrap().to_string_lossy().into_owned();
         let geom = TreeGeometry::from_superblock(&sb);
 
@@ -420,13 +419,7 @@ fn a_leaf_built_with_an_item_removed_reads_back_correctly() {
 /// A leaf that will not fit is refused rather than truncated.
 #[test]
 fn an_overfull_leaf_is_refused() {
-    let Some(img) = images().into_iter().next() else {
-        eprintln!("no fixtures — skipping");
-        return;
-    };
-    let Some((sb, _)) = leaves(&img) else {
-        return;
-    };
+    let (sb, _) = leaves(&fixture("btrfs-default.img"));
 
     let big = vec![0u8; sb.nodesize as usize];
     let items = [LeafItem {
@@ -476,22 +469,21 @@ fn an_overfull_leaf_is_refused() {
 /// correctly, and is wrong.
 #[test]
 fn a_leaf_read_at_an_address_it_was_not_built_for_is_rejected() {
-    let Some(img) = images().into_iter().next() else {
-        eprintln!("no fixtures — skipping");
-        return;
-    };
-    let Some((sb, blocks)) = leaves(&img) else {
-        return;
-    };
-    let Some(theirs) = blocks.first() else {
-        return;
-    };
+    let (sb, blocks) = leaves(&fixture("btrfs-default.img"));
+    let theirs = blocks
+        .first()
+        .expect("btrfs-default.img holds at least one leaf");
 
     let geom = TreeGeometry::from_superblock(&sb);
     let parsed = items_of(theirs);
-    if parsed.iter().any(|(_, r)| r.end > theirs.len()) {
-        return;
-    }
+    // The scan only accepts blocks whose checksum verifies, so an item
+    // reaching past the end of one is a misreading of the item array
+    // rather than a leaf to leave alone.
+    assert!(
+        !parsed.iter().any(|(_, r)| r.end > theirs.len()),
+        "an item of the leaf at {} spans past the end of the block",
+        le64(theirs, o::BYTENR)
+    );
     let items: Vec<LeafItem> = parsed
         .iter()
         .map(|(key, range)| LeafItem {
@@ -538,13 +530,7 @@ fn a_leaf_read_at_an_address_it_was_not_built_for_is_rejected() {
 /// leaf cannot have is told so.
 #[test]
 fn a_leaf_that_claims_to_be_a_node_is_refused() {
-    let Some(img) = images().into_iter().next() else {
-        eprintln!("no fixtures — skipping");
-        return;
-    };
-    let Some((sb, _)) = leaves(&img) else {
-        return;
-    };
+    let (sb, _) = leaves(&fixture("btrfs-default.img"));
 
     let data = [0u8; 8];
     let items = [LeafItem {
@@ -580,13 +566,7 @@ fn a_leaf_that_claims_to_be_a_node_is_refused() {
 /// others.
 #[test]
 fn unsorted_items_are_refused() {
-    let Some(img) = images().into_iter().next() else {
-        eprintln!("no fixtures — skipping");
-        return;
-    };
-    let Some((sb, _)) = leaves(&img) else {
-        return;
-    };
+    let (sb, _) = leaves(&fixture("btrfs-default.img"));
 
     let a = [1u8; 8];
     let items = [

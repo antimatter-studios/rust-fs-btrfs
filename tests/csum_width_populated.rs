@@ -13,13 +13,14 @@
 //! and must be refused once a byte of it is flipped underneath the
 //! driver, which shows the digests were there and were compared.
 //!
-//! Skips without btrfs-progs, unless `BTRFS_ORACLE_FIXTURES=required`,
-//! which the fixture CI job sets.
+//! `mkfs.btrfs` runs in the harness VM, where this suite's btrfs-progs
+//! lives, so every width is always built and none of the four is ever
+//! quietly left out.
 
 use fs_btrfs::superblock::ChecksumType;
 use fs_btrfs::{Error, Filesystem};
+use fs_btrfs_test_support::{oracle, temp_path};
 use fs_core::{BlockRead, FileDevice};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -46,25 +47,22 @@ fn content() -> Vec<u8> {
         .collect()
 }
 
-/// A scratch directory this process created, under a name nobody could
-/// have predicted.
+/// A scratch directory this process created, below the suite's own
+/// scratch root inside this repository -- which is where images have to
+/// live, since `mkfs.btrfs` reads them from the harness VM, and that guest
+/// sees this repository and nothing else of the host.
 ///
 /// `create_dir`, not `create_dir_all`: it fails when the path already
 /// exists -- a symlink planted there included -- so everything written
-/// below it is written into a directory this test made, on a shared host
-/// too. The name carries the time and a counter as well as the pid.
+/// below it is written into a directory this test made. The root above it
+/// is already this process's alone; the counter keeps two of its tests
+/// apart.
 fn unique_scratch(tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     loop {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let dir = std::env::temp_dir().join(format!(
-            "btrfs-{tag}-{}-{nanos}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let dir =
+            std::path::PathBuf::from(temp_path!("{tag}-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
         match std::fs::create_dir(&dir) {
             Ok(()) => return dir,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -73,9 +71,8 @@ fn unique_scratch(tag: &str) -> std::path::PathBuf {
     }
 }
 
-/// A populated image checksummed with `csum`, or `None` without
-/// `mkfs.btrfs`.
-fn image(csum: &str, data: &[u8]) -> Option<(Scratch, std::path::PathBuf)> {
+/// A populated image checksummed with `csum`.
+fn image(csum: &str, data: &[u8]) -> (Scratch, std::path::PathBuf) {
     let dir = unique_scratch(&format!("csum-{csum}"));
     let scratch = Scratch(dir.clone());
     let root = dir.join("root");
@@ -86,27 +83,17 @@ fn image(csum: &str, data: &[u8]) -> Option<(Scratch, std::path::PathBuf)> {
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
-    let made = match Command::new("mkfs.btrfs")
+    let made = oracle("mkfs.btrfs")
         .args(["-f", "--csum", csum, "--rootdir"])
         .arg(&root)
         .arg(&img)
-        .output()
-    {
-        Ok(made) => made,
-        Err(e) => {
-            assert!(
-                std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() != Ok("required"),
-                "BTRFS_ORACLE_FIXTURES=required, but mkfs.btrfs is not runnable: {e}"
-            );
-            return None;
-        }
-    };
+        .output();
     assert!(
         made.status.success(),
         "mkfs.btrfs --csum {csum}: {}",
         String::from_utf8_lossy(&made.stderr)
     );
-    Some((scratch, img))
+    (scratch, img)
 }
 
 /// Flips one byte of the first read holding `marker`, once armed.
@@ -142,10 +129,7 @@ fn every_checksum_width_reads_a_populated_file_and_refuses_a_damaged_one() {
         ("sha256", ChecksumType::Sha256),
         ("blake2", ChecksumType::Blake2b256),
     ] {
-        let Some((_scratch, img)) = image(csum, &data) else {
-            eprintln!("no mkfs.btrfs -- skipping");
-            return;
-        };
+        let (_scratch, img) = image(csum, &data);
         let device: Arc<dyn BlockRead> = Arc::new(FileDevice::open(&img).unwrap());
         let fs = Filesystem::mount(device.clone()).unwrap();
         assert_eq!(

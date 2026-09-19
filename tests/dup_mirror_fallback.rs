@@ -38,48 +38,80 @@
 //! # Why it is cheap, having been called expensive
 //!
 //! The first reading of this gap was that it needed a Linux-only image
-//! builder. It does not: `.vm-share/btrfs-dup.img` already ships. It is
-//! gitignored, so a fresh worktree lacks it and a symlink is enough —
-//! which is worth remembering before the next "no fixture available".
-//! Public API only, no `mkfs.btrfs`, no VM.
+//! builder of its own. It does not: `test-disks/btrfs-dup.img` is one of
+//! the fixtures `chore fixtures` already builds, and everything below
+//! works from it through the public API — no `mkfs.btrfs`, nothing this
+//! file has to provision.
 //!
 //! # Vacuity
 //!
-//! Without `.vm-share` this suite reports `ok` having done nothing —
-//! the shape of every oracle suite here, and the shape that makes
-//! `13 passed in 0.00s` and `13 passed in 33.61s` look identical. So it
-//! prints what it did and how long the image was, and the assertions
-//! below check the fixture is a DUP one before believing any pass:
-//! a chunk with one copy has nothing to fall back to, and a test that
-//! "passed" on it would mean nothing at all.
+//! This suite used to report `ok` having done nothing when the fixture
+//! was absent — the shape of every oracle suite here, and the shape that
+//! makes `13 passed in 0.00s` and `13 passed in 33.61s` look identical
+//! in a log. THAT IS NOW IMPOSSIBLE RATHER THAN MERELY DOCUMENTED: every
+//! image below comes from `fs_btrfs_test_support::fixture`, which fails
+//! the test and names the task that builds the image instead of handing
+//! back a `None` for the test to skip on.
+//!
+//! The other half of vacuity is still this file's own to hold, because
+//! no helper can: it prints what it did and how long the image was, and
+//! the assertions below check the fixture is a DUP one before believing
+//! any pass — a chunk with one copy has nothing to fall back to, and a
+//! test that "passed" on it would mean nothing at all.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fs_btrfs::superblock::SUPER_INFO_OFFSET;
 use fs_btrfs::{ChunkMap, Superblock};
+use fs_btrfs_test_support::{fixture, temp_path, Image};
 use fs_core::FileDevice;
 
-fn dup_image() -> Option<PathBuf> {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".vm-share")
-        .join("btrfs-dup.img");
-    p.exists().then_some(p)
+fn dup_image() -> PathBuf {
+    fixture("btrfs-dup.img")
 }
 
-/// Write `bytes` somewhere unique to this process and hand back a guard
-/// that removes it, so a panic mid-test does not leave the image behind.
+/// A copy of a fixture, somewhere unique to this process, with a guard
+/// that removes it so a panic mid-test does not leave the image behind.
+///
+/// COPIED BY THE FILESYSTEM, and damaged a byte at a time. It used to
+/// read the fixture into a `Vec`, clone it per case and write the clone
+/// out: `btrfs-pool-a.img` is 512 MiB, seven tests run at once, and the
+/// harness guest has four gigabytes — so the guest's kernel killed this
+/// binary outright. Nothing here ever wanted the whole image; each case
+/// flips one byte.
 struct Scratch(PathBuf);
 
 impl Scratch {
-    fn new(tag: &str, bytes: &[u8]) -> Self {
-        let path = std::env::temp_dir().join(format!(
+    fn copy_of(tag: &str, src: &Path) -> Self {
+        // In the repository's own scratch directory, not the system
+        // one: these images are what the oracle tools would be pointed
+        // at, and the harness VM sees this repository and nothing else
+        // of the host.
+        let path = PathBuf::from(temp_path!(
             "btrfs-dup-{tag}-{}-{:?}.img",
             std::process::id(),
             std::thread::current().id()
         ));
-        std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        std::fs::copy(src, &path)
+            .unwrap_or_else(|e| panic!("copying {} to {}: {e}", src.display(), path.display()));
         Self(path)
+    }
+
+    /// Flip every bit of the byte at `offset`, in the copy.
+    fn flip(&self, offset: u64) {
+        use std::os::unix::fs::FileExt;
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&self.0)
+            .unwrap_or_else(|e| panic!("opening {} to damage it: {e}", self.0.display()));
+        let mut byte = [0u8; 1];
+        file.read_exact_at(&mut byte, offset)
+            .unwrap_or_else(|e| panic!("reading {} at {offset}: {e}", self.0.display()));
+        byte[0] ^= 0xFF;
+        file.write_all_at(&byte, offset)
+            .unwrap_or_else(|e| panic!("damaging {} at {offset}: {e}", self.0.display()));
     }
 }
 
@@ -91,22 +123,16 @@ impl Drop for Scratch {
 
 #[test]
 fn a_damaged_first_copy_of_the_chunk_root_does_not_stop_the_mount() {
-    let Some(src) = dup_image() else {
-        eprintln!(
-            "no .vm-share/btrfs-dup.img — run ./scripts/vm-build-fixtures.sh; \
-             skipping, and this suite proved nothing"
-        );
-        return;
-    };
-    let bytes = std::fs::read(&src).expect("read fixture");
+    let src = dup_image();
+    let source = Image::open(&src);
     eprintln!(
         "dup_mirror_fallback: {} ({} bytes)",
         src.display(),
-        bytes.len()
+        source.len()
     );
 
-    let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
-        .expect("superblock");
+    let head = source.read_at(SUPER_INFO_OFFSET, 4096);
+    let sb = Superblock::parse_at(&head, SUPER_INFO_OFFSET).expect("superblock");
     let map = ChunkMap::bootstrap(&sb).expect("bootstrap");
 
     // THE HARNESS CHECKS BEFORE THE ASSERTION. A chunk with one copy has
@@ -130,7 +156,7 @@ fn a_damaged_first_copy_of_the_chunk_root_does_not_stop_the_mount() {
     // fixture that could not mount would make the interesting result
     // below indistinguishable from a broken image.
     {
-        let pristine = Scratch::new("pristine", &bytes);
+        let pristine = Scratch::copy_of("pristine", &src);
         let dev = FileDevice::open(&pristine.0).expect("open pristine");
         fs_btrfs::fs::Filesystem::mount(Arc::new(dev)).expect("the undamaged fixture must mount");
     }
@@ -140,11 +166,8 @@ fn a_damaged_first_copy_of_the_chunk_root_does_not_stop_the_mount() {
     // only thing that catches it. That is what a bad sector produces,
     // and it is the case the fallback exists for; damaging the header
     // instead would be caught by the identity fields and prove less.
-    let mut damaged = bytes.clone();
-    let at = (first.physical + 200) as usize;
-    damaged[at] ^= 0xFF;
-
-    let image = Scratch::new("damaged", &damaged);
+    let image = Scratch::copy_of("damaged", &src);
+    image.flip(first.physical + 200);
     let dev = FileDevice::open(&image.0).expect("open damaged");
     fs_btrfs::fs::Filesystem::mount(Arc::new(dev)).unwrap_or_else(|e| {
         panic!(
@@ -171,13 +194,9 @@ fn a_damaged_first_copy_of_the_chunk_root_does_not_stop_the_mount() {
 /// passing.
 #[test]
 fn a_damaged_first_copy_of_any_named_root_does_not_stop_the_mount() {
-    let Some(src) = dup_image() else {
-        eprintln!("no .vm-share/btrfs-dup.img; skipping, and this suite proved nothing");
-        return;
-    };
-    let bytes = std::fs::read(&src).expect("read fixture");
-    let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
-        .expect("superblock");
+    let src = dup_image();
+    let head = Image::open(&src).read_at(SUPER_INFO_OFFSET, 4096);
+    let sb = Superblock::parse_at(&head, SUPER_INFO_OFFSET).expect("superblock");
 
     // THE FULL MAP, NOT THE BOOTSTRAP ONE. `ChunkMap::bootstrap` knows
     // only the system chunks embedded in the superblock, so it cannot
@@ -185,7 +204,7 @@ fn a_damaged_first_copy_of_any_named_root_does_not_stop_the_mount() {
     // silently exercised one root while claiming two. Mounting the
     // pristine image builds the real map, which is also the thing under
     // test having worked.
-    let pristine = Scratch::new("map", &bytes);
+    let pristine = Scratch::copy_of("map", &src);
     let dev = FileDevice::open(&pristine.0).expect("open pristine");
     let mounted = fs_btrfs::fs::Filesystem::mount(Arc::new(dev)).expect("pristine must mount");
     let map = mounted.chunk_map();
@@ -203,9 +222,8 @@ fn a_damaged_first_copy_of_any_named_root_does_not_stop_the_mount() {
         let second = map.map_mirror(addr, 1).expect("mirror 1");
         assert_ne!(first.physical, second.physical, "{what}: copies coincide");
 
-        let mut damaged = bytes.clone();
-        damaged[(first.physical + 200) as usize] ^= 0xFF;
-        let image = Scratch::new(what, &damaged);
+        let image = Scratch::copy_of(what, &src);
+        image.flip(first.physical + 200);
         let dev = FileDevice::open(&image.0).expect("open damaged");
         fs_btrfs::fs::Filesystem::mount(Arc::new(dev)).unwrap_or_else(|e| {
             panic!(
@@ -238,7 +256,7 @@ fn a_damaged_first_copy_of_any_named_root_does_not_stop_the_mount() {
 /// does reach, whose mirror read must be `read_logical_pool_mirror`
 /// rather than the single-device form: reverting either one alone fails
 /// this test and nothing else. It is served by a different fixture:
-/// `.vm-share/btrfs-pool-{a,b}.img`, a real two-device filesystem whose
+/// `test-disks/btrfs-pool-{a,b}.img`, a real two-device filesystem whose
 /// metadata mkfs put in RAID1 — so a tree block's two copies are on
 /// DIFFERENT devices, and damaging one means writing to one image and
 /// leaving the other alone.
@@ -250,20 +268,9 @@ fn a_damaged_first_copy_of_any_named_root_does_not_stop_the_mount() {
 /// Establish the wall by trying.
 #[test]
 fn a_damaged_copy_on_one_pool_device_does_not_stop_the_pool_reading() {
-    let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
-    let (a, b) = (
-        share.join("btrfs-pool-a.img"),
-        share.join("btrfs-pool-b.img"),
-    );
-    if !a.exists() || !b.exists() {
-        eprintln!(
-            "no .vm-share/btrfs-pool-{{a,b}}.img — run ./scripts/vm-build-pool-fixtures.sh; \
-             skipping, and this suite proved nothing"
-        );
-        return;
-    }
-    let bytes_a = std::fs::read(&a).expect("read pool a");
-    let bytes_b = std::fs::read(&b).expect("read pool b");
+    // Both halves, or neither: one member of a two-device filesystem is
+    // not a pool, and a missing one fails here naming `chore fixtures`.
+    let (a, b) = (fixture("btrfs-pool-a.img"), fixture("btrfs-pool-b.img"));
 
     let open = |pa: &Path, pb: &Path| -> Vec<Arc<dyn fs_core::BlockRead>> {
         vec![
@@ -274,8 +281,8 @@ fn a_damaged_copy_on_one_pool_device_does_not_stop_the_pool_reading() {
 
     // The control, and the map: a pristine pool opens, and the mount is
     // what builds the ChunkMap that says where the copies live.
-    let pristine_a = Scratch::new("pool-a", &bytes_a);
-    let pristine_b = Scratch::new("pool-b", &bytes_b);
+    let pristine_a = Scratch::copy_of("pool-a", &a);
+    let pristine_b = Scratch::copy_of("pool-b", &b);
     let fs = fs_btrfs::fs::Filesystem::mount_pool(open(&pristine_a.0, &pristine_b.0))
         .expect("the undamaged pool must open");
     fs.list_path("/").expect("the undamaged pool must read");
@@ -319,19 +326,13 @@ fn a_damaged_copy_on_one_pool_device_does_not_stop_the_pool_reading() {
             "{what}: unexpected devid {}",
             first.devid
         );
-        let mut damaged_a = bytes_a.clone();
-        let mut damaged_b = bytes_b.clone();
-        {
-            let target = if first.devid == 1 {
-                &mut damaged_a
-            } else {
-                &mut damaged_b
-            };
-            target[(first.physical + 200) as usize] ^= 0xFF;
+        let da = Scratch::copy_of("pool-a-damaged", &a);
+        let db = Scratch::copy_of("pool-b-damaged", &b);
+        if first.devid == 1 {
+            da.flip(first.physical + 200);
+        } else {
+            db.flip(first.physical + 200);
         }
-
-        let da = Scratch::new("pool-a-damaged", &damaged_a);
-        let db = Scratch::new("pool-b-damaged", &damaged_b);
         let fs = fs_btrfs::fs::Filesystem::mount_pool(open(&da.0, &db.0)).unwrap_or_else(|e| {
             panic!(
                 "{what}: copy 0 at devid {} physical {} was damaged and copy 1 at devid {} \
@@ -368,15 +369,11 @@ fn a_damaged_copy_on_one_pool_device_does_not_stop_the_pool_reading() {
 /// over-correction, which no defeat case here can see.
 #[test]
 fn a_damaged_second_copy_is_not_noticed_at_all() {
-    let Some(src) = dup_image() else {
-        eprintln!("no .vm-share/btrfs-dup.img; skipping, and this suite proved nothing");
-        return;
-    };
-    let bytes = std::fs::read(&src).expect("read fixture");
-    let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
-        .expect("superblock");
+    let src = dup_image();
+    let head = Image::open(&src).read_at(SUPER_INFO_OFFSET, 4096);
+    let sb = Superblock::parse_at(&head, SUPER_INFO_OFFSET).expect("superblock");
 
-    let pristine = Scratch::new("map2", &bytes);
+    let pristine = Scratch::copy_of("map2", &src);
     let dev = FileDevice::open(&pristine.0).expect("open pristine");
     let mounted = fs_btrfs::fs::Filesystem::mount(Arc::new(dev)).expect("pristine must mount");
     let map = mounted.chunk_map();
@@ -393,9 +390,8 @@ fn a_damaged_second_copy_is_not_noticed_at_all() {
         let second = map.map_mirror(addr, 1).expect("mirror 1");
         assert_ne!(first.physical, second.physical, "{what}: copies coincide");
 
-        let mut damaged = bytes.clone();
-        damaged[(second.physical + 200) as usize] ^= 0xFF;
-        let image = Scratch::new(&format!("{what}-second"), &damaged);
+        let image = Scratch::copy_of(&format!("{what}-second"), &src);
+        image.flip(second.physical + 200);
         let dev = FileDevice::open(&image.0).expect("open damaged");
         let fs = fs_btrfs::fs::Filesystem::mount(Arc::new(dev)).unwrap_or_else(|e| {
             panic!(
@@ -423,26 +419,21 @@ fn a_damaged_second_copy_is_not_noticed_at_all() {
 /// satisfy the fallback assertion.
 #[test]
 fn damaging_every_copy_is_still_refused() {
-    let Some(src) = dup_image() else {
-        eprintln!("no .vm-share/btrfs-dup.img; skipping, and this suite proved nothing");
-        return;
-    };
-    let bytes = std::fs::read(&src).expect("read fixture");
-    let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
-        .expect("superblock");
+    let src = dup_image();
+    let head = Image::open(&src).read_at(SUPER_INFO_OFFSET, 4096);
+    let sb = Superblock::parse_at(&head, SUPER_INFO_OFFSET).expect("superblock");
     let map = ChunkMap::bootstrap(&sb).expect("bootstrap");
 
     let addr = sb.chunk_root;
     let copies = map.mirrors_at(addr).expect("mirrors_at");
     assert!(copies >= 2, "not a DUP fixture");
 
-    let mut damaged = bytes.clone();
+    let image = Scratch::copy_of("both", &src);
     for mirror in 0..copies {
         let m = map.map_mirror(addr, mirror).expect("mirror");
-        damaged[(m.physical + 200) as usize] ^= 0xFF;
+        image.flip(m.physical + 200);
     }
 
-    let image = Scratch::new("both", &damaged);
     let dev = FileDevice::open(&image.0).expect("open damaged");
     let err = fs_btrfs::fs::Filesystem::mount(Arc::new(dev))
         .err()
@@ -498,13 +489,9 @@ impl fs_core::BlockRead for Unreadable {
 
 #[test]
 fn an_unreadable_first_copy_does_not_stop_the_mount() {
-    let Some(src) = dup_image() else {
-        eprintln!("no .vm-share/btrfs-dup.img; skipping, and this suite proved nothing");
-        return;
-    };
-    let bytes = std::fs::read(&src).expect("read fixture");
-    let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
-        .expect("superblock");
+    let src = dup_image();
+    let head = Image::open(&src).read_at(SUPER_INFO_OFFSET, 4096);
+    let sb = Superblock::parse_at(&head, SUPER_INFO_OFFSET).expect("superblock");
     let map = ChunkMap::bootstrap(&sb).expect("bootstrap");
 
     let addr = sb.chunk_root;
@@ -520,7 +507,7 @@ fn an_unreadable_first_copy_does_not_stop_the_mount() {
         "the two copies are the same bytes"
     );
 
-    let pristine = Scratch::new("unreadable", &bytes);
+    let pristine = Scratch::copy_of("unreadable", &src);
     let nodesize = sb.nodesize as u64;
     let bad = first.physical..first.physical + nodesize;
 
@@ -583,13 +570,9 @@ fn an_unreadable_first_copy_does_not_stop_the_mount() {
 /// the error must still be the read's.
 #[test]
 fn an_unreadable_first_copy_reports_the_io_error_not_a_checksum() {
-    let Some(src) = dup_image() else {
-        eprintln!("no .vm-share/btrfs-dup.img; skipping, and this suite proved nothing");
-        return;
-    };
-    let bytes = std::fs::read(&src).expect("read fixture");
-    let sb = Superblock::parse_at(&bytes[SUPER_INFO_OFFSET as usize..], SUPER_INFO_OFFSET)
-        .expect("superblock");
+    let src = dup_image();
+    let head = Image::open(&src).read_at(SUPER_INFO_OFFSET, 4096);
+    let sb = Superblock::parse_at(&head, SUPER_INFO_OFFSET).expect("superblock");
     let map = ChunkMap::bootstrap(&sb).expect("bootstrap");
 
     let addr = sb.chunk_root;
@@ -601,9 +584,8 @@ fn an_unreadable_first_copy_reports_the_io_error_not_a_checksum() {
     let second = map.map_mirror(addr, 1).expect("mirror 1");
 
     // Copy 1 rotted, copy 0 unreadable.
-    let mut damaged = bytes.clone();
-    damaged[(second.physical + 200) as usize] ^= 0xFF;
-    let image = Scratch::new("unreadable-both", &damaged);
+    let image = Scratch::copy_of("unreadable-both", &src);
+    image.flip(second.physical + 200);
 
     let dev = Arc::new(Unreadable {
         inner: FileDevice::open(&image.0).expect("open"),

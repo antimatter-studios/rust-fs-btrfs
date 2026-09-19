@@ -1,7 +1,7 @@
 //! Reproducing the split the kernel made.
 //!
-//! `scripts/build-split-fixtures.sh` captures a filesystem either side
-//! of one leaf splitting. So the leaf that split is on disk, and so are
+//! `chore fixtures` captures a filesystem either side of one leaf
+//! splitting. So the leaf that split is on disk, and so are
 //! the two it became — which makes this checkable rather than a matter
 //! of policy: given the items that were in the leaf plus the ones the
 //! new file added, [`fs_btrfs::leaf_edit::split`] must produce the two
@@ -13,22 +13,29 @@
 //! built with item sizes from 12 to 232 bytes so the two rules disagree,
 //! and the kernel's answer picks one.
 //!
-//! Fixtures are gitignored. Build them with
-//! `./scripts/vm-build-split-fixtures.sh`.
+//! BOTH PAIRS ARE CHECKED, EVERY RUN. They are separate fixtures with
+//! separate names — `btrfs-split-*` and `btrfs-split-vary-*` — and both
+//! are required, so the pair that can tell the two splitting rules apart
+//! cannot be the one that happened to be missing. The fixtures are
+//! gitignored and built by `chore fixtures`.
 
 use fs_btrfs::btree::{header_offsets as o, HEADER_SIZE};
 use fs_btrfs::chunk::DiskKey;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::leaf_edit::{split, OwnedItem};
+use fs_btrfs_test_support::{fixture, le32, le64};
 use fs_core::FileDevice;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
-mod common;
-use common::{le32, le64};
-
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
+/// A fixture, mounted. An image that will not mount is a broken fixture,
+/// not a pair to step around.
+fn mount(path: &Path) -> Filesystem {
+    let dev = Arc::new(
+        FileDevice::open(path)
+            .unwrap_or_else(|error| panic!("opening {}: {error}", path.display())),
+    );
+    Filesystem::mount(dev).unwrap_or_else(|error| panic!("mounting {}: {error}", path.display()))
 }
 
 fn items_of(block: &[u8]) -> Vec<OwnedItem> {
@@ -56,30 +63,34 @@ fn items_of(block: &[u8]) -> Vec<OwnedItem> {
 /// up leaves of the right generation that nothing points at any more,
 /// and pairing those with each other is how the first version of this
 /// test came to compare a 43-item "split" that never happened.
-fn live_fs_leaves(path: &Path) -> Option<Vec<Vec<OwnedItem>>> {
+fn live_fs_leaves(path: &Path) -> Vec<Vec<OwnedItem>> {
     const ROOT_ITEM_KEY: u8 = 132;
     const ROOT_ITEM_BYTENR: usize = 176;
 
-    let dev = Arc::new(FileDevice::open(path).ok()?);
-    let fs = Filesystem::mount(dev).ok()?;
+    let fs = mount(path);
 
     // The fs tree's root, from the root tree.
-    let root =
-        fs.root_tree_items()
-            .ok()?
-            .into_iter()
-            .find_map(|(objectid, key_type, _, data)| {
-                (objectid == 5 && key_type == ROOT_ITEM_KEY && data.len() >= ROOT_ITEM_BYTENR + 8)
-                    .then(|| le64(&data, ROOT_ITEM_BYTENR))
-            })?;
+    let root = fs
+        .root_tree_items()
+        .unwrap_or_else(|error| panic!("reading the root tree of {}: {error}", path.display()))
+        .into_iter()
+        .find_map(|(objectid, key_type, _, data)| {
+            (objectid == 5 && key_type == ROOT_ITEM_KEY && data.len() >= ROOT_ITEM_BYTENR + 8)
+                .then(|| le64(&data, ROOT_ITEM_BYTENR))
+        })
+        .unwrap_or_else(|| panic!("{} holds no ROOT_ITEM for the fs tree", path.display()));
 
     // Depth-first, left to right, so the leaves come out in key order.
     let mut out = Vec::new();
     let mut stack = vec![root];
     while let Some(at) = stack.pop() {
-        let Ok(block) = fs.read_tree_block(at) else {
-            continue;
-        };
+        // Every address here came out of a live pointer, so a block that
+        // will not read is a broken fixture. Passing over it would drop a
+        // leaf from the comparison and change the count the split is
+        // measured by.
+        let block = fs.read_tree_block(at).unwrap_or_else(|error| {
+            panic!("reading the block at {at} of {}: {error}", path.display())
+        });
         match block.body.key_ptrs() {
             Some(ptrs) => {
                 for p in ptrs.iter().rev() {
@@ -89,7 +100,7 @@ fn live_fs_leaves(path: &Path) -> Option<Vec<Vec<OwnedItem>>> {
             None => out.push(items_of(block.bytes())),
         }
     }
-    Some(out)
+    out
 }
 
 /// A real split: the leaf that divided, and the two it became.
@@ -102,24 +113,18 @@ struct RealSplit {
     nodesize: usize,
 }
 
-fn real_split(pair: &str) -> Option<RealSplit> {
-    let before = share().join(format!("btrfs-split{pair}-before.img"));
-    let after = share().join(format!("btrfs-split{pair}-after.img"));
-    if !before.exists() || !after.exists() {
-        return None;
-    }
-    let nodesize = {
-        let dev = Arc::new(FileDevice::open(&after).ok()?);
-        Filesystem::mount(dev).ok()?.superblock().nodesize as usize
-    };
+fn real_split(pair: &str) -> RealSplit {
+    let before = fixture(&format!("btrfs-split{pair}-before.img"));
+    let after = fixture(&format!("btrfs-split{pair}-after.img"));
+    let nodesize = mount(&after).superblock().nodesize as usize;
 
-    let source = live_fs_leaves(&before)?;
-    let result = live_fs_leaves(&after)?;
+    let source = live_fs_leaves(&before);
+    let result = live_fs_leaves(&after);
 
     assert_eq!(
         result.len(),
         source.len() + 1,
-        "{pair}: the fs tree went from {} live leaves to {}. A single split adds exactly \
+        "btrfs-split{pair}: the fs tree went from {} live leaves to {}. A single split adds exactly \
          one, so this pair does not hold the event it is supposed to.",
         source.len(),
         result.len()
@@ -132,14 +137,14 @@ fn real_split(pair: &str) -> Option<RealSplit> {
     all.extend_from_slice(&result[at + 1]);
     assert!(
         all.len() > source[at].len(),
-        "{pair}: a split adds the item that caused it"
+        "btrfs-split{pair}: a split adds the item that caused it"
     );
 
-    Some(RealSplit {
+    RealSplit {
         all,
         kernel_left: result[at].len(),
         nodesize,
-    })
+    }
 }
 
 /// Splitting a leaf the kernel split gives two valid leaves.
@@ -153,13 +158,13 @@ fn real_split(pair: &str) -> Option<RealSplit> {
 ///
 /// The input is real: the items of a leaf the kernel genuinely split,
 /// including the one that caused it.
-fn check(pair: &str) -> Option<(usize, usize, usize)> {
-    let real = real_split(pair)?;
+fn check(pair: &str) -> (usize, usize, usize) {
+    let real = real_split(pair);
     let (left, right) = split(&real.all).expect("splitting");
 
     assert!(
         !left.is_empty() && !right.is_empty(),
-        "{pair}: a half with nothing in it is not a leaf the tree has a use for"
+        "btrfs-split{pair}: a half with nothing in it is not a leaf the tree has a use for"
     );
 
     // Together, exactly the input — nothing lost, nothing invented.
@@ -167,7 +172,7 @@ fn check(pair: &str) -> Option<(usize, usize, usize)> {
     rejoined.extend_from_slice(&right);
     assert_eq!(
         rejoined, real.all,
-        "{pair}: the two halves are not the items that went in"
+        "btrfs-split{pair}: the two halves are not the items that went in"
     );
 
     // In key order, on both sides and across the boundary, because a
@@ -177,14 +182,14 @@ fn check(pair: &str) -> Option<(usize, usize, usize)> {
         for w in half.windows(2) {
             assert!(
                 key(&w[0]) < key(&w[1]),
-                "{pair}: a half is out of order at {:?}",
+                "btrfs-split{pair}: a half is out of order at {:?}",
                 w[0].key
             );
         }
     }
     assert!(
         key(left.last().unwrap()) < key(&right[0]),
-        "{pair}: the boundary is out of order — the left half ends at {:?} and the right \
+        "btrfs-split{pair}: the boundary is out of order — the left half ends at {:?} and the right \
          begins at {:?}",
         left.last().unwrap().key,
         right[0].key
@@ -195,21 +200,18 @@ fn check(pair: &str) -> Option<(usize, usize, usize)> {
         let need = HEADER_SIZE + half.len() * 25 + half.iter().map(|i| i.data.len()).sum::<usize>();
         assert!(
             need <= real.nodesize,
-            "{pair}: the {side} half needs {need} bytes and a leaf holds {}",
+            "btrfs-split{pair}: the {side} half needs {need} bytes and a leaf holds {}",
             real.nodesize
         );
     }
 
-    Some((left.len(), right.len(), real.kernel_left))
+    (left.len(), right.len(), real.kernel_left)
 }
 
 /// A real split divides into two valid leaves.
 #[test]
 fn splitting_a_leaf_the_kernel_split_gives_two_valid_leaves() {
-    let Some((l, r, kernel)) = check("") else {
-        eprintln!("no split fixture; build it with ./scripts/vm-build-split-fixtures.sh");
-        return;
-    };
+    let (l, r, kernel) = check("");
     eprintln!("even item sizes: {l} | {r}  (the kernel put {kernel} on the left)");
 }
 
@@ -220,10 +222,7 @@ fn splitting_a_leaf_the_kernel_split_gives_two_valid_leaves() {
 /// and both must still be valid — which is the claim being made.
 #[test]
 fn splitting_a_leaf_of_uneven_items_gives_two_valid_leaves() {
-    let Some((l, r, kernel)) = check("-vary") else {
-        eprintln!("no varied split fixture — skipping");
-        return;
-    };
+    let (l, r, kernel) = check("-vary");
     eprintln!("uneven item sizes: {l} | {r}  (the kernel put {kernel} on the left)");
 }
 
@@ -236,11 +235,8 @@ fn splitting_a_leaf_of_uneven_items_gives_two_valid_leaves() {
 /// producing the same numbers.
 #[test]
 fn the_kernels_own_boundary_is_recorded() {
-    let mut seen = 0usize;
     for pair in ["", "-vary"] {
-        let Some(real) = real_split(pair) else {
-            continue;
-        };
+        let real = real_split(pair);
         let total = real.all.len();
         eprintln!(
             "kernel: {total} items -> {} | {}   (half is {}, half+1 is {})",
@@ -258,10 +254,6 @@ fn the_kernels_own_boundary_is_recorded() {
              near the middle at all",
             real.kernel_left
         );
-        seen += 1;
-    }
-    if seen == 0 {
-        eprintln!("no split fixture — skipping");
     }
 }
 

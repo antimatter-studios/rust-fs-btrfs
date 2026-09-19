@@ -4,42 +4,36 @@
 //! Every read hardcoded copy 0, so a volume whose primary superblock was
 //! damaged could not be mounted though the commit path writes all three.
 //! A fresh `mkfs.btrfs` image of 256 MiB has copies 0 and 1 and no copy 2,
-//! so the absent copy is exercised by every case. Skips without
-//! btrfs-progs, unless `BTRFS_ORACLE_FIXTURES=required`, which the CI job
-//! that installs them sets.
+//! so the absent copy is exercised by every case. `mkfs.btrfs` runs in the
+//! harness VM, which is the one place the btrfs-progs tools live, so it is
+//! always there and nothing here skips.
 
 use fs_btrfs::error::Error;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::super_write::stamp_checksum;
 use fs_btrfs::superblock::{offsets, read_superblock, ChecksumType, SUPER_OFFSETS};
+use fs_btrfs_test_support::{oracle, temp_path};
 use fs_core::{BlockDevice, BlockRead, FileDevice};
-use std::process::Command;
 use std::sync::Arc;
 
-fn fresh_image(name: &str) -> Option<std::path::PathBuf> {
-    let dir = std::env::temp_dir().join(format!("btrfs-sb-mirrors-{}-{name}", std::process::id()));
+/// A fresh volume of 256 MiB, under the suite's own directory inside this
+/// repository -- which is where it has to be, because the guest that runs
+/// `mkfs.btrfs` sees this repository and nothing else of the host.
+fn fresh_image(name: &str) -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(temp_path!("sb-mirrors-{name}"));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("img");
     std::fs::File::create(&path)
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
-    let made = match Command::new("mkfs.btrfs").arg("-f").arg(&path).output() {
-        Ok(made) => made,
-        Err(e) => {
-            assert!(
-                std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() != Ok("required"),
-                "BTRFS_ORACLE_FIXTURES=required, but mkfs.btrfs is not runnable: {e}"
-            );
-            return None;
-        }
-    };
+    let made = oracle("mkfs.btrfs").arg("-f").arg(&path).output();
     assert!(
         made.status.success(),
         "{}",
         String::from_utf8_lossy(&made.stderr)
     );
-    Some(path)
+    path
 }
 
 /// Rewrite one superblock copy in place: 4 KiB read and written, not
@@ -77,10 +71,7 @@ fn mount_rw(path: &std::path::Path) -> Result<Filesystem, Error> {
 /// not an error for either mount.
 #[test]
 fn an_undamaged_volume_uses_the_primary_and_its_absent_third_copy_is_not_damage() {
-    let Some(path) = fresh_image("control") else {
-        eprintln!("no mkfs.btrfs -- skipping");
-        return;
-    };
+    let path = fresh_image("control");
     assert_eq!(read(&path).1, 0);
     mount_ro(&path).expect("mounts read-only");
     mount_rw(&path).expect("mounts read-write");
@@ -91,10 +82,7 @@ fn an_undamaged_volume_uses_the_primary_and_its_absent_third_copy_is_not_damage(
 /// written until it has been checked.
 #[test]
 fn a_zeroed_primary_mounts_read_only_from_the_mirror() {
-    let Some(path) = fresh_image("zeroed") else {
-        eprintln!("no mkfs.btrfs -- skipping");
-        return;
-    };
+    let path = fresh_image("zeroed");
     edit_copy(&path, 0, |sb| sb.fill(0));
     assert_eq!(read(&path).1, 1, "the mirror was not used");
     mount_ro(&path).unwrap_or_else(|e| panic!("a zeroed primary must mount from copy 1: {e:?}"));
@@ -112,10 +100,7 @@ fn a_zeroed_primary_mounts_read_only_from_the_mirror() {
 /// what a commit torn between its copies needs.
 #[test]
 fn the_copy_with_the_newer_generation_wins() {
-    let Some(path) = fresh_image("newer") else {
-        eprintln!("no mkfs.btrfs -- skipping");
-        return;
-    };
+    let path = fresh_image("newer");
     let (gen0, _) = read(&path);
     edit_copy(&path, 1, |sb| {
         sb[offsets::GENERATION..offsets::GENERATION + 8].copy_from_slice(&(gen0 + 1).to_le_bytes());
@@ -174,10 +159,7 @@ impl BlockDevice for MirrorFailsOnce {
 /// (Greptile on #146). A writable mount must never be of a mirror.
 #[test]
 fn a_mirror_that_reads_only_the_second_time_is_not_mounted_writable() {
-    let Some(path) = fresh_image("flaky") else {
-        eprintln!("no mkfs.btrfs -- skipping");
-        return;
-    };
+    let path = fresh_image("flaky");
     let (gen0, _) = read(&path);
     edit_copy(&path, 1, |sb| {
         sb[offsets::GENERATION..offsets::GENERATION + 8].copy_from_slice(&(gen0 + 1).to_le_bytes());

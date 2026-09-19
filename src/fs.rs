@@ -2520,7 +2520,7 @@ mod tests {
     ///
     /// # WHY THIS IS A UNIT TEST AND NOT A FIXTURE TEST
     ///
-    /// `.vm-share/btrfs-pool-{a,b}.img` cannot show the difference.
+    /// `test-disks/btrfs-pool-{a,b}.img` cannot show the difference.
     /// Measured on it: every chunk — system, metadata and data — puts
     /// stripe 0 on devid 1, which is also the handle `mount_pool` picks
     /// (`by_id.values().next()`, so the lowest devid). So on that
@@ -2545,8 +2545,8 @@ mod tests {
     /// 0 is on the higher devid -- `mkfs.btrfs` produces one if the
     /// devices are given in the other order -- would let
     /// `tests/dup_mirror_fallback.rs` witness the routing end to end
-    /// through `mount_pool`. That is a change to
-    /// `scripts/vm-build-pool-fixtures.sh`.
+    /// through `mount_pool`. That is a change to the `pool` recipe in
+    /// `test-disks/guest-build-images.sh`.
     #[test]
     fn the_primary_read_of_a_pool_follows_the_devid_not_only_the_offset() {
         let map = raid1_stripe0_on_devid2();

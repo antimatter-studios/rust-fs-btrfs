@@ -4,15 +4,15 @@
 //! metadata-only dump mounted and read garbage from where its absent data
 //! extents pointed, and a seed device mounted read-write. The images are
 //! fresh `mkfs.btrfs` files with bits OR-ed into the primary superblock's
-//! `flags`; the test skips without btrfs-progs unless
-//! `BTRFS_ORACLE_FIXTURES=required`, which the fixture CI job sets.
+//! `flags`. `mkfs.btrfs` runs in the harness VM, which is the one place the
+//! btrfs-progs tools live, so it is always there and nothing here skips.
 
 use fs_btrfs::error::Error;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::super_write::stamp_checksum;
 use fs_btrfs::superblock::{offsets, super_flags, ChecksumType};
+use fs_btrfs_test_support::{oracle, temp_path};
 use fs_core::{BlockDevice, BlockRead, FileDevice};
-use std::process::Command;
 use std::sync::Arc;
 
 const SUPERBLOCK: usize = 0x1_0000;
@@ -26,53 +26,30 @@ impl Drop for Scratch {
     }
 }
 
-/// A scratch directory this process created, under a name nobody could
-/// have predicted.
+/// A scratch directory of this case's own, below the suite's own
+/// directory inside this repository -- which is where it has to be,
+/// because the guest that runs `mkfs.btrfs` sees this repository and
+/// nothing else of the host.
 ///
-/// `create_dir`, not `create_dir_all`: it fails when the path already
-/// exists -- a symlink planted there included -- so everything written
-/// below it is written into a directory this test made, on a shared host
-/// too. The name carries the time and a counter as well as the pid.
-fn unique_scratch(tag: &str) -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    loop {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let dir = std::env::temp_dir().join(format!(
-            "btrfs-{tag}-{}-{nanos}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        match std::fs::create_dir(&dir) {
-            Ok(()) => return dir,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => panic!("cannot create a scratch directory: {e}"),
-        }
-    }
+/// `create_dir`, not `create_dir_all`: the suite's directory is this
+/// process's alone, so a name already taken means two cases share one
+/// image, and stopping says so where a silent reuse would not.
+fn scratch_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(temp_path!("sb-flags-{tag}"));
+    std::fs::create_dir(&dir).unwrap_or_else(|e| panic!("cannot create {}: {e}", dir.display()));
+    dir
 }
 
-/// A fresh image with `bits` OR-ed into the superblock's `flags`, or
-/// `None` without `mkfs.btrfs`.
-fn image_with_flags(name: &str, bits: u64) -> Option<(Scratch, std::path::PathBuf)> {
-    let dir = unique_scratch(&format!("sb-flags-{name}"));
+/// A fresh image with `bits` OR-ed into the superblock's `flags`.
+fn image_with_flags(name: &str, bits: u64) -> (Scratch, std::path::PathBuf) {
+    let dir = scratch_dir(name);
     let scratch = Scratch(dir.clone());
     let path = dir.join("img");
     std::fs::File::create(&path)
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
-    let made = match Command::new("mkfs.btrfs").arg("-f").arg(&path).output() {
-        Ok(made) => made,
-        Err(e) => {
-            assert!(
-                std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() != Ok("required"),
-                "BTRFS_ORACLE_FIXTURES=required, but mkfs.btrfs is not runnable: {e}"
-            );
-            return None;
-        }
-    };
+    let made = oracle("mkfs.btrfs").arg("-f").arg(&path).output();
     assert!(
         made.status.success(),
         "mkfs.btrfs failed: {}",
@@ -85,7 +62,7 @@ fn image_with_flags(name: &str, bits: u64) -> Option<(Scratch, std::path::PathBu
     sb[at..at + 8].copy_from_slice(&(flags | bits).to_le_bytes());
     stamp_checksum(sb, ChecksumType::Crc32c);
     std::fs::write(&path, &bytes).unwrap();
-    Some((scratch, path))
+    (scratch, path)
 }
 
 fn mount(path: &std::path::Path) -> fs_btrfs::error::Result<Filesystem> {
@@ -102,10 +79,7 @@ fn a_metadata_only_dump_is_refused_at_every_mount() {
         ("metadump", super_flags::METADUMP),
         ("metadump-v2", super_flags::METADUMP_V2),
     ] {
-        let Some((_scratch, path)) = image_with_flags(name, bits) else {
-            eprintln!("no mkfs.btrfs -- skipping");
-            return;
-        };
+        let (_scratch, path) = image_with_flags(name, bits);
         for (how, result) in [("read-only", mount(&path)), ("read-write", mount_rw(&path))] {
             match result {
                 Err(Error::UnsupportedFeature(m)) => {
@@ -120,10 +94,7 @@ fn a_metadata_only_dump_is_refused_at_every_mount() {
 
 #[test]
 fn a_seed_device_mounts_read_only_and_refuses_read_write() {
-    let Some((_scratch, path)) = image_with_flags("seed", super_flags::SEEDING) else {
-        eprintln!("no mkfs.btrfs -- skipping");
-        return;
-    };
+    let (_scratch, path) = image_with_flags("seed", super_flags::SEEDING);
     mount(&path).unwrap_or_else(|e| panic!("a seed must still be readable: {e:?}"));
     match mount_rw(&path) {
         Err(Error::UnsupportedFeature(m)) => assert!(m.contains("seed"), "{m}"),
@@ -137,10 +108,7 @@ fn a_seed_device_mounts_read_only_and_refuses_read_write() {
 #[test]
 fn an_unflagged_image_and_the_error_flag_still_mount_read_write() {
     for (name, bits) in [("plain", 0), ("error-flag", super_flags::ERROR)] {
-        let Some((_scratch, path)) = image_with_flags(name, bits) else {
-            eprintln!("no mkfs.btrfs -- skipping");
-            return;
-        };
+        let (_scratch, path) = image_with_flags(name, bits);
         mount(&path).unwrap_or_else(|e| panic!("{name}: read-only: {e:?}"));
         mount_rw(&path).unwrap_or_else(|e| panic!("{name}: read-write: {e:?}"));
     }

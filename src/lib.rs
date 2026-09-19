@@ -100,12 +100,16 @@ pub use xattr::XattrEntry;
 // file stayed, and seven assertions quietly stopped existing. Inline,
 // there is no declaration to lose. It cannot live in `tests/` either:
 // the question it answers is about the library target that the debug
-// step in ci.yml builds, so it has to be part of that target.
+// run builds, so it has to be part of that target.
 #[cfg(test)]
 mod overflow_checks {
-    /// Set by the debug step in `ci.yml`, and by nothing else.
+    /// Set by the `test:unit` task in `chores.yml`, and by nothing
+    /// else. CI runs that task (the `unit` job) rather than a `cargo
+    /// test` of its own, so the variable travels with the task and a
+    /// workstation's `chore test:unit` arms this exactly as the gate
+    /// does.
     ///
-    /// The release steps must NOT set it: overflow checks are off there
+    /// The release runs must NOT set it: overflow checks are off there
     /// deliberately, because that is what ships. Setting it on a
     /// release run makes this module fail every time, which is the
     /// correct and loud response to that misconfiguration.
@@ -141,9 +145,13 @@ mod overflow_checks {
     /// test that passes because its fixture is missing -- and that is
     /// not guarded here because it cannot be: a build has no way to
     /// know whether it was supposed to be the checking one. It is
-    /// guarded in `tests/ci_profile.rs`, which reads `ci.yml` and
-    /// refuses if no `cargo test` there runs without `--release` while
-    /// setting this variable.
+    /// guarded in `tests/ci_profile.rs`, which follows the whole chain:
+    /// `ci.yml` still runs `chore test:unit` on a job that gates a pull
+    /// request, `chores.yml`'s `test:unit` still runs without
+    /// `--release` while setting this variable, and
+    /// `scripts/test-targets.sh unit` still names `--lib`. Any one of
+    /// those three breaking is enough to leave this test armed by
+    /// nothing.
     #[test]
     fn the_build_the_gate_asked_to_check_does_check() {
         let asked = match std::env::var(HANDSHAKE) {

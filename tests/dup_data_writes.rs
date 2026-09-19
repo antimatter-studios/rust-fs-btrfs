@@ -10,9 +10,9 @@
 //! The image is `mkfs.btrfs --rootdir` of one 64 KiB file, the file's
 //! inode is marked nodatacow and nodatasum in every copy of its fs-tree
 //! leaf (restamped), and the outcome is read from the raw image: the new
-//! pattern must be there twice and the old one nowhere. Skips without
-//! btrfs-progs, unless `BTRFS_ORACLE_FIXTURES=required`, which the CI job
-//! that installs them sets.
+//! pattern must be there twice and the old one nowhere. `mkfs.btrfs` runs
+//! in the harness VM, which is where this suite's btrfs-progs lives, so
+//! there is no missing tool to step around.
 
 use fs_btrfs::btree::{header_offsets, HEADER_SIZE, ITEM_SIZE};
 use fs_btrfs::chunk::objectid;
@@ -20,8 +20,8 @@ use fs_btrfs::fs::Filesystem;
 use fs_btrfs::superblock::Superblock;
 use fs_btrfs::tree_write::stamp_checksum;
 use fs_btrfs::write::{INODE_NODATACOW, INODE_NODATASUM};
+use fs_btrfs_test_support::{oracle, temp_path};
 use fs_core::{BlockDevice, FileDevice};
-use std::process::Command;
 use std::sync::Arc;
 
 const SUPERBLOCK: usize = 0x1_0000;
@@ -45,7 +45,9 @@ fn count(haystack: &[u8], needle: &[u8]) -> usize {
 
 #[test]
 fn a_nodatacow_write_on_a_dup_filesystem_reaches_both_copies() {
-    let dir = std::env::temp_dir().join(format!("btrfs-dup-data-{}", std::process::id()));
+    // Inside the repository, because `mkfs.btrfs` reads the image from the
+    // harness VM, which sees this tree and nothing else of the host.
+    let dir = std::path::PathBuf::from(temp_path!("dup-data"));
     let root = dir.join("root");
     std::fs::create_dir_all(&root).unwrap();
     let old = pattern(0x11);
@@ -56,19 +58,11 @@ fn a_nodatacow_write_on_a_dup_filesystem_reaches_both_copies() {
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
-    let Ok(made) = Command::new("mkfs.btrfs")
+    let made = oracle("mkfs.btrfs")
         .args(["-f", "-d", "dup", "-m", "dup", "--rootdir"])
         .arg(&root)
         .arg(&img)
-        .output()
-    else {
-        assert!(
-            std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() != Ok("required"),
-            "BTRFS_ORACLE_FIXTURES=required, but mkfs.btrfs is not runnable"
-        );
-        eprintln!("no mkfs.btrfs -- skipping");
-        return;
-    };
+        .output();
     assert!(
         made.status.success(),
         "{}",

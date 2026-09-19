@@ -13,7 +13,10 @@
 //! transaction, and the owning tree — and required to come back byte for
 //! byte.
 //!
-//! Fixtures are gitignored. Build them with `chore fixtures`.
+//! The fixtures are gitignored and built by `chore fixtures`, in the
+//! fs-linux-test-harness VM — every `METADATA_ITEM` rebuilt here is one
+//! that kernel wrote. A missing fixture fails the test that wanted it:
+//! an oracle with nothing to compare against passes without comparing.
 
 use fs_btrfs::block_group::BlockGroup;
 use fs_btrfs::chunk::{key_type, DiskKey};
@@ -22,60 +25,52 @@ use fs_btrfs::extent_write::{
     SKINNY_METADATA_ITEM_SIZE,
 };
 use fs_btrfs::fs::Filesystem;
+use fs_btrfs_test_support::{fixture, fixtures_matching, le64, spans_several_devices};
 use fs_core::FileDevice;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-mod common;
-use common::le64;
-
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
-
+/// Every fixture whose extent tree this file walks.
 fn images() -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(share()) else {
-        return Vec::new();
-    };
-    let mut out: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "img"))
-        .filter(|p| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("btrfs-"))
-        })
+    let images: Vec<PathBuf> = fixtures_matching("btrfs-")
+        .into_iter()
+        // One member of a multi-device filesystem is refused a mount on
+        // purpose: its extent tree accounts for space on the other
+        // disk. `tests/pool_oracle.rs` is where such an image belongs.
+        .filter(|p| !spans_several_devices(p))
         .collect();
-    out.sort();
-    out
+    assert!(
+        !images.is_empty(),
+        "every fixture belongs to a multi-device filesystem, so there is no extent tree \
+         here to rebuild from"
+    );
+    images
 }
 
-fn open(img: &Path) -> Option<Filesystem> {
-    let dev = Arc::new(FileDevice::open(img).ok()?);
-    Filesystem::mount(dev).ok()
+fn open(img: &Path) -> Filesystem {
+    let dev = Arc::new(
+        FileDevice::open(img).unwrap_or_else(|e| panic!("opening {}: {e}", img.display())),
+    );
+    Filesystem::mount(dev).unwrap_or_else(|e| panic!("mounting {}: {e}", img.display()))
 }
 
 /// Rebuilding an allocation record gives back what the kernel wrote.
 #[test]
 fn every_metadata_item_re_encodes_identically() {
     let images = images();
-    if images.is_empty() {
-        eprintln!("no fixtures; build them with `chore fixtures`");
-        return;
-    }
 
     let mut total = 0usize;
     let mut images_checked = 0usize;
 
     for img in &images {
-        let Some(fs) = open(img) else { continue };
         let name = img.file_name().unwrap().to_string_lossy().into_owned();
+        let fs = open(img);
         let sb = fs.superblock().clone();
 
         let mut seen = 0usize;
         let mut failure: Option<String> = None;
 
-        let walked = fs.for_each_extent_item(&mut |key: &DiskKey, data: &[u8]| {
+        fs.for_each_extent_item(&mut |key: &DiskKey, data: &[u8]| {
             if key.key_type != key_type::METADATA_ITEM || failure.is_some() {
                 return;
             }
@@ -138,11 +133,9 @@ fn every_metadata_item_re_encodes_identically() {
                     key.objectid, ours[i], data[i]
                 ));
             }
-        });
+        })
+        .unwrap_or_else(|e| panic!("{name}: walking the extent tree: {e}"));
 
-        if walked.is_err() {
-            continue;
-        }
         if let Some(msg) = failure {
             panic!("{name}: {msg}");
         }
@@ -173,33 +166,23 @@ fn every_metadata_item_re_encodes_identically() {
 /// — starting from an empty group and adding each block back.
 #[test]
 fn replaying_the_allocations_reaches_the_used_count_the_kernel_recorded() {
-    let images = images();
-    if images.is_empty() {
-        eprintln!("no fixtures — skipping");
-        return;
-    }
-
     let mut checked = 0usize;
-    for img in &images {
-        let Some(fs) = open(img) else { continue };
+    for img in &images() {
         let name = img.file_name().unwrap().to_string_lossy().into_owned();
+        let fs = open(img);
         let nodesize = fs.superblock().nodesize as u64;
-        let Ok(groups) = fs.block_groups() else {
-            continue;
-        };
+        let groups = fs
+            .block_groups()
+            .unwrap_or_else(|e| panic!("{name}: reading the block groups: {e}"));
 
         // Every tree block, by which group holds it.
         let mut blocks: Vec<u64> = Vec::new();
-        if fs
-            .for_each_extent_item(&mut |key: &DiskKey, _: &[u8]| {
-                if key.key_type == key_type::METADATA_ITEM {
-                    blocks.push(key.objectid);
-                }
-            })
-            .is_err()
-        {
-            continue;
-        }
+        fs.for_each_extent_item(&mut |key: &DiskKey, _: &[u8]| {
+            if key.key_type == key_type::METADATA_ITEM {
+                blocks.push(key.objectid);
+            }
+        })
+        .unwrap_or_else(|e| panic!("{name}: walking the extent tree: {e}"));
 
         for group in groups
             .iter()
@@ -236,10 +219,9 @@ fn replaying_the_allocations_reaches_the_used_count_the_kernel_recorded() {
 /// A filesystem without `SKINNY_METADATA` is refused, not approximated.
 #[test]
 fn recording_is_refused_without_the_feature_that_defines_the_shape() {
-    let Some(fs) = images().iter().find_map(|p| open(p)) else {
-        eprintln!("no fixtures — skipping");
-        return;
-    };
+    // Any fixture would do — the refusal is about a feature bit, not
+    // about this image — so it names the plainest one.
+    let fs = open(&fixture("btrfs-default.img"));
 
     let mut sb = fs.superblock().clone();
     sb.incompat_flags &= !fs_btrfs::superblock::incompat::SKINNY_METADATA;

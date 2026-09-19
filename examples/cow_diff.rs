@@ -8,7 +8,8 @@
 //!
 //!   cargo run --example cow_diff -- before.img after.img
 //!
-//! Build the images with `./scripts/vm-build-cow-fixtures.sh`.
+//! Build the images with `chore fixtures cow` (the real kernel makes
+//! them, inside the fs-linux-test-harness VM).
 
 use fs_btrfs::btree::header_offsets as o;
 use fs_btrfs::chunk::{key_type, DiskKey};
