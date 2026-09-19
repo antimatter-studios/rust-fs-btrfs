@@ -1,8 +1,9 @@
 //! Extended attributes, read against a filesystem the Linux kernel made.
 //!
-//! The fixture is built by `scripts/build-xattr-fixtures.sh`: a mounted
-//! Btrfs filesystem with attributes set by `setfattr`, and `getfattr`'s
-//! own dump recorded beside it. The dump is the reference answer, so
+//! The fixture is built by `chore fixtures`, inside the
+//! fs-linux-test-harness VM: a mounted Btrfs filesystem with attributes
+//! set by `setfattr`, and `getfattr`'s own dump recorded beside it in
+//! `test-disks/`. The dump is the reference answer, so
 //! what is checked here is agreement with the kernel rather than
 //! agreement with this driver's assumptions — which is the only kind of
 //! check worth having for an on-disk layout.
@@ -11,35 +12,26 @@
 //! the parser decodes them with, so they cannot tell whether the layout
 //! is right at all. This file can.
 //!
-//! Fixtures are gitignored, so this skips cleanly on a fresh clone:
-//!
-//! ```sh
-//! ./scripts/vm-build-xattr-fixtures.sh   # macOS, via the oracle VM
-//! ./scripts/build-xattr-fixtures.sh      # on Linux, directly
-//! ```
+//! The fixtures are gitignored and generated: `chore fixtures` builds
+//! them, and a missing one fails the test that wanted it rather than
+//! skipping. A skipped test reads exactly like a passing one, and an
+//! xattr suite that never opened an image would report the parser
+//! perfect.
 
 use fs_btrfs::Filesystem;
+use fs_btrfs_test_support::fixture;
 use fs_core::FileDevice;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
-
-/// The fixture and the kernel's dump of it, or `None` when it has not
-/// been built.
-fn fixture() -> Option<(Filesystem, Reference)> {
-    let img = share().join("btrfs-xattr.img");
-    let manifest = share().join("btrfs-xattr.manifest");
-    if !img.exists() || !manifest.exists() {
-        return None;
-    }
+/// The mounted fixture and the kernel's dump of it.
+fn mounted() -> (Filesystem, Reference) {
+    let img = fixture("btrfs-xattr.img");
+    let manifest = fixture("btrfs-xattr.manifest");
     let dev = FileDevice::open(&img).expect("open the xattr fixture");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount the xattr fixture");
     let text = std::fs::read_to_string(&manifest).expect("read the manifest");
-    Some((fs, parse_getfattr(&text)))
+    (fs, parse_getfattr(&text))
 }
 
 /// What `getfattr` said, as `path -> {name -> value}`.
@@ -125,10 +117,7 @@ fn ours(fs: &Filesystem, path: &str) -> BTreeMap<String, Vec<u8>> {
 /// set of names and every value.
 #[test]
 fn every_attribute_the_kernel_reports_reads_back_identically() {
-    let Some((fs, reference)) = fixture() else {
-        eprintln!("no btrfs-xattr fixture — skipping");
-        return;
-    };
+    let (fs, reference) = mounted();
     assert!(
         reference.len() >= 4,
         "the manifest names only {} paths — the fixture did not build properly, and \
@@ -163,10 +152,7 @@ fn every_attribute_the_kernel_reports_reads_back_identically() {
 /// fails loudly.
 #[test]
 fn two_names_sharing_one_key_both_come_back() {
-    let Some((fs, _)) = fixture() else {
-        eprintln!("no btrfs-xattr fixture — skipping");
-        return;
-    };
+    let (fs, _) = mounted();
     let a = "user.tag1371838";
     let b = "user.tag2000402";
     assert_eq!(
@@ -206,10 +192,7 @@ fn two_names_sharing_one_key_both_come_back() {
 /// difference.
 #[test]
 fn an_empty_value_is_not_an_absent_attribute() {
-    let Some((fs, _)) = fixture() else {
-        eprintln!("no btrfs-xattr fixture — skipping");
-        return;
-    };
+    let (fs, _) = mounted();
     let inode = fs.lookup_path("/plain.txt").expect("plain.txt");
     assert_eq!(
         fs.get_xattr(inode.ino, b"user.empty").unwrap(),
@@ -228,10 +211,7 @@ fn an_empty_value_is_not_an_absent_attribute() {
 /// between "none" and "could not look".
 #[test]
 fn a_file_without_attributes_lists_nothing() {
-    let Some((fs, _)) = fixture() else {
-        eprintln!("no btrfs-xattr fixture — skipping");
-        return;
-    };
+    let (fs, _) = mounted();
     let inode = fs.lookup_path("/bare.txt").expect("bare.txt");
     assert!(fs.list_xattrs(inode.ino).unwrap().is_empty());
     assert_eq!(fs.get_xattr(inode.ino, b"user.colour").unwrap(), None);
@@ -244,10 +224,7 @@ fn a_file_without_attributes_lists_nothing() {
 /// must not.
 #[test]
 fn a_namespace_other_than_user_survives_intact() {
-    let Some((fs, _)) = fixture() else {
-        eprintln!("no btrfs-xattr fixture — skipping");
-        return;
-    };
+    let (fs, _) = mounted();
     let inode = fs.lookup_path("/dir/inner.txt").expect("dir/inner.txt");
     let got = fs.list_xattrs(inode.ino).unwrap();
     assert_eq!(got.len(), 1);
@@ -259,10 +236,7 @@ fn a_namespace_other_than_user_survives_intact() {
 /// would show it.
 #[test]
 fn a_directory_carries_attributes() {
-    let Some((fs, _)) = fixture() else {
-        eprintln!("no btrfs-xattr fixture — skipping");
-        return;
-    };
+    let (fs, _) = mounted();
     let inode = fs.lookup_path("/dir").expect("/dir");
     assert!(inode.is_dir());
     assert_eq!(
@@ -276,10 +250,7 @@ fn a_directory_carries_attributes() {
 /// NUL and report a shorter value with no error.
 #[test]
 fn a_binary_value_survives_byte_for_byte() {
-    let Some((fs, _)) = fixture() else {
-        eprintln!("no btrfs-xattr fixture — skipping");
-        return;
-    };
+    let (fs, _) = mounted();
     let inode = fs.lookup_path("/plain.txt").expect("plain.txt");
     assert_eq!(
         fs.get_xattr(inode.ino, b"user.binary").unwrap(),
@@ -292,10 +263,7 @@ fn a_binary_value_survives_byte_for_byte() {
 /// other belongs is a mistake a short value would hide.
 #[test]
 fn a_long_value_comes_back_at_its_full_length() {
-    let Some((fs, _)) = fixture() else {
-        eprintln!("no btrfs-xattr fixture — skipping");
-        return;
-    };
+    let (fs, _) = mounted();
     let inode = fs.lookup_path("/plain.txt").expect("plain.txt");
     let value = fs
         .get_xattr(inode.ino, b"user.long")
@@ -309,10 +277,7 @@ fn a_long_value_comes_back_at_its_full_length() {
 /// list. The two are indistinguishable to a caller otherwise.
 #[test]
 fn listing_attributes_of_a_missing_inode_is_refused() {
-    let Some((fs, _)) = fixture() else {
-        eprintln!("no btrfs-xattr fixture — skipping");
-        return;
-    };
+    let (fs, _) = mounted();
     assert!(fs.list_xattrs(u64::MAX / 2).is_err());
     assert!(fs.get_xattr(u64::MAX / 2, b"user.colour").is_err());
 }

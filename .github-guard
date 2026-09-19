@@ -3,40 +3,33 @@
 # git-config format: check with `git config -f .github-guard --list`, and
 # double-quote any value containing # or ;.
 
-# Required status checks for main. A declaration beats discovery exactly.
+# What must pass before main takes a merge. github-guard reads this from the
+# default branch on the server and applies it to branch protection.
 #
-# Discovery requires checks BY JOB NAME, which is a guess at the PR gate and
-# drifts silently: a renamed job, an added workflow, or any future check
-# reporting under the github-actions app changes what is required without
-# anyone deciding to. Pinning it costs nothing and makes the intent
-# reviewable — the settings page has no reviewer, and nothing in the
-# repository said what the gate was supposed to be (antimatter-studios/diskjockey#197).
+#   ci-ok   ci.yml: the one always-run gate. It fails when any job it needs
+#           failed, was cancelled or was skipped: the unit tier with no
+#           fixtures, the kernel-made fixtures built in the
+#           fs-linux-test-harness VM, the whole suite (lint, unit, the
+#           btrfs-progs oracles, the kernel oracles) on x86_64, the
+#           VM-free tiers on aarch64, and the suite compiled and run
+#           inside the guest.
 #
-# The two names below are what ci.yml produces on a pull request today, and
-# they are already what protection requires, so this is a pin rather than a
-# correction. It is still worth landing. The `test` job is a matrix —
-# `name: test-${{ matrix.os }}` over `os: [ubuntu-latest]` — and the day a
-# second os joins that list it produces a check nobody required, which is the
-# exact shape of fake coverage the audit found elsewhere in the constellation:
-# a leg that runs, goes red, and merges anyway. With the list declared here,
-# adding a leg to the matrix without adding it here is a visible omission in
-# the same diff rather than an invisible one on a settings page.
+# WHY A GATE RATHER THAN A LIST OF JOBS (#187). This file used to name two
+# jobs — `test-ubuntu-latest` and `validate against kernel btrfs driver` —
+# and that is a shape with two failure modes, both of which were live here.
+# A renamed or split job leaves a required check that never reports, which
+# blocks every pull request with nothing to point at; and an ADDED job is
+# required by nobody, so a leg can run, go red, and merge anyway. The first
+# came due immediately: the move into the harness VM renames both of those
+# jobs out of existence and adds three more. Requiring the aggregate
+# instead means jobs can be added, renamed or split freely, and the
+# aggregate fails on a SKIPPED job too — which is the case a list of names
+# cannot express at all.
 #
-# `validate against kernel btrfs driver` is the kernel-gate job, and it is the
-# one that decides whether this driver reads Btrfs: real filesystems built by
-# mkfs.btrfs, described by btrfs-progs and mounted by the in-kernel driver.
-# The unit suite cannot replace it — it compares the parser against fixtures
-# built from the same reading of the spec, so a misread field is consistent
-# with itself and passes. It is required, not advisory.
-#
-# release.yml is deliberately absent: it triggers on a version tag, never on a
-# pull request, and a required check that never reports blocks every merge
+# release.yml is deliberately absent: it triggers on a version tag, never on
+# a pull request, and a required check that never reports blocks every merge
 # forever.
 #
-# Names must match the check-run names GitHub reports. These are the job
-# `name:` values, not the job ids, and the matrix leg is spelled
-# `test-ubuntu-latest` (this workflow interpolates the os into the name
-# itself, so there is no `test / ubuntu-latest` job-matrix spelling here).
 # ONE NAME, AND IT IS THE AGGREGATE. `ci-ok` needs every other job in
 # ci.yml and fails unless each concluded success, so a job renamed, split
 # into a matrix leg or added is gated the moment it is in the workflow --

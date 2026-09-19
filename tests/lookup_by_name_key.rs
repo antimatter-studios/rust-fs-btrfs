@@ -10,9 +10,16 @@
 //! listing the directory each time is 20,000 x 20,000 entries materialised
 //! -- minutes. By key it is 20,000 map lookups. The bound below is two orders
 //! of magnitude above the keyed cost and two below the listing one.
-//! Skips when btrfs-progs is not installed.
+//!
+//! `mkfs.btrfs` runs in the fs-linux-test-harness VM, like every oracle
+//! tool, so one version of btrfs-progs builds this directory on every
+//! machine — and the tree it is built from lives inside this repository,
+//! which is the only part of the host the guest can see. Nothing skips:
+//! a guest that cannot run the tool fails the test naming the task that
+//! provisions it.
 
 use fs_btrfs::{dir, Filesystem};
+use fs_btrfs_test_support::{oracle, temp_path};
 use fs_core::FileDevice;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,23 +30,13 @@ const COLLIDING: [&str; 2] = ["c59888d", "c1040060"];
 
 #[test]
 fn a_lookup_fetches_the_name_by_key() {
-    let Some(mkfs) = [
-        "/usr/sbin/mkfs.btrfs",
-        "/sbin/mkfs.btrfs",
-        "/usr/bin/mkfs.btrfs",
-    ]
-    .into_iter()
-    .find(|p| std::path::Path::new(p).exists()) else {
-        eprintln!("skip: btrfs-progs not installed");
-        return;
-    };
     assert_eq!(
         dir::name_hash(COLLIDING[0].as_bytes()),
         dir::name_hash(COLLIDING[1].as_bytes()),
         "fixture: the pair must collide"
     );
 
-    let root = std::env::temp_dir().join(format!("fs_btrfs_lookup_key_{}", std::process::id()));
+    let root = std::path::PathBuf::from(temp_path!("lookup-by-name-key"));
     let big = root.join("big");
     std::fs::create_dir_all(&big).unwrap();
     for i in 0..NAMES - COLLIDING.len() {
@@ -52,12 +49,11 @@ fn a_lookup_fetches_the_name_by_key() {
     std::fs::File::create(&image)
         .and_then(|f| f.set_len(256 * 1024 * 1024))
         .unwrap();
-    let out = std::process::Command::new(mkfs)
+    let out = oracle("mkfs.btrfs")
         .args(["-q", "-f", "--rootdir"])
         .arg(&root)
         .arg(&image)
-        .output()
-        .unwrap();
+        .output();
     assert!(
         out.status.success(),
         "{}",

@@ -10,9 +10,9 @@
 //!
 //! The image is `mkfs.btrfs --rootdir` of a file whose bytes ARE a zlib
 //! stream; its extent item is then marked zlib-compressed with a chosen
-//! window, in every copy of the leaf, and restamped. Skips without
-//! btrfs-progs, unless `BTRFS_ORACLE_FIXTURES=required`, which the CI job
-//! that installs them sets.
+//! window, in every copy of the leaf, and restamped. `mkfs.btrfs` runs in
+//! the harness VM, the one place this suite has btrfs-progs, so the tool is
+//! always there and nothing here is conditional on finding it.
 
 use fs_btrfs::btree::{header_offsets, HEADER_SIZE, ITEM_SIZE};
 use fs_btrfs::chunk::objectid;
@@ -20,8 +20,8 @@ use fs_btrfs::error::Error;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::superblock::Superblock;
 use fs_btrfs::tree_write::stamp_checksum;
+use fs_btrfs_test_support::{oracle, temp_path};
 use fs_core::FileDevice;
-use std::process::Command;
 use std::sync::Arc;
 
 const SUPERBLOCK: usize = 0x1_0000;
@@ -50,13 +50,17 @@ fn plain() -> Vec<u8> {
 }
 
 /// An image whose file's extent is zlib with the window `window(sector,
-/// ram_bytes)` returns as (`offset`, `num_bytes`). The window is computed
-/// from the volume's sector size, because every extent field must be whole
-/// sectors (#89) and `mkfs.btrfs` picks the host page size: 4 KiB on x86,
-/// 16 KiB on a 16K-page arm64 kernel.
-/// and the file's inode number; `None` without mkfs.btrfs.
-fn image(name: &str, window: impl Fn(u64, u64) -> (u64, u64)) -> Option<(std::path::PathBuf, u64)> {
-    let dir = std::env::temp_dir().join(format!("btrfs-comp-window-{}-{name}", std::process::id()));
+/// ram_bytes)` returns as (`offset`, `num_bytes`), and the file's inode
+/// number. The window is computed from the volume's sector size, because
+/// every extent field must be whole sectors (#89) and `mkfs.btrfs` picks
+/// the page size of the machine it runs on -- here the harness guest: 4 KiB
+/// on x86, 16 KiB on a 16K-page arm64 kernel.
+///
+/// The image and the directory copied into it both live under the suite's
+/// scratch directory inside this repository, because that is the tree the
+/// guest running `mkfs.btrfs` can see.
+fn image(name: &str, window: impl Fn(u64, u64) -> (u64, u64)) -> (std::path::PathBuf, u64) {
+    let dir = std::path::PathBuf::from(temp_path!("comp-window-{name}"));
     let root = dir.join("root");
     std::fs::create_dir_all(&root).unwrap();
     let plain = plain();
@@ -72,22 +76,12 @@ fn image(name: &str, window: impl Fn(u64, u64) -> (u64, u64)) -> Option<(std::pa
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
-    let made = match Command::new("mkfs.btrfs")
+    let made = oracle("mkfs.btrfs")
         .arg("-f")
         .arg("--rootdir")
         .arg(&root)
         .arg(&img)
-        .output()
-    {
-        Ok(made) => made,
-        Err(e) => {
-            assert!(
-                std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() != Ok("required"),
-                "BTRFS_ORACLE_FIXTURES=required, but mkfs.btrfs is not runnable: {e}"
-            );
-            return None;
-        }
-    };
+        .output();
     assert!(
         made.status.success(),
         "{}",
@@ -151,7 +145,7 @@ fn image(name: &str, window: impl Fn(u64, u64) -> (u64, u64)) -> Option<(std::pa
     }
     assert!(patched > 0, "fixture: the file's extent item was found");
     std::fs::write(&img, &bytes).unwrap();
-    Some((img, ino))
+    (img, ino)
 }
 
 fn read_first_block(img: &std::path::Path, ino: u64) -> Result<Vec<u8>, Error> {
@@ -163,10 +157,7 @@ fn read_first_block(img: &std::path::Path, ino: u64) -> Result<Vec<u8>, Error> {
 #[test]
 fn a_compressed_window_that_overflows_is_refused_not_a_panic() {
     // Whole sectors at any sector size up to 64 KiB, and the sum overflows.
-    let Some((img, ino)) = image("overflow", |_, _| (!0xFFFF_u64, 0x1_0000)) else {
-        eprintln!("no mkfs.btrfs -- skipping");
-        return;
-    };
+    let (img, ino) = image("overflow", |_, _| (!0xFFFF_u64, 0x1_0000));
     let got = std::panic::catch_unwind(|| read_first_block(&img, ino));
     match got {
         Err(_) => panic!("a compressed extent's offset near u64::MAX panicked"),
@@ -181,10 +172,7 @@ fn a_compressed_window_that_overflows_is_refused_not_a_panic() {
 
 #[test]
 fn a_compressed_window_past_the_decoded_length_is_refused_by_name() {
-    let Some((img, ino)) = image("past", |sector, ram| (ram, sector)) else {
-        eprintln!("no mkfs.btrfs -- skipping");
-        return;
-    };
+    let (img, ino) = image("past", |sector, ram| (ram, sector));
     match read_first_block(&img, ino) {
         Err(Error::BadSuperblock(m)) => assert!(
             m.contains("an extent item covers"),
@@ -201,10 +189,7 @@ fn a_compressed_window_past_the_decoded_length_is_refused_by_name() {
 /// Control: a window inside the decoded bytes reads them.
 #[test]
 fn a_compressed_window_inside_the_extent_reads() {
-    let Some((img, ino)) = image("inside", |sector, _| (0, sector)) else {
-        eprintln!("no mkfs.btrfs -- skipping");
-        return;
-    };
+    let (img, ino) = image("inside", |sector, _| (0, sector));
     let got = read_first_block(&img, ino).expect("a valid compressed window reads");
     assert_eq!(got, plain()[..4096]);
     let _ = std::fs::remove_dir_all(img.parent().unwrap());

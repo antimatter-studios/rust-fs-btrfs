@@ -7,26 +7,17 @@
 //! `dump-super -f` shows for the new generation must name the tree root,
 //! chunk root, size and usage the superblock holds and the extent,
 //! filesystem, device and checksum roots `dump-tree -t root` lists. Before
-//! this, the slot still described a commit the kernel made. Skips when
-//! btrfs-progs is not installed.
+//! this, the slot still described a commit the kernel made. The tools run
+//! in the harness VM, which is the one place they live, so they are always
+//! there and nothing here skips.
 
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::super_write::Commit;
+use fs_btrfs_test_support::{assert_btrfs_check_clean, dump_super, dump_tree, oracle, temp_path};
 use fs_core::{BlockDevice, FileDevice};
 use std::collections::BTreeMap;
-use std::process::Command;
+use std::path::Path;
 use std::sync::Arc;
-
-fn btrfs(args: &[&str]) -> Option<String> {
-    let out = Command::new("btrfs").args(args).output().ok()?;
-    assert!(
-        out.status.success(),
-        "btrfs {args:?}: {}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
-}
 
 /// `(bytenr, generation, level)` from a `dump-super -f` backup line.
 fn triple(line: &str) -> (u64, u64, u8) {
@@ -38,8 +29,8 @@ fn triple(line: &str) -> (u64, u64, u8) {
 }
 
 /// The backup slot for `generation`, as btrfs-progs decodes it.
-fn backup_slot(image: &str, generation: u64) -> BTreeMap<String, String> {
-    let dump = btrfs(&["inspect-internal", "dump-super", "-f", image]).unwrap();
+fn backup_slot(image: &Path, generation: u64) -> BTreeMap<String, String> {
+    let dump = dump_super(image);
     let header = format!("backup {}:", (generation - 1) % 4);
     let mut out = BTreeMap::new();
     for line in dump
@@ -56,8 +47,8 @@ fn backup_slot(image: &str, generation: u64) -> BTreeMap<String, String> {
 }
 
 /// `(bytenr, generation, level)` of each global tree's `ROOT_ITEM`.
-fn root_items(image: &str) -> BTreeMap<String, (u64, u64, u8)> {
-    let dump = btrfs(&["inspect-internal", "dump-tree", "-t", "root", image]).unwrap();
+fn root_items(image: &Path) -> BTreeMap<String, (u64, u64, u8)> {
+    let dump = dump_tree(image, "root");
     let mut out = BTreeMap::new();
     let lines: Vec<&str> = dump.lines().collect();
     for (i, line) in lines.iter().enumerate() {
@@ -93,11 +84,10 @@ fn root_items(image: &str) -> BTreeMap<String, (u64, u64, u8)> {
 
 #[test]
 fn a_commit_fills_its_backup_slot() {
-    if Command::new("btrfs").arg("--version").output().is_err() {
-        eprintln!("skip: btrfs-progs not installed");
-        return;
-    }
-    let root = std::env::temp_dir().join(format!("fs_btrfs_backup_ring_{}", std::process::id()));
+    // Scratch inside this repository: the guest that runs the tools sees
+    // this repository and nothing else of the host, so an image anywhere
+    // else is a path they cannot open.
+    let root = std::path::PathBuf::from(temp_path!("backup-ring"));
     std::fs::create_dir_all(root.join("tree")).unwrap();
     for i in 0..50 {
         std::fs::write(root.join(format!("tree/f{i}")), format!("file {i}")).unwrap();
@@ -106,18 +96,16 @@ fn a_commit_fills_its_backup_slot() {
     std::fs::File::create(&image)
         .and_then(|f| f.set_len(256 * 1024 * 1024))
         .unwrap();
-    let out = Command::new("mkfs.btrfs")
+    let out = oracle("mkfs.btrfs")
         .args(["-q", "-f", "-s", "4096", "-n", "16384", "--rootdir"])
         .arg(root.join("tree"))
         .arg(&image)
-        .output()
-        .unwrap();
+        .output();
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let image = image.to_str().unwrap().to_string();
 
     for _ in 0..2 {
         let generation = {
@@ -144,9 +132,9 @@ fn a_commit_fills_its_backup_slot() {
             generation
         };
 
-        btrfs(&["check", "--readonly", &image]).unwrap();
+        assert_btrfs_check_clean(&image, &format!("generation {generation}"));
         let slot = backup_slot(&image, generation);
-        let sb = btrfs(&["inspect-internal", "dump-super", &image]).unwrap();
+        let sb = dump_super(&image);
         let field = |name: &str| -> String {
             sb.lines()
                 .find(|l| l.split_whitespace().next() == Some(name))

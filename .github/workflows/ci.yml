@@ -1,5 +1,69 @@
 name: CI
 
+# EVERY JOB RUNS CHORE TASKS, so a green local `chore test` is the same
+# evidence as a green run here (see the test contract at the top of
+# chores.yml):
+#
+#   unit         `chore test:unit` on a runner with NO fixtures: the tests
+#                that need no tool, no fixture and no VM, in the debug
+#                profile that traps an arithmetic overflow. That the job
+#                passes with test-disks/ empty is what proves the split.
+#   fixtures     `chore fixtures`: the kernel-made images, built in the
+#                fs-linux-test-harness VM under KVM on x86_64, and handed
+#                to the other jobs as an artifact (they are disk images,
+#                the same for every architecture).
+#   test         x86_64, where GitHub gives us KVM: `chore lint` and
+#                `chore test` — the whole gate, with EVERY btrfs-progs
+#                call and every kernel mount happening inside the harness
+#                VM. Nothing installs btrfs-progs on the runner, and the
+#                log shows `[oracle vm]` / `[kernel vm]` for each one.
+#   test-arm64   aarch64 matters on its own (c_char is unsigned there, and
+#                it is what DiskJockey ships on) but GitHub's arm64
+#                runners have NO KVM, so no VM can run: this job runs the
+#                tiers that need none — lint, the unit tier, and the
+#                fixture-reading tests. The tool and kernel oracles are
+#                architecture-independent (they read the same images) and
+#                are covered by `test`; so are the script tests, which
+#                check the tree rather than the machine.
+#   suite-in-vm  `chore test:vm`: the whole suite COMPILED AND RUN INSIDE
+#                the guest. That is how a macOS host runs a Linux suite,
+#                and this job is what keeps that path working.
+#   ci-ok        the one required check: green only when every job above
+#                ran and succeeded (failed, cancelled OR skipped fails it).
+#
+# WHAT THIS REPLACED, AND WHY IT MATTERS MORE HERE THAN ANYWHERE ELSE.
+# The old `kernel-gate` job was a list of fifty-odd steps: it installed
+# btrfs-progs on the runner, built most of the fixtures with `sudo mount
+# -o loop` there, and then invoked thirty-four suites by name. Two
+# consequences, both of which bit:
+#
+#   * a suite that was not in the list ran nowhere. `read_path_cost` and
+#     `dup_mirror_fallback` both arrived after the list and were never
+#     added to it, so neither executed an assertion on a pull request
+#     (#70). The tiers are derived from the tests now
+#     (scripts/test-targets.sh), so a new suite is in the gate the moment
+#     its file is committed.
+#   * the kernel half of the gate needed root on the runner, so it did
+#     not exist away from CI at all — a developer on a Mac could not run
+#     it, and neither could one on Linux without handing a test suite
+#     sudo. It runs in the harness guest now, the same way everywhere.
+#
+# THE FLOORS SURVIVED THE MOVE. Each of those steps carried the number of
+# tests it executed on a known-good run, because `cargo test` exits 0 on
+# "0 passed; 0 failed" and a suite that empties from the inside reports
+# green having stopped checking. Those numbers now live in
+# .github/test-floors.txt, one per integration target, and
+# scripts/test-floor.sh checks each of them against that target's own
+# `test result:` line in the tier log. Same guard, one file, and it no
+# longer requires the workflow to name every suite.
+#
+# THE OUTPUT BUDGET IS IN THE TASKS, so it is in this workflow too. Each
+# tier writes its full output to tmp/logs/<tier>.log and prints a verdict;
+# a tier that prints more than its measured budget FAILS (exit 65), which
+# is how a job that starts emitting thousands of lines turns red here
+# rather than being noticed by whoever scrolls it next. See the budget
+# table at the top of chores.yml.
+
 on:
   push:
     branches: [main]
@@ -7,790 +71,292 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
-  # The tag of the sibling repo this crate's path dependency resolves to
-  # (`am-fs-core = { path = "../rust-fs-core", version = "0.2" }`). Must match
-  # the `am-fs-core` version recorded in Cargo.lock, or `--locked` will refuse
-  # to build. Bump in lockstep with the constraint in Cargo.toml.
-  FS_CORE_REF: v0.2.10
+  CHORE_VERSION: "0.11.0"
 
 jobs:
-  test:
-    name: test-${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
-    # `shell: bash` rather than the runner's default, for `pipefail` and
-    # nothing else. The default for a `run:` on Linux is `bash -e {0}`,
-    # where the exit status of a pipeline is the LAST command's — so
-    # `cargo test ... | bash scripts/test-floor.sh N` would report the
-    # floor's verdict and discard the test run's, and a suite that failed
-    # every test would be green as long as it executed enough of them.
-    # Naming the shell explicitly gets `-eo pipefail`, which keeps the
-    # test run's own status. Every step in the job that already writes
-    # `set -euo pipefail` is unaffected by the change.
+  unit:
+    name: unit (no tools, no fixtures)
+    runs-on: ubuntu-24.04
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
-      # The crate has a path dep on am-fs-core (../rust-fs-core).
-      # Clone the sibling repo alongside so cargo can resolve it.
-      # Anonymous HTTPS clone — rust-fs-core is public.
-      - name: Clone sibling rust-fs-core
-        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - name: Install chore
+        # Pinned (CHORE_VERSION) and checked against the release's
+        # checksums: the siblings, the tools and the tests all come
+        # through it.
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        # rust-fs-core (the path dependency) and fs-linux-test-harness, at
+        # the refs pinned in chores.yml.
+        run: chore siblings
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Cache cargo registry
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      # `--locked` so a drifting Cargo.lock fails the gate instead of
-      # being silently resolved past. Every other `cargo test` in the
-      # constellation pins it; this one did not. See #103.
-      #
-      # THE FLOOR, MEASURED RATHER THAN GUESSED: 476 tests executed here
-      # on 2026-09-17, run 35242813679 (commit 28f8ee6, the last green
-      # CI on main). 450 leaves room for a suite that loses a test to a
-      # refactor without leaving room for one that loses them all.
-      # `cargo test` exits 0 on "0 passed; 0 failed", so a build that
-      # produced no test binaries, a filter that selected nothing and a
-      # full green run are the same colour; only the count tells them
-      # apart. See scripts/test-floor.sh.
-      - run: cargo test --locked --release | bash scripts/test-floor.sh 450
-
-      # AND ONCE WITHOUT `--release`, COVERING THE LIBRARY UNIT TESTS --
-      # NOTHING ELSE ON THIS TRIGGER DOES.
-      #
-      # overflow-checks defaults on in [profile.dev] and off in
-      # [profile.release]. Cargo.toml's [profile.release] carries lto,
-      # codegen-units, opt-level and panic only, and its [profile.dev]
-      # carries opt-level and panic only -- neither overrides the
-      # default, so the run above wraps a bad addition silently and
-      # reports success.
-      #
-      # This repository is NOT in the same position as its siblings, and
-      # the difference is worth stating so nobody "simplifies" this
-      # away. There IS debug coverage on this trigger: the kernel-gate
-      # job below runs eighteen `cargo test --test <name>` invocations
-      # in the debug profile, on every pull request. But `--test <name>`
-      # selects ONE integration target and never builds the library's
-      # own unit tests, so the library unit tests in src/ -- the largest
-      # body of arithmetic in the crate -- run under --release and
-      # nowhere else. `release.yml:66`, `cargo test --all-targets`, does
-      # cover them in debug, but triggers on a version TAG, so a
-      # wrapping defect merges green and surfaces when someone else cuts
-      # the next release.
-      #
-      # `EXPECT_OVERFLOW_CHECKS=1` tells
-      # `overflow_checks::the_build_the_gate_asked_to_check_does_check`
-      # in src/lib.rs that this is the run that must trap an overflow --
-      # asking the build directly rather than inferring it from which
-      # spellings of "disabled" happen to be absent from Cargo.toml. The
-      # release run must NOT set it: the checks are off there
-      # deliberately, because that is what ships.
-      #
-      # Do not remove this as a duplicate of the kernel-gate runs, and
-      # do not drop the variable from it: tests/ci_profile.rs asserts
-      # that ci.yml still runs a `cargo test` which covers the library
-      # unit tests, without `--release`, setting this variable -- and
-      # that the kernel-gate's `--test <name>` runs do not satisfy it.
-      #
-      # Its own floor, because it is its own selection: `--lib` runs the
-      # library unit tests and nothing else, so it can empty entirely
-      # while the release run above stays full. 231 executed on
-      # 2026-09-17, run 35242813679; floor 220.
-      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib | bash scripts/test-floor.sh 220
-
-      # The VM-teardown guards, which decide whether a machine is left
-      # running. They stub pgrep and vagrant, so they need neither.
-      #
-      # These existed and ran nowhere: the same hole the fixture oracles
-      # had, in the tests written to close it.
-      - name: VM teardown and reaper semantics
+          key: ${{ runner.os }}-unit-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: No fixtures are present
         run: |
           set -euo pipefail
-          # These are shell tests, not cargo ones, so they are counted by
-          # their own `ok` lines rather than by libtest's summary — but
-          # the failure is identical in shape: `tests/scripts/*.sh`
-          # matching fewer files, or a script that returns 0 having
-          # asserted nothing, is a step that passes having checked
-          # nothing. 102 assertions across 5 scripts on 2026-09-17, run
-          # 35242813679; floor 95.
-          assertions=0
-          for t in tests/scripts/*.sh; do
-            echo "::group::$t"
-            log="$RUNNER_TEMP/$(basename "$t").log"
-            bash "$t" | tee "$log"
-            # `grep -c` exits 1 when it counts nothing, which is a
-            # result here rather than an error: the floor below is what
-            # reports it, with the total and the number it expected.
-            found=$(grep -ac '^ok' "$log" || true)
-            assertions=$((assertions + found))
-            echo "::endgroup::"
-          done
-          echo "assertions executed: $assertions (floor 95)"
-          if [ "$assertions" -lt 95 ]; then
-            echo "::error::only $assertions script assertions executed, floor is 95 — 102 ran on 2026-09-17, and a run that asserts less than that stopped early rather than passed" >&2
+          if ls test-disks/*.img >/dev/null 2>&1; then
+            echo "::error::test-disks/ has images; this job must prove the unit tier needs none"
             exit 1
           fi
+      - name: chore test:unit
+        # The DEBUG profile, which is the point: overflow-checks are on
+        # here and off in release, and the task sets
+        # EXPECT_OVERFLOW_CHECKS=1 so src/lib.rs can prove the build it
+        # was asked to check does check. `--lib` is what carries the
+        # library's own unit tests, the largest body of arithmetic in the
+        # crate. tests/ci_profile.rs refuses a workflow that stops
+        # running this task.
+        run: chore test:unit
+      - name: The unit tier executed its tests
+        run: bash scripts/test-floor.sh --log tmp/logs/unit.log 322
 
-  # The gate that actually decides whether this driver reads Btrfs.
-  #
-  # The unit suite can only prove the parser agrees with the fixtures we
-  # hand-built, and those fixtures were built from the same reading of the
-  # spec as the parser — so a misread field is consistent with itself and
-  # passes. This job removes that circularity: real filesystems, built by
-  # the canonical mkfs.btrfs, described by the canonical dump tool, and
-  # accepted by the in-kernel driver.
-  #
-  # It is a required check, not an optional confirmation. In the sister
-  # XFS driver the equivalent job found three live parser bugs on its
-  # first run, with the whole unit suite green.
-  #
-  # No VM here: GitHub's Linux runners are already Linux. The Vagrant VM
-  # in tests/vagrant exists only so macOS developers can run this same
-  # gate locally, and it builds the same geometry matrix from the same
-  # scripts/fixture-geometries.sh list.
-  kernel-gate:
-    name: validate against kernel btrfs driver
-    # THE JOB THAT BUILDS FIXTURES IS THE JOB THAT MUST HAVE THEM.
-    #
-    # `tests/fixtures_present.rs` refuses to run the suite here without
-    # them, because eight steps below exist only to produce them and a
-    # broken one would otherwise leave every oracle skipping while this
-    # job reported success.
-    #
-    # Deliberately not keyed on `CI`: the `test` job above runs the same
-    # suites with no fixtures at all, where skipping is correct, and a
-    # `CI` check would fail it for a condition that is right there.
-    env:
-      AM_FIXTURES_REQUIRED: '1'
-    runs-on: ubuntu-latest
-    # `shell: bash` for `pipefail`, and only for that. Every oracle step
-    # below pipes into scripts/test-floor.sh, and under the runner's
-    # default `bash -e {0}` a pipeline's status is the last command's —
-    # the floor would answer for the test run, and an oracle that failed
-    # every assertion would report green as long as it executed enough
-    # of them. `-eo pipefail` keeps `cargo test`'s own status. The steps
-    # here that already begin `set -euo pipefail` are unchanged by it.
+  fixtures:
+    name: fixtures (harness VM, x86_64 KVM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
     defaults:
       run:
         shell: bash
-    # A FLOOR ON EVERY ORACLE, BECAUSE THIS JOB IS A LIST OF NAMES.
-    #
-    # Each step below is `cargo test --test <name>`, which selects one
-    # integration target by a name written in two places: this file and
-    # `tests/<name>.rs`. Nothing checks that the two agree, and a suite
-    # that empties from the inside — every test renamed, gated out, or
-    # moved — reports `0 passed`, exits 0, and this job stays green
-    # having stopped checking that the driver reads Btrfs. The audit in
-    # antimatter-studios/diskjockey#197 found precisely that shape
-    # across the constellation, and the comments throughout this file
-    # record that this repository has been bitten by the skipping
-    # version of it more than once.
-    #
-    # So every invocation carries the number of tests it executed on a
-    # known-good run: run 35242813679, commit 28f8ee6, 2026-09-17, the
-    # last green CI on main before this was added. The number beside
-    # each step is that run's count for that step; scripts/test-floor.sh
-    # refuses a run that executes fewer. The counts are small and exact
-    # rather than discounted, because these suites are fixed sets of
-    # oracles and "one fewer than yesterday" is the event worth
-    # catching — with three tests in a suite there is no margin that is
-    # both non-zero and forgiving. Adding a test means raising the
-    # number in the same diff; so does removing one, which is the point.
     steps:
       - uses: actions/checkout@v4
-      - name: Clone sibling rust-fs-core
-        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - name: chore fixtures
+        run: chore fixtures
+      - name: chore vm:status (the VM is down again)
+        run: '! chore vm:status'
+      # TARRED, AND `--sparse` IS NOT OPTIONAL. These images total about
+      # ten gigabytes of address space and a few hundred megabytes of
+      # actual data: two 2 GiB populated filesystems, ten 400 MiB
+      # geometries, four 600 MiB compressing mounts. upload-artifact
+      # uploads files, not extents, so it would read and store every hole
+      # as zeroes. `tar --sparse` skips the holes on the way in, and the
+      # consumers below restore them on the way out.
+      - name: Pack the fixtures, holes and all
+        run: tar --sparse -czf fixtures.tar.gz -C test-disks .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixtures
+          path: fixtures.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    name: test (x86_64, oracles and kernel in the VM)
+    needs: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Cache cargo registry
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-kgate-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install btrfs-progs
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          # `attr` provides setfattr/getfattr, which the extended-attribute
-          # fixture both sets attributes with and takes its reference
-          # answer from. Without it that fixture builds a filesystem with
-          # no attributes and a manifest saying so, and its oracle test
-          # passes having compared nothing.
-          sudo apt-get install -y -qq btrfs-progs attr
-          btrfs --version
-          mkfs.btrfs --version
-          # The exotic checksum algorithms live in separate crypto
-          # modules. Load them now so a mount of an xxhash/sha256/blake2
-          # image is not the first thing that discovers they are missing.
-          sudo modprobe btrfs
-          sudo modprobe xxhash_generic || echo "note: xxhash_generic unavailable"
-          sudo modprobe sha256_generic || echo "note: sha256_generic unavailable"
-          sudo modprobe blake2b_generic || echo "note: blake2b_generic unavailable"
-
-      # Same matrix, same naming, same output directory as the VM builder
-      # a developer runs on macOS. Aborts if the default geometry cannot
-      # be built, and prints a loud block for any geometry it had to skip.
-      # THE GUARD RUNS FIRST, and it has to be named here to run at all.
-      #
-      # This job invokes suites by name and has no catch-all `cargo
-      # test`, so a suite absent from the list executes nowhere. The
-      # first version of this change added `fixtures_present.rs` and
-      # mentioned it only in a comment — so the check written to catch
-      # silently-skipping suites was itself silently skipped, in the very
-      # commit that introduced it, and reported green.
-      #
-      # It runs after the fixture steps below rather than before them,
-      # which is why this step sits at the end of the build sequence
-      # despite being the cheapest thing here.
-      - name: Build the fixture matrix
-        run: bash scripts/build-fixtures-native.sh
-
-      # `btrfs check` is the reference consistency checker. If it rejects
-      # an image, the fixture is bad and nothing downstream means
-      # anything — better to fail here than to chase a phantom parser bug.
-      - name: Reference-check every fixture
-        run: |
-          set -euo pipefail
-          bad=0
-          for img in .vm-share/btrfs-*.img; do
-            echo "::group::btrfs check $(basename "$img")"
-            if sudo btrfs check --readonly "$img"; then
-              echo "OK $(basename "$img")"
-            else
-              echo "btrfs check REJECTED $(basename "$img")" >&2
-              bad=1
-            fi
-            echo "::endgroup::"
-          done
-          [ "$bad" -eq 0 ] || { echo "reference checker rejected a fixture" >&2; exit 1; }
-
-      # Proof that the kernel itself accepts these images: loop-mount each
-      # one with the in-kernel btrfs driver, write and read a file back,
-      # and unmount cleanly. The default geometry is a hard requirement;
-      # the rest are mounted too, and a failure on any of them fails the
-      # job with the list named.
-      # This MUST run before the mount step below. Mounting a Btrfs
-      # filesystem advances its generation counter and rewrites the
-      # superblock, so an image that has been mounted no longer matches
-      # the dump taken straight out of mkfs -- the comparison would fail
-      # on `generation` for reasons that have nothing to do with the
-      # parser. The sibling XFS gate hit the same trap with its
-      # free-space counters.
-      # The subvolume fixture, which needs to mount and so cannot come
-      # from build-fixtures-native.sh. Same script the VM runner calls —
-      # deliberately one copy, so CI and a developer's local run cannot
-      # mean different things.
-      #
-      # Without this, tests/subvol_oracle.rs finds no fixture and skips,
-      # which reads exactly like passing. It did, on the run that added
-      # it.
-      - name: Build the subvolume fixture
-        run: sudo bash scripts/build-subvol-fixtures.sh
-
-      # The chunk-tree walk's refusals, on images the test damages itself
-      # after mkfs.btrfs, which only this job installs. `required` turns a
-      # missing mkfs.btrfs into a failure instead of a skip that reads as a
-      # pass (#85).
-      - name: A malformed chunk item fails the mount by name
-        env:
-          BTRFS_ORACLE_FIXTURES: required
-        run: cargo test --test chunk_tree_items -- --nocapture | bash scripts/test-floor.sh 3
-
-      # Extended attributes have to be SET, which needs a mount, so this
-      # cannot come from the mkfs-only matrix either. Same script the VM
-      # runner calls. Without it tests/xattr_oracle.rs finds no fixture
-      # and skips, which reads exactly like passing.
-      - name: Build the extended-attribute fixture
-        run: sudo bash scripts/build-xattr-fixtures.sh
-
-      # The checked-in fixture's attribute names are all UTF-8, so a name
-      # that is not only gets tested here, where btrfs-progs and attr are
-      # installed: the test builds its own image with `mkfs.btrfs
-      # --rootdir`. `required` turns a missing tool into a failure instead
-      # of a skip that reads as a pass (#104).
-      - name: A non-UTF-8 attribute name reads back through the C ABI
-        env:
-          BTRFS_ORACLE_FIXTURES: required
-        run: cargo test --test getxattr_byte_names -- --nocapture | bash scripts/test-floor.sh 1
-
-      # A filesystem holding a checksummed file and a NODATASUM one, so
-      # the data-checksum path can be judged on both. `chattr +C` needs
-      # a mount, so this cannot come from the mkfs-only matrix either.
-      #
-      # This build existed inline in the VM orchestrator, which no
-      # workflow calls — so the image was built on developers' machines
-      # and nowhere else, and tests/csum_oracle.rs skipped here and
-      # reported success on every branch. A skip reads exactly like a
-      # pass, which is why the test below sets BTRFS_ORACLE_FIXTURES and
-      # the harness turns a missing fixture into a failure.
-      - name: Build the nodatacow fixture
-        run: sudo bash scripts/build-nodatacow-fixtures.sh
-
-      # One filesystem per compression algorithm, with the manifest the
-      # kernel wrote for it. build-fixtures-native.sh never made these,
-      # so compression_oracle found nothing on every pull request and
-      # reported success: the zlib, LZO and zstd decoders were checked on
-      # developers' machines only (#69). `required` makes a missing one a
-      # failure.
-      - name: Build the compression fixtures
-        run: sudo bash scripts/build-compression-fixtures.sh
-
-      - name: Compressed files read back as the kernel wrote them
-        env:
-          BTRFS_ORACLE_FIXTURES: required
-        run: cargo test --test compression_oracle -- --nocapture | bash scripts/test-floor.sh 3
-
-      # Superblock mirror selection, on images the test edits itself after
-      # mkfs.btrfs, which only this job installs. `required` turns a
-      # missing mkfs.btrfs into a failure instead of a skip that reads as a
-      # pass (#90).
-      - name: A damaged or older primary superblock is read from a mirror
-        env:
-          BTRFS_ORACLE_FIXTURES: required
-        run: cargo test --test superblock_mirrors -- --nocapture | bash scripts/test-floor.sh 4
-
-      # Data checksums, against a filesystem the kernel made: a flipped
-      # byte in a checksummed file must be refused, and the same flip in
-      # a NODATASUM file must still read. The second half is the one
-      # that would be a regression rather than a bug — a driver refusing
-      # every file in a `chattr +C` directory is worse for a user than
-      # one that does not verify at all.
-      - name: Data checksums against the kernel's own
-        env:
-          BTRFS_ORACLE_FIXTURES: required
-        run: cargo test --test csum_oracle -- --nocapture | bash scripts/test-floor.sh 6
-
-      # A snapshot the kernel took leaves a data extent reading `refs 1`
-      # when the subvolume's tree is a node, so the count alone cannot say
-      # an extent is unshared. The in-place write must still refuse it
-      # (#63). `required` makes a missing snapshot image a failure.
-      - name: An in-place write refuses an extent a snapshot reads
-        env:
-          BTRFS_ORACLE_FIXTURES: required
-        run: cargo test --test snapshot_shared_write -- --nocapture | bash scripts/test-floor.sh 1
-
-      # The same snapshot image: a transaction that would move a tree block
-      # both trees reference must be refused rather than delete its record
-      # (#178).
-      - name: A transaction refuses to release a shared tree block
-        env:
-          BTRFS_ORACLE_FIXTURES: required
-        run: cargo test --test shared_tree_block_release -- --nocapture | bash scripts/test-floor.sh 1
-
-      # mount_rw's compat_ro refusal is tested on images the test makes
-      # itself with mkfs.btrfs, which only this job installs. `required`
-      # turns a missing mkfs.btrfs into a failure instead of a skip that
-      # reads as a pass (#72).
-      - name: An unmaintained compat_ro feature refuses a read-write mount
-        env:
-          BTRFS_ORACLE_FIXTURES: required
-        run: cargo test --test compat_ro_write_refusal -- --nocapture | bash scripts/test-floor.sh 2
-
-      # Data checksums of every width on a populated image: the matrix's
-      # populated fixtures are all crc32c, so the superblock's digest width
-      # never reached the data path as anything but 4 (#102). The images
-      # are mkfs.btrfs --rootdir, required here so a missing tool fails.
-      - name: Every checksum width reads and verifies file data
-        env:
-          BTRFS_ORACLE_FIXTURES: required
-        run: cargo test --test csum_width_populated -- --nocapture | bash scripts/test-floor.sh 1
-
-      # A metadata-only dump is refused, and a seed device refuses a
-      # read-write mount. mkfs.btrfs images with superblock flags added;
-      # required here so a missing mkfs.btrfs fails rather than skips (#76).
-      - name: Superblock flags that gate a mount are acted on
-        env:
-          BTRFS_ORACLE_FIXTURES: required
-        run: cargo test --test super_flags_refusals -- --nocapture | bash scripts/test-floor.sh 3
-
-      # Seven superblocks of one filesystem, six commits apart. Six
-      # rather than one because the backup ring has four slots and the
-      # index is (generation - 1) mod 4 — a single commit exercises one
-      # slot, and a writer that hardcoded a slot number would pass.
-      - name: Build the commit fixtures
-        run: sudo bash scripts/build-commit-fixtures.sh
-
-      # Turn each captured superblock into the next one and require the
-      # bytes to match. The superblock is the commit point, so this is
-      # the strongest claim available about a writer that has not yet
-      # written anything.
-      - name: Reproduce each committed superblock
-        run: cargo test --test super_write_oracle -- --nocapture | bash scripts/test-floor.sh 3
-
-      # Data writes on a `-d dup` volume, built by the test with
-      # mkfs.btrfs, which only this job installs. `required` turns a
-      # missing mkfs.btrfs into a failure instead of a skip that reads as a
-      # pass (#71).
-      - name: A data write reaches every copy of a dup extent
-        env:
-          BTRFS_ORACLE_FIXTURES: required
-        run: cargo test --test dup_data_writes -- --nocapture | bash scripts/test-floor.sh 1
-
-      # The default fixture above exercises CRC32C only. Rebuild the same
-      # commit sequence with the widest checksum and DUP data/metadata
-      # profiles so the writer is judged against the other superblock
-      # checksum width and a different chunk layout as well.
-      - name: Build SHA-256 DUP commit fixtures
-        env:
-          BTRFS_CSUM: sha256
-          BTRFS_GEOMETRY_ARGS: -d dup -m dup
-        run: sudo env BTRFS_CSUM="$BTRFS_CSUM" BTRFS_GEOMETRY_ARGS="$BTRFS_GEOMETRY_ARGS" bash scripts/build-commit-fixtures.sh
-
-      - name: Reproduce SHA-256 DUP committed superblocks
-        run: cargo test --test super_write_oracle -- --nocapture | bash scripts/test-floor.sh 3
-
-      # Compared against `btrfs subvolume list` for the same filesystem,
-      # which is the reference a user would check against.
-      - name: Compare the subvolume listing against btrfs-progs
-        run: cargo test --test subvol_oracle -- --nocapture | bash scripts/test-floor.sh 8
-
-      # Compressed-extent windows, on an image the test builds with
-      # mkfs.btrfs, which only this job installs. `required` turns a
-      # missing mkfs.btrfs into a failure instead of a skip that reads as a
-      # pass (#73).
-      - name: A compressed extent's window is checked before it is read
-        env:
-          BTRFS_ORACLE_FIXTURES: required
-        run: cargo test --test compressed_extent_window -- --nocapture | bash scripts/test-floor.sh 3
-
-      - name: Run the oracle test against the fixtures
-        run: cargo test --test oracle_vm_fixtures -- --nocapture | bash scripts/test-floor.sh 3
-
-      # A whole-file read of an inode claiming 2^60 bytes, on an image the
-      # test builds with mkfs.btrfs, which only this job installs.
-      # `required` turns a missing mkfs.btrfs into a failure instead of a
-      # skip that reads as a pass (#80).
-      - name: An impossible file size is an error, not an abort
-        env:
-          BTRFS_ORACLE_FIXTURES: required
-        run: cargo test --test read_file_huge_size -- --nocapture | bash scripts/test-floor.sh 1
-
-      # Rebuild every tree block the kernel wrote and require the bytes
-      # back. These run HERE, not in the fixture-less job, because
-      # without fixtures they find nothing and report success — which is
-      # what the leaf oracle did until this step existed.
-      - name: Re-encode every kernel leaf
-        run: cargo test --test tree_write_oracle -- --nocapture | bash scripts/test-floor.sh 6
-
-      # An extent item whose window points outside its extent, on an image
-      # the test edits after mkfs.btrfs, which only this job installs.
-      # `required` turns a missing mkfs.btrfs into a failure instead of a
-      # skip that reads as a pass (#89).
-      - name: A write cannot follow a window outside its extent
-        env:
-          BTRFS_ORACLE_FIXTURES: required
-        run: cargo test --test extent_window_write -- --nocapture | bash scripts/test-floor.sh 3
-
-      - name: Re-encode every kernel node
-        run: cargo test --test node_write_oracle -- --nocapture | bash scripts/test-floor.sh 4
-
-      # Btrfs records allocation twice — the extent tree holds what is
-      # taken, the free-space tree holds the complement. Deriving one
-      # from the other and requiring them to agree is a check neither
-      # source can make of itself, and it is what catches a SKINNY
-      # metadata item read as a length.
-      - name: Cross-check free space against the kernel's own record
-        run: cargo test --test free_space_oracle -- --nocapture | bash scripts/test-floor.sh 4
-
-      # An allocation is not made until the extent tree records it.
-      # The item's shape follows a feature bit rather than the struct
-      # definition, so it is rebuilt from the kernel's own.
-      - name: Re-encode every allocation record
-        run: cargo test --test extent_write_oracle -- --nocapture | bash scripts/test-floor.sh 3
-
-      # The order a commit reaches the device in, which is the
-      # crash-consistency rather than a performance detail. Checked
-      # against the sequence blktrace recorded from a live commit.
-      - name: Commit ordering and barriers
-        run: cargo test --test commit_order -- --nocapture | bash scripts/test-floor.sh 3
-
-      # A preallocated extent, made by retyping an extent item on an image
-      # the test builds with mkfs.btrfs, which only this job installs.
-      # `required` turns a missing mkfs.btrfs into a failure instead of a
-      # skip that reads as a pass (#74).
-      - name: A preallocated extent is refused as preallocated
-        env:
-          BTRFS_ORACLE_FIXTURES: required
-        run: cargo test --test prealloc_extent_write -- --nocapture | bash scripts/test-floor.sh 1
-
-      # A whole image before and after one change, so what a transaction
-      # actually does can be measured rather than reasoned about. The
-      # control pair — a mount cycle that changes nothing — is what makes
-      # the other one mean anything.
-      - name: Build the before/after transaction pair
-        run: sudo bash scripts/build-cow-fixtures.sh
-
-      # What must be true of a transaction whatever it was for. Asserted
-      # against the kernel's transactions, and written before the
-      # planner exists so the planner has something to satisfy that was
-      # not shaped around it.
-      - name: Transaction invariants
-        run: cargo test --test transaction_oracle -- --nocapture | bash scripts/test-floor.sh 5
-
-      # What a planned transaction contains, bounded above by what the
-      # kernel actually rewrote for the same change.
-      - name: Transaction plan
-        run: cargo test --test transaction_plan -- --nocapture | bash scripts/test-floor.sh 7
-
-      # Repeat the transaction oracle against a non-default checksum and
-      # profile, keeping the default pair beside it so both configurations
-      # can reach the end-to-end kernel gate below.
-      - name: Build SHA-256 DUP transaction fixtures
-        env:
-          BTRFS_CSUM: sha256
-          BTRFS_GEOMETRY_ARGS: -d dup -m dup
-          BTRFS_FIXTURE_SUFFIX: -sha256-dup
-        run: sudo env BTRFS_CSUM="$BTRFS_CSUM" BTRFS_GEOMETRY_ARGS="$BTRFS_GEOMETRY_ARGS" BTRFS_FIXTURE_SUFFIX="$BTRFS_FIXTURE_SUFFIX" bash scripts/build-cow-fixtures.sh
-
-      - name: Transaction invariants on SHA-256 DUP
-        env:
-          BTRFS_COW_SUFFIX: -sha256-dup
-        run: cargo test --test transaction_oracle -- --nocapture | bash scripts/test-floor.sh 5
-
-      - name: Transaction plan on SHA-256 DUP COW fixtures
-        env:
-          BTRFS_COW_SUFFIX: -sha256-dup
-        run: cargo test --test transaction_plan -- --nocapture | bash scripts/test-floor.sh 7
-
-      # Recording an allocation is an insert into the extent tree and
-      # releasing one is a delete. Both are checked by round-tripping
-      # every item of real leaves.
-      - name: Leaf editing
-        run: cargo test --test leaf_edit_oracle -- --nocapture | bash scripts/test-floor.sh 3
-
-      # A relocation whose old block's record is not under the key the plan
-      # expects, on an image the test edits after mkfs.btrfs, which only
-      # this job installs. `required` turns a missing mkfs.btrfs into a
-      # failure instead of a skip that reads as a pass (#87).
-      - name: A missing extent record refuses the relocation
-        env:
-          BTRFS_ORACLE_FIXTURES: required
-        run: cargo test --test extent_record_missing -- --nocapture | bash scripts/test-floor.sh 1
-
-      # A filesystem either side of one leaf splitting, plus a second
-      # pair with deliberately uneven item sizes — without which
-      # half-the-count and half-the-bytes cannot be told apart.
-      - name: Build the leaf-split pairs
-        run: |
-          set -euo pipefail
-          sudo bash scripts/build-split-fixtures.sh
-          sudo env BTRFS_SPLIT_VARY=1 BTRFS_SPLIT_SUFFIX=-vary bash scripts/build-split-fixtures.sh
-
-      - name: Reproduce the kernel's leaf split
-        run: cargo test --test split_oracle -- --nocapture | bash scripts/test-floor.sh 4
-
-      # A plan turned into blocks: same contents, new addresses, every
-      # pointer following what it names. The relocated tree must hold
-      # exactly what the original held.
-      - name: Render a plan into blocks
-        run: cargo test --test render_plan -- --nocapture | bash scripts/test-floor.sh 4
-
-      # The whole write path, judged by the kernel's own tools: perform a
-      # transaction on a copy of a filesystem, have btrfs check pass it,
-      # then have the kernel MOUNT it read-write, write a file, and
-      # unmount — and check it again afterwards.
-      #
-      # This is the gate that cannot be satisfied by agreeing with
-      # ourselves. Everything else here compares against bytes the
-      # kernel already wrote; this asks it to accept bytes we wrote.
-      # A filesystem spanning two devices, which is different in kind
-      # from every other fixture: reading one disk of it is not a partial
-      # read but a read of the wrong bytes.
-      - name: Build the two-device pool
-        run: sudo bash scripts/build-pool-fixtures.sh
-
-      - name: Refuse one device of a pool
-        run: cargo test --test pool_oracle -- --nocapture | bash scripts/test-floor.sh 4
-
-      # Every fixture step above has run by now, so the count means what
-      # it says. Placed any earlier it counts images that have not been
-      # built yet: its first version sat before the cow, split and pool
-      # builds, saw 16 of 25, and failed a job whose fixture steps had all
-      # succeeded. The suites above it still run first, so a fixture that
-      # is genuinely missing makes them skip AND fails this step, which
-      # fails the job either way.
-      - name: The fixtures the steps above were supposed to build
-        run: cargo test --test fixtures_present -- --nocapture | bash scripts/test-floor.sh 1
-
-      # Every integration target a step above did not name, found rather
-      # than listed (#70).
-      #
-      # This step was written so the next suite added would be covered by
-      # default, and was a hand-kept list: `read_path_cost` arrived after it
-      # and was never in it, so it ran only in the other job, with no
-      # fixtures, and never executed an assertion on a pull request.
-      # `dup_mirror_fallback` fell through the same way before it was
-      # noticed. So the list is gone. The targets are `tests/*.rs`; the ones
-      # this job already runs by name are the `cargo test --test <name>`
-      # lines in this file; the rest run here. A new suite is in the gate
-      # the moment its file is committed, and one given its own step above
-      # leaves this one by being named there.
-      - name: The remaining integration targets
-        run: |
-          set -euo pipefail
-          # The `| bash scripts/test-floor.sh <n>` tails the steps above
-          # now carry do not disturb this: the pattern matches the
-          # `cargo test --test <name>` at the head of each of those
-          # lines exactly as before, and a target named there still
-          # leaves this step by being named there.
-          named=$(grep -oE 'cargo test --test [a-z0-9_]+' .github/workflows/ci.yml \
-            | awk '{print $4}' | sort -u)
-          # In a function so the whole loop's output can be counted as
-          # one run. `ran` counts targets and the floor counts tests,
-          # and they answer different questions: the enumeration can
-          # find thirteen files and execute nothing at all in them.
-          remaining() {
-            ran=0
-            for f in tests/*.rs; do
-              t=$(basename "$f" .rs)
-              if grep -qx "$t" <<<"$named"; then
-                continue
-              fi
-              echo "::group::$t"
-              cargo test --test "$t" -- --nocapture
-              echo "::endgroup::"
-              ran=$((ran + 1))
-            done
-            # Zero would mean the enumeration broke, not that nothing is left.
-            [ "$ran" -gt 0 ] || { echo "no integration target left to run: the enumeration is broken" >&2; exit 1; }
-            echo "ran $ran targets not named above"
-          }
-          # 148 tests across 13 targets on 2026-09-17, run 35242813679;
-          # floor 140. This one is discounted rather than exact because
-          # it is the step a new suite lands in by default, and its
-          # membership moves whenever a step above is added or removed.
-          remaining | bash scripts/test-floor.sh 140
-
-      - name: Write both transactions and let the kernel judge them
-        run: |
-          set -euo pipefail
-          for suffix in "" "-sha256-dup"; do
-            input=".vm-share/btrfs-cow-before${suffix}.img"
-            output="/tmp/written${suffix}.img"
-            echo "::group::write transaction ${suffix:-default}"
-            cargo run --release --example write_transaction "$input" "$output"
-            echo "::group::btrfs check"
-            sudo btrfs check --readonly "$output"
-            echo "::endgroup::"
-            m=$(mktemp -d)
-            sudo mount -o loop "$output" "$m"
-            echo "hello from the kernel" | sudo tee "$m/newfile" >/dev/null
-            sudo sync
-            sudo umount "$m"
-            rmdir "$m"
-            echo "::group::btrfs check after the kernel used it"
-            sudo btrfs check --readonly "$output"
-            echo "::endgroup::"
-            echo "::endgroup::"
-          done
-
-      - name: Loop-mount with the in-kernel btrfs driver
-        run: |
-          set -euo pipefail
-          # Start from a clean ring buffer so the dmesg scrape below only
-          # sees what these mounts produced.
-          sudo dmesg -C
-          failed=()
-          for img in .vm-share/btrfs-*.img; do
-            name="$(basename "$img" .img)"
-
-            # A member of a multi-device filesystem cannot be loop-mounted
-            # on its own — the KERNEL refuses it for the same reason this
-            # driver does, since half the chunks live on the other disk.
-            # Mounting a pool needs both devices registered, which is a
-            # different test from this one.
-            devices=$(od -An -tu8 -j $((65536 + 0x88)) -N 8 "$img" | tr -d ' ')
-            if [ "${devices:-1}" -gt 1 ]; then
-              echo "skipping $name: $devices devices, not a single-device fixture"
-              continue
-            fi
-
-            mnt="/mnt/$name"
-            sudo mkdir -p "$mnt"
-            echo "::group::mount $name"
-            # Mount a copy. Mounting mutates the filesystem -- generation
-            # bump, superblock rewrite, possible log replay -- and the
-            # fixtures must stay byte-identical to what mkfs produced so
-            # they keep matching their dumps.
-            work="/tmp/mount-$name.img"
-            cp --sparse=always "$img" "$work"
-            if sudo mount -t btrfs -o loop "$work" "$mnt"; then
-              # A mount that succeeds but cannot do IO is not a pass.
-              echo "kernel round-trip" | sudo tee "$mnt/probe.txt" >/dev/null
-              sudo sync
-              got="$(sudo cat "$mnt/probe.txt")"
-              sudo umount "$mnt"
-              if [ "$got" != "kernel round-trip" ]; then
-                echo "$name: read-back mismatch" >&2
-                failed+=("$name")
-              else
-                echo "$name: kernel mounted, wrote and read back cleanly"
-              fi
-            else
-              echo "$name: the in-kernel btrfs driver REFUSED this image" >&2
-              failed+=("$name")
-            fi
-            rm -f "$work"
-            echo "::endgroup::"
-          done
-          if [ "${#failed[@]}" -gt 0 ]; then
-            echo "kernel rejected: ${failed[*]}" >&2
-            exit 1
-          fi
-
-      # The kernel is chatty when it is unhappy and silent when it is not.
-      # Anything above info level about btrfs during those mounts means
-      # the image is malformed in a way the mount itself tolerated —
-      # exactly the class of defect a self-consistent parser produces.
-      - name: Scrape dmesg for btrfs complaints
-        run: |
-          set -euo pipefail
-          # Kept inside the workspace so the failure artifact below can
-          # collect it alongside the superblock dumps.
-          sudo dmesg > .vm-share/dmesg.txt
-          echo "::group::btrfs kernel log"
-          grep -i btrfs .vm-share/dmesg.txt || echo "(no btrfs lines)"
-          echo "::endgroup::"
-          if grep -Ei 'BTRFS (warning|error|critical|alert|emerg)' .vm-share/dmesg.txt; then
-            echo >&2
-            echo "the kernel logged btrfs warnings/errors for these images." >&2
-            echo "a mount that succeeds while the kernel complains is not a pass." >&2
-            exit 1
-          fi
-          echo "kernel logged no btrfs warnings or errors."
-
-      # Finally the driver itself: parse the same images on the host and
-      # require every field to match what the reference dump reports.
-      # Fixtures were written to .vm-share above, which is where the test
-      # looks for them.
-      - name: Upload fixtures on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
+          key: ${{ runner.os }}-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
         with:
-          name: btrfs-fixtures
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - name: chore tools
+        run: chore tools
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+      - name: Unpack the fixtures
+        run: tar --sparse -xzf fixtures.tar.gz -C test-disks
+      # THE EVIDENCE, NOT THE CLAIM. The runner has btrfs-progs, so
+      # instead every one of its programs is replaced with a stub that
+      # fails loudly. Nothing this job runs may use them: the tools
+      # belong to the guest, and a test that reached for one here would
+      # turn the run red with a message saying so, rather than quietly
+      # passing against whatever version this image happens to ship.
+      - name: Make the runner's own btrfs-progs unusable
+        run: |
+          set -eu
+          for tool in btrfs mkfs.btrfs btrfstune btrfs-image btrfs-convert \
+                      btrfs-find-root btrfs-map-logical fsck.btrfs; do
+            path="$(command -v "$tool" 2>/dev/null || true)"
+            [ -n "$path" ] || continue
+            sudo mv "$path" "$path.host-copy"
+            printf '#!/bin/sh\necho "::error::%s ran on the runner; the oracle tools belong in the VM" >&2\nexit 97\n' \
+              "$tool" | sudo tee "$path" >/dev/null
+            sudo chmod +x "$path"
+            echo "poisoned $path"
+          done
+      - name: chore lint
+        run: chore lint
+      - name: chore test
+        run: chore test
+      - name: chore vm:status (the VM is down again)
+        run: '! chore vm:status'
+      # THE FLOORS. Per target against the whole-suite log, which is the
+      # one run that builds every integration target, plus a total for
+      # each tier that runs on its own. A target missing from the log
+      # counts as zero, so a suite that stopped being built fails here.
+      - name: Every suite executed its tests
+        run: bash scripts/test-floor.sh --targets .github/test-floors.txt --log tmp/logs/suite.log
+      # Each of these is what that tier executed on a green `chore test`
+      # of this branch, exactly. A tier runs on its own in some job here
+      # and inside the whole-suite run in others, so it needs a total of
+      # its own: the per-target file above only sees the suite log.
+      - name: The tiers executed their tests
+        run: |
+          set -euo pipefail
+          bash scripts/test-floor.sh --log tmp/logs/unit.log 322
+          bash scripts/test-floor.sh --log tmp/logs/oracle.log 30
+          bash scripts/test-floor.sh --log tmp/logs/kernel.log 5
+          bash scripts/test-floor.sh --log tmp/logs/suite.log 500
+      # The shell tests are counted by their own `ok` lines rather than
+      # by libtest's summary, but the failure is identical in shape:
+      # `tests/scripts/*.sh` matching fewer files, or a script that
+      # returns 0 having asserted nothing, is a step that passes having
+      # checked nothing.
+      - name: The script tests executed their assertions
+        run: |
+          set -euo pipefail
+          # 53 assertions across four scripts, measured on this branch.
+          # Floor 45: room for a check to be folded into another without
+          # room for a script to stop asserting.
+          assertions=$(grep -ac '^ok' tmp/logs/scripts.log || true)
+          echo "script assertions executed: $assertions (floor 45)"
+          if [ "$assertions" -lt 45 ]; then
+            echo "::error::only $assertions script assertions executed, floor is 45 — a run that asserts fewer stopped early rather than passed" >&2
+            exit 1
+          fi
+
+  test-arm64:
+    name: test (aarch64, no KVM on this runner)
+    needs: fixtures
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
           path: |
-            .vm-share/*.superdump
-            .vm-share/dmesg.txt
-          if-no-files-found: warn
-          retention-days: 7
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-aarch64-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+      - name: Unpack the fixtures
+        run: tar --sparse -xzf fixtures.tar.gz -C test-disks
+      - name: chore lint
+        run: chore lint
+      - name: chore test:unit
+        run: chore test:unit
+      # Everything that reads a fixture but needs no VM. The oracle and
+      # kernel tiers cannot run here — GitHub's arm64 runners have no
+      # /dev/kvm — and they are not architecture-specific: they read the
+      # same bytes the x86_64 job's guest reads.
+      - name: chore test:images
+        run: chore test:images
+      - name: Both tiers executed their tests
+        run: |
+          set -euo pipefail
+          bash scripts/test-floor.sh --log tmp/logs/unit.log 322
+          bash scripts/test-floor.sh --log tmp/logs/images.log 142
+
+  suite-in-vm:
+    name: suite in the guest (the macOS path)
+    needs: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+      - name: Unpack the fixtures
+        run: tar --sparse -xzf fixtures.tar.gz -C test-disks
+      # No Rust on the runner: the toolchain that matters is the one the
+      # guest installs from rust-toolchain.toml. That is the point of the
+      # job — on a Mac there is no usable host toolchain for these tests
+      # either.
+      - name: chore test:vm
+        run: chore test:vm
+      - name: chore vm:status (the VM is down again)
+        run: '! chore vm:status'
+      - name: The in-guest suite executed its tests
+        run: bash scripts/test-floor.sh --log tmp/logs/vm.log 500
 
   # ONE CHECK GATES THIS REPOSITORY, AND IT STANDS FOR EVERY JOB (#187).
   #
@@ -800,7 +366,9 @@ jobs:
   # required by nobody. That is what the sweep in #197 found in five
   # repositories. The opposite spelling is worse: a required check no job
   # produces reads as permanently pending, and with enforce_admins on
-  # nothing merges and there is no failure to point at.
+  # nothing merges and there is no failure to point at. This branch is the
+  # case the rule was written for: it retires both jobs the list used to
+  # name and adds three more.
   #
   # `if: always()` because a job that was cancelled or skipped is not a job
   # that passed, and an aggregate that runs only on success cannot say so:
@@ -809,22 +377,19 @@ jobs:
   # failed without opening it.
   ci-ok:
     name: ci-ok
-    needs: [test, kernel-gate]
     if: always()
+    needs: [unit, fixtures, test, test-arm64, suite-in-vm]
     runs-on: ubuntu-latest
     steps:
-      - name: every gating job must have concluded success
+      - name: Every job ran and succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
         run: |
-          echo "test:        ${{ needs.test.result }}"
-          echo "kernel-gate: ${{ needs.kernel-gate.result }}"
-          failed=0
-          for one in "test:${{ needs.test.result }}" "kernel-gate:${{ needs.kernel-gate.result }}"; do
-              job=${one%%:*}
-              result=${one#*:}
-              if [ "$result" != "success" ]; then
-                  echo "::error::$job concluded '$result', not 'success' -- failure, cancellation and skipping all mean the gate did not run to completion"
-                  failed=1
-              fi
-          done
-          [ "$failed" = 0 ] || exit 1
-          echo "all gating jobs succeeded"
+          set -euo pipefail
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          bad="$(echo "$NEEDS" | jq -r '[to_entries[] | select(.value.result != "success") | .key] | join(", ")')"
+          if [ -n "$bad" ]; then
+            echo "::error::not green: $bad (failed, cancelled or skipped)"
+            exit 1
+          fi
+          echo "all required jobs succeeded"

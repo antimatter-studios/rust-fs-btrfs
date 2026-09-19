@@ -938,13 +938,21 @@ fn carve(
     out
 }
 
+/// Library tests that need the fs-linux-test-harness VM.
+///
+/// THE NAME IS LOAD-BEARING. `chore test:unit` runs the library's own
+/// tests with `--skip needs_host::`, because that tier must pass on a
+/// runner with no VM and no fixtures — which is what proves the split.
+/// These run in the whole-release suite instead, where the VM is up.
+/// A module named anything else would be run there, fail to reach a
+/// guest, and take the unit tier down with it.
 #[cfg(test)]
-mod superblock_mirror_tests {
+mod needs_host {
     use crate::fs::Filesystem;
     use crate::superblock::SUPER_OFFSETS;
+    use fs_btrfs_test_support::{oracle, temp_path};
     use fs_core::FileDevice;
     use std::collections::BTreeSet;
-    use std::process::Command;
     use std::sync::Arc;
 
     /// A new tree block never lands on a superblock copy.
@@ -956,24 +964,25 @@ mod superblock_mirror_tests {
     /// first copy of its DUP metadata chunk across 64 MiB, where
     /// `Filesystem::commit` writes the second superblock after the tree
     /// blocks. This allocates every block the group has and checks each
-    /// one's copies against that window. Skips without btrfs-progs.
+    /// one's copies against that window.
+    ///
+    /// `mkfs.btrfs` runs in the harness VM, like every oracle tool, so
+    /// the image is made by one version of btrfs-progs on every machine
+    /// — and the scratch directory is inside this repository, which is
+    /// the only part of the host the guest can see.
     #[test]
     fn no_tree_block_is_allocated_over_a_superblock_copy() {
-        let dir = std::env::temp_dir().join(format!("btrfs-alloc-super-{}", std::process::id()));
+        let dir = std::path::PathBuf::from(temp_path!("alloc-over-super"));
         std::fs::create_dir_all(&dir).unwrap();
         let img = dir.join("fs.img");
         std::fs::File::create(&img)
             .unwrap()
             .set_len(256 * 1024 * 1024)
             .unwrap();
-        let Ok(made) = Command::new("mkfs.btrfs")
+        let made = oracle("mkfs.btrfs")
             .args(["-q", "-f", "-s", "4096", "-n", "16384"])
             .arg(&img)
-            .output()
-        else {
-            eprintln!("skip: mkfs.btrfs not installed");
-            return;
-        };
+            .output();
         assert!(
             made.status.success(),
             "{}",

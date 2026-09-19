@@ -123,6 +123,7 @@ cargo test --release --test read_path_cost -- --nocapture
 ```
 
 It measures every one of `btrfs-rich.img`, `btrfs-deep4k.img` and
-`btrfs-commit.img` present in `.vm-share`, one block of output each, so
-both tables above come from the one command. It skips without fixtures.
-Build them with the scripts in `tests/scripts`.
+`btrfs-commit.img` from `test-disks/`, one block of output each, so both
+tables above come from the one command. It does not skip: a missing
+fixture fails it, naming `chore fixtures`, which builds them with the
+real kernel inside the fs-linux-test-harness VM.

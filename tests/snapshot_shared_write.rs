@@ -9,52 +9,21 @@
 //! an extent from a generation at or before the tree's `last_snapshot` as
 //! shared.
 //!
-//! The image is `snapshot/btrfs-nodatacow-snapshot.img` from
-//! `scripts/build-nodatacow-fixtures.sh`: a `chattr +C` file, then a
-//! read-only snapshot of the top-level subvolume, taken by the kernel. The
-//! test first checks with btrfs-progs that the case is real, meaning the
-//! file's extent does read `refs 1`. It then asks the driver to overwrite
-//! the file and requires a refusal and an image unchanged byte for byte.
-//! Skips when the fixture is missing, unless `BTRFS_ORACLE_FIXTURES=required`.
+//! The image is `snapshot/btrfs-nodatacow-snapshot.img` from `chore
+//! fixtures`: a `chattr +C` file, then a read-only snapshot of the
+//! top-level subvolume, taken by the kernel. The test first checks with
+//! btrfs-progs — which runs in the harness VM, where the tools live —
+//! that the case is real, meaning the file's extent does read `refs 1`.
+//! It then asks the driver to overwrite the file and requires a refusal
+//! and an image unchanged byte for byte.
 
 use fs_btrfs::fs::Filesystem;
+use fs_btrfs_test_support::{dump_tree, fixture, temp_path};
 use fs_core::{BlockDevice, FileDevice};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 const FILE: &str = "/nc/inplace.bin";
-
-fn fixture() -> Option<PathBuf> {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".vm-share")
-        .join("snapshot")
-        .join("btrfs-nodatacow-snapshot.img");
-    if p.exists() {
-        return Some(p);
-    }
-    assert!(
-        std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() != Ok("required"),
-        "BTRFS_ORACLE_FIXTURES=required, but {} is missing",
-        p.display()
-    );
-    eprintln!("skip: {} not built", p.display());
-    None
-}
-
-fn dump_tree(image: &Path, tree: &str) -> String {
-    let out = Command::new("btrfs")
-        .args(["inspect-internal", "dump-tree", "-t", tree])
-        .arg(image)
-        .output()
-        .expect("btrfs-progs");
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
 
 /// The number after `word` in `line`.
 fn after(line: &str, word: &str) -> u64 {
@@ -69,12 +38,11 @@ fn after(line: &str, word: &str) -> u64 {
 
 #[test]
 fn a_write_under_a_snapshot_is_refused_though_the_extent_counts_one_reference() {
-    let Some(source) = fixture() else {
-        return;
-    };
-    let dir = std::env::temp_dir().join(format!("btrfs-snapshot-write-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let image = dir.join("snapshot.img");
+    let source = fixture("snapshot/btrfs-nodatacow-snapshot.img");
+    // The working copy lives in the repository's scratch directory,
+    // which is the tree the oracle tools see: the dumps below are taken
+    // from this copy, not from the fixture the write must not touch.
+    let image = PathBuf::from(temp_path!("snapshot-write.img"));
     std::fs::copy(&source, &image).unwrap();
 
     let ino = {
@@ -137,5 +105,5 @@ fn a_write_under_a_snapshot_is_refused_though_the_extent_counts_one_reference() 
         std::fs::read(&image).unwrap() == before,
         "the refused write changed the image"
     );
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&image);
 }

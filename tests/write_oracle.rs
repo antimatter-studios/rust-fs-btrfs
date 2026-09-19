@@ -9,19 +9,19 @@
 //! have run past its extent into something the file's own contents would
 //! never reveal.
 //!
-//! The write happens on the host, because the driver is Rust and the
-//! oracle VM has no Rust toolchain; the verification happens in the VM,
-//! where the tooling and a kernel are. `scripts/vm.sh` bridges them.
-//!
-//! Fixtures are gitignored and the VM is not always up, so this skips
-//! rather than fails when either is missing. Generate the fixture with
-//! `./scripts/vm-build-fixtures.sh`.
+//! The write is this crate's; the two judgements are not, and neither of
+//! them happens here. `btrfs check` and the mount both run in the
+//! fs-linux-test-harness VM, which is the one place the tools and a
+//! btrfs kernel exist — reached through `fs_btrfs_test_support`, which
+//! fails the test when the VM or the fixture is missing rather than
+//! letting it pass on no evidence.
 
 use fs_btrfs::Filesystem;
+use fs_btrfs_test_support::{
+    assert_btrfs_check_clean, fixture, guest_kernel_read_ok, sha256_hex, temp_path,
+};
 use fs_core::FileDevice;
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 /// A `chattr +C` file: written in place, unchecksummed, unshared.
@@ -29,23 +29,25 @@ const INPLACE: &str = "/nc/inplace.bin";
 /// An ordinary file on the same volume, which must be refused.
 const COW: &str = "/cow.bin";
 
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
-
-/// A working copy in the shared folder, removed when it drops —
-/// including on a panic. Every other suite here treats each `.img` there
-/// as a fixture to check, so one left behind fails unrelated tests.
+/// A working copy under the scratch directory, removed when it drops —
+/// including on a panic. The fixture itself is never written to: it is
+/// an input to the whole suite, and half a gigabyte of it, so each test
+/// takes its own copy and gives the space back.
 struct Scratch(PathBuf);
 
 impl Scratch {
     fn from(source: &Path, name: &str) -> Self {
-        let path = share().join(name);
+        let path = PathBuf::from(temp_path!("{name}"));
         std::fs::copy(source, &path).expect("copy the fixture");
         Scratch(path)
     }
     fn path(&self) -> &Path {
         &self.0
+    }
+    /// The path as the guest will be given it: the harness mounts this
+    /// repository at the same absolute path there.
+    fn guest_path(&self) -> &str {
+        self.0.to_str().expect("the scratch path is text")
     }
 }
 
@@ -53,33 +55,6 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
-}
-
-fn fixture() -> Option<PathBuf> {
-    let p = share().join("btrfs-nodatacow.img");
-    p.exists().then_some(p)
-}
-
-fn vm_run(script: &str) -> Option<String> {
-    let out = Command::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/vm.sh"))
-        .arg("run")
-        .arg(script)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        eprintln!(
-            "vm.sh run failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn ino_of(fs: &Filesystem, path: &str) -> u64 {
@@ -91,10 +66,7 @@ fn ino_of(fs: &Filesystem, path: &str) -> u64 {
 /// The whole point: overwrite a `nodatacow` file and have Linux agree.
 #[test]
 fn an_in_place_write_survives_the_kernel_and_the_checker() {
-    let Some(source) = fixture() else {
-        eprintln!("no btrfs-nodatacow fixture — skipping");
-        return;
-    };
+    let source = fixture("btrfs-nodatacow.img");
     let scratch = Scratch::from(&source, "btrfs-write.img");
     let img = scratch.path();
 
@@ -122,45 +94,21 @@ fn an_in_place_write_survives_the_kernel_and_the_checker() {
         assert_eq!(n, payload.len(), "a short write should not be possible");
     }
 
-    let script = format!(
-        r#"
-        set -e
-        cp /share/btrfs-write.img /tmp/w.img
-        echo "CHECK_BEGIN"
-        btrfs check /tmp/w.img 2>&1 && echo "CHECK_RC=0" || echo "CHECK_RC=$?"
-        echo "CHECK_END"
-        mnt=$(mktemp -d)
-        mount -o ro,loop /tmp/w.img "$mnt"
-        echo "SHA $(sha256sum "$mnt{INPLACE}" | cut -d' ' -f1)"
-        umount "$mnt"; rmdir "$mnt"; rm -f /tmp/w.img
-        "#
-    );
-    let Some(out) = vm_run(&script) else {
-        eprintln!("oracle VM unavailable — skipping verification");
-        return;
-    };
+    // The checker first, on the image as it lies: a write that ran past
+    // its extent is visible to it and to nothing else.
+    assert_btrfs_check_clean(img, "after an in-place write");
 
-    let got = out
-        .lines()
-        .find_map(|l| l.strip_prefix("SHA "))
-        .unwrap_or_else(|| panic!("the VM did not report a hash:\n{out}"))
-        .trim();
+    // Then the kernel, which is the only reader whose agreement means
+    // the bytes are really there. One guest call: mount, hash, unmount.
+    let got = guest_kernel_read_ok(
+        scratch.guest_path(),
+        "in-place write",
+        &format!(r#"sha256sum "$MNT{INPLACE}" | cut -d' ' -f1"#),
+    );
     assert_eq!(
-        got, expected,
-        "the kernel reads back different bytes than were written\n{out}"
-    );
-
-    let report: String = out
-        .lines()
-        .skip_while(|l| !l.starts_with("CHECK_BEGIN"))
-        .take_while(|l| !l.starts_with("CHECK_END"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    // The checker's exit status, not a keyword scan: its normal output
-    // ends "no error found", which any search for "error" matches.
-    assert!(
-        report.contains("CHECK_RC=0"),
-        "the checker rejected the filesystem after an in-place write:\n{report}"
+        got.trim(),
+        expected,
+        "the kernel reads back different bytes than were written"
     );
 }
 
@@ -172,10 +120,7 @@ fn an_in_place_write_survives_the_kernel_and_the_checker() {
 /// normal Btrfs file while looking correct on this fixture.
 #[test]
 fn a_copy_on_write_file_is_refused() {
-    let Some(source) = fixture() else {
-        eprintln!("no btrfs-nodatacow fixture — skipping");
-        return;
-    };
+    let source = fixture("btrfs-nodatacow.img");
     let scratch = Scratch::from(&source, "btrfs-cow-refused.img");
     let img = scratch.path();
 
@@ -203,10 +148,7 @@ fn a_copy_on_write_file_is_refused() {
 /// A read-only mount refuses, and leaves the volume untouched.
 #[test]
 fn a_read_only_mount_refuses_to_write() {
-    let Some(source) = fixture() else {
-        eprintln!("no btrfs-nodatacow fixture — skipping");
-        return;
-    };
+    let source = fixture("btrfs-nodatacow.img");
     let scratch = Scratch::from(&source, "btrfs-ro.img");
     let img = scratch.path();
 

@@ -11,16 +11,17 @@
 //! block is re-keyed from METADATA_ITEM (169) to EXTENT_ITEM (168) -- the
 //! non-skinny key type, which sorts in the same place -- in every copy of
 //! its extent tree leaf, restamped. Relocating that block must then fail
-//! to render. Skips without btrfs-progs, unless
-//! `BTRFS_ORACLE_FIXTURES=required`.
+//! to render. `mkfs.btrfs` runs in the harness VM, which is where this
+//! suite's btrfs-progs lives, so the tool is never absent and nothing here
+//! is conditional.
 
 use fs_btrfs::btree::{header_offsets, HEADER_SIZE, ITEM_SIZE};
 use fs_btrfs::chunk::{key_type, objectid};
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::superblock::Superblock;
 use fs_btrfs::tree_write::stamp_checksum;
+use fs_btrfs_test_support::{oracle, temp_path};
 use fs_core::{BlockRead, FileDevice};
-use std::process::Command;
 use std::sync::Arc;
 
 const SUPERBLOCK: usize = 0x1_0000;
@@ -29,30 +30,23 @@ fn le64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
-fn image() -> Option<std::path::PathBuf> {
-    let dir = std::env::temp_dir().join(format!("btrfs-extent-record-{}", std::process::id()));
+/// A fresh `mkfs.btrfs` image, under the suite's scratch directory inside
+/// this repository -- the only tree the guest running the tool can see.
+fn image() -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(temp_path!("extent-record"));
     std::fs::create_dir_all(&dir).unwrap();
     let img = dir.join("img");
     std::fs::File::create(&img)
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
-    let made = match Command::new("mkfs.btrfs").arg("-f").arg(&img).output() {
-        Ok(made) => made,
-        Err(e) => {
-            assert!(
-                std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() != Ok("required"),
-                "BTRFS_ORACLE_FIXTURES=required, but mkfs.btrfs is not runnable: {e}"
-            );
-            return None;
-        }
-    };
+    let made = oracle("mkfs.btrfs").arg("-f").arg(&img).output();
     assert!(
         made.status.success(),
         "{}",
         String::from_utf8_lossy(&made.stderr)
     );
-    Some(img)
+    img
 }
 
 fn mount(img: &std::path::Path) -> Filesystem {
@@ -61,10 +55,7 @@ fn mount(img: &std::path::Path) -> Filesystem {
 
 #[test]
 fn a_block_whose_record_is_not_under_the_expected_key_is_not_relocated() {
-    let Some(img) = image() else {
-        eprintln!("no mkfs.btrfs -- skipping");
-        return;
-    };
+    let img = image();
     let root = {
         let fs = mount(&img);
         let root = fs.superblock().root;

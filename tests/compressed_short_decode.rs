@@ -8,18 +8,29 @@
 //! tell it from data. Every other decode failure in that module is
 //! reported; this one was not, and it is the one that hides damage.
 //!
-//! The image is a file of 256 KiB written by the kernel under
-//! `compress-force=lzo`, so it holds several compressed extents. The first
-//! The first extent's LZO stream then has its length header lowered so it
-//! ends after one segment: the decoder finishes cleanly and hands back
-//! 4 KiB where the item says 128 KiB, which is what a truncated or damaged
-//! stream looks like from the reader's side. Truncating the *input* instead
-//! is caught by the framing — this is the case that is not.
+//! THE IMAGE IS THE LZO FIXTURE, on a copy this test is free to damage.
+//! `test-disks/btrfs-comp-lzo.img` is written by the kernel through a
+//! `compress=lzo` mount in the harness guest (`chore fixtures`), which is
+//! the only way to get a compressed extent — `mkfs.btrfs --rootdir` does
+//! not compress. Its `/big.txt` is 1.7 MiB of text, so it spans many
+//! compressed extents and its first one is not its last.
+//!
+//! That extent's LZO stream then has its length header lowered so it ends
+//! after one segment: the decoder finishes cleanly and hands back a
+//! fraction of the bytes the item promises, which is what a truncated or
+//! damaged stream looks like from the reader's side. Truncating the
+//! *input* instead is caught by the framing — this is the case that is
+//! not.
 //!
 //! The inode is marked `nodatasum` for the same reason the write-side
 //! fixtures do: the checksums cover the bytes on disk, and this edits
-//! them. Skips without btrfs-progs or a kernel that can mount btrfs, unless
-//! `BTRFS_ORACLE_FIXTURES=required`.
+//! them.
+//!
+//! Nothing here skips. The fixture is built by `chore fixtures` and a
+//! missing one fails the test that wanted it, naming the task that
+//! builds it — this suite used to make its own image with `sudo mount -o
+//! loop` on the host and return early wherever that was not possible,
+//! which is a pass that has checked nothing.
 
 use fs_btrfs::btree::{header_offsets, HEADER_SIZE, ITEM_SIZE};
 use fs_btrfs::chunk::objectid;
@@ -27,13 +38,14 @@ use fs_btrfs::fs::Filesystem;
 use fs_btrfs::superblock::Superblock;
 use fs_btrfs::tree_write::stamp_checksum;
 use fs_btrfs::write::{INODE_NODATACOW, INODE_NODATASUM};
+use fs_btrfs_test_support::{fixture, le64, sha256_hex, temp_path, Image};
 use fs_core::{BlockRead, FileDevice};
-use std::process::Command;
 use std::sync::Arc;
 
 const SUPERBLOCK: usize = 0x1_0000;
-/// Two compression units, so the first extent is not the last.
-const LEN: usize = 256 * 1024;
+/// The fixture's large file: text, so LZO keeps it, and long enough to
+/// need many compression units — so its first extent is not its last.
+const FILE: &str = "/big.txt";
 const DISK_BYTENR: usize = 21;
 const INODE_FLAGS: usize = 64;
 const INODE_ITEM_KEY: u8 = 1;
@@ -42,73 +54,29 @@ const LZO_LEN: usize = 4;
 const COMPRESSION: usize = 16;
 const EXTENT_DATA_KEY: u8 = 108;
 
-fn le64(b: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
-}
-
-/// Ask the kernel for a compressed file, which is the only way to get one:
-/// `mkfs.btrfs --rootdir` does not compress.
-fn image(name: &str) -> Option<std::path::PathBuf> {
-    let dir =
-        std::env::temp_dir().join(format!("btrfs-short-decode-{}-{name}", std::process::id()));
+/// A writable copy of the LZO fixture, under this run's scratch
+/// directory. The fixture itself is an input to the whole suite and is
+/// never edited in place.
+fn image(name: &str) -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(temp_path!("short-decode-{name}"));
     std::fs::create_dir_all(&dir).unwrap();
     let img = dir.join("img");
-    std::fs::File::create(&img)
-        .unwrap()
-        .set_len(400 * 1024 * 1024)
-        .unwrap();
-    // Compressible enough that LZO keeps it — btrfs stores an extent
-    // uncompressed when compressing it barely helps — and varied enough
-    // that a run of zeros in the result is visible as wrong. Each line
-    // carries its own number, so every byte of the file says where it
-    // belongs.
-    let body: Vec<u8> = {
-        let mut out: Vec<u8> = Vec::with_capacity(LEN + 64);
-        let mut line = 0u32;
-        while out.len() < LEN {
-            out.extend_from_slice(
-                format!("the quick brown fox jumps over the lazy dog {line:08}\n").as_bytes(),
-            );
-            line += 1;
+    std::fs::copy(fixture("btrfs-comp-lzo.img"), &img).unwrap();
+    img
+}
+
+/// What the kernel says `FILE` holds: its size and its SHA-256, from the
+/// manifest the guest wrote beside the image.
+fn expected() -> (u64, String) {
+    let manifest = std::fs::read_to_string(fixture("btrfs-comp-lzo.manifest")).unwrap();
+    for line in manifest.lines() {
+        let mut fields = line.split('\t');
+        if fields.next() == Some(FILE) {
+            let size = fields.next().unwrap().parse().unwrap();
+            return (size, fields.next().unwrap().to_string());
         }
-        out.truncate(LEN);
-        out
-    };
-    std::fs::write(dir.join("body"), &body).unwrap();
-    let script = format!(
-        r#"
-        mkfs.btrfs -f {img} > /dev/null 2>&1 || exit 10
-        m=$(mktemp -d)
-        mount -o loop,compress-force=lzo {img} "$m" || exit 11
-        cp {body} "$m/file.bin"
-        sync
-        umount "$m"
-        rmdir "$m"
-        chmod 666 {img}
-        "#,
-        img = img.display(),
-        body = dir.join("body").display()
-    );
-    let out = Command::new("sudo")
-        .args([
-            "-n",
-            "env",
-            &format!("PATH={}", std::env::var("PATH").unwrap_or_default()),
-            "bash",
-            "-c",
-            &script,
-        ])
-        .output();
-    let ok = matches!(&out, Ok(o) if o.status.success());
-    if !ok {
-        assert!(
-            std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() != Ok("required"),
-            "BTRFS_ORACLE_FIXTURES=required, but the fixture could not be built: {out:?}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-        return None;
     }
-    Some(img)
+    panic!("the LZO fixture's manifest does not name {FILE}:\n{manifest}");
 }
 
 /// Apply `edit(key_type, key_offset, body)` to `ino`'s items in every
@@ -118,12 +86,20 @@ fn edit_items(
     ino: u64,
     mut edit: impl FnMut(u8, u64, &mut [u8]) -> bool,
 ) -> usize {
-    let mut bytes = std::fs::read(img).unwrap();
-    let sb = Superblock::parse(&bytes[SUPERBLOCK..SUPERBLOCK + 4096]).unwrap();
+    // A BLOCK AT A TIME, read and written back only where something
+    // changed: this fixture is 600 MiB, two tests run at once, and the
+    // harness guest has four gigabytes. See `Image`.
+    let image = Image::open(img);
+    let head = image.read_at(SUPERBLOCK as u64, 4096);
+    let sb = Superblock::parse(&head).unwrap();
     let node = sb.nodesize as usize;
     let mut patched = 0;
-    for at in (0..bytes.len() - node).step_by(4096) {
-        let block = &mut bytes[at..at + node];
+    let mut block_buf = vec![0u8; node];
+    let mut at = 0u64;
+    while image.try_read_at(at, &mut block_buf) {
+        let here = at;
+        at += 4096;
+        let block = &mut block_buf[..];
         if block[header_offsets::FSID..header_offsets::FSID + 16] != sb.fsid
             || le64(block, header_offsets::OWNER) != objectid::FS_TREE
             || block[header_offsets::LEVEL] != 0
@@ -150,11 +126,22 @@ fn edit_items(
         }
         if hit {
             stamp_checksum(block, &sb);
+            write_window(img, here, block);
             patched += 1;
         }
     }
-    std::fs::write(img, &bytes).unwrap();
     patched
+}
+
+/// Put `bytes` back at `offset` in `img`.
+fn write_window(img: &std::path::Path, offset: u64, bytes: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    std::fs::File::options()
+        .write(true)
+        .open(img)
+        .unwrap_or_else(|e| panic!("opening {} to write: {e}", img.display()))
+        .write_all_at(bytes, offset)
+        .unwrap_or_else(|e| panic!("writing {} at {offset}: {e}", img.display()));
 }
 
 fn mount(img: &std::path::Path) -> Filesystem {
@@ -166,12 +153,10 @@ fn mount(img: &std::path::Path) -> Filesystem {
 /// about nothing.
 #[test]
 fn the_compressed_file_as_made_reads_back() {
-    let Some(img) = image("control") else {
-        eprintln!("no kernel or btrfs-progs -- skipping");
-        return;
-    };
+    let img = image("control");
+    let (size, sha256) = expected();
     let fs = mount(&img);
-    let ino = fs.lookup_path("/file.bin").unwrap().ino;
+    let ino = fs.lookup_path(FILE).unwrap().ino;
     let mut compressed = 0usize;
     edit_items(&img, ino, |key_type, _, body| {
         if key_type == EXTENT_DATA_KEY && body[COMPRESSION] != 0 {
@@ -181,26 +166,23 @@ fn the_compressed_file_as_made_reads_back() {
     });
     assert!(
         compressed >= 2,
-        "the fixture holds {compressed} compressed extents, so none of them is a \
-         non-final one"
+        "the fixture holds {compressed} compressed extents of {FILE}, so none of them \
+         is a non-final one"
     );
     let read = mount(&img).read_file(ino).expect("an ordinary read");
-    assert_eq!(read.len(), LEN);
+    assert_eq!(read.len() as u64, size);
     assert_eq!(
-        read,
-        std::fs::read(img.parent().unwrap().join("body")).unwrap(),
-        "the file did not read back what was written to it"
+        sha256_hex(&read),
+        sha256,
+        "{FILE} did not read back what the kernel wrote to it"
     );
     let _ = std::fs::remove_dir_all(img.parent().unwrap());
 }
 
 #[test]
 fn a_short_decode_in_a_non_final_extent_is_refused() {
-    let Some(img) = image("short") else {
-        eprintln!("no kernel or btrfs-progs -- skipping");
-        return;
-    };
-    let ino = mount(&img).lookup_path("/file.bin").unwrap().ino;
+    let img = image("short");
+    let ino = mount(&img).lookup_path(FILE).unwrap().ino;
     // The FIRST extent, which is not the file's last.
     let mut first_extent = 0u64;
     let patched = edit_items(&img, ino, |key_type, key_offset, body| match key_type {
@@ -232,13 +214,11 @@ fn a_short_decode_in_a_non_final_extent_is_refused() {
             .map(first_extent)
             .expect("the extent's address")
             .physical;
-        let mut bytes = std::fs::read(&img).unwrap();
-        let at = physical as usize;
+        let framing = Image::open(&img).read_at(physical, LZO_LEN + 4);
         let first_segment =
-            u32::from_le_bytes(bytes[at + LZO_LEN..at + LZO_LEN + 4].try_into().unwrap()) as usize;
+            u32::from_le_bytes(framing[LZO_LEN..LZO_LEN + 4].try_into().unwrap()) as usize;
         let shortened = (LZO_LEN + LZO_LEN + first_segment) as u32;
-        bytes[at..at + LZO_LEN].copy_from_slice(&shortened.to_le_bytes());
-        std::fs::write(&img, &bytes).unwrap();
+        write_window(&img, physical, &shortened.to_le_bytes());
     }
 
     match mount(&img).read_file(ino) {

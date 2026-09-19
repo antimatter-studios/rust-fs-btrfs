@@ -20,44 +20,440 @@ chore_min_version: 0.10.0
 # differs from rust-blk-probe, whose single binary lets its `artifact` name
 # a file: this crate produces libfs_btrfs.a AND the headers beside it, so
 # there is no single path to name.
+#
+# THE TEST CONTRACT (the fs-linux-test-harness README's "Consumer test
+# contract" is the general form; rust-fs-ext4 is the template this
+# repository was migrated onto):
+#
+#   chore siblings     check out ../rust-fs-core and ../fs-linux-test-harness
+#                      at their pinned refs
+#   chore tools        install and verify what the HOST needs: ripgrep, and
+#                      the VM (Vagrant, QEMU, KVM/HVF). NOT btrfs-progs
+#   chore fixtures     build test-disks/ — kernel-made, so in the harness VM
+#   chore test:unit    tests that need no tool, no fixture and no VM
+#   chore test:images  tests that read a fixture but need no VM
+#   chore test:oracle  the driver writes, btrfs-progs reads back
+#                      (`btrfs check` for consistency, `btrfs
+#                      inspect-internal dump-super/dump-tree` for content
+#                      and metadata, `mkfs.btrfs` for the images a test
+#                      damages itself)
+#   chore test:kernel  the driver writes, THE REAL KERNEL reads back: our
+#                      images loop-mounted by Linux in the guest
+#   chore test:vm      the whole suite compiled and run INSIDE the guest
+#   chore test         everything, exactly as CI runs it
+#
+# WHERE THINGS RUN, and why.
+#
+#   THE ORACLE TOOLS RUN IN THE GUEST, ALWAYS. btrfs-progs on a
+#   workstation is whatever that machine has — a Homebrew formula on a
+#   Mac, a distribution build on Linux, a different version per developer
+#   — and on a Mac it is not the platform these images are for at all.
+#   One Debian guest, one version, the same answers everywhere. There is
+#   no host path to fall back to: tests/test_contract.rs fails the suite
+#   if a test runs one here.
+#
+#   THE KERNEL ORACLES MOUNT IN THE GUEST, ALWAYS. This is the change
+#   that matters most in this repository. The gate used to loop-mount
+#   every fixture with `sudo mount -o loop` ON THE CI RUNNER, and build
+#   most of the fixtures the same way — which is a privilege this suite
+#   should not need, and which a macOS developer cannot have at all, so
+#   the kernel half of the gate was simply unavailable away from CI.
+#   It happens in the guest now, and it happens the same way everywhere.
+#
+#   THE LINUX TESTS RUN ON LINUX. On a Linux host that is this host, and
+#   `chore test` compiles and runs them here. On a Mac nothing Linux-shaped
+#   runs natively: `chore test` runs `test:vm` instead, which builds and
+#   runs the same sources inside the guest.
+#
+# NOTHING SKIPS: a missing tool, fixture or VM fails the test that needed
+# it, naming the task that provides it. This repository has been bitten
+# by the other arrangement more than once — the leaf oracle ran against
+# no fixtures at all and reported green, and the compression and
+# nodatacow oracles found nothing on every pull request for the same
+# reason (#69).
+#
+# QUIET BY DEFAULT, --verbose ON REQUEST, AND THE BUDGET IS A NUMBER.
+#
+#   A task prints a VERDICT: one line per tier, a final count, and the path
+#   of the log holding everything else. A failure prints the excerpt.
+#   `chore test -- --verbose` (or FLTH_VERBOSE=1) streams the whole run.
+#
+#   Nothing is thrown away: every tier's output goes to tmp/logs/<tier>.log
+#   in full, including the per-call `[oracle vm]` and `[kernel vm]`
+#   evidence that `--show-output` produces. What changed is where it is
+#   read from.
+#
+#   Each tier carries an OUTPUT BUDGET -- a line and a byte count that fails
+#   the run (exit 65) when the tier prints more than it is allowed to, told
+#   apart from a failing suite by its status. The budgets below are
+#   MEASURED, and measured on the NOISIEST honest run rather than the
+#   quietest -- which is a COLD BUILD, where cargo prints a `Compiling`
+#   line per dependency. A workstation with a warm target directory is
+#   several dozen lines quieter than a runner that has just checked out,
+#   and sizing to the warm figure is how a budget that looks like it has
+#   thirty per cent turns out to have almost none. `vm` is the clearest
+#   case: 845 lines on this arm64 KVM host with the guest's build cache
+#   warm, 957 on the first run in a fresh guest.
+#
+#     tier      measured          budget            headroom, and why
+#     unit        368 /  24,411      480 /  32,000   ~30%: tests get added
+#     images      296 /  13,865      385 /  18,000   ~30%
+#     oracle      361 /  19,014      470 /  25,000   ~30%. --show-output is
+#                                                    most of it, and it is
+#                                                    the evidence, so it
+#                                                    stays -- in the log
+#     kernel       84 /   6,906      110 /   9,000   ~30%
+#     suite       810 /  44,217    1,060 /  57,500   ~30%: every target
+#                                                    once, so it grows
+#                                                    with the suite
+#     scripts      60 /   2,728       80 /   4,000   ~33%: four tests
+#     vm          957 /  50,636    1,250 /  66,000   ~30%: the same suite,
+#                                                    plus the guest's own
+#                                                    build, from cold
+#
+#   EVERY ONE OF THEM IS MEASURED, and none is a guess left wide "for
+#   now". A budget above what a tier prints still fails the run that
+#   starts printing thousands of lines, which is the failure it is for --
+#   but one set several times the real figure fails nothing anybody will
+#   live to see, and teaches the next reader that the number is
+#   decorative. These are what the tiers printed on a green `chore test`
+#   and `chore test:vm` of this branch -- on a CI runner and on a
+#   workstation, the higher of the two -- plus about thirty per cent.
+#
+#   Raise one DELIBERATELY when a tier grows, the way the executed-test
+#   floors are raised. A budget nobody can breach measures nothing, and
+#   tests/scripts/test-output-budget.sh fails a tier that has none.
+#
+#   Why it is worth a task's while: a passing run that prints three thousand
+#   lines hides the twenty that matter, and every reader pays for it --
+#   a person scrolling, a CI log viewer, and an agent working here, which
+#   re-reads its transcript on every step and so pays for one loud run many
+#   times over. See the fs-linux-test-harness README, "Output: quiet by
+#   default, --verbose on request".
 vars:
   TRIPLE: aarch64-apple-darwin
   LIBNAME: fs_btrfs
 
-# The safety net for a leaked VM.
+  # The sibling pins. One place, read by `chore siblings` and — through
+  # that task — by CI. URL as well as ref: the family is not all in one
+  # org, and a URL rebuilt from a repo name points at a repository that
+  # does not exist for exactly the ones that are not.
+  #
+  # FS_CORE_REF must match the `am-fs-core` version recorded in
+  # Cargo.lock, or `--locked` will refuse to build. Bump it in lockstep
+  # with the constraint in Cargo.toml.
+  FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
+  FS_CORE_REF: v0.2.10
+  LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
+  LINUX_HARNESS_REF: v0.1.0
+
+# The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
+# harness is a sibling that `chore siblings` itself checks out: without
+# it this file must still load far enough to run that task. Every task
+# here that needs the VM says so when the harness is absent.
 #
-# `defer:` is the primary teardown and stays it: it runs once per task,
-# it is positional so it only registers if the thing it tears down was
-# actually reached, and a `defer:` that fails FAILS AN OTHERWISE-GREEN
-# TASK — which is what makes a machine that would not stop impossible
-# to miss.
+# No `dir:` — see the harness's vm.chores.yml: its tasks must run from
+# this repository's root, where fs-linux-test-harness.toml is.
+includes:
+  vm:
+    taskfile: ../fs-linux-test-harness/vm.chores.yml
+    optional: true
+
+# The reaper: any chore invocation stops a VM nothing else brought down
+# (a killed `chore fixtures`, a script run by hand). Fails soft, and does
+# nothing before the harness is checked out.
 #
-# What `defer:` cannot cover is a path that never reached it. A bare
-# `cargo test` boots the machine — several suites shell out to
-# scripts/vm.sh — with chore not involved at all. A run killed outright
-# (SIGKILL, a background job reaped by its harness) never unwinds
-# anything, in chore or in a shell trap. Both happened here in one
-# afternoon.
-#
-# `after_all` runs once per invocation, on success, on failure and on
-# Ctrl-C, so any LATER chore invocation of any task cleans up what was
-# left behind. `chore build` is enough.
+# THE SAFETY NET, NOT THE TEARDOWN. What it cannot cover is a path that
+# never reached a teardown at all: a bare `cargo test` that booted the
+# machine through an oracle call with chore not involved, or a run killed
+# outright, which unwinds nothing in chore or in a shell trap. Both
+# happened here in one afternoon, and on 2026-09-07 a VM was held for
+# THIRTEEN HOURS by a task whose process had been killed.
 #
 # It fails SOFT, and that is the right shape for a net rather than a
-# shortcoming: chore prints an after_all failure without failing the
-# run. Turning an unrelated `chore build` red because something else
-# left a VM running would teach people to ignore it. The loud failure
-# stays on `defer:`, where it belongs.
-#
-# `vm.sh reap` probes with a process check, not `vagrant status`: ~20ms
-# against ~1s. That is what makes it affordable on every task rather
-# than wired into the few that use the VM — the objection that kept it
-# out before.
+# shortcoming: turning an unrelated `chore build` red because something
+# else left a VM running would teach people to ignore it. The harness's
+# own `vm.sh reap` probes with a process check rather than `vagrant
+# status` — about 20 ms against a second — which is what makes it
+# affordable on every task rather than wired into the few that use the VM.
 lifecycle:
   after_all:
-    - ./scripts/vm.sh reap
+    - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh reap'
 
 tasks:
+  siblings:
+    desc: Check out the sibling repos this crate builds and tests against, at their pinned refs
+    # init + fetch-by-ref rather than clone: a pin may be a bare commit,
+    # which `git clone --branch` cannot name. REFUSES TO MOVE A DIRTY
+    # SIBLING — a checkout is destructive to uncommitted work.
+    cmds:
+      - |
+        set -eu
+        printf '%s\t%s\t%s\n' \
+          rust-fs-core          '{{.FS_CORE_URL}}'       '{{.FS_CORE_REF}}' \
+          fs-linux-test-harness '{{.LINUX_HARNESS_URL}}' '{{.LINUX_HARNESS_REF}}' \
+        | while IFS="$(printf '\t')" read -r name url ref; do
+            dir="../$name"
+            if [ ! -d "$dir/.git" ]; then
+              echo "siblings: cloning $name at $ref"
+              git init --quiet "$dir"
+              git -C "$dir" remote add origin "$url"
+              git -C "$dir" fetch --quiet --depth 1 origin "$ref"
+              git -C "$dir" checkout --quiet FETCH_HEAD
+              continue
+            fi
+            if [ -n "$(git -C "$dir" status --porcelain)" ]; then
+              echo "siblings: $name has uncommitted changes -- refusing to move it." >&2
+              exit 1
+            fi
+            git -C "$dir" fetch --quiet origin "$ref"
+            if [ "$(git -C "$dir" rev-parse HEAD)" = "$(git -C "$dir" rev-parse FETCH_HEAD)" ]; then
+              echo "siblings: $name already at $ref"
+              continue
+            fi
+            echo "siblings: moving $name to $ref"
+            git -C "$dir" checkout --quiet FETCH_HEAD
+          done
+
+  tools:
+    desc: "Install and verify what the HOST needs: ripgrep, and the VM the oracle tools live in"
+    cmds: ['scripts/tools.sh']
+
+  fixtures:
+    desc: 'Build every test-disks/ fixture (kernel-made, in the fs-linux-test-harness VM); name targets to rebuild only those'
+    # Up to date while the recipes are unchanged and every artefact
+    # exists; --force rebuilds. The VM comes down when the build ends,
+    # however it ends (build-fixtures.sh sources the harness's
+    # vm-session.sh).
+    #
+    # THIS LIST AND test-disks/build-fixtures.sh MUST AGREE. The script
+    # is the one that knows which target produces which file; this is
+    # what chore compares against to decide the task is up to date.
+    sources:
+      - test-disks/build-fixtures.sh
+      - test-disks/guest-build-images.sh
+      - scripts/vm-setup.sh
+    generates:
+      # geometry
+      - test-disks/btrfs-default.img
+      - test-disks/btrfs-node4k.img
+      - test-disks/btrfs-node16k.img
+      - test-disks/btrfs-csum-crc32c.img
+      - test-disks/btrfs-csum-xxhash.img
+      - test-disks/btrfs-csum-sha256.img
+      - test-disks/btrfs-csum-blake2.img
+      - test-disks/btrfs-single.img
+      - test-disks/btrfs-dup.img
+      - test-disks/btrfs-mixed.img
+      # populated, rich, compression
+      - test-disks/btrfs-deep4k.img
+      - test-disks/btrfs-deep16k.img
+      - test-disks/btrfs-rich.img
+      - test-disks/btrfs-comp-zlib.img
+      - test-disks/btrfs-comp-lzo.img
+      - test-disks/btrfs-comp-zstd.img
+      # the ones that need a mount to populate
+      - test-disks/btrfs-subvol.img
+      - test-disks/btrfs-xattr.img
+      - test-disks/btrfs-nodatacow.img
+      - test-disks/snapshot/btrfs-nodatacow-snapshot.img
+      # the write-path pairs, in both geometries
+      - test-disks/btrfs-commit.img
+      - test-disks/btrfs-commit-sha256-dup.img
+      - test-disks/btrfs-cow-before.img
+      - test-disks/btrfs-cow-control.img
+      - test-disks/btrfs-cow-after.img
+      - test-disks/btrfs-cow-before-sha256-dup.img
+      - test-disks/btrfs-cow-control-sha256-dup.img
+      - test-disks/btrfs-cow-after-sha256-dup.img
+      - test-disks/btrfs-split-before.img
+      - test-disks/btrfs-split-after.img
+      - test-disks/btrfs-split-vary-before.img
+      - test-disks/btrfs-split-vary-after.img
+      - test-disks/btrfs-pool-a.img
+      - test-disks/btrfs-pool-b.img
+    # A hung boot must not hold the VM and the machine-wide slot for
+    # ever. The split fixtures alone mount and unmount up to four hundred
+    # times, and the populated pair writes eighty thousand files, so this
+    # is the longest-running task here by a wide margin.
+    timeout: 120m
+    on_timeout:
+      - cmd: '../fs-linux-test-harness/scripts/vm.sh down || ../fs-linux-test-harness/scripts/vm.sh destroy'
+    cmds:
+      - 'test-disks/build-fixtures.sh {{.CLI_ARGS}}'
+
+  fixtures:clean:
+    desc: Remove the built fixtures (they are regenerable, and large)
+    cmds:
+      - |
+        set -eu
+        rm -rf test-disks/snapshot
+        rm -f test-disks/btrfs-*.img test-disks/*.superdump test-disks/*.manifest \
+              test-disks/*.compression test-disks/*.super test-disks/btrfs-split*.txt
+
+  test:unit:
+    desc: 'Tests that need no tool and no fixture: the library, and every tests/*.rs that reaches neither'
+    # In the DEBUG profile, which is the point: overflow-checks are on
+    # here and off in release, and EXPECT_OVERFLOW_CHECKS=1 arms
+    # overflow_checks::the_build_the_gate_asked_to_check_does_check in
+    # src/lib.rs to prove it. `--lib` is what carries the library's own
+    # unit tests -- the largest body of arithmetic in the crate -- which
+    # ran under --release and nowhere else before this task existed.
+    # tests/ci_profile.rs checks that the CI workflow still runs this
+    # task (the `unit` job) with that variable set.
+    #
+    # Which targets: scripts/test-targets.sh, derived from the tests
+    # rather than listed here. CI runs this job with no fixtures present,
+    # which is what proves the split.
+    cmds:
+      - 'EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 480 32000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
+
+  test:images:
+    desc: 'The tests that read a fixture but need no VM — what a host without KVM can still run'
+    # The tier CI's aarch64 job runs: GitHub's arm64 runners have no
+    # /dev/kvm, so no VM can start there, and the oracle and kernel tiers
+    # read the same images on every architecture anyway. Named as a tier
+    # rather than skipped inside the tests, so what does not run there is
+    # visible in the workflow rather than hidden in a green log.
+    cmds:
+      - 'scripts/tier.sh test:images images 385 18000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh images)'
+
+  test:oracle:
+    desc: 'The driver writes, btrfs-progs reads back — every tool call made inside the harness VM'
+    # --show-output keeps what each passing oracle test checked (the
+    # `[oracle vm]` lines: every tool invocation, where it ran and its
+    # verdict), so a green run carries its evidence rather than a count.
+    # It goes to tmp/logs/oracle.log, not the terminal -- the evidence is
+    # kept, and reading it is a choice rather than a toll. `--verbose`
+    # streams it live.
+    #
+    # NO `vm:up` HERE, deliberately. The first oracle call in each test
+    # process brings the VM up (idempotent, milliseconds when it is
+    # already running) and every later call rides one shared SSH
+    # connection. Nothing holds it, so the `after_all` reaper stops it
+    # when this invocation ends — one boot for the tier, and no VM left
+    # behind by a run that was interrupted.
+    cmds:
+      - scripts/tools.sh --check
+      - test-disks/build-fixtures.sh --check
+      - 'scripts/tier.sh test:oracle oracle 470 25000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
+
+  test:kernel:
+    desc: 'The driver writes, THE KERNEL reads back: our images loop-mounted by Linux in the guest'
+    # The gap btrfs-progs cannot close: a volume `btrfs check` calls
+    # valid can still be one Linux mounts differently. These tests mount
+    # every fixture in the guest, write through the in-kernel driver and
+    # read back, perform a whole transaction with this crate and have the
+    # kernel accept the result, and scrape the guest's own kernel log —
+    # because a mount that succeeds while the kernel logs a warning is
+    # not a pass.
+    cmds:
+      - test-disks/build-fixtures.sh --check
+      - 'scripts/tier.sh test:kernel kernel 110 9000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+
+  test:vm:
+    desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
+    # scripts/guest-suite.sh, through the harness's [test] guest_command.
+    # The toolchain and the build directory live on the VM's own disk, so
+    # the first run pays a full build and later runs are incremental.
+    # FLTH_KEEP_VM=1 keeps the VM up for the next one.
+    timeout: 180m
+    on_timeout:
+      - cmd: '../fs-linux-test-harness/scripts/vm.sh down || ../fs-linux-test-harness/scripts/vm.sh destroy'
+    cmds:
+      # The sibling crates this one builds against are staged on the
+      # share first: the guest is given THIS repository, not the
+      # directory that holds it, so a path dependency on ../rust-fs-core
+      # has nothing to resolve to until it is put there. From the pinned
+      # checkout's HEAD, so what the guest builds against is what
+      # `chore siblings` pinned and nothing uncommitted.
+      - |
+        set -eu
+        [ -x ../fs-linux-test-harness/scripts/vm.sh ] || {
+          echo "test:vm needs the harness sibling -- run 'chore siblings'." >&2
+          exit 1
+        }
+        share="$(../fs-linux-test-harness/scripts/vm.sh share)"
+        for sibling in rust-fs-core; do
+          [ -d "../$sibling/.git" ] || {
+            echo "test:vm: ../$sibling is not checked out -- run 'chore siblings'." >&2
+            exit 1
+          }
+          dest="$share/siblings/$sibling"
+          rm -rf "$dest"
+          mkdir -p "$dest"
+          git -C "../$sibling" archive --format=tar HEAD | tar -x -C "$dest"
+        done
+        # --verbose is ours, not cargo's: tier.sh reads it out of CLI_ARGS
+        # and streams, and it must not also reach the in-guest `cargo test`,
+        # where it would mean something else entirely.
+        guest_args=""
+        for arg in ${CLI_ARGS:-}; do
+          case "$arg" in --verbose|-v) continue ;; esac
+          guest_args="$guest_args $arg"
+        done
+        # shellcheck disable=SC2086  # the words are the point
+        scripts/tier.sh test:vm vm 1250 66000 -- \
+          ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
+
+  test:
+    desc: 'Everything, exactly as CI runs it — natively on Linux, inside the VM anywhere else'
+    # WE RUN THE LINUX TESTS ON LINUX. This host is Linux, so they run
+    # here; on a Mac there is no btrfs, no loop mount and no btrfs-progs
+    # worth trusting, so the same sources are built and run inside the
+    # guest instead (`test:vm`). Not a reduced run and not a skip: the
+    # whole suite, one Linux away.
+    cmds:
+      - |
+        set -eu
+        # --verbose belongs to the whole run, and test:native's tiers are
+        # separate chore invocations: an exported variable is what reaches
+        # them, which is why tier.sh reads FLTH_VERBOSE as well as the flag.
+        case " ${CLI_ARGS:-} " in
+          *" --verbose "*|*" -v "*) export FLTH_VERBOSE=1 ;;
+        esac
+        if [ "$(uname -s)" != Linux ]; then
+          echo "test: this host is $(uname -s) -- running the Linux suite in the harness VM."
+          exec "{{.CHORE_EXE}}" test:vm
+        fi
+        "{{.CHORE_EXE}}" test:native
+
+  test:native:
+    desc: 'The suite on this (Linux) host: unit (debug), the oracles, the kernel oracles, everything (release), the scripts'
+    # Checks for the host tools and the fixtures FIRST and fails naming
+    # the task that provides them, rather than letting several hundred
+    # tests each fail on the same missing image.
+    #
+    # test:oracle and test:kernel run before the whole suite, which runs
+    # those tests again: the price (a minute) of their evidence being in
+    # every log, and of `test` staying plainly "everything".
+    cmds:
+      - task: test:unit
+      - scripts/tools.sh --check
+      - test-disks/build-fixtures.sh --check
+      - task: test:oracle
+      - task: test:kernel
+      - 'scripts/tier.sh "test:native (whole suite, release)" suite 1060 57500 -- scripts/test.sh --locked --release'
+      - task: test:scripts
+      # THE LAST LINE: one number across the tiers, and where the detail is.
+      - scripts/test-verdict.sh unit oracle kernel suite
+
+  test:scripts:
+    desc: The shell tests (tests/scripts/*.sh), every one by glob
+    # By glob, so a test added later needs no edit here -- a guard that
+    # has to be registered somewhere else is a guard that gets silently
+    # skipped.
+    cmds:
+      - |
+        set -eu
+        scripts/tier.sh test:scripts scripts 80 4000 -- bash -c '
+          set -eu
+          for t in tests/scripts/*.sh; do
+            echo "== $t"
+            bash "$t"
+          done
+        '
+
   staticlib:
     desc: Build the static library and its headers into this crate's dist/
     # NO `out` ARGUMENT, deliberately. A library does not write into its
@@ -106,188 +502,22 @@ tasks:
       # consumer handed only fs_btrfs.h cannot compile.
       - 'cp "../rust-fs-core/include/fs_core.h" "{{.OUT}}/include/fs_core.h"'
 
-  build:
-    desc: Debug build
-    cmds: ['cargo build']
-
-  test:
-    desc: Test suite
-    # The VM comes down afterwards, and that is the point of doing this
-    # through chore rather than through cargo directly.
-    #
-    # The suite's real evidence comes from the oracle VM: the tests shell
-    # out to scripts/vm.sh, which boots it on demand, and nothing brought
-    # it back down. On the XFS side several were left running at once,
-    # with a VM disk that had grown to 4.7 GB.
-    #
-    # `defer:` runs when the task finishes whether it PASSED OR FAILED,
-    # and on interrupt too: PATTERNS.md — "Ctrl-C on a task that brought
-    # a topology up still tears it down, on a bounded budget". That is
-    # the property that matters, because every leak was either a failure
-    # path or someone moving on, and neither is fixed by remembering.
-    #
-    # `defer:` here rather than relying on the `lifecycle: after_all`
-    # reaper at the top of this file, because the two are for different
-    # things. This one is the teardown: it belongs to the task that
-    # booted the machine, and it FAILS THE TASK if the machine will not
-    # stop. The reaper is a net for the paths no defer can reach, and it
-    # fails soft. Having both is the point; either alone leaves a hole.
-    #
-    # `timeout:` is the third layer, and it covers what neither of the
-    # other two can: a task that HANGS. `defer:` needs the body to end,
-    # and a body that never returns ends nothing. The reaper needs a
-    # LATER chore invocation, and nobody runs one while they are waiting
-    # for this. So a stalled `cargo test` -- a suite deadlocked, an ssh
-    # into the guest that never comes back -- holds the machine and the
-    # global oracle slot with every net behaving exactly as written.
-    #
-    # That is not hypothetical. On 2026-09-07 a VM was held for THIRTEEN
-    # HOURS by a task whose process had been killed: no chore ran, no
-    # second repository asked for the slot, and no hold file was set. A
-    # plain leak that nothing was positioned to notice.
-    #
-    # Measured against that exact case, a hung task holding a live VM:
-    # 23 seconds against a 20-second budget, the guest halted properly
-    # rather than orphaned, and the slot released.
-    #
-    # The handler runs FIRST, while the process group is still alive,
-    # which is what lets `vm.sh down` reach the guest and halt it rather
-    # than leave a parentless qemu behind. chore then signals the group
-    # itself, so this is not only as reliable as the handler.
-    #
-    # `$TIMEOUT_PGID` is space-separated -- concurrent `deps:` can have
-    # several groups in flight -- and empty for an `interactive:` task,
-    # so the loop is the portable form rather than a bare `kill`.
-    #
-    # AND IT DOES NOT REPLACE THE GUEST'S OWN DEADLINE. A timer dies
-    # with the process that owns it, so a SIGKILL to chore defeats this
-    # entirely -- which is precisely what happened on the night above.
-    # The guest schedules its own poweroff at boot for that case, and
-    # `chore help timeouts` argues for keeping both rather than merely
-    # permitting it. Fast precise net inside, dumb unkillable net
-    # outside.
-    timeout: 45m
-    on_timeout:
-      - cmd: 'echo "timeout: reclaiming the oracle VM (spent $TIMEOUT)"'
-      - cmd: './scripts/vm.sh down'
-      - cmd: 'for g in $TIMEOUT_PGID; do kill -TERM -"$g" 2>/dev/null || true; done'
-    cmds:
-      - defer: ./scripts/vm.sh down
-      - cargo test
-
   lint:
     desc: Formatting and clippy, exactly as CI runs them
+    # `--locked` is not decoration. It makes the build fail rather than
+    # silently update Cargo.lock, which is what keeps a local gate and
+    # CI checking the same dependency versions — and it is what the
+    # release process relies on.
+    #
+    # This exists so the CI gate can be reproduced locally. If the two
+    # ever differ, this is the copy that is wrong.
     cmds:
       - cargo fmt --check
       - cargo clippy --locked --all-targets -- -D warnings
 
-  vm:up:
-    desc: Boot the oracle VM and keep it up until `chore vm:down`
-    # `hold` marks the machine as deliberately left running, so the
-    # after_all reaper leaves it alone. Without it this task would boot
-    # a VM and the lifecycle hook would stop it again on the way out —
-    # the one case where an unconditional net is wrong.
-    #
-    # NOT replaceable with `{{.TASK}}`, which a lifecycle hook does have
-    # and which names the invoked task. That would stop `chore vm:up`
-    # reaping its own machine and nothing more: the requirement is that
-    # the machine survives `chore build` an hour later, and by then
-    # `{{.TASK}}` says `build`. The mark has to outlive the invocation
-    # that set it, because so does the machine — which is also why
-    # `down` and `destroy` clear it rather than leaving it to go stale.
-    cmds:
-      - './scripts/vm.sh up'
-      - './scripts/vm.sh hold'
-
-  vm:down:
-    desc: Halt the oracle VM, keeping its disk image
-    cmds: ['./scripts/vm.sh down']
-
-  vm:status:
-    desc: Say whether the oracle VM is running
-    # "Is anything still up?" had no answer short of reading `ps` for a
-    # qemu command line. Every leak was found that way, after the fact.
-    cmds: ['./scripts/vm.sh status']
-
-  vm:destroy:
-    desc: Destroy the oracle VM, reclaiming its disk image
-    # Halting keeps the image and a re-boot is quick; destroying reclaims
-    # the space and the next run pays a full provision. The choice is a
-    # disk-versus-time one, so it is two tasks rather than a flag with a
-    # default that would be wrong half the time.
-    cmds: ['./scripts/vm.sh destroy']
-
-  fixtures:
-    desc: 'Build test fixtures: chore fixtures [--set geometry|subvol|commit|cow|split|pool|all] [--only name,name]'
-    args:
-      - name: set
-        desc: which set to build; every set by default
-      - name: only
-        desc: 'rebuild just these fixtures, comma separated (e.g. --only deep16k)'
-    vars:
-      set: all
-      only: ''
-    # Same reasoning as `test`. Building fixtures is the other thing that
-    # boots the VM, and the one that runs longest unattended.
-    #
-    # THIS USED TO RUN ONLY vm-build-fixtures.sh. The subvolume and
-    # commit fixtures cannot be produced by build-fixtures-native.sh —
-    # they need to mount — so `chore fixtures` left them missing, and the
-    # three oracles that read them found nothing and SKIPPED. A skipped
-    # oracle reads exactly like a passing one, which is how the leaf
-    # oracle went unnoticed running against no fixtures at all. CI builds
-    # all three; this now builds the same three.
-    cmds:
-      - defer: ./scripts/vm.sh down
-      - |
-        set -euo pipefail
-        # One boot for the whole run, one teardown at the end.
-        #
-        # Each wrapper now tears the machine down when it finishes, which
-        # is right when it is run on its own and wrong three in a row:
-        # build, halt, boot, build, halt, boot. KEEP_VM tells them to
-        # leave it up. The `defer:` above is what brings it down — once,
-        # whether this succeeded or failed, and chore fails the task if
-        # that teardown fails.
-        export KEEP_VM=1
-        # Rebuilding one fixture instead of the matrix. The full set
-        # takes the better part of an hour, most of it filling two deep
-        # trees with tens of thousands of files, so an interrupted run
-        # used to mean rebuilding all of it to repair the one image that
-        # was half written.
-        export BTRFS_ONLY='{{.only}}'
-        ./scripts/vm.sh up
-        run() {
-          echo "==> $1"
-          "./scripts/$1"
-        }
-        case "{{.set}}" in
-          geometry) run vm-build-fixtures.sh ;;
-          subvol)   run vm-build-subvol-fixtures.sh ;;
-          commit)   run vm-build-commit-fixtures.sh ;;
-          cow)      run vm-build-cow-fixtures.sh ;;
-          split)    run vm-build-split-fixtures.sh ;;
-          pool)     run vm-build-pool-fixtures.sh ;;
-          all)
-            # Geometry first: most suites read those. The other two are
-            # independent of it and of each other.
-            run vm-build-fixtures.sh
-            run vm-build-subvol-fixtures.sh
-            run vm-build-commit-fixtures.sh
-            run vm-build-cow-fixtures.sh
-            run vm-build-pool-fixtures.sh
-            run vm-build-split-fixtures.sh
-            BTRFS_SPLIT_VARY=1 BTRFS_SPLIT_SUFFIX=-vary run vm-build-split-fixtures.sh
-            ;;
-          *)
-            echo "unknown set '{{.set}}' — one of: geometry subvol commit cow split pool all" >&2
-            exit 2
-            ;;
-        esac
-
-  fixtures:clean:
-    desc: Remove the built fixtures (they are regenerable, and large)
-    cmds: ['rm -rf .vm-share/*.img .vm-share/*.dump .vm-share/*.manifest']
+  build:
+    desc: Debug build
+    cmds: ['cargo build']
 
   clean:
     desc: Remove this crate's cargo output

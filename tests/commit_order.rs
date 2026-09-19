@@ -5,8 +5,9 @@
 //! is not a slower commit; it is a filesystem that a power cut turns
 //! into one pointing at blocks that were never written.
 //!
-//! `scripts/trace-commit.sh` recorded what the kernel actually does, and
-//! `docs/transaction-format.md` writes it down:
+//! The order is not reasoned out here. One live kernel commit was
+//! recorded with `blktrace`, and `docs/transaction-format.md` writes
+//! down what that trace showed:
 //!
 //!   tree blocks (every mirror) → flush → superblocks → flush
 //!
@@ -14,12 +15,17 @@
 //! assertions are about that sequence. A real device cannot be asked
 //! what order it saw things in, which is the whole reason this is a
 //! recording one.
+//!
+//! The image the recorder reads through is a real one, built by `chore
+//! fixtures` in the fs-linux-test-harness VM. A fixture that is not
+//! there fails the test that wanted it: an ordering check that never
+//! ran is indistinguishable from one that held.
 
 use fs_btrfs::commit::PlacedBlock;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::super_write::Commit;
+use fs_btrfs_test_support::fixture;
 use fs_core::{BlockDevice, BlockRead, Error as CoreError, Result as CoreResult};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// What the device was asked to do, in order.
@@ -95,28 +101,20 @@ impl BlockDevice for Recorder {
     }
 }
 
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
-
-fn image(name: &str) -> Option<Vec<u8>> {
-    let p = share().join(name);
-    p.exists().then(|| std::fs::read(&p).ok()).flatten()
-}
-
-fn mounted(name: &str) -> Option<(Filesystem, Arc<Recorder>)> {
-    let dev = Arc::new(Recorder::new(image(name)?));
-    let fs = Filesystem::mount_rw(dev.clone() as Arc<dyn BlockDevice>).ok()?;
-    Some((fs, dev))
+/// The named fixture, mounted read-write through a recording device.
+fn mounted(name: &str) -> (Filesystem, Arc<Recorder>) {
+    let path = fixture(name);
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let dev = Arc::new(Recorder::new(bytes));
+    let fs = Filesystem::mount_rw(dev.clone() as Arc<dyn BlockDevice>)
+        .unwrap_or_else(|e| panic!("mounting {} read-write: {e}", path.display()));
+    (fs, dev)
 }
 
 /// Where the flushes fall, which is the whole claim.
 #[test]
 fn tree_blocks_land_before_the_first_flush_and_superblocks_between_the_two() {
-    let Some((fs, dev)) = mounted("btrfs-default.img") else {
-        eprintln!("no fixture; build them with `chore fixtures`");
-        return;
-    };
+    let (fs, dev) = mounted("btrfs-default.img");
     let nodesize = fs.superblock().nodesize as usize;
 
     // Two blocks, placed wherever the allocator says is free. What is
@@ -223,10 +221,7 @@ fn tree_blocks_land_before_the_first_flush_and_superblocks_between_the_two() {
 /// The trace shows the kernel writing both before the barrier.
 #[test]
 fn both_mirrors_of_a_dup_block_are_written() {
-    let Some((fs, dev)) = mounted("btrfs-dup.img") else {
-        eprintln!("no DUP fixture — skipping");
-        return;
-    };
+    let (fs, dev) = mounted("btrfs-dup.img");
     let nodesize = fs.superblock().nodesize as usize;
 
     let at = fs.find_metadata_block().expect("somewhere to put a block");
@@ -282,10 +277,7 @@ fn both_mirrors_of_a_dup_block_are_written() {
 /// offset it belongs at, and a reader rejects one found somewhere else.
 #[test]
 fn each_superblock_copy_records_where_it_belongs() {
-    let Some((fs, dev)) = mounted("btrfs-default.img") else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let (fs, dev) = mounted("btrfs-default.img");
     fs.commit(
         &[],
         &Commit {

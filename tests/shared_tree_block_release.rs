@@ -10,49 +10,21 @@
 //! children when it's copied, is what the kernel does. Until this driver
 //! does the same, the plan must be refused.
 //!
-//! The image is `snapshot/btrfs-nodatacow-snapshot.img` from
-//! `scripts/build-nodatacow-fixtures.sh`, a read-only snapshot the kernel
-//! took of the top-level subvolume. btrfs-progs names a tree block the
-//! extent tree records with two references, and the planner and renderer
-//! are asked to move it. Skips when the fixture is missing, unless
-//! `BTRFS_ORACLE_FIXTURES=required`.
+//! The image is `snapshot/btrfs-nodatacow-snapshot.img` from `chore
+//! fixtures`, a read-only snapshot the kernel took of the top-level
+//! subvolume. btrfs-progs — in the harness VM, where the tools are —
+//! names a tree block the extent tree records with two references, and
+//! the planner and renderer are asked to move it.
 
 use fs_btrfs::fs::Filesystem;
+use fs_btrfs_test_support::{dump_tree, fixture};
 use fs_core::FileDevice;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 use std::sync::Arc;
-
-fn fixture() -> Option<PathBuf> {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".vm-share")
-        .join("snapshot")
-        .join("btrfs-nodatacow-snapshot.img");
-    if p.exists() {
-        return Some(p);
-    }
-    assert!(
-        std::env::var("BTRFS_ORACLE_FIXTURES").as_deref() != Ok("required"),
-        "BTRFS_ORACLE_FIXTURES=required, but {} is missing",
-        p.display()
-    );
-    eprintln!("skip: {} not built", p.display());
-    None
-}
 
 /// A tree block the extent tree records with more than one reference.
 fn shared_tree_block(image: &Path) -> u64 {
-    let out = Command::new("btrfs")
-        .args(["inspect-internal", "dump-tree", "-t", "extent"])
-        .arg(image)
-        .output()
-        .expect("btrfs-progs");
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let dump = String::from_utf8_lossy(&out.stdout);
+    let dump = dump_tree(image, "extent");
     let lines: Vec<&str> = dump.lines().collect();
     for (i, line) in lines.iter().enumerate() {
         let Some(key) = line.split("key (").nth(1) else {
@@ -75,9 +47,7 @@ fn shared_tree_block(image: &Path) -> u64 {
 
 #[test]
 fn a_plan_that_releases_a_shared_tree_block_is_refused() {
-    let Some(image) = fixture() else {
-        return;
-    };
+    let image = fixture("snapshot/btrfs-nodatacow-snapshot.img");
     let shared = shared_tree_block(&image);
     let fs = Filesystem::mount(Arc::new(FileDevice::open(&image).unwrap())).expect("mount");
     let generation = fs.superblock().generation + 1;
