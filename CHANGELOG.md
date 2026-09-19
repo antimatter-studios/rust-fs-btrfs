@@ -8,6 +8,31 @@ never does.
 
 ### Added
 
+- **The parsers are fuzzed, on two tiers.** Nothing here had a fuzz
+  target. `fuzz/` holds six `cargo-fuzz` targets — superblock, tree
+  block, inode item, directory items, xattr items and chunk item — and
+  runs nightly on a bounded budget; `tests/fuzz_decoders.rs` is the gate,
+  47,616 deterministic cases in under a second on the stable toolchain.
+
+  The tree-block target **re-stamps the checksum after mutating**, and
+  that is what makes it test btrfs rather than test crc32c:
+  `TreeBlock::parse` verifies the checksum before it looks at anything
+  else, so without a re-stamp every mutated block is rejected on the
+  first line and the item walk is never reached. It also passes the
+  block's own recorded `bytenr`, because a block that does not claim to
+  live where it was read from is refused by a second identity check
+  behind the first. A crafted image satisfies both — whoever wrote it
+  chose those numbers — so satisfying them is what makes the test
+  resemble the threat. `a_restamped_tree_block_still_parses` exists to
+  prove that path is actually reached; without it, a `restamp` computing
+  the wrong digest would look exactly like a target finding no bugs.
+
+  There is deliberately no whole-image target: the smallest filesystem
+  `mkfs.btrfs` will make is 16 MiB even with `--mixed`, over the 10 MiB
+  ceiling github-guard enforces, and the mount path is already the
+  best-covered thing here (#65).
+
+
 - **A path can cross into subvolumes.** `Filesystem::resolve_path` walks a
   path through any number of subvolume boundaries and returns the inode
   together with the read-only handle of the tree it belongs to
