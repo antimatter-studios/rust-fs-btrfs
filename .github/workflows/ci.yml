@@ -263,13 +263,13 @@ jobs:
       - name: The script tests executed their assertions
         run: |
           set -euo pipefail
-          # 47 assertions across three scripts, measured on this branch.
-          # Floor 40: room for a check to be folded into another without
+          # 53 assertions across four scripts, measured on this branch.
+          # Floor 45: room for a check to be folded into another without
           # room for a script to stop asserting.
           assertions=$(grep -ac '^ok' tmp/logs/scripts.log || true)
-          echo "script assertions executed: $assertions (floor 40)"
-          if [ "$assertions" -lt 40 ]; then
-            echo "::error::only $assertions script assertions executed, floor is 40 — a run that asserts fewer stopped early rather than passed" >&2
+          echo "script assertions executed: $assertions (floor 45)"
+          if [ "$assertions" -lt 45 ]; then
+            echo "::error::only $assertions script assertions executed, floor is 45 — a run that asserts fewer stopped early rather than passed" >&2
             exit 1
           fi
 

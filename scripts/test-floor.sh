@@ -78,7 +78,16 @@ if [ "${1:-}" = "--targets" ]; then
     # or `Running unittests src/lib.rs (...)` before each binary, and
     # libtest prints `test result: ok. N passed` after it. Pairing the two
     # is what gives a count per target.
+    #
+    # THE ESCAPE SEQUENCES COME OFF FIRST, and that is not tidiness.
+    # Every job here sets CARGO_TERM_COLOR=always, so cargo colours its
+    # own `Running` line -- libtest does not colour its summary, because
+    # a pipe is not a terminal. So the totals matched and every PER-TARGET
+    # count came back zero: fifty targets, each reported as a suite that
+    # had emptied from the inside, on a run where all 500 tests passed.
+    # A guard that reads a log must not depend on how the log was coloured.
     counts=$(awk '
+        { gsub(/\033\[[0-9;]*[a-zA-Z]/, "") }
         /^[[:space:]]*Running unittests/ { target = "lib"; next }
         /^[[:space:]]*Running tests\// {
             target = $2
@@ -130,7 +139,11 @@ if [ "${1:-}" = "--log" ]; then
             exit 2
             ;;
     esac
-    executed=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
+    executed=$(awk '
+        { gsub(/\033\[[0-9;]*[a-zA-Z]/, "") }
+        /test result: ok\. [0-9]+ passed/ { s += $4 }
+        END { print s + 0 }
+    ' "$log")
     echo "tests executed: $executed (floor $floor, from $log)"
     if [ "$executed" -lt "$floor" ]; then
         echo "::error::only $executed tests executed, floor is $floor -- a run that executes fewer tests than the floor stopped early rather than passed. If the suite legitimately shrank, lower the floor in .github/workflows/ci.yml in the same commit that shrank it, so the number stays something someone decided." >&2
@@ -160,7 +173,11 @@ tee "$log"
 # binary, and summing them covers a run that built several. `awk` rather
 # than `bc` so this works unchanged on a macOS or Windows runner if a
 # matrix leg is ever added.
-executed=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
+executed=$(awk '
+    { gsub(/\033\[[0-9;]*[a-zA-Z]/, "") }
+    /test result: ok\. [0-9]+ passed/ { s += $4 }
+    END { print s + 0 }
+' "$log")
 echo "tests executed: $executed (floor $floor)"
 
 if [ "$executed" -lt "$floor" ]; then

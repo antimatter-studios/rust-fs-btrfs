@@ -99,7 +99,7 @@ chore_min_version: 0.10.0
 #     suite       813 /  43,817    1,060 /  57,000   ~30%: every target
 #                                                    once, so it grows
 #                                                    with the suite
-#     scripts      53 /   2,418       70 /   4,000   ~32%: three tests
+#     scripts      60 /   2,728       80 /   4,000   ~33%: four tests
 #     vm          849 /  47,176    1,110 /  62,000   ~30%: the same suite,
 #                                                    plus the guest's own
 #                                                    build
@@ -438,7 +438,7 @@ tasks:
     cmds:
       - |
         set -eu
-        scripts/tier.sh test:scripts scripts 70 4000 -- bash -c '
+        scripts/tier.sh test:scripts scripts 80 4000 -- bash -c '
           set -eu
           for t in tests/scripts/*.sh; do
             echo "== $t"
