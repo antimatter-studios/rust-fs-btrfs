@@ -85,24 +85,31 @@ chore_min_version: 0.10.0
 #
 #   Each tier carries an OUTPUT BUDGET -- a line and a byte count that fails
 #   the run (exit 65) when the tier prints more than it is allowed to, told
-#   apart from a failing suite by its status. The budgets below are MEASURED,
-#   on this arm64 KVM host:
+#   apart from a failing suite by its status. The budgets below are
+#   MEASURED, and measured on the NOISIEST honest run rather than the
+#   quietest -- which is a COLD BUILD, where cargo prints a `Compiling`
+#   line per dependency. A workstation with a warm target directory is
+#   several dozen lines quieter than a runner that has just checked out,
+#   and sizing to the warm figure is how a budget that looks like it has
+#   thirty per cent turns out to have almost none. `vm` is the clearest
+#   case: 845 lines on this arm64 KVM host with the guest's build cache
+#   warm, 957 on the first run in a fresh guest.
 #
 #     tier      measured          budget            headroom, and why
-#     unit        359 /  23,580      470 /  31,000   ~30%: tests get added
-#     images      293 /  13,228      380 /  17,000   ~30%
-#     oracle      357 /  17,734      470 /  23,000   ~30%. --show-output is
+#     unit        368 /  24,411      480 /  32,000   ~30%: tests get added
+#     images      296 /  13,865      385 /  18,000   ~30%
+#     oracle      361 /  19,014      470 /  25,000   ~30%. --show-output is
 #                                                    most of it, and it is
 #                                                    the evidence, so it
 #                                                    stays -- in the log
-#     kernel       83 /   6,383      110 /   8,300   ~30%
-#     suite       809 /  43,451    1,060 /  57,000   ~30%: every target
+#     kernel       84 /   6,906      110 /   9,000   ~30%
+#     suite       810 /  44,217    1,060 /  57,500   ~30%: every target
 #                                                    once, so it grows
 #                                                    with the suite
 #     scripts      60 /   2,728       80 /   4,000   ~33%: four tests
-#     vm          849 /  47,176    1,110 /  62,000   ~30%: the same suite,
+#     vm          957 /  50,636    1,250 /  66,000   ~30%: the same suite,
 #                                                    plus the guest's own
-#                                                    build
+#                                                    build, from cold
 #
 #   EVERY ONE OF THEM IS MEASURED, and none is a guess left wide "for
 #   now". A budget above what a tier prints still fails the run that
@@ -110,7 +117,8 @@ chore_min_version: 0.10.0
 #   but one set several times the real figure fails nothing anybody will
 #   live to see, and teaches the next reader that the number is
 #   decorative. These are what the tiers printed on a green `chore test`
-#   and `chore test:vm` of this branch, plus about thirty per cent.
+#   and `chore test:vm` of this branch -- on a CI runner and on a
+#   workstation, the higher of the two -- plus about thirty per cent.
 #
 #   Raise one DELIBERATELY when a tier grows, the way the executed-test
 #   floors are raised. A budget nobody can breach measures nothing, and
@@ -298,7 +306,7 @@ tasks:
     # rather than listed here. CI runs this job with no fixtures present,
     # which is what proves the split.
     cmds:
-      - 'EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 470 31000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
+      - 'EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 480 32000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
 
   test:images:
     desc: 'The tests that read a fixture but need no VM — what a host without KVM can still run'
@@ -308,7 +316,7 @@ tasks:
     # rather than skipped inside the tests, so what does not run there is
     # visible in the workflow rather than hidden in a green log.
     cmds:
-      - 'scripts/tier.sh test:images images 380 17000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh images)'
+      - 'scripts/tier.sh test:images images 385 18000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh images)'
 
   test:oracle:
     desc: 'The driver writes, btrfs-progs reads back — every tool call made inside the harness VM'
@@ -328,7 +336,7 @@ tasks:
     cmds:
       - scripts/tools.sh --check
       - test-disks/build-fixtures.sh --check
-      - 'scripts/tier.sh test:oracle oracle 470 23000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
+      - 'scripts/tier.sh test:oracle oracle 470 25000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
 
   test:kernel:
     desc: 'The driver writes, THE KERNEL reads back: our images loop-mounted by Linux in the guest'
@@ -341,7 +349,7 @@ tasks:
     # not a pass.
     cmds:
       - test-disks/build-fixtures.sh --check
-      - 'scripts/tier.sh test:kernel kernel 110 8300 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - 'scripts/tier.sh test:kernel kernel 110 9000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
@@ -385,7 +393,7 @@ tasks:
           guest_args="$guest_args $arg"
         done
         # shellcheck disable=SC2086  # the words are the point
-        scripts/tier.sh test:vm vm 1110 62000 -- \
+        scripts/tier.sh test:vm vm 1250 66000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
 
   test:
@@ -425,7 +433,7 @@ tasks:
       - test-disks/build-fixtures.sh --check
       - task: test:oracle
       - task: test:kernel
-      - 'scripts/tier.sh "test:native (whole suite, release)" suite 1060 57000 -- scripts/test.sh --locked --release'
+      - 'scripts/tier.sh "test:native (whole suite, release)" suite 1060 57500 -- scripts/test.sh --locked --release'
       - task: test:scripts
       # THE LAST LINE: one number across the tiers, and where the detail is.
       - scripts/test-verdict.sh unit oracle kernel suite
