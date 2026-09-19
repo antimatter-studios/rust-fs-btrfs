@@ -1,0 +1,65 @@
+[package]
+name = "fs-btrfs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The explorer half of the fuzzing setup. The gate half is
+# tests/fuzz_decoders.rs in the parent crate, which replays and mutates
+# the same corpus on the stable toolchain -- see that file's header for
+# why the work is split in two, and for why there is no whole-image
+# target here.
+#
+# Run one target:
+#   cargo +nightly fuzz run tree_block -- -max_total_time=60
+# Run all of them, which is what CI does:
+#   scripts/fuzz-all.sh 60
+
+[dependencies]
+libfuzzer-sys = "0.4"
+am-fs-btrfs = { path = ".." }
+
+[[bin]]
+name = "superblock"
+path = "fuzz_targets/superblock.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tree_block"
+path = "fuzz_targets/tree_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inode_item"
+path = "fuzz_targets/inode_item.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dir_items"
+path = "fuzz_targets/dir_items.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xattr_items"
+path = "fuzz_targets/xattr_items.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunk_item"
+path = "fuzz_targets/chunk_item.rs"
+test = false
+doc = false
+bench = false
