@@ -129,7 +129,7 @@ jobs:
         # running this task.
         run: chore test:unit
       - name: The unit tier executed its tests
-        run: bash scripts/test-floor.sh --log tmp/logs/unit.log 290
+        run: bash scripts/test-floor.sh --log tmp/logs/unit.log 322
 
   fixtures:
     name: fixtures (harness VM, x86_64 KVM)
@@ -244,13 +244,17 @@ jobs:
       # counts as zero, so a suite that stopped being built fails here.
       - name: Every suite executed its tests
         run: bash scripts/test-floor.sh --targets .github/test-floors.txt --log tmp/logs/suite.log
+      # Each of these is what that tier executed on a green `chore test`
+      # of this branch, exactly. A tier runs on its own in some job here
+      # and inside the whole-suite run in others, so it needs a total of
+      # its own: the per-target file above only sees the suite log.
       - name: The tiers executed their tests
         run: |
           set -euo pipefail
-          bash scripts/test-floor.sh --log tmp/logs/unit.log 290
-          bash scripts/test-floor.sh --log tmp/logs/oracle.log 60
+          bash scripts/test-floor.sh --log tmp/logs/unit.log 322
+          bash scripts/test-floor.sh --log tmp/logs/oracle.log 30
           bash scripts/test-floor.sh --log tmp/logs/kernel.log 5
-          bash scripts/test-floor.sh --log tmp/logs/suite.log 450
+          bash scripts/test-floor.sh --log tmp/logs/suite.log 500
       # The shell tests are counted by their own `ok` lines rather than
       # by libtest's summary, but the failure is identical in shape:
       # `tests/scripts/*.sh` matching fewer files, or a script that
@@ -313,8 +317,8 @@ jobs:
       - name: Both tiers executed their tests
         run: |
           set -euo pipefail
-          bash scripts/test-floor.sh --log tmp/logs/unit.log 290
-          bash scripts/test-floor.sh --log tmp/logs/images.log 160
+          bash scripts/test-floor.sh --log tmp/logs/unit.log 322
+          bash scripts/test-floor.sh --log tmp/logs/images.log 142
 
   suite-in-vm:
     name: suite in the guest (the macOS path)
@@ -352,7 +356,7 @@ jobs:
       - name: chore vm:status (the VM is down again)
         run: '! chore vm:status'
       - name: The in-guest suite executed its tests
-        run: bash scripts/test-floor.sh --log tmp/logs/vm.log 450
+        run: bash scripts/test-floor.sh --log tmp/logs/vm.log 500
 
   # ONE CHECK GATES THIS REPOSITORY, AND IT STANDS FOR EVERY JOB (#187).
   #

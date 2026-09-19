@@ -28,4 +28,60 @@
 # `lib` is the library's own unit tests, which `cargo test` reports as
 # `Running unittests src/lib.rs`.
 #
+# Measured on a green `chore test` of this branch: fifty targets, 500
+# tests between them. Every number below is that run's count for that
+# target, exactly — a floor set under the measurement is a floor that
+# lets a suite lose tests quietly, which is the thing this file exists
+# to refuse.
+#
 # <target> <floor>
+backup_ring               1
+bootstrap_chain           2
+btree_oracle              4
+capi                      32
+chore_manifest            15
+chunk_tree_items          3
+ci_aggregate_gate         3
+ci_profile                67
+commit_order              3
+compat_ro_write_refusal   2
+compressed_extent_window  3
+compressed_short_decode   2
+compression_oracle        3
+csum_oracle               6
+csum_width_populated      1
+dup_data_writes           1
+dup_mirror_fallback       7
+extent_record_missing     1
+extent_window_read        2
+extent_window_write       3
+extent_write_oracle       3
+fixtures_present          2
+free_space_oracle         4
+fs_oracle                 13
+fstree_oracle             2
+getxattr_byte_names       1
+kernel_readback           2
+leaf_edit_oracle          3
+lib                       231
+lookup_by_name_key        1
+node_write_oracle         4
+oracle_vm_fixtures        3
+pool_oracle               4
+prealloc_extent_write     1
+read_file_huge_size       1
+read_path_cost            1
+render_plan               4
+shared_tree_block_release 1
+snapshot_shared_write     1
+split_oracle              4
+subvol_oracle             8
+superblock_mirrors        4
+super_flags_refusals      3
+super_write_oracle        3
+test_contract             5
+transaction_oracle        5
+transaction_plan          7
+tree_write_oracle         6
+write_oracle              3
+xattr_oracle              9
