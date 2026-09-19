@@ -24,7 +24,7 @@
 //! around its own fixture is a pool test that never opened a pool.
 
 use fs_btrfs::fs::Filesystem;
-use fs_btrfs_test_support::{fixture, sha256_hex};
+use fs_btrfs_test_support::{fixture, sha256_hex, Image};
 use fs_core::FileDevice;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -72,8 +72,10 @@ fn the_fixture_really_is_one_filesystem_on_two_devices() {
     let (a, b) = (fixture("btrfs-pool-a.img"), fixture("btrfs-pool-b.img"));
 
     let read = |p: &Path| -> ([u8; 16], u64, u64) {
-        let raw = std::fs::read(p).expect("reading a pool member");
-        let sb = &raw[0x10000..0x11000];
+        // The superblock alone: these members are 512 MiB each and only
+        // 4 KiB of one is wanted. See `Image`.
+        let raw = Image::open(p).read_at(0x1_0000, 0x1000);
+        let sb = &raw[..];
         let mut fsid = [0u8; 16];
         fsid.copy_from_slice(&sb[0x20..0x30]);
         (

@@ -38,7 +38,7 @@ use fs_btrfs::fs::Filesystem;
 use fs_btrfs::superblock::Superblock;
 use fs_btrfs::tree_write::stamp_checksum;
 use fs_btrfs::write::{INODE_NODATACOW, INODE_NODATASUM};
-use fs_btrfs_test_support::{fixture, le64, sha256_hex, temp_path};
+use fs_btrfs_test_support::{fixture, le64, sha256_hex, temp_path, Image};
 use fs_core::{BlockRead, FileDevice};
 use std::sync::Arc;
 
@@ -86,12 +86,20 @@ fn edit_items(
     ino: u64,
     mut edit: impl FnMut(u8, u64, &mut [u8]) -> bool,
 ) -> usize {
-    let mut bytes = std::fs::read(img).unwrap();
-    let sb = Superblock::parse(&bytes[SUPERBLOCK..SUPERBLOCK + 4096]).unwrap();
+    // A BLOCK AT A TIME, read and written back only where something
+    // changed: this fixture is 600 MiB, two tests run at once, and the
+    // harness guest has four gigabytes. See `Image`.
+    let image = Image::open(img);
+    let head = image.read_at(SUPERBLOCK as u64, 4096);
+    let sb = Superblock::parse(&head).unwrap();
     let node = sb.nodesize as usize;
     let mut patched = 0;
-    for at in (0..bytes.len() - node).step_by(4096) {
-        let block = &mut bytes[at..at + node];
+    let mut block_buf = vec![0u8; node];
+    let mut at = 0u64;
+    while image.try_read_at(at, &mut block_buf) {
+        let here = at;
+        at += 4096;
+        let block = &mut block_buf[..];
         if block[header_offsets::FSID..header_offsets::FSID + 16] != sb.fsid
             || le64(block, header_offsets::OWNER) != objectid::FS_TREE
             || block[header_offsets::LEVEL] != 0
@@ -118,11 +126,22 @@ fn edit_items(
         }
         if hit {
             stamp_checksum(block, &sb);
+            write_window(img, here, block);
             patched += 1;
         }
     }
-    std::fs::write(img, &bytes).unwrap();
     patched
+}
+
+/// Put `bytes` back at `offset` in `img`.
+fn write_window(img: &std::path::Path, offset: u64, bytes: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    std::fs::File::options()
+        .write(true)
+        .open(img)
+        .unwrap_or_else(|e| panic!("opening {} to write: {e}", img.display()))
+        .write_all_at(bytes, offset)
+        .unwrap_or_else(|e| panic!("writing {} at {offset}: {e}", img.display()));
 }
 
 fn mount(img: &std::path::Path) -> Filesystem {
@@ -195,13 +214,11 @@ fn a_short_decode_in_a_non_final_extent_is_refused() {
             .map(first_extent)
             .expect("the extent's address")
             .physical;
-        let mut bytes = std::fs::read(&img).unwrap();
-        let at = physical as usize;
+        let framing = Image::open(&img).read_at(physical, LZO_LEN + 4);
         let first_segment =
-            u32::from_le_bytes(bytes[at + LZO_LEN..at + LZO_LEN + 4].try_into().unwrap()) as usize;
+            u32::from_le_bytes(framing[LZO_LEN..LZO_LEN + 4].try_into().unwrap()) as usize;
         let shortened = (LZO_LEN + LZO_LEN + first_segment) as u32;
-        bytes[at..at + LZO_LEN].copy_from_slice(&shortened.to_le_bytes());
-        std::fs::write(&img, &bytes).unwrap();
+        write_window(&img, physical, &shortened.to_le_bytes());
     }
 
     match mount(&img).read_file(ino) {

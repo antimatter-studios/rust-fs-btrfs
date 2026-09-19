@@ -24,7 +24,7 @@
 //! same `ok` as one that exercised every entry point.
 
 use fs_btrfs::capi::*;
-use fs_btrfs_test_support::{fixture, temp_path};
+use fs_btrfs_test_support::{fixture, temp_path, Image};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::PathBuf;
 
@@ -552,7 +552,10 @@ fn a_non_utf8_path_is_rejected() {
 // ---------------------------------------------------------------------
 
 struct FileContext {
-    bytes: Vec<u8>,
+    /// The image, read a window at a time rather than held whole: the
+    /// rich fixture is 600 MiB and this callback is handed a few
+    /// kilobytes at a time. See `Image`.
+    image: Image,
     /// Set to make every read fail, proving failures surface.
     fail: bool,
 }
@@ -567,18 +570,11 @@ unsafe extern "C" fn ctx_read(
     if ctx.fail {
         return -1;
     }
-    let start = offset as usize;
-    let end = start.saturating_add(length as usize);
-    if end > ctx.bytes.len() {
+    let mut window = vec![0u8; length as usize];
+    if !ctx.image.try_read_at(offset, &mut window) {
         return -1;
     }
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            ctx.bytes[start..end].as_ptr(),
-            buf.cast::<u8>(),
-            end - start,
-        )
-    };
+    unsafe { std::ptr::copy_nonoverlapping(window.as_ptr(), buf.cast::<u8>(), window.len()) };
     0
 }
 
@@ -586,10 +582,10 @@ unsafe extern "C" fn ctx_read(
 fn mounts_over_a_caller_supplied_reader() {
     let img = rich_image();
     let ctx = Box::new(FileContext {
-        bytes: std::fs::read(&img).unwrap(),
+        image: Image::open(&img),
         fail: false,
     });
-    let size = ctx.bytes.len() as u64;
+    let size = ctx.image.len();
     let cfg = fs_btrfs_blockdev_cfg_t {
         read: Some(ctx_read),
         context: Box::into_raw(ctx) as *mut c_void,
@@ -620,8 +616,10 @@ fn mounts_over_a_caller_supplied_reader() {
 /// zeroed data — a caller cannot tell those apart.
 #[test]
 fn a_failing_callback_surfaces_as_an_error() {
+    // The image is never read — `fail` short-circuits every call — so
+    // which one it names does not matter, only that it opens.
     let ctx = Box::new(FileContext {
-        bytes: vec![0u8; 256 * 1024],
+        image: Image::open(&rich_image()),
         fail: true,
     });
     let cfg = fs_btrfs_blockdev_cfg_t {

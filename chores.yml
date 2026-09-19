@@ -89,14 +89,14 @@ chore_min_version: 0.10.0
 #   on this arm64 KVM host:
 #
 #     tier      measured          budget            headroom, and why
-#     unit        361 /  23,744      470 /  31,000   ~30%: tests get added
-#     images      293 /  13,229      380 /  17,000   ~30%
-#     oracle      358 /  17,805      470 /  23,000   ~30%. --show-output is
+#     unit        359 /  23,580      470 /  31,000   ~30%: tests get added
+#     images      293 /  13,228      380 /  17,000   ~30%
+#     oracle      357 /  17,734      470 /  23,000   ~30%. --show-output is
 #                                                    most of it, and it is
 #                                                    the evidence, so it
 #                                                    stays -- in the log
 #     kernel       83 /   6,383      110 /   8,300   ~30%
-#     suite       813 /  43,817    1,060 /  57,000   ~30%: every target
+#     suite       809 /  43,451    1,060 /  57,000   ~30%: every target
 #                                                    once, so it grows
 #                                                    with the suite
 #     scripts      60 /   2,728       80 /   4,000   ~33%: four tests
