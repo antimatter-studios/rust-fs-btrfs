@@ -1,0 +1,14 @@
+   Compiling am-fs-btrfs v0.6.2 (/mnt/storage/t3code/.t3/worktrees/diskjockey/rust-fs-btrfs-probe)
+    Finished `release` profile [optimized] target(s) in 3m 38s
+     Running tests/probe_btrfs_scale.rs (target/release/deps/probe_btrfs_scale-f54d399b7d089577)
+
+running 3 tests
+test probe_default ... [default] 2500 writes over 20 checked rounds; refusals: {}
+ok
+test probe_mixed ... [mixed] 2500 writes over 20 checked rounds; refusals: {}
+ok
+test probe_node4k_dup ... [n4k-dup] 2500 writes over 20 checked rounds; refusals: {}
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 139.22s
+

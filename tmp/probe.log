@@ -1,0 +1,56 @@
+   Compiling version_check v0.9.5
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling typenum v1.20.1
+   Compiling rustversion v1.0.23
+   Compiling generic-array v0.14.7
+   Compiling libc v0.2.189
+   Compiling autocfg v1.5.1
+   Compiling semver v1.0.28
+   Compiling num-traits v0.2.19
+   Compiling syn v3.0.5
+   Compiling rustc_version v0.4.1
+   Compiling thiserror v2.0.20
+   Compiling cfg-if v1.0.4
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling crc32c v0.6.8
+   Compiling encoding_rs v0.8.41
+   Compiling foldhash v0.2.0
+   Compiling hashbrown v0.17.1
+   Compiling digest v0.10.7
+   Compiling cpufeatures v0.2.17
+   Compiling arrayvec v0.7.8
+   Compiling multiversion_no_op v1.0.0
+   Compiling constant_time_eq v0.4.2
+   Compiling adler2 v2.0.1
+   Compiling scopeguard v1.2.0
+   Compiling twox-hash v2.1.3
+   Compiling arraydeque v0.5.1
+   Compiling simdutf8 v0.1.5
+   Compiling ruzstd v0.9.0
+   Compiling miniz_oxide v0.9.1
+   Compiling thiserror-impl v2.0.20
+   Compiling blake2b_simd v1.0.5
+   Compiling saphyr-parser v0.0.12
+   Compiling sha2 v0.10.9
+   Compiling hashlink v0.12.2
+   Compiling ordered-float v5.5.0
+   Compiling am-lzo1x v0.1.0
+   Compiling am-fs-core v0.2.10 (/mnt/storage/t3code/.t3/worktrees/diskjockey/rust-fs-core)
+   Compiling saphyr v0.0.12
+   Compiling am-fs-btrfs v0.6.2 (/mnt/storage/t3code/.t3/worktrees/diskjockey/rust-fs-btrfs-probe)
+    Finished `release` profile [optimized] target(s) in 7m 18s
+     Running tests/probe_btrfs_scale.rs (target/release/deps/probe_btrfs_scale-f54d399b7d089577)
+
+running 3 tests
+test probe_default ... [default] 300 writes over 6 checked rounds; refusals: {}
+ok
+test probe_mixed ... [mixed] 300 writes over 6 checked rounds; refusals: {}
+ok
+test probe_node4k_dup ... [n4k-dup] 300 writes over 6 checked rounds; refusals: {}
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.60s
+
