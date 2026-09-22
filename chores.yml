@@ -512,6 +512,7 @@ tasks:
     # This exists so the CI gate can be reproduced locally. If the two
     # ever differ, this is the copy that is wrong.
     cmds:
+      - scripts/agents-core-check.sh
       - cargo fmt --check
       - cargo clippy --locked --all-targets -- -D warnings
 
