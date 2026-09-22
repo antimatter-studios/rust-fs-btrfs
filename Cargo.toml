@@ -6,6 +6,11 @@ license = "MIT"
 description = "Pure-Rust Btrfs filesystem driver. Exposes a C ABI (fs_btrfs_*) suitable for FFI from C/C++/Swift/Go."
 repository = "https://github.com/antimatter-studios/rust-fs-btrfs"
 
+# The fuzz crate is its own package, on its own toolchain, and is not
+# part of this one. Without this, `cargo package` and `cargo publish`
+# try to include it and fail on the nightly-only dependency.
+exclude = ["fuzz"]
+
 [lib]
 name = "fs_btrfs"
 crate-type = ["staticlib", "rlib"]
