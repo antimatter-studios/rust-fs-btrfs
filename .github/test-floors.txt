@@ -41,7 +41,6 @@ btree_oracle              4
 capi                      32
 chore_manifest            15
 chunk_tree_items          3
-ci_aggregate_gate         3
 ci_profile                67
 commit_order              3
 compat_ro_write_refusal   2
