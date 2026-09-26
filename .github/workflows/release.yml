@@ -17,7 +17,7 @@ env:
   # this one is for the publish job below, which clones by hand because it
   # needs nothing else chore provides. Bump the two in lockstep with the
   # am-fs-core version constraint in Cargo.toml.
-  FS_CORE_REF: v0.2.10
+  FS_CORE_REF: v0.2.13
 
 jobs:
   test:

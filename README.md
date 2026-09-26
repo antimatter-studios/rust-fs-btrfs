@@ -185,10 +185,17 @@ at all ([#70][i70]).
 ### Output
 
 A task prints a verdict, not a transcript: a line per tier, a final count, and
-the path of the log under `tmp/logs/` that holds everything else. `chore test --
---verbose` streams the whole run. Each tier carries a **measured output budget**,
-and a tier that prints more than it is allowed to fails the build (exit 65) —
-the table is at the top of `chores.yml`.
+the path of the log under `tmp/logs/` that holds everything else. A failing
+tier is one line as well — its status and its log — unless
+`OUTPUT_BUDGET_FAIL_TAIL=N` asks for the last N lines. `chore test --
+--verbose` (or `OUTPUT_BUDGET_VERBOSE=1`) streams the whole run. Each tier
+carries a **measured output budget**, and a tier that prints more than it is
+allowed to fails the build (exit 65) — the table is at the top of `chores.yml`.
+
+The wrapper enforcing that is `scripts/output-budget.sh` from **rust-fs-core**,
+resolved at run time by `scripts/tier.sh` — the sibling checkout first, then the
+packaged crate — and verified by `--version` before it is used. It is not copied
+into this repository, because a copy is something that drifts.
 
 ## Lint
 
