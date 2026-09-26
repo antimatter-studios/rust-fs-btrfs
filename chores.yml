@@ -75,8 +75,10 @@ chore_min_version: 0.10.0
 # QUIET BY DEFAULT, --verbose ON REQUEST, AND THE BUDGET IS A NUMBER.
 #
 #   A task prints a VERDICT: one line per tier, a final count, and the path
-#   of the log holding everything else. A failure prints the excerpt.
-#   `chore test -- --verbose` (or FLTH_VERBOSE=1) streams the whole run.
+#   of the log holding everything else. A FAILURE IS ONE LINE TOO -- the
+#   status and the log, no excerpt, unless OUTPUT_BUDGET_FAIL_TAIL=N asks
+#   for one.
+#   `chore test -- --verbose` (or OUTPUT_BUDGET_VERBOSE=1) streams the whole run.
 #
 #   Nothing is thrown away: every tier's output goes to tmp/logs/<tier>.log
 #   in full, including the per-call `[oracle vm]` and `[kernel vm]`
@@ -106,7 +108,12 @@ chore_min_version: 0.10.0
 #     suite       810 /  44,217    1,060 /  57,500   ~30%: every target
 #                                                    once, so it grows
 #                                                    with the suite
-#     scripts      60 /   2,728       80 /   4,000   ~33%: four tests
+#     scripts      72 /   3,400       95 /   4,450   ~30%: four tests. Up
+#                                                    from 60 / 2,728 when
+#                                                    output-budget.sh grew
+#                                                    the resolver's refusal
+#                                                    cases -- measured
+#                                                    2026-09-26
 #     vm          957 /  50,636    1,250 /  66,000   ~30%: the same suite,
 #                                                    plus the guest's own
 #                                                    build, from cold
@@ -122,14 +129,18 @@ chore_min_version: 0.10.0
 #
 #   Raise one DELIBERATELY when a tier grows, the way the executed-test
 #   floors are raised. A budget nobody can breach measures nothing, and
-#   tests/scripts/test-output-budget.sh fails a tier that has none.
+#   tests/scripts/output-budget.sh fails a tier that has none.
 #
 #   Why it is worth a task's while: a passing run that prints three thousand
 #   lines hides the twenty that matter, and every reader pays for it --
 #   a person scrolling, a CI log viewer, and an agent working here, which
 #   re-reads its transcript on every step and so pays for one loud run many
-#   times over. See the fs-linux-test-harness README, "Output: quiet by
-#   default, --verbose on request".
+#   times over.
+#
+#   THE WRAPPER ITSELF IS rust-fs-core's, resolved at run time by
+#   scripts/tier.sh -- not a copy committed here, and no longer read out of
+#   ../fs-linux-test-harness. See that script's header for the resolution
+#   order and the `--version` contract it holds the wrapper to.
 vars:
   TRIPLE: aarch64-apple-darwin
   LIBNAME: fs_btrfs
@@ -143,7 +154,12 @@ vars:
   # Cargo.lock, or `--locked` will refuse to build. Bump it in lockstep
   # with the constraint in Cargo.toml.
   FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
-  FS_CORE_REF: v0.2.10
+  # v0.2.13 is the release the tiers need: v0.2.11 first packaged
+  # scripts/output-budget.sh and v0.2.13 is the one where a FAILING tier is
+  # quiet too -- a verdict naming the log, no tail unless asked. scripts/tier.sh
+  # resolves that script from core and verifies it by --version on every run,
+  # so this pin cannot go back below v0.2.13 while it does.
+  FS_CORE_REF: v0.2.13
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   LINUX_HARNESS_REF: v0.1.0
 
@@ -189,16 +205,36 @@ tasks:
     cmds:
       - |
         set -eu
+        # SIBLINGS LIVE BESIDE THE MAIN TREE, NOT BESIDE THIS CHECKOUT.
+        #
+        # `../$name` was resolved from wherever the task ran, and a thread worktree
+        # is not next to the main checkout -- it lives under the agent's own
+        # directory. Measured on 2026-09-22 the same family resolved
+        # ../rust-fs-core to THREE different places: beside the main checkouts,
+        # beside the ntfs worktrees, and beside the diskjockey ones. One of those
+        # was a day out of date and was winning silently for anything resolving
+        # relatively.
+        #
+        # A sibling set is a property of the machine, not of a checkout. One copy
+        # on disk is the whole point of siblings over submodules, and it holds only
+        # if every checkout of every crate agrees where that copy is.
+        # --git-common-dir names the main tree from a worktree AND from the main
+        # checkout, so this answers the same from anywhere.
+        #
+        # --path-format=absolute is required, not tidiness: without it a main
+        # checkout reports a bare `.git` and this resolves to `//$name`.
+        common="$(git rev-parse --path-format=absolute --git-common-dir)"
+        siblings_root="$(cd "$common/../.." && pwd)"
         printf '%s\t%s\t%s\n' \
           rust-fs-core          '{{.FS_CORE_URL}}'       '{{.FS_CORE_REF}}' \
           fs-linux-test-harness '{{.LINUX_HARNESS_URL}}' '{{.LINUX_HARNESS_REF}}' \
         | while IFS="$(printf '\t')" read -r name url ref; do
-            dir="../$name"
+            dir="$siblings_root/$name"
             if [ ! -d "$dir/.git" ]; then
               echo "siblings: cloning $name at $ref"
               git init --quiet "$dir"
               git -C "$dir" remote add origin "$url"
-              git -C "$dir" fetch --quiet --depth 1 origin "$ref"
+              git -C "$dir" fetch --quiet origin "$ref"   # not --depth 1: merge-base needs history
               git -C "$dir" checkout --quiet FETCH_HEAD
               continue
             fi
@@ -206,13 +242,56 @@ tasks:
               echo "siblings: $name has uncommitted changes -- refusing to move it." >&2
               exit 1
             fi
-            git -C "$dir" fetch --quiet origin "$ref"
-            if [ "$(git -C "$dir" rev-parse HEAD)" = "$(git -C "$dir" rev-parse FETCH_HEAD)" ]; then
-              echo "siblings: $name already at $ref"
-              continue
+            git -C "$dir" fetch --quiet origin main
+            # THE PIN HAS TO BE NAMEABLE IN THE SIBLING, and fetching it is not
+            # enough to make it so. `git fetch origin main v0.2.13` does NOT
+            # create refs/tags/v0.2.13 locally -- measured 2026-09-26 on git
+            # 2.47.3 -- so the merge-base below would be asked about an object
+            # this checkout has never heard of, exit 128, and be read as "below
+            # the floor". A sibling the fresh-clone path above created has no
+            # tags at all, which is exactly when the floor check matters.
+            # Fetched into a ref of our own, forced, so it is always present and
+            # always current.
+            git -C "$dir" fetch --quiet --force origin "$ref:refs/chore/pin"
+            # THE PIN IS A FLOOR, NOT A TARGET, AND THE SIBLING STAYS ON A BRANCH.
+            #
+            # This used to compare HEAD with the pinned ref and check out the ref
+            # whenever they differed, which had two consequences, both observed.
+            #
+            # It moved the checkout BACKWARDS. One copy of core is shared by every
+            # crate on the machine, so the oldest pin in the family won: a sibling two
+            # commits ahead was silently rewound to satisfy this repository.
+            #
+            # And checking out a tag DETACHES. Core was found detached and 52 commits
+            # stale, four days after a `chore siblings` run put it there, because a
+            # detached HEAD reads as a deliberate state and nothing complains about it.
+            # On a branch, being behind shows up in `git status` the first time anyone
+            # looks -- and a commit made in the sibling belongs to something.
+            #
+            # So: guarantee a FLOOR, and never move anyone off their branch.
+            #
+            # An earlier cut of this checked out main unconditionally, which is only a
+            # little better than the detach it replaced. rust-fs-core was found on
+            # release/v0.2.12 with an unpushed commit while a release was being cut;
+            # checking out main would have taken it away mid-cut. The previous
+            # revision of this task did worse to that same checkout on 2026-09-22 --
+            # it rewound a shared core three weeks, to a September 6th commit.
+            #
+            # If the checkout already contains the pinned ref it is left exactly as it
+            # is, on whatever branch that is. Only a checkout genuinely below the floor
+            # is moved, and only by fast-forwarding a main that is already checked out.
+            # Anything else is reported for a human, because this is one checkout
+            # shared by every crate on the machine and not this task's to hijack.
+            current="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
+            if git -C "$dir" merge-base --is-ancestor refs/chore/pin HEAD; then
+              echo "siblings: $name at or ahead of $ref (on $current)"
+            elif [ "$current" = "main" ] && git -C "$dir" merge --ff-only --quiet origin/main 2>/dev/null; then
+              echo "siblings: $name fast-forwarded to $(git -C "$dir" rev-parse --short HEAD)"
+            else
+              echo "siblings: $name is on '$current' and below $ref; this task will not move it." >&2
+              echo "          It is one checkout shared by every crate here -- move it yourself." >&2
+              exit 1
             fi
-            echo "siblings: moving $name to $ref"
-            git -C "$dir" checkout --quiet FETCH_HEAD
           done
 
   tools:
@@ -408,9 +487,9 @@ tasks:
         set -eu
         # --verbose belongs to the whole run, and test:native's tiers are
         # separate chore invocations: an exported variable is what reaches
-        # them, which is why tier.sh reads FLTH_VERBOSE as well as the flag.
+        # them, which is why tier.sh reads OUTPUT_BUDGET_VERBOSE as well as the flag.
         case " ${CLI_ARGS:-} " in
-          *" --verbose "*|*" -v "*) export FLTH_VERBOSE=1 ;;
+          *" --verbose "*|*" -v "*) export OUTPUT_BUDGET_VERBOSE=1 ;;
         esac
         if [ "$(uname -s)" != Linux ]; then
           echo "test: this host is $(uname -s) -- running the Linux suite in the harness VM."
@@ -446,7 +525,7 @@ tasks:
     cmds:
       - |
         set -eu
-        scripts/tier.sh test:scripts scripts 80 4000 -- bash -c '
+        scripts/tier.sh test:scripts scripts 95 4450 -- bash -c '
           set -eu
           for t in tests/scripts/*.sh; do
             echo "== $t"

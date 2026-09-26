@@ -26,7 +26,7 @@ dependencies = [
 
 [[package]]
 name = "am-fs-core"
-version = "0.2.10"
+version = "0.2.13"
 
 [[package]]
 name = "am-lzo1x"
