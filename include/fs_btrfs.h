@@ -149,11 +149,23 @@ int64_t fs_btrfs_read_file(fs_btrfs_fs_t *fs, const char *path,
                            void *buf, uint64_t offset, uint64_t length);
 
 /*
- * Length written excluding the terminator, or -1.
+ * Target of the symbolic link at `path`. The contract every driver in
+ * the family shares:
  *
- * A buffer too small for the target plus its terminator is REFUSED with
- * ERANGE rather than truncated — a truncated target is a path to
- * somewhere else, and a caller following it could not tell.
+ *   success     returns the target length in bytes, EXCLUDING the NUL
+ *               (the value Linux readlink(2) returns), and writes the
+ *               target followed by a NUL terminator into buf. Test for
+ *               success with `>= 0`, not `== 0`.
+ *   too small   bufsize < length + 1 returns -1, fs_btrfs_last_errno()
+ *               is ERANGE, fs_btrfs_last_error() names the size needed,
+ *               and NOTHING is written into buf. Never a truncation —
+ *               deliberately unlike Linux: a truncated target is a path
+ *               to somewhere else, and a caller following it could not
+ *               tell.
+ *   NULL        a NULL fs, path or buf returns -1 with EINVAL.
+ *   not a link  returns -1 with EINVAL, as readlink(2) does.
+ *   otherwise   -1, with fs_btrfs_last_errno() set by this call (ENOENT
+ *               for a missing path, EIO for a damaged volume, ...).
  */
 int fs_btrfs_readlink(fs_btrfs_fs_t *fs, const char *path,
                       char *buf, size_t bufsize);

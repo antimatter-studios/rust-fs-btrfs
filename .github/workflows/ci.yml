@@ -253,7 +253,7 @@ jobs:
           set -euo pipefail
           bash scripts/test-floor.sh --log tmp/logs/unit.log 322
           bash scripts/test-floor.sh --log tmp/logs/oracle.log 30
-          bash scripts/test-floor.sh --log tmp/logs/kernel.log 5
+          bash scripts/test-floor.sh --log tmp/logs/kernel.log 6
           bash scripts/test-floor.sh --log tmp/logs/suite.log 500
       # The shell tests are counted by their own `ok` lines rather than
       # by libtest's summary, but the failure is identical in shape:
@@ -318,7 +318,7 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/test-floor.sh --log tmp/logs/unit.log 322
-          bash scripts/test-floor.sh --log tmp/logs/images.log 142
+          bash scripts/test-floor.sh --log tmp/logs/images.log 149
 
   suite-in-vm:
     name: suite in the guest (the macOS path)
