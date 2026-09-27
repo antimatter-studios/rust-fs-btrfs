@@ -4,7 +4,7 @@ chore_min_version: 0.10.0
 # THE CONTRACT THIS FILE EXISTS TO OWN.
 #
 # How to build rust-fs-btrfs is knowledge that belongs to rust-fs-btrfs. It used to
-# live in diskjockey/scripts/build-fs-*.sh — four scripts, 757 lines between
+# live in a consumer's build scripts — four of them, 757 lines between
 # them, byte-identical once you normalise the driver name, of which three
 # lines per script were actually about the filesystem: the cargo invocation,
 # the header name and the archive name.
@@ -211,7 +211,7 @@ tasks:
         # is not next to the main checkout -- it lives under the agent's own
         # directory. Measured on 2026-09-22 the same family resolved
         # ../rust-fs-core to THREE different places: beside the main checkouts,
-        # beside the ntfs worktrees, and beside the diskjockey ones. One of those
+        # beside the ntfs worktrees, and beside a consumer's. One of those
         # was a day out of date and was winning silently for anything resolving
         # relatively.
         #
