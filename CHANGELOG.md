@@ -4,7 +4,7 @@ Notable changes to `am-fs-btrfs`, newest first. This is a `0.x` crate, so the
 **minor** is the compatibility boundary: a minor bump may break API, a patch
 never does.
 
-## [Unreleased]
+## [0.7.0] — 2026-09-27
 
 ### Breaking
 
@@ -215,7 +215,8 @@ never does.
   the path silently.
 - Both `metadata_uuid` renderings the reference tooling emits are tolerated.
 
-[Unreleased]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.6.1...HEAD
+[0.7.0]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.6.2...v0.7.0
+[0.6.2]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.4.0...v0.5.0
