@@ -34,6 +34,7 @@ const ENOENT: i32 = 2;
 const EIO: i32 = 5;
 const ENOTDIR: i32 = 20;
 const EISDIR: i32 = 21;
+const EINVAL: i32 = 22;
 const ERANGE: i32 = 34;
 
 fn rich_image() -> PathBuf {
@@ -315,6 +316,171 @@ fn readlink_refuses_a_buffer_too_small_for_the_target() {
         "a refused readlink must not have written into the buffer"
     );
     unsafe { fs_btrfs_umount(fs) };
+}
+
+// ---------------------------------------------------------------------
+// The family readlink contract (#205)
+//
+// Every driver in the family answers readlink the same way: the target
+// length on success (excluding the NUL, like readlink(2)) with the target
+// and a terminator written; -1 ERANGE and an untouched buffer when it does
+// not fit; -1 EINVAL for a NULL argument; and -1 with THIS call's errno on
+// any other failure.
+// ---------------------------------------------------------------------
+
+/// The fixture's link, as `ln -s inline.txt link-short` made it.
+const LINK_SHORT_TARGET: &[u8] = b"inline.txt";
+
+/// Fill value no readlink writes, so "untouched" is checkable. See
+/// `readlink_refuses_a_buffer_too_small_for_the_target` for why it is
+/// compared as `c_char` rather than converted.
+const UNTOUCHED: c_char = 0x7F;
+
+fn readlink_into(fs: *mut fs_btrfs_fs, path: &str, buf: &mut [c_char], bufsize: usize) -> i32 {
+    assert!(bufsize <= buf.len());
+    unsafe { fs_btrfs_readlink(fs, cstr(path).as_ptr(), buf.as_mut_ptr(), bufsize) }
+}
+
+/// Leave an errno behind that no readlink failure below should report, so
+/// a check that reads errno sees this call's value and not a stale one.
+fn poison_errno(fs: *mut fs_btrfs_fs) {
+    let mut small = [0 as c_char; 1];
+    assert_eq!(readlink_into(fs, "/link-short", &mut small, 1), -1);
+    assert_eq!(fs_btrfs_last_errno(), ERANGE);
+}
+
+fn as_bytes(buf: &[c_char]) -> Vec<u8> {
+    buf.iter().map(|&c| c.to_ne_bytes()[0]).collect()
+}
+
+#[test]
+fn readlink_returns_the_length_and_writes_the_target_and_a_nul() {
+    let fs = mount();
+    let mut buf = [UNTOUCHED; 64];
+    let n = readlink_into(fs, "/link-short", &mut buf, 64);
+    assert_eq!(
+        n,
+        LINK_SHORT_TARGET.len() as i32,
+        "success returns the target length excluding the NUL: {}",
+        last_error()
+    );
+    let bytes = as_bytes(&buf);
+    assert_eq!(&bytes[..LINK_SHORT_TARGET.len()], LINK_SHORT_TARGET);
+    assert_eq!(
+        bytes[LINK_SHORT_TARGET.len()],
+        0,
+        "the target is NUL-terminated"
+    );
+    assert!(
+        buf[LINK_SHORT_TARGET.len() + 1..]
+            .iter()
+            .all(|&c| c == UNTOUCHED),
+        "nothing past the terminator is written"
+    );
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+#[test]
+fn readlink_fits_a_buffer_of_exactly_length_plus_one() {
+    let fs = mount();
+    let len = LINK_SHORT_TARGET.len();
+    let mut buf = [UNTOUCHED; 64];
+    let n = readlink_into(fs, "/link-short", &mut buf, len + 1);
+    assert_eq!(n, len as i32, "an exact fit succeeds: {}", last_error());
+    let bytes = as_bytes(&buf);
+    assert_eq!(&bytes[..len], LINK_SHORT_TARGET);
+    assert_eq!(bytes[len], 0);
+    assert!(buf[len + 1..].iter().all(|&c| c == UNTOUCHED));
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+#[test]
+fn readlink_refuses_a_buffer_one_short_of_the_terminator() {
+    let fs = mount();
+    let len = LINK_SHORT_TARGET.len();
+    let mut buf = [UNTOUCHED; 64];
+    assert_eq!(readlink_into(fs, "/link-short", &mut buf, len), -1);
+    assert_eq!(fs_btrfs_last_errno(), ERANGE);
+    let message = last_error();
+    assert!(
+        message.contains(&(len + 1).to_string()),
+        "the message names the size needed ({}): {message}",
+        len + 1
+    );
+    assert!(
+        buf.iter().all(|&c| c == UNTOUCHED),
+        "a refused readlink writes nothing, not even a terminator"
+    );
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+/// A zero-length buffer is a buffer too small, not a NULL pointer.
+#[test]
+fn readlink_into_a_zero_length_buffer_is_erange() {
+    let fs = mount();
+    let mut buf = [UNTOUCHED; 4];
+    assert_eq!(readlink_into(fs, "/link-short", &mut buf, 0), -1);
+    assert_eq!(fs_btrfs_last_errno(), ERANGE, "{}", last_error());
+    assert!(buf.iter().all(|&c| c == UNTOUCHED));
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+/// readlink(2) on something that is not a link is EINVAL — for a regular
+/// file as much as for a directory, so EISDIR would misdirect.
+#[test]
+fn readlink_on_a_non_symlink_sets_einval() {
+    let fs = mount();
+    for path in ["/inline.txt", "/sub"] {
+        poison_errno(fs);
+        let mut buf = [UNTOUCHED; 64];
+        assert_eq!(readlink_into(fs, path, &mut buf, 64), -1, "{path}");
+        assert_eq!(fs_btrfs_last_errno(), EINVAL, "{path}: {}", last_error());
+        assert!(buf.iter().all(|&c| c == UNTOUCHED), "{path}");
+    }
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+#[test]
+fn readlink_on_a_missing_path_sets_enoent() {
+    let fs = mount();
+    poison_errno(fs);
+    let mut buf = [UNTOUCHED; 64];
+    assert_eq!(readlink_into(fs, "/no-such-link", &mut buf, 64), -1);
+    assert_eq!(fs_btrfs_last_errno(), ENOENT, "{}", last_error());
+    assert!(buf.iter().all(|&c| c == UNTOUCHED));
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+#[test]
+fn readlink_with_a_null_argument_is_einval() {
+    let fs = mount();
+    let link = cstr("/link-short");
+    let mut buf = [UNTOUCHED; 64];
+    unsafe {
+        poison_errno(fs);
+        assert_eq!(
+            fs_btrfs_readlink(std::ptr::null_mut(), link.as_ptr(), buf.as_mut_ptr(), 64),
+            -1
+        );
+        assert_eq!(fs_btrfs_last_errno(), EINVAL, "NULL fs");
+
+        poison_errno(fs);
+        assert_eq!(
+            fs_btrfs_readlink(fs, std::ptr::null(), buf.as_mut_ptr(), 64),
+            -1
+        );
+        assert_eq!(fs_btrfs_last_errno(), EINVAL, "NULL path");
+
+        poison_errno(fs);
+        assert_eq!(
+            fs_btrfs_readlink(fs, link.as_ptr(), std::ptr::null_mut(), 64),
+            -1
+        );
+        assert_eq!(fs_btrfs_last_errno(), EINVAL, "NULL buf");
+
+        fs_btrfs_umount(fs);
+    }
+    assert!(buf.iter().all(|&c| c == UNTOUCHED));
 }
 
 // ---------------------------------------------------------------------

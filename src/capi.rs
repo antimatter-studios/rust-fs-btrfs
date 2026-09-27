@@ -48,6 +48,8 @@ const ENOENT: c_int = 2;
 const EIO: c_int = 5;
 const ENOTDIR: c_int = 20;
 const EISDIR: c_int = 21;
+/// `EINVAL` — a NULL argument, or readlink on something that is not a link.
+const EINVAL: c_int = 22;
 const EROFS_ERRNO: c_int = 30;
 /// `ERANGE` — a result did not fit the caller's buffer.
 const ERANGE: c_int = 34;
@@ -639,7 +641,18 @@ pub unsafe extern "C" fn fs_btrfs_read_file(
     })
 }
 
-/// Target of a symbolic link, NUL-terminated and truncated to `bufsize`.
+/// Target of a symbolic link: its length on success, or -1.
+///
+/// The family's readlink contract, shared by every driver so a layer
+/// above needs one shape for it:
+///
+/// - success returns the target length in bytes EXCLUDING the NUL, as
+///   Linux `readlink(2)` does, and writes the target followed by a NUL;
+/// - `bufsize < length + 1` returns -1 with `ERANGE`, a message naming the
+///   size needed, and NOTHING written into `buf` — never a truncation;
+/// - a NULL `fs`, `path` or `buf` returns -1 with `EINVAL`;
+/// - a path that is not a symlink returns -1 with `EINVAL`, as
+///   `readlink(2)` does, and any other failure -1 with this call's errno.
 ///
 /// # Safety
 ///
@@ -653,8 +666,8 @@ pub unsafe extern "C" fn fs_btrfs_readlink(
     bufsize: usize,
 ) -> c_int {
     guard(-1, || {
-        if fs.is_null() || buf.is_null() || bufsize == 0 {
-            set_error("fs or buf is NULL, or bufsize is zero".into(), EIO);
+        if fs.is_null() || path.is_null() || buf.is_null() {
+            set_error("readlink: fs, path or buf is NULL".into(), EINVAL);
             return -1;
         }
         let Some(path) = (unsafe { borrow_str(path, "path") }) else {
@@ -668,32 +681,43 @@ pub unsafe extern "C" fn fs_btrfs_readlink(
                 return -1;
             }
         };
+        if !found.is_symlink() {
+            set_error(format!("readlink: {path} is not a symbolic link"), EINVAL);
+            return -1;
+        }
         match fs.read_link(found.ino) {
             Ok(target) => {
                 // Refuse rather than truncate. A truncated symlink target
                 // is a path to somewhere else, and a caller following it
                 // has no way to tell — so a buffer that cannot hold the
                 // whole target plus its terminator is an error, not a
-                // partial success. ERANGE tells the caller to retry with
-                // a larger buffer, which is the standard idiom.
-                //
-                // The sibling EROFS driver already behaved this way; the
-                // family now agrees.
-                if target.len() + 1 > bufsize {
+                // partial success, and nothing is written. ERANGE tells
+                // the caller to retry with a larger buffer.
+                let needed = target.len() + 1;
+                if needed > bufsize {
                     set_error(
                         format!(
-                            "readlink buffer holds {bufsize} bytes, need {} for the target \
-                             and its terminator",
-                            target.len() + 1
+                            "readlink buffer holds {bufsize} bytes, need {needed} for the target \
+                             and its terminator"
                         ),
                         ERANGE,
                     );
                     return -1;
                 }
-                let out = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), bufsize) };
+                // `read_link` bounds a target by PATH_MAX, so the length
+                // always fits the return type; refuse rather than wrap if
+                // that ever stops being true.
+                let Ok(len) = c_int::try_from(target.len()) else {
+                    set_error(
+                        format!("readlink target of {} bytes is too long", target.len()),
+                        EIO,
+                    );
+                    return -1;
+                };
+                let out = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), needed) };
                 out[..target.len()].copy_from_slice(&target);
                 out[target.len()] = 0;
-                target.len() as c_int
+                len
             }
             Err(e) => {
                 record(&e);

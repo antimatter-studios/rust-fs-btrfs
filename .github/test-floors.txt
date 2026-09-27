@@ -38,7 +38,7 @@
 backup_ring               1
 bootstrap_chain           2
 btree_oracle              4
-capi                      32
+capi                      39
 chore_manifest            15
 chunk_tree_items          3
 ci_profile                67
@@ -70,6 +70,7 @@ pool_oracle               4
 prealloc_extent_write     1
 read_file_huge_size       1
 read_path_cost            1
+readlink_kernel_oracle    1
 render_plan               4
 shared_tree_block_release 1
 snapshot_shared_write     1

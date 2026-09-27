@@ -6,6 +6,21 @@ never does.
 
 ## [Unreleased]
 
+### Breaking
+
+- **`fs_btrfs_readlink` follows the family readlink contract** (#205),
+  shared by every driver so a layer above needs one shape for the call:
+  success returns the target length excluding the NUL, as `readlink(2)`
+  does, with the target and a terminator written; a buffer smaller than
+  the length plus one is `-1`/`ERANGE` with a message naming the size
+  needed and nothing written; a NULL `fs`, `path` or `buf` is
+  `-1`/`EINVAL`; and any other failure sets this call's errno. What
+  changed here is the errno: a NULL argument was `EIO` (or `ENOENT` for
+  the path) and is `EINVAL`; a zero `bufsize` was `EIO` and is `ERANGE`;
+  and a path that is not a symlink was `EISDIR`, which is wrong for a
+  regular file, and is `EINVAL` as `readlink(2)` reports it. A caller
+  testing the result `== 0` for success must test `>= 0`.
+
 ### Added
 
 - **The parsers are fuzzed, on two tiers.** Nothing here had a fuzz
