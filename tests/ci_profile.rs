@@ -2613,3 +2613,244 @@ jobs:
         }
     }
 }
+
+/// Which `am-fs-core` this crate is built against, as stated in one file.
+///
+/// Four spellings, because the pin is a dependency version in a
+/// manifest, a resolved version in a lockfile, an environment variable
+/// in a workflow, and an argument to `git clone`. All four are returned
+/// normalised without the leading `v`, paired with the spelling that
+/// produced them so a failure names what to edit.
+///
+/// A comment is not a declaration. `chores.yml` explains its pin in
+/// prose, and a scan that read the prose would report a disagreement
+/// nobody can fix.
+///
+/// A value that is not a literal version is not a declaration either:
+/// `release.yml` clones `--branch "$FS_CORE_REF"`, which is the
+/// variable declared above it and not a second, independent pin.
+fn am_fs_core_versions_declared(text: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut previous = "";
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if previous == "name = \"am-fs-core\"" {
+            if let Some(v) = quoted_value_after(line, "version") {
+                found.push(("the locked am-fs-core `version`".to_string(), v));
+            }
+        }
+        previous = line;
+        if line.contains("am-fs-core") {
+            if let Some(v) = quoted_value_after(line, "version") {
+                found.push(("the am-fs-core dependency's `version`".to_string(), v));
+            }
+        }
+        if let Some(rest) = line.split_once("FS_CORE_REF:") {
+            if let Some(v) = as_version(rest.1) {
+                found.push(("`FS_CORE_REF`".to_string(), v));
+            }
+        }
+        if line.contains("rust-fs-core") {
+            if let Some(rest) = line.split_once("--branch ") {
+                if let Some(v) = as_version(rest.1.split_whitespace().next().unwrap_or("")) {
+                    found.push(("the `git clone --branch` ref".to_string(), v));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The value of `key = "..."` on a line, if it is there.
+fn quoted_value_after(line: &str, key: &str) -> Option<String> {
+    let after = line.split_once(key)?.1;
+    let after = after.trim_start().strip_prefix('=')?.trim_start();
+    let inner = after.strip_prefix('"')?;
+    let end = inner.find('"')?;
+    Some(inner[..end].to_string())
+}
+
+/// `v0.2.13`, `"0.2.13"` and `0.2.13` are the same pin; `"$FS_CORE_REF"`
+/// and `main` are not pins at all.
+fn as_version(raw: &str) -> Option<String> {
+    let t = raw.trim().trim_matches(|c| c == '"' || c == '\'');
+    let t = t.strip_prefix('v').unwrap_or(t);
+    let parts: Vec<&str> = t.split('.').collect();
+    if parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        Some(t.to_string())
+    } else {
+        None
+    }
+}
+
+/// Every file that declares one.
+///
+/// A fixed list rather than a walk: the point is that each of these is
+/// known to carry a pin, so one that stops carrying it is a failure
+/// rather than a file the walk no longer visits. `fuzz/Cargo.toml` is
+/// not here: it reaches `am-fs-core` only through this crate, so its
+/// pin lives in `fuzz/Cargo.lock` alone.
+const FILES_THAT_PIN_AM_FS_CORE: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "fuzz/Cargo.lock",
+    "chores.yml",
+    ".github/workflows/release.yml",
+    ".github/workflows/fuzz.yml",
+];
+
+/// How many declarations the files above carry between them: one each.
+///
+/// Asserted as a number as well as file by file, so a second pin
+/// appearing in one of them -- a second clone step, a duplicated
+/// lockfile entry -- is a failure to look at rather than a count that
+/// quietly grew.
+const AM_FS_CORE_DECLARATIONS: usize = 6;
+
+/// Every file that names the `am-fs-core` this crate is built against
+/// names the same one.
+///
+/// Six files carry that version and nothing compared them.
+/// `fuzz/Cargo.lock` still resolved `am-fs-core` 0.2.10 after the crate,
+/// its own lockfile, `chores.yml` and both workflows had moved to
+/// 0.2.13. Nothing noticed: the fuzz run does not build `--locked`, so
+/// cargo rewrote the stale entry in the runner's copy and the committed
+/// one stayed wrong. The same drift in rust-fs-squashfs left its nightly
+/// fuzz run red four nights running on an overflow core had already
+/// fixed.
+///
+/// The count is asserted as well as the agreement. A scan that stopped
+/// matching would otherwise report perfect agreement among nothing.
+#[test]
+fn every_declaration_of_the_am_fs_core_pin_names_the_same_version() {
+    let root = manifest_dir();
+    let mut declared: Vec<(&str, String, String)> = Vec::new();
+    let mut silent = Vec::new();
+
+    for rel in FILES_THAT_PIN_AM_FS_CORE {
+        let found = am_fs_core_versions_declared(&read_or_panic(&root.join(rel)));
+        if found.is_empty() {
+            silent.push(*rel);
+        }
+        for (spelling, version) in found {
+            declared.push((rel, spelling, version));
+        }
+    }
+
+    assert!(
+        silent.is_empty(),
+        "these files are listed as declaring the am-fs-core pin and no longer do: \
+         {silent:?}. Either the pin moved somewhere this guard does not read -- in \
+         which case add it to FILES_THAT_PIN_AM_FS_CORE -- or the file stopped \
+         pinning the sibling and now builds against whatever is checked out."
+    );
+    assert_eq!(
+        declared.len(),
+        AM_FS_CORE_DECLARATIONS,
+        "expected {AM_FS_CORE_DECLARATIONS} declarations of the am-fs-core pin \
+         across {FILES_THAT_PIN_AM_FS_CORE:?}, found {declared:?}"
+    );
+
+    let agreed = &declared[0].2;
+    let disagreeing: Vec<String> = declared
+        .iter()
+        .filter(|(_, _, v)| v != agreed)
+        .map(|(file, spelling, v)| format!("{file}: {spelling} says {v}"))
+        .collect();
+    assert!(
+        disagreeing.is_empty(),
+        "the am-fs-core pin disagrees across the files that declare it. \
+         {}: {} says {agreed}, but {disagreeing:?}. A bump has to move every \
+         one of them.",
+        declared[0].0,
+        declared[0].1,
+    );
+}
+
+mod core_pin_parser {
+    use super::{am_fs_core_versions_declared, as_version};
+
+    /// The real dependency line.
+    #[test]
+    fn a_path_dependency_declares_its_version() {
+        let toml = "am-fs-core = { path = \"../rust-fs-core\", version = \"0.2.13\" }\n";
+        assert_eq!(
+            am_fs_core_versions_declared(toml),
+            vec![(
+                "the am-fs-core dependency's `version`".to_string(),
+                "0.2.13".to_string()
+            )],
+        );
+    }
+
+    /// A lockfile entry declares its version on the line after its name,
+    /// and the bare `"am-fs-core",` in a dependents list declares nothing.
+    #[test]
+    fn a_lockfile_entry_declares_its_version() {
+        let lock = "[[package]]\nname = \"am-fs-btrfs\"\nversion = \"0.7.0\"\n\
+                    dependencies = [\n \"am-fs-core\",\n]\n\n\
+                    [[package]]\nname = \"am-fs-core\"\nversion = \"0.2.10\"\n";
+        assert_eq!(
+            am_fs_core_versions_declared(lock),
+            vec![(
+                "the locked am-fs-core `version`".to_string(),
+                "0.2.10".to_string()
+            )],
+        );
+    }
+
+    /// The workflow spelling, with and without the `v`.
+    #[test]
+    fn the_env_variable_declares_its_version() {
+        assert_eq!(
+            am_fs_core_versions_declared("  FS_CORE_REF: v0.2.13\n"),
+            vec![("`FS_CORE_REF`".to_string(), "0.2.13".to_string())],
+        );
+    }
+
+    /// The clone spelling, which is how fuzz.yml carries its pin.
+    #[test]
+    fn a_clone_branch_declares_its_version() {
+        let line = "run: git clone --depth 1 --branch v0.2.13 \
+                    https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core\n";
+        assert_eq!(
+            am_fs_core_versions_declared(line),
+            vec![(
+                "the `git clone --branch` ref".to_string(),
+                "0.2.13".to_string()
+            )],
+        );
+    }
+
+    /// Prose naming a version is not a declaration.
+    #[test]
+    fn a_comment_naming_a_version_is_not_a_declaration() {
+        let yaml = "  # v0.2.13: the release whose wrapper answers --verbose.\n  \
+                    # FS_CORE_REF: v0.2.10 was the pin before.\n";
+        assert!(am_fs_core_versions_declared(yaml).is_empty());
+    }
+
+    /// `release.yml` clones `--branch "$FS_CORE_REF"`: the variable, not
+    /// a second pin.
+    #[test]
+    fn a_branch_that_is_a_variable_is_not_a_declaration() {
+        let line = "run: git clone --depth 1 --branch \"$FS_CORE_REF\" \
+                    https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core\n";
+        assert!(am_fs_core_versions_declared(line).is_empty());
+    }
+
+    /// A branch name is not a version.
+    #[test]
+    fn a_branch_name_is_not_a_version() {
+        assert_eq!(as_version("main"), None);
+        assert_eq!(as_version("v0.2"), None);
+        assert_eq!(as_version("v0.2.13"), Some("0.2.13".to_string()));
+    }
+}
