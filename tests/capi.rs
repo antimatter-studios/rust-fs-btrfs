@@ -1255,3 +1255,71 @@ fn the_xattr_entry_points_tolerate_nulls() {
     assert_eq!(fs_btrfs_last_errno(), ENOENT, "{}", last_error());
     unsafe { fs_btrfs_umount(fs) };
 }
+
+// ---- paths are bytes (#214) --------------------------------------------
+
+/// `/caf\xe9.txt` — latin-1 for `café.txt`, which is what a name written
+/// on a Linux box with a non-UTF-8 locale looks like. `\xe9` alone is not
+/// a legal UTF-8 sequence.
+///
+/// `c_char` is `i8` on x86_64 and Apple targets and `u8` on
+/// aarch64-linux, so `from_ne_bytes` is the spelling that works on both.
+fn non_utf8_path() -> Vec<c_char> {
+    b"/caf\xe9.txt\0"
+        .iter()
+        .map(|&b| c_char::from_ne_bytes([b]))
+        .collect()
+}
+
+/// A name that is not valid UTF-8 is REACHABLE, not merely refused.
+///
+/// Btrfs directory entry names are raw bytes and the format has no field
+/// that could say what encoding they are in, so such names are ordinary
+/// rather than hostile: any image built on a box with a non-UTF-8 locale
+/// holds them.
+///
+/// This crate refused them at the ABI, which is better than answering
+/// about the wrong inode — but it left the file listed and unopenable.
+/// `fs_btrfs_dir_next` hands the caller the entry's name from the raw
+/// bytes, so the ABI reported a name it then refused to accept, and
+/// composing the path from those same bytes produced the same rejection
+/// (#214).
+///
+/// The fixture has no such file, so what is asserted here is the shape
+/// of the refusal: a path naming no file is `ENOENT`, the honest answer
+/// for bytes that name nothing, and NOT a complaint about the argument's
+/// encoding. That is what tells a caller the file is absent rather than
+/// that its own string handling is wrong.
+#[test]
+fn a_non_utf8_path_is_taken_as_bytes_and_reported_as_missing() {
+    let fs = mount();
+    let path = non_utf8_path();
+    let mut attr = zeroed_attr();
+    let rc = unsafe { fs_btrfs_stat(fs, path.as_ptr(), &mut attr) };
+    assert_eq!(rc, -1, "a path naming no file was answered as a stat");
+    let msg = last_error();
+    assert!(
+        !msg.contains("not valid UTF-8"),
+        "the path was refused for its encoding rather than looked up: {msg}"
+    );
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+/// And the directory iterator, which is the entry point a caller reaches
+/// these names through in the first place.
+#[test]
+fn dir_open_takes_a_non_utf8_path_as_bytes() {
+    let fs = mount();
+    let path = non_utf8_path();
+    let iter = unsafe { fs_btrfs_dir_open(fs, path.as_ptr()) };
+    assert!(
+        iter.is_null(),
+        "a path naming no directory opened an iterator"
+    );
+    let msg = last_error();
+    assert!(
+        !msg.contains("not valid UTF-8"),
+        "the path was refused for its encoding rather than looked up: {msg}"
+    );
+    unsafe { fs_btrfs_umount(fs) };
+}
