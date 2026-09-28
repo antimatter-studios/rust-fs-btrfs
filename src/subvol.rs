@@ -341,11 +341,26 @@ impl Filesystem {
     /// [`Error::NotFound`]: crate::error::Error::NotFound
     /// [`Error::NotADirectory`]: crate::error::Error::NotADirectory
     pub fn resolve_path(&self, path: &str) -> Result<PathTarget> {
+        self.resolve_path_bytes(path.as_bytes())
+    }
+
+    /// [`resolve_path`] with the path given as bytes.
+    ///
+    /// The real one; the `&str` form above is the convenience. Btrfs
+    /// directory entry names are raw bytes with no encoding rule, so a
+    /// component is compared byte for byte against the on-disk entry and
+    /// nothing is decoded on the way (#214).
+    ///
+    /// [`resolve_path`]: Self::resolve_path
+    pub fn resolve_path_bytes(&self, path: &[u8]) -> Result<PathTarget> {
         use crate::error::Error;
         let mut tree: Option<Filesystem> = None;
         let mut inode = self.root_inode()?;
-        for component in path.split('/').filter(|c| !c.is_empty() && *c != ".") {
-            if component == ".." {
+        for component in path
+            .split(|&b| b == b'/')
+            .filter(|c| !c.is_empty() && *c != b".")
+        {
+            if component == b".." {
                 return Err(Error::UnsupportedFeature(
                     "`..` in a path is not resolved by resolve_path".into(),
                 ));
@@ -357,7 +372,7 @@ impl Filesystem {
                 return Err(Error::NotFound);
             }
             let here = tree.as_ref().unwrap_or(self);
-            let entry = here.lookup_entry(inode.ino, component.as_bytes())?;
+            let entry = here.lookup_entry(inode.ino, component)?;
             if entry.is_inode() {
                 inode = here.read_inode(entry.ino)?;
                 continue;
