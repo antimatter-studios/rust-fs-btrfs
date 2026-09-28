@@ -230,6 +230,45 @@ pub extern "C" fn fs_btrfs_last_errno() -> c_int {
 /// # Safety
 ///
 /// `p` must be NULL or point to a NUL-terminated string.
+/// The bytes of a NUL-terminated in-image path, not decoded.
+///
+/// EVERY IN-IMAGE NAME COMES THROUGH HERE. Btrfs directory entry names
+/// are raw bytes and the format has no field that could say what
+/// encoding they are in, so this ABI does not decide: it compares what
+/// the caller passed against what the image holds, byte for byte.
+///
+/// This is what `fs_btrfs_dir_next` already did in the other direction
+/// — it fills the entry name from the raw bytes — and the asymmetry was
+/// the defect. The ABI reported a name it then refused to accept, so a
+/// caller that walked a directory and stat'd each entry failed on
+/// exactly the entries this same library had just handed it, with no
+/// byte-oriented entry point to work around it (#214).
+///
+/// Source-compatible for every caller passing UTF-8, because UTF-8 is a
+/// byte string too. NULL is still refused, because the argument is the
+/// problem.
+///
+/// # Safety
+///
+/// `p` must be NULL or point to a NUL-terminated string.
+unsafe fn borrow_bytes<'a>(p: *const c_char, what: &str) -> Option<&'a [u8]> {
+    if p.is_null() {
+        set_error(format!("{what} is NULL"), ENOENT);
+        return None;
+    }
+    Some(unsafe { CStr::from_ptr(p) }.to_bytes())
+}
+
+/// A byte path as text, FOR A MESSAGE ONLY.
+///
+/// `from_utf8_lossy` is exactly wrong for a lookup — it maps distinct
+/// names onto one, so two files become indistinguishable — and exactly
+/// right for an error string, which a person reads and nothing compares.
+/// Never feed the result back into a lookup.
+fn shown(path: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(path)
+}
+
 unsafe fn borrow_str<'a>(p: *const c_char, what: &str) -> Option<&'a str> {
     if p.is_null() {
         set_error(format!("{what} is NULL"), ENOENT);
@@ -460,10 +499,10 @@ pub unsafe extern "C" fn fs_btrfs_stat(
             set_error("fs or out is NULL".into(), EIO);
             return -1;
         }
-        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
-        match unsafe { &*fs }.fs.lookup_path(path) {
+        match unsafe { &*fs }.fs.lookup_path_bytes(path) {
             Ok(inode) => {
                 fill_attr(&inode, out);
                 0
@@ -524,10 +563,10 @@ pub unsafe extern "C" fn fs_btrfs_dir_open(
             set_error("fs is NULL".into(), EIO);
             return std::ptr::null_mut();
         }
-        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return std::ptr::null_mut();
         };
-        match unsafe { &*fs }.fs.list_path(path) {
+        match unsafe { &*fs }.fs.list_path_bytes(path) {
             Ok(entries) => Box::into_raw(Box::new(fs_btrfs_dir_iter {
                 entries,
                 next: 0,
@@ -619,11 +658,11 @@ pub unsafe extern "C" fn fs_btrfs_read_file(
             set_error("fs or buf is NULL".into(), EIO);
             return -1;
         }
-        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
         let fs = &unsafe { &*fs }.fs;
-        let found = match fs.lookup_path(path) {
+        let found = match fs.lookup_path_bytes(path) {
             Ok(i) => i,
             Err(e) => {
                 record(&e);
@@ -670,11 +709,11 @@ pub unsafe extern "C" fn fs_btrfs_readlink(
             set_error("readlink: fs, path or buf is NULL".into(), EINVAL);
             return -1;
         }
-        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
         let fs = &unsafe { &*fs }.fs;
-        let found = match fs.lookup_path(path) {
+        let found = match fs.lookup_path_bytes(path) {
             Ok(i) => i,
             Err(e) => {
                 record(&e);
@@ -682,7 +721,10 @@ pub unsafe extern "C" fn fs_btrfs_readlink(
             }
         };
         if !found.is_symlink() {
-            set_error(format!("readlink: {path} is not a symbolic link"), EINVAL);
+            set_error(
+                format!("readlink: {} is not a symbolic link", shown(path)),
+                EINVAL,
+            );
             return -1;
         }
         match fs.read_link(found.ino) {
@@ -761,11 +803,11 @@ pub unsafe extern "C" fn fs_btrfs_listxattr(
             set_error("fs is NULL".into(), EIO);
             return -1;
         }
-        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
         let fs = &unsafe { &*fs }.fs;
-        let found = match fs.lookup_path(path) {
+        let found = match fs.lookup_path_bytes(path) {
             Ok(i) => i,
             Err(e) => {
                 record(&e);
@@ -820,7 +862,7 @@ pub unsafe extern "C" fn fs_btrfs_getxattr(
             set_error("fs is NULL".into(), EIO);
             return -1;
         }
-        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
         // A NAME IS BYTES. `listxattr` hands names out raw and Linux
@@ -833,7 +875,7 @@ pub unsafe extern "C" fn fs_btrfs_getxattr(
         }
         let name = unsafe { CStr::from_ptr(name) }.to_bytes();
         let fs = &unsafe { &*fs }.fs;
-        let found = match fs.lookup_path(path) {
+        let found = match fs.lookup_path_bytes(path) {
             Ok(i) => i,
             Err(e) => {
                 record(&e);
@@ -844,7 +886,11 @@ pub unsafe extern "C" fn fs_btrfs_getxattr(
             Ok(Some(v)) => v,
             Ok(None) => {
                 set_error(
-                    format!("{path} has no attribute {}", String::from_utf8_lossy(name)),
+                    format!(
+                        "{} has no attribute {}",
+                        shown(path),
+                        String::from_utf8_lossy(name)
+                    ),
                     ENOENT,
                 );
                 return -1;
@@ -946,11 +992,11 @@ pub unsafe extern "C" fn fs_btrfs_can_write_in_place(
             set_error("fs is NULL".into(), EIO);
             return -1;
         }
-        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
         let fs = &unsafe { &*fs }.fs;
-        let found = match fs.lookup_path(path) {
+        let found = match fs.lookup_path_bytes(path) {
             Ok(i) => i,
             Err(e) => {
                 record(&e);
@@ -995,11 +1041,11 @@ pub unsafe extern "C" fn fs_btrfs_write_file(
             set_error("fs or buf is NULL".into(), EIO);
             return -1;
         }
-        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
         let fs = &unsafe { &*fs }.fs;
-        let found = match fs.lookup_path(path) {
+        let found = match fs.lookup_path_bytes(path) {
             Ok(i) => i,
             Err(e) => {
                 record(&e);
