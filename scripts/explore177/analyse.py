@@ -56,7 +56,7 @@ for i, line in enumerate(lines):
     if kind == "FREE_SPACE_BITMAP":
         leafbitmap[leaf] = True
     if kind == "FREE_SPACE_INFO":
-        fl = re.search(r"extent count (\d+) flags (\d+)", lines[i + 1])
+        fl = re.search(r"extent.count (\d+) flags (\d+)", lines[i + 1])
         groups[objectid] = [offset, int(fl.group(2)), [leaf], 0, int(fl.group(1))]
         order.append(objectid)
         continue

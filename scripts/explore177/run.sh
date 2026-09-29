@@ -26,6 +26,7 @@ variant() {
     sudo umount $m; rmdir $m
     sudo chown $(id -u) $img
     btrfs --version | head -1
+    btrfs inspect-internal dump-tree -t 10 $img | grep -m3 -A1 FREE_SPACE_INFO
     python3 $HERE/analyse.py $img | tee $OUT/$name.txt | grep -v "^  leaf#" | head -60
     grep -c "^  leaf#" $OUT/$name.txt
     local cand; cand=$(grep ^CANDIDATE $OUT/$name.txt | head -1)
