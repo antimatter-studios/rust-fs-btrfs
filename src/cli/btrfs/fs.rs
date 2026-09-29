@@ -510,7 +510,7 @@ pub fn csum_name(t: ChecksumType) -> &'static str {
         ChecksumType::Crc32c => "crc32c",
         ChecksumType::XxHash64 => "xxhash64",
         ChecksumType::Sha256 => "sha256",
-        ChecksumType::Blake2b256 => "blake2b",
+        ChecksumType::Blake2b256 => "blake2",
     }
 }
 

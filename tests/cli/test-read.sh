@@ -113,7 +113,7 @@ check "get of an unknown key exits 2" test $? -eq 2
 jq_check "get of an unknown key is a structured error" '.code == 2' "$SANDBOX/nk.err"
 
 # Every checksum algorithm, from the geometry fixtures.
-for pair in crc32c:crc32c xxhash:xxhash64 sha256:sha256 blake2:blake2b; do
+for pair in crc32c:crc32c xxhash:xxhash64 sha256:sha256 blake2:blake2; do
     fixture="$DISKS/btrfs-csum-${pair%%:*}.img"
     if [ ! -s "$fixture" ]; then
         fail "${fixture#"$REPO"/} is missing: \`chore fixtures\` builds it"
