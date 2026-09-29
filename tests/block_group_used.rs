@@ -15,8 +15,10 @@
 //! first relocates mkfs's small first group, which would otherwise be
 //! turned into free-space bitmaps (refused for its own reason). A second
 //! balance after the files are written packs every group, so its free space
-//! is a few runs; a plan touching a group whose records still straddle a
-//! leaf (#177, read from btrfs-progs' own dump) is not the one used.
+//! is a few runs, and deleting every tenth file then leaves room in the
+//! extent-tree leaves that recorded them. A plan touching a group whose
+//! records straddle a leaf (#177, read from btrfs-progs' own dump), or one
+//! needing an insert into a full extent-tree leaf, is not the one used.
 
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::super_write::Commit;
@@ -116,6 +118,7 @@ fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
          for f in $(seq 0 399); do head -c 1048576 /dev/zero > \"$MNT/f$f\"; done\n\
          sync\n\
          btrfs balance start --full-balance \"$MNT\" >/dev/null\n\
+         for f in $(seq 0 10 399); do rm \"$MNT/f$f\"; done\n\
          sync",
     );
 
@@ -140,6 +143,7 @@ fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
     let leaves = tree_leaves(&image);
     let tried = leaves.len().min(300);
     let mut chosen = None;
+    let mut full_leaf = 0usize;
     for dirty in leaves.into_iter().take(tried) {
         let plan = fs
             .plan_transaction_closed(&[dirty], 64)
@@ -150,18 +154,27 @@ fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
             .iter()
             .chain(allocated.iter())
             .any(|g| g.is_some_and(|g| straddling.contains(&g)));
-        if released != allocated && !touches_a_straddle {
-            chosen = Some((plan, released, allocated));
-            break;
+        if released == allocated || touches_a_straddle {
+            continue;
+        }
+        // Inserting into a full extent-tree leaf is not implemented, and
+        // is refused by name; a plan that needs it is not this test's.
+        match fs.render_plan(&plan, generation) {
+            Ok(blocks) => {
+                chosen = Some((plan, blocks, released, allocated));
+                break;
+            }
+            Err(e) if e.to_string().contains("does not fit") => full_leaf += 1,
+            Err(e) => panic!("rendering a plan moving the leaf at {dirty}: {e}"),
         }
     }
-    let (plan, released, allocated) = chosen.unwrap_or_else(|| {
+    let (plan, blocks, released, allocated) = chosen.unwrap_or_else(|| {
         panic!(
             "none of {tried} tree leaves moves across groups without touching a group whose \
-             free-space records straddle a leaf ({straddling:?} do)"
+             free-space records straddle a leaf ({straddling:?} do); {full_leaf} crossed \
+             groups but needed an insert into a full extent-tree leaf"
         )
     });
-    let blocks = fs.render_plan(&plan, generation).expect("rendering");
     let root = fs
         .planned_root(&plan)
         .expect("the plan moves the root tree");
