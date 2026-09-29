@@ -14,12 +14,17 @@
 //! fills and tree blocks end up in every one of them. `btrfs balance`
 //! first relocates mkfs's small first group, which would otherwise be
 //! turned into free-space bitmaps (refused for its own reason). A second
-//! balance after the files are written packs every group, so its free space
-//! is a few runs — but its extent-tree leaves are packed full too, so a
-//! few more files are written after it, and the leaves their records land
-//! in split, leaving room where the allocator will look next. A plan touching a group whose
-//! records straddle a leaf (#177, read from btrfs-progs' own dump), or one
-//! needing an insert into a full extent-tree leaf, is not the one used.
+//! balance after the files are written packs every group, so no group
+//! has free space to speak of — and then the 64 files at the LOWEST
+//! addresses, by `filefrag`, are deleted. That opens one hole at the
+//! bottom of the first group, which is where the allocator looks first;
+//! it is a few free-space records rather than a scatter; and the extent
+//! items those files took out of the leaves covering the hole leave room
+//! for the records of the blocks moved into it. Every tree leaf outside
+//! that group then moves across groups. A plan touching a group whose
+//! records straddle a leaf (#177, read from btrfs-progs' own dump), or
+//! one needing an insert into a full extent-tree leaf, is still passed
+//! over rather than used.
 
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::super_write::Commit;
@@ -119,7 +124,10 @@ fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
          for f in $(seq 0 399); do head -c 1048576 /dev/zero > \"$MNT/f$f\"; done\n\
          sync\n\
          btrfs balance start --full-balance \"$MNT\" >/dev/null\n\
-         for f in $(seq 0 39); do head -c 262144 /dev/zero > \"$MNT/g$f\"; done\n\
+         for f in $(seq 0 399); do\n\
+           at=$(filefrag -v \"$MNT/f$f\" | awk '$1 == \"0:\" {sub(/\\.\\./, \"\", $4); print $4; exit}')\n\
+           echo \"$at f$f\"\n\
+         done | sort -n | head -n 64 | while read -r _ f; do rm \"$MNT/$f\"; done\n\
          sync",
     );
 
