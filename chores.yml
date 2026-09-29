@@ -142,13 +142,15 @@ chore_min_version: 0.10.0
 #     vm          957 /  50,636    1,250 /  66,000   ~30%: the same suite,
 #                                                    plus the guest's own
 #                                                    build, from cold
-#     cli          11 /     456       15 /     600   ~30%: CI's, on #225's
-#                                                    first run (36613265993).
-#                                                    Every
-#                                                    file is three lines when it
-#                                                    passes and every tool a
-#                                                    doctor line, so a new one
-#                                                    is a visible step
+#     cli          14 /     533       19 /     700   ~30%: 14 / 511 on macOS
+#                                                    with test-read.sh, plus
+#                                                    the 22 bytes CI's longer
+#                                                    paths add (measured on
+#                                                    its first run). Every
+#                                                    file is three lines when
+#                                                    it passes and every tool
+#                                                    a doctor line, so a new
+#                                                    one is a visible step
 #
 #   EVERY ONE OF THEM IS MEASURED, and none is a guess left wide "for
 #   now". A budget above what a tier prints still fails the run that
@@ -592,10 +594,10 @@ tasks:
     #
     # FLOOR: each file prints a `test result: ok. N passed` line, which
     # test-floor.sh sums as it does cargo's. 34 checks executed when the
-    # tier was added; the floor is about 95% of that.
+    # tier was added, 120 with test-read.sh; the floor is about 95% of that.
     cmds:
-      - 'scripts/tier.sh test:cli cli 15 600 -- scripts/test-cli.sh'
-      - 'scripts/test-floor.sh --log tmp/logs/cli.log 32'
+      - 'scripts/tier.sh test:cli cli 19 700 -- scripts/test-cli.sh'
+      - 'scripts/test-floor.sh --log tmp/logs/cli.log 114'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
