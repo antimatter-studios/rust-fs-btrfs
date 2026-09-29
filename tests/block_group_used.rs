@@ -15,8 +15,9 @@
 //! first relocates mkfs's small first group, which would otherwise be
 //! turned into free-space bitmaps (refused for its own reason). A second
 //! balance after the files are written packs every group, so its free space
-//! is a few runs, and deleting every tenth file then leaves room in the
-//! extent-tree leaves that recorded them. A plan touching a group whose
+//! is a few runs — but its extent-tree leaves are packed full too, so a
+//! few more files are written after it, and the leaves their records land
+//! in split, leaving room where the allocator will look next. A plan touching a group whose
 //! records straddle a leaf (#177, read from btrfs-progs' own dump), or one
 //! needing an insert into a full extent-tree leaf, is not the one used.
 
@@ -118,7 +119,7 @@ fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
          for f in $(seq 0 399); do head -c 1048576 /dev/zero > \"$MNT/f$f\"; done\n\
          sync\n\
          btrfs balance start --full-balance \"$MNT\" >/dev/null\n\
-         for f in $(seq 0 10 399); do rm \"$MNT/f$f\"; done\n\
+         for f in $(seq 0 39); do head -c 262144 /dev/zero > \"$MNT/g$f\"; done\n\
          sync",
     );
 
