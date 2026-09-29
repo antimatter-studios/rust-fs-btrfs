@@ -83,11 +83,13 @@ print("FST leaves:", len(leafaddr))
 for n, (a, items, free) in enumerate(leafaddr):
     print(f"  leaf#{n} at {a} items {items} free {free} bitmap={leafbitmap[n]}")
 
-fs_blocks = [
-    (int(m.group(2)), m.group(1))
-    for m in re.finditer(r"^(leaf|node) (\d+) ", dump("-t", "5"), re.MULTILINE)
-]
-print("fs tree blocks:", len(fs_blocks), "root", fs_blocks[0] if fs_blocks else None)
+fs_blocks = []
+for tree in ("5", "7"):
+    fs_blocks += [
+        (int(m.group(1)), "leaf")
+        for m in re.finditer(r"^leaf (\d+) ", dump("-t", tree), re.MULTILINE)
+    ]
+print("fs+csum leaves:", len(fs_blocks))
 
 for start in order:
     length, flags, leaves, records, count, before = groups[start]

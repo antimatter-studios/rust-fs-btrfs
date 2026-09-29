@@ -37,7 +37,7 @@ variant() {
         set -- x $g $len $blk
         cp --sparse=always $img $OUT/$name-t.img
         echo "transaction dirtying $4 in group $2"
-        $EX $OUT/$name-t.img $4 | grep -v "^rewrite"
+        $EX $OUT/$name-t.img $4 | grep -v "^rewrite\|first diff\|^touched" | cut -c1-160
         echo "explore177 exit ${PIPESTATUS[0]}"
         btrfs check --readonly $OUT/$name-t.img 2>&1 | grep -v "^\[\|^total\|^ referenced\|^file data\|^btree space\|^UUID\|^Opening\|^Checking" | head -30
         echo "btrfs check exit ${PIPESTATUS[0]}"
@@ -45,6 +45,9 @@ variant() {
     echo "::endgroup::"
 }
 
-variant mixed4g-bal-k4 4G "-M -n 4096 -s 4096" 2600 1024 4 yes
-variant mixed4g-bal-k6 4G "-M -n 4096 -s 4096" 2600 1024 6 yes
-variant mixed2g-bal-k4 2G "-M -n 4096 -s 4096" 1300 1024 4 yes
+variant m2g-k5 2G "-M -n 4096 -s 4096" 1300 1024 5 yes
+variant m2g-k6 2G "-M -n 4096 -s 4096" 1300 1024 6 yes
+variant m3g-k6 3G "-M -n 4096 -s 4096" 2000 1024 6 yes
+variant m4g-k8 4G "-M -n 4096 -s 4096" 2600 1024 8 yes
+variant m4g-k10 4G "-M -n 4096 -s 4096" 2600 1024 10 yes
+variant m2g-512k-k8 2G "-M -n 4096 -s 4096" 2600 512 8 yes
