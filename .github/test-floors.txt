@@ -61,6 +61,7 @@ free_space_oracle         4
 fs_oracle                 13
 fstree_oracle             2
 getxattr_byte_names       1
+hard_link_extref          5
 kernel_readback           2
 leaf_edit_oracle          3
 lib                       231
