@@ -113,8 +113,23 @@ check "no test spawns an oracle tool on the host" \
 # diagnostic meant to be run in the guest. `ci.yml` uses it once, to
 # REPLACE the runner's btrfs-progs with stubs that fail loudly, which is
 # the opposite request.
+#
+# `\b` on BOTH sides (#200). It used to require a trailing space, which
+# catches `sudo mount` in a shell recipe and misses `Command::new("sudo")`
+# in a test by one character -- the quote. That shape passed every gate here
+# while running mkfs.btrfs and a loop mount on the host. The probe below
+# proves the pattern reads the Rust spelling before the tree is scanned.
+root_pattern='^[^#/]*\bsudo\b'
+probe="$(mktemp -d "${TMPDIR:-/tmp}/scratch-paths.XXXXXX")"
+printf '    let out = Command::new("%s")\n' sudo > "$probe/escape.rs"
+if rg -q "$root_pattern" "$probe/escape.rs"; then
+    ok "the root check reads a test that spawns it from Rust"
+else
+    fail "the root check reads a test that spawns it from Rust (its pattern misses Command::new(\"sudo\"))"
+fi
+rm -rf "$probe"
 check "no test or fixture recipe needs root" \
-    "$(rg -n '^[^#/]*\bsudo ' "$REPO/tests" "$REPO/test-disks" \
+    "$(rg -n "$root_pattern" "$REPO/tests" "$REPO/test-disks" \
         --glob '!**/*.md' \
         --glob "!$(basename "$SELF")" || true)"
 

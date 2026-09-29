@@ -198,6 +198,75 @@ fn harness_spawns(text: &str) -> Vec<String> {
     hits
 }
 
+/// Programs whose whole job is to run ANOTHER program: a privilege
+/// escalation, or a launcher. Every scan above reads the literal a process
+/// is spawned with, so a test that hands its work to one of these walks
+/// past all of them — the tool it really runs is characters inside a later
+/// argument, which nothing inspects (#200). The trampoline is the
+/// violation, whatever it carries. Built at run time so that no line of
+/// this file spells the escalation out, which the shell guard would read
+/// as this file asking for root.
+fn launchers() -> Vec<String> {
+    let mut names: Vec<String> = [["su", "do"], ["do", "as"], ["pk", "exec"], ["ru", "n0"]]
+        .iter()
+        .map(|p| p.concat())
+        .collect();
+    names.extend(
+        [
+            "su", "env", "script", "xargs", "nohup", "timeout", "nice", "ionice", "stdbuf",
+            "setsid", "chroot", "unshare", "nsenter",
+        ]
+        .map(String::from),
+    );
+    names
+}
+
+/// Shells. A test may run one of this repository's own scripts through
+/// one — `bash scripts/test-targets.sh unit` is how the tier guards ask the
+/// script that decides the tiers — but not hand it a command line with
+/// `-c`, which is the same trampoline as a launcher.
+const SHELLS: [&str; 6] = ["bash", "sh", "dash", "zsh", "ksh", "fish"];
+
+/// Places in `text` that spawn a launcher, or a shell given a command
+/// string.
+fn trampoline_spawns(text: &str) -> Vec<String> {
+    let spawn = ["Command", "::", "new", "("].concat();
+    let launchers = launchers();
+    let mut hits = Vec::new();
+    for (at, _) in text.match_indices(&spawn) {
+        let rest = text[at + spawn.len()..].trim_start();
+        let Some(literal) = rest.strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = literal.find('"') else {
+            continue;
+        };
+        let program = &literal[..end];
+        let last = program.rsplit('/').next().unwrap_or(program);
+        if launchers.iter().any(|l| l == last) {
+            hits.push(program.to_string());
+            continue;
+        }
+        if !SHELLS.contains(&last) {
+            continue;
+        }
+        // The rest of the statement: everything up to its `;`.
+        let statement = &literal[end + 1..];
+        let statement = &statement[..statement.find(';').unwrap_or(statement.len())];
+        let gives_a_command_string = statement.split('"').skip(1).step_by(2).any(|arg| {
+            arg.len() > 1
+                && arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg[1..].chars().all(|c| c.is_ascii_alphabetic())
+                && arg.contains('c')
+        });
+        if gives_a_command_string {
+            hits.push(format!("{program} -c"));
+        }
+    }
+    hits
+}
+
 /// Lines that print a skip notice: the signature of a test that returns
 /// early and passes having checked nothing.
 fn announced_skips(text: &str) -> Vec<String> {
@@ -269,6 +338,47 @@ fn no_test_drives_the_vm_or_mounts_a_filesystem_itself() {
 }
 
 #[test]
+fn no_test_hands_its_work_to_a_launcher_or_a_shell_command() {
+    let mut offenders = Vec::new();
+    for (path, text) in all_test_sources() {
+        for hit in trampoline_spawns(&text) {
+            offenders.push(format!("{}: {hit}", path.display()));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these spawn a program whose job is to run another one — a privilege \
+         escalation, a launcher, or a shell given `-c` — so the scans above see \
+         only the trampoline and not the oracle tool or mount it carries. Run the \
+         tool through fs_btrfs_test_support::oracle (it runs in the guest); a \
+         repository script may be run as `bash <script>`:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// The reproduction from #200, whole: every scan together must refuse it.
+/// Each of them used to wave it through, because it spawns a literal that
+/// is neither a tool, a harness program nor a variable.
+#[test]
+fn a_privileged_shell_carrying_the_tools_is_refused() {
+    let escape = [
+        "let out = Command",
+        "::new(\"",
+        "su",
+        "do\")\n    .args([\"-n\", \"bash\", \"-c\", \"mount -o loop x /mnt && mkfs",
+        ".btrfs -f x\"])\n    .output()\n    .expect(\"privileged shell\");\n",
+    ]
+    .concat();
+    let all: Vec<String> = direct_tool_spawns(&escape)
+        .into_iter()
+        .chain(indirect_spawns(&escape))
+        .chain(harness_spawns(&escape))
+        .chain(trampoline_spawns(&escape))
+        .collect();
+    assert!(!all.is_empty(), "the #200 reproduction passes every scan");
+}
+
+#[test]
 fn no_test_spawns_a_program_it_named_in_a_variable() {
     let mut offenders = Vec::new();
     for (path, text) in all_test_sources() {
@@ -335,6 +445,35 @@ fn the_scans_recognise_the_shapes_they_refuse() {
         [
             "../fs-linux-test-harness/scripts/vm.sh".to_string(),
             "mount".to_string()
+        ]
+    );
+
+    let trampolines = [
+        "Command",
+        "::new(\"env\").arg(\"mkfs.btrfs\");\n",
+        "Command",
+        "::new(\"bash\").arg(\"-c\").arg(script);\n",
+        "Command",
+        "::new(\"/bin/sh\").args([\"-ec\", script]);\n",
+        "Command",
+        "::new(\"/usr/bin/",
+        "do",
+        "as\").arg(\"true\");\n",
+        "Command",
+        "::new(\"bash\").arg(&script).arg(\"unit\");\n",
+        "Command",
+        "::new(\"bash\").arg(&script).arg(\"--artefacts\");\n",
+        "Command",
+        "::new(\"cargo\").args([\"test\", \"-c\"]);\n",
+    ]
+    .concat();
+    assert_eq!(
+        trampoline_spawns(&trampolines),
+        [
+            "env".to_string(),
+            "bash -c".to_string(),
+            "/bin/sh -c".to_string(),
+            ["/usr/bin/", "do", "as"].concat(),
         ]
     );
 
