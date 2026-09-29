@@ -98,7 +98,15 @@ chore_min_version: 0.10.0
 #   warm, 957 on the first run in a fresh guest.
 #
 #     tier      measured          budget            headroom, and why
-#     unit        368 /  24,411      480 /  32,000   ~30%: tests get added
+#     unit        497 /  30,611      650 /  40,000   ~30%: tests get added.
+#                                                    497 / 30,611 is CI's
+#                                                    unit job on #225's
+#                                                    first run (36613265993):
+#                                                    COLD, because the lock
+#                                                    changed, so 99 lines are
+#                                                    cargo fetching and
+#                                                    compiling, clap's among
+#                                                    them. Was 368 / 24,411
 #     images      296 /  13,865      385 /  18,000   ~30%
 #     oracle      361 /  19,014      470 /  25,000   ~30%. --show-output is
 #                                                    most of it, and it is
@@ -134,10 +142,9 @@ chore_min_version: 0.10.0
 #     vm          957 /  50,636    1,250 /  66,000   ~30%: the same suite,
 #                                                    plus the guest's own
 #                                                    build, from cold
-#     cli          11 /     432       15 /     620   ~30%: measured on a macOS
-#                                                    run of this change, to be
-#                                                    replaced by CI's before it
-#                                                    merges. Every
+#     cli          11 /     456       15 /     600   ~30%: CI's, on #225's
+#                                                    first run (36613265993).
+#                                                    Every
 #                                                    file is three lines when it
 #                                                    passes and every tool a
 #                                                    doctor line, so a new one
@@ -425,7 +432,7 @@ tasks:
     # rather than listed here. CI runs this job with no fixtures present,
     # which is what proves the split.
     cmds:
-      - 'EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 480 32000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
+      - 'EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 650 40000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
 
   test:images:
     desc: 'The tests that read a fixture but need no VM — what a host without KVM can still run'
@@ -584,7 +591,7 @@ tasks:
     # test-floor.sh sums as it does cargo's. 34 checks executed when the
     # tier was added; the floor is about 95% of that.
     cmds:
-      - 'scripts/tier.sh test:cli cli 15 620 -- scripts/test-cli.sh'
+      - 'scripts/tier.sh test:cli cli 15 600 -- scripts/test-cli.sh'
       - 'scripts/test-floor.sh --log tmp/logs/cli.log 32'
 
   test:scripts:
