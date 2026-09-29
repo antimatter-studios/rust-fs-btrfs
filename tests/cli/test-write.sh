@@ -32,8 +32,9 @@ check "the manifest gives /nocow/data.bin a size ($size)" test -n "$size"
 
 # The write this library can make.
 head -c "$size" /dev/urandom >"$SANDBOX/new.bin"
-fs.btrfs "$img" write /nocow/data.bin <"$SANDBOX/new.bin" >"$SANDBOX/w.json" 2>"$SANDBOX/w.err"
-check "write /nocow/data.bin exits 0 ($(cat "$SANDBOX/w.err"))" test $? -eq 0
+status=0
+fs.btrfs "$img" write /nocow/data.bin <"$SANDBOX/new.bin" >"$SANDBOX/w.json" 2>"$SANDBOX/w.err" || status=$?
+check "write /nocow/data.bin exits 0, not $status ($(cat "$SANDBOX/w.err"))" test "$status" -eq 0
 jq_check "write reports the path and $size bytes, not created" \
     ".path == \"/nocow/data.bin\" and .bytes == $size and .created == false" "$SANDBOX/w.json"
 check "read /nocow/data.bin is what was written" cmp -s "$SANDBOX/new.bin" <(fs.btrfs "$img" read /nocow/data.bin)
@@ -51,8 +52,9 @@ sparse_copy "$img" "$SANDBOX/before.img"
 # refused CODE PATTERN PATH STDIN-FILE
 refused() {
     local code="$1" pattern="$2" path="$3" input="$4"
-    fs.btrfs "$img" write "$path" <"$input" >"$SANDBOX/r.out" 2>"$SANDBOX/r.err"
-    check "write $path ($(basename "$input")) exits $code" test $? -eq "$code"
+    local status=0
+    fs.btrfs "$img" write "$path" <"$input" >"$SANDBOX/r.out" 2>"$SANDBOX/r.err" || status=$?
+    check "write $path ($(basename "$input")) exits $code, not $status" test "$status" -eq "$code"
     check "write $path prints nothing on stdout" test ! -s "$SANDBOX/r.out"
     jq_check "write $path says why ($pattern)" ".code == $code and (.error | test(\"$pattern\"))" "$SANDBOX/r.err"
 }
