@@ -99,6 +99,17 @@ pub mod root_item {
     pub const FLAGS: usize = 208;
     /// The height of the tree this item names.
     pub const LEVEL: usize = 238;
+    /// `u64`. A second copy of [`GENERATION`], right after `level`.
+    ///
+    /// The kernel compares the two when it reads a root, and when they
+    /// differ it takes the item for one written by a kernel that predates
+    /// the extended fields and RESETS them — the subvolume's UUIDs and
+    /// times — logging "mismatching generation and generation_v2". Every
+    /// writer of [`GENERATION`] writes this too, as `btrfs_update_root`
+    /// does. Found by `tests/crash_consistency.rs` (#195), which is the
+    /// first test here to read the kernel's log after mounting a commit of
+    /// this crate.
+    pub const GENERATION_V2: usize = 239;
     /// The smallest item any of these fields can be read out of.
     pub const MIN_SIZE: usize = FLAGS + 8;
 }
