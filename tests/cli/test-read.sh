@@ -121,8 +121,9 @@ for pair in crc32c:crc32c xxhash:xxhash64 sha256:sha256 blake2:blake2b; do
     fi
     check "get btrfs.csum_type of btrfs-csum-${pair%%:*} is ${pair#*:}" \
         test "$(fs.btrfs "$fixture" get btrfs.csum_type --text 2>&1)" = "${pair#*:}"
-    fs.btrfs "$fixture" ls / >"$SANDBOX/csum.json" 2>"$SANDBOX/csum.err"
-    check "ls / of btrfs-csum-${pair%%:*} exits 0 ($(cat "$SANDBOX/csum.err"))" test $? -eq 0
+    status=0
+    fs.btrfs "$fixture" ls / >"$SANDBOX/csum.json" 2>"$SANDBOX/csum.err" || status=$?
+    check "ls / of btrfs-csum-${pair%%:*} exits 0, not $status ($(cat "$SANDBOX/csum.err"))" test "$status" -eq 0
 done
 
 # A log waiting for replay: get still answers, and says it is dirty; the
