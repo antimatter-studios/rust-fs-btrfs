@@ -364,3 +364,211 @@ pub fn guest_kernel_probe(image: &str, payload: &str) -> KernelProbe {
             .collect(),
     }
 }
+
+/// One image derived from a base by overlaying byte ranges on it: each
+/// `(offset, file)` writes the whole of `file` at `offset`.
+///
+/// What a crash test hands the kernel. The images it needs differ from
+/// one another by a few tree blocks and a superblock, and each is half
+/// a gigabyte of mostly hole, so they are never materialised on the
+/// host: the patches cross the share, and the guest builds each image
+/// on its own disk just before it mounts it.
+pub struct Variant {
+    /// What the test calls it, for its own failure messages.
+    pub label: String,
+    /// `(offset, file)`, applied in order. Every file lives inside this
+    /// repository, which is the only part of the host the guest sees.
+    pub patches: Vec<(u64, std::path::PathBuf)>,
+}
+
+/// What the kernel and the checker made of one [`Variant`].
+#[derive(Debug)]
+pub struct VariantVerdict {
+    /// The variant's label.
+    pub label: String,
+    /// Whether `mount -o ro` succeeded.
+    pub mounted: bool,
+    /// What `mount` printed when it refused.
+    pub mount_error: String,
+    /// The script's standard output, when the mount succeeded.
+    pub report: String,
+    /// The script's exit status (0 when it was not run).
+    pub report_status: i32,
+    /// Every btrfs line the kernel logged above info level during this
+    /// variant's mount, and nothing from any other.
+    pub complaints: Vec<String>,
+    /// `btrfs check --readonly`'s exit status on the variant.
+    pub check_status: i32,
+    /// Everything `btrfs check` printed, both streams.
+    pub check_output: String,
+}
+
+/// MOUNT MANY VARIANTS OF ONE IMAGE, IN ONE GUEST CALL: for each, build
+/// it, mount it read-only (on a read-only loop device), run `script`
+/// against `$MNT`, unmount, and hand the same bytes to `btrfs check
+/// --readonly`.
+///
+/// One call rather than one per variant because a crash sweep is dozens
+/// of mounts, and each is otherwise a round trip, a sparse copy of the
+/// base across the share and a lock cycle. The base crosses once.
+///
+/// A refused mount is DATA here, not a failure: an interrupted commit
+/// may legitimately leave an image the kernel refuses, and the test is
+/// what decides whether that refusal was acceptable. The helper fails
+/// only when the guest could not run the sweep at all.
+///
+/// The kernel's device registry is told to forget between variants.
+/// Every variant carries the same fsid and devid with a different
+/// generation, and a registry still holding the previous one's is a
+/// mount failure that has nothing to do with the bytes.
+#[track_caller]
+pub fn guest_kernel_read_variants(
+    base: &std::path::Path,
+    variants: &[Variant],
+    script: &str,
+) -> Vec<VariantVerdict> {
+    let _bracket = GUEST_MOUNT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    session();
+    let inside = |path: &std::path::Path| {
+        assert!(
+            path.starts_with(repo()),
+            "the kernel oracle was given {}, which is outside {}. The guest sees this \
+             repository and nothing else of the host.",
+            path.display(),
+            repo().display()
+        );
+    };
+    inside(base);
+    for variant in variants {
+        for (_, file) in &variant.patches {
+            inside(file);
+        }
+    }
+
+    let run = Run::new();
+    let results = run.dir.join(format!(
+        "variants.{}",
+        run.status
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+    ));
+    let _ = std::fs::remove_dir_all(&results);
+
+    let mut calls = String::new();
+    for (index, variant) in variants.iter().enumerate() {
+        calls.push_str(&format!("variant {index}"));
+        for (offset, file) in &variant.patches {
+            calls.push_str(&format!(" {offset} {}", guest_quote(&file.to_string_lossy())));
+        }
+        calls.push('\n');
+    }
+    let guest = format!(
+        r#"set -euo pipefail
+base={base}
+res={results}
+SCRIPT={script}
+mkdir -p "$res"
+work="$(mktemp -d /var/tmp/fs-btrfs-variants.XXXXXX)"
+mnt="$work/mnt"
+mkdir -p "$mnt"
+loop=""
+cleanup() {{
+    mountpoint -q "$mnt" && umount "$mnt" || true
+    if [ -n "$loop" ]; then losetup -d "$loop" 2>/dev/null || true; fi
+    rm -rf "$work"
+}}
+trap cleanup EXIT
+cp --sparse=always "$base" "$work/base"
+variant() {{
+    out="$res/$1"
+    shift
+    mkdir -p "$out"
+    cp --sparse=always "$work/base" "$work/image"
+    while [ $# -gt 0 ]; do
+        dd if="$2" of="$work/image" bs=65536 oflag=seek_bytes seek="$1" conv=notrunc status=none
+        shift 2
+    done
+    btrfs device scan --forget >/dev/null 2>&1 || true
+    dmesg -C
+    loop="$(losetup --find --show --read-only "$work/image")"
+    if mount -t btrfs -o ro "$loop" "$mnt" 2> "$out/mount.err"; then
+        echo 1 > "$out/mounted"
+        s=0
+        MNT="$mnt" bash -euo pipefail -c "$SCRIPT" > "$out/report" 2> "$out/report.err" || s=$?
+        echo "$s" > "$out/report.status"
+        umount "$mnt"
+    else
+        echo 0 > "$out/mounted"
+    fi
+    losetup -d "$loop"
+    loop=""
+    dmesg | grep -Ei 'BTRFS (warning|error|critical|alert|emerg)' > "$out/complaints" || true
+    c=0
+    btrfs check --readonly "$work/image" > "$out/check" 2>&1 || c=$?
+    echo "$c" > "$out/check.status"
+    rm -f "$work/image"
+}}
+{calls}btrfs device scan --forget >/dev/null 2>&1 || true
+echo done > "$res/finished""#,
+        base = guest_quote(&base.to_string_lossy()),
+        results = guest_quote(&results.to_string_lossy()),
+        script = guest_quote(script),
+    );
+    let out = guest_shell(&guest)
+        .unwrap_or_else(|error| panic!("cannot run the kernel oracle in the guest: {error}"));
+    assert!(
+        results.join("finished").is_file(),
+        "the variant sweep did not finish in the fs-linux-test-harness VM (the harness \
+         exited {:?}). `chore vm:status` shows the VM.\n{}{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let read = |index: usize, name: &str| -> String {
+        std::fs::read_to_string(results.join(index.to_string()).join(name)).unwrap_or_default()
+    };
+    let number = |index: usize, name: &str| -> i32 {
+        read(index, name).trim().parse().unwrap_or_else(|_| {
+            panic!(
+                "variant {index} ({}) left no {name} behind, so the guest did not finish it",
+                variants[index].label
+            )
+        })
+    };
+    let verdicts: Vec<VariantVerdict> = variants
+        .iter()
+        .enumerate()
+        .map(|(index, variant)| {
+            let mounted = number(index, "mounted") == 1;
+            VariantVerdict {
+                label: variant.label.clone(),
+                mounted,
+                mount_error: read(index, "mount.err"),
+                report: read(index, "report"),
+                report_status: if mounted {
+                    number(index, "report.status")
+                } else {
+                    0
+                },
+                complaints: read(index, "complaints")
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                check_status: number(index, "check.status"),
+                check_output: read(index, "check"),
+            }
+        })
+        .collect();
+    let _ = std::fs::remove_dir_all(&results);
+    println!(
+        "[kernel vm] mount -t btrfs -o ro + btrfs check --readonly, {} variants of {} -> \
+         {} mounted",
+        verdicts.len(),
+        base.display(),
+        verdicts.iter().filter(|v| v.mounted).count()
+    );
+    verdicts
+}

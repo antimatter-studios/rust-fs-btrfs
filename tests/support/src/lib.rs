@@ -12,8 +12,9 @@ mod kernel;
 mod oracle;
 
 pub use kernel::{
-    guest_kernel_probe, guest_kernel_read, guest_kernel_read_ok, guest_kernel_report,
-    guest_kernel_write, guest_kernel_write_ok, KernelProbe,
+    guest_kernel_probe, guest_kernel_read, guest_kernel_read_ok, guest_kernel_read_variants,
+    guest_kernel_report, guest_kernel_write, guest_kernel_write_ok, KernelProbe, Variant,
+    VariantVerdict,
 };
 pub use oracle::{guest_base64, guest_quote, oracle, Oracle};
 
