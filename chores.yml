@@ -344,6 +344,8 @@ tasks:
       # the ones that need a mount to populate
       - test-disks/btrfs-subvol.img
       - test-disks/btrfs-xattr.img
+      - test-disks/btrfs-acl-node4k.img
+      - test-disks/btrfs-acl-node16k.img
       - test-disks/btrfs-nodatacow.img
       - test-disks/snapshot/btrfs-nodatacow-snapshot.img
       # the write-path pairs, in both geometries
