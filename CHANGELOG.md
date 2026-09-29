@@ -8,6 +8,16 @@ never does.
 
 ### Fixed
 
+- **A transaction keeps each block group's `used` count true** (#223).
+  A plan releases every block it moves at its old address and allocates
+  it at a new one, and the two are often in different block groups.
+  `bytes_used` still added up, but no `BLOCK_GROUP_ITEM` was rewritten, so
+  the group a block moved into was under-counted and the group it left
+  over-counted, which `btrfs check` reports as "block group [...] used X
+  but extent items used Y". The plan now includes the extent-tree leaf
+  holding each group's item whose count moves, and `render_plan` moves
+  `used` by what it allocates in the group less what it releases there.
+
 - **A commit writes `ROOT_ITEM.generation_v2` with `generation`** (#195).
   `render_plan` updated a moved root's `generation` and left its second
   copy stale, so the kernel mounting the result logged "mismatching
