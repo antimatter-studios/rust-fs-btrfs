@@ -379,7 +379,8 @@ impl Filesystem {
     /// Propagates a read failure, and [`Error::UnsupportedFeature`] if a
     /// block cannot be re-encoded at its new size — which cannot happen
     /// for a straight relocation and is reported rather than assumed
-    /// away.
+    /// away — or if the plan touches a block group whose free-space
+    /// records span more than one leaf (#177).
     pub fn render_plan(
         &self,
         plan: &Plan,
@@ -390,6 +391,12 @@ impl Filesystem {
         use crate::tree_write::{build_leaf, build_node, chunk_tree_uuid_of, BlockIdentity};
 
         // Where each moved block is going.
+        // Before any block is rendered, so the answer does not depend on
+        // which leaf the loop below happens to reach first.
+        if plan.trees().contains(&objectid::FREE_SPACE_TREE) {
+            self.refuse_free_space_straddle(plan)?;
+        }
+
         let moved: BTreeMap<u64, u64> = plan.rewrites.iter().map(|r| (r.old, r.new)).collect();
 
         let mut out = Vec::with_capacity(plan.rewrites.len());
@@ -768,6 +775,68 @@ impl Filesystem {
         self.leaves_holding(root, &keys)
     }
 
+    /// Refuse a plan that touches a block group whose free-space records
+    /// span more than one leaf (#177).
+    ///
+    /// [`Filesystem::apply_free_space`] rewrites a group from the leaf
+    /// holding its `FREE_SPACE_INFO`, and writes every run of the group
+    /// back into that leaf. A leaf can end among a group's records, and
+    /// then the next leaf keeps its own copies of the group's tail: the
+    /// tree records that free space twice, and out of key order across
+    /// the boundary, which `btrfs check` reports as "free space extent
+    /// ... overlaps with previous". Moving records between leaves, and
+    /// the keys above them, is not implemented, so the plan is refused.
+    ///
+    /// Measured on a kernel-made 4 KiB-node volume: with ~160 records to
+    /// a leaf, a boundary lands inside some group as soon as a few groups
+    /// are fragmented (`tests/free_space_straddle.rs`).
+    fn refuse_free_space_straddle(&self, plan: &Plan) -> Result<()> {
+        let Ok(root) = self.tree_root(objectid::FREE_SPACE_TREE) else {
+            return Ok(());
+        };
+        let moved: Vec<u64> = plan
+            .released()
+            .into_iter()
+            .chain(plan.allocated())
+            .collect();
+        let touched: Vec<crate::block_group::BlockGroup> = self
+            .block_groups()?
+            .into_iter()
+            .filter(|g| moved.iter().any(|a| g.contains(*a)))
+            .collect();
+        if touched.is_empty() {
+            return Ok(());
+        }
+
+        // Which leaves hold records of each touched group, in one walk.
+        let mut leaves: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+        self.for_each_tree_block(root, &mut |at, block, _| {
+            let Some(items) = block.body.items() else {
+                return;
+            };
+            for item in items {
+                if !matches!(
+                    item.key.key_type,
+                    FREE_SPACE_INFO_KEY | FREE_SPACE_EXTENT_KEY | FREE_SPACE_BITMAP_KEY
+                ) {
+                    continue;
+                }
+                if let Some(group) = touched.iter().find(|g| g.contains(item.key.objectid)) {
+                    leaves.entry(group.start).or_default().insert(at);
+                }
+            }
+        })?;
+
+        match leaves.iter().find(|(_, held)| held.len() > 1) {
+            Some((start, held)) => Err(Error::UnsupportedFeature(format!(
+                "the free-space records of the block group at {start} span {} leaves, and \
+                 rewriting a group across a leaf boundary is not implemented",
+                held.len()
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// Rewrite a free-space tree leaf so it describes what the plan
     /// leaves behind.
     ///
@@ -795,7 +864,13 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] for a leaf holding a
     /// `FREE_SPACE_BITMAP`, which needs its bits rewritten rather than
     /// its extents and is not implemented. Refusing beats writing
-    /// extents where the kernel will read bits.
+    /// extents where the kernel will read bits. And for a group the plan
+    /// touches that no block group item describes: its free set cannot
+    /// be derived, and carrying its records leaves the plan's
+    /// allocations recorded as free.
+    ///
+    /// A group whose records continue into the next leaf is refused
+    /// before this runs, by [`Filesystem::refuse_free_space_straddle`].
     fn apply_free_space(
         &self,
         items: Vec<crate::leaf_edit::OwnedItem>,
@@ -850,9 +925,20 @@ impl Filesystem {
             let group = groups.iter().find(|g| g.start == start);
 
             match (touched, group) {
-                // Untouched, or a group that no longer exists: carry the
-                // whole run through exactly as it was.
-                (false, _) | (_, None) => out.extend_from_slice(&items[i..j]),
+                // Untouched: carry the whole run through exactly as it
+                // was, including an INFO naming a group that no longer
+                // exists.
+                (false, _) => out.extend_from_slice(&items[i..j]),
+                // Touched, but no block group starts here: the free-space
+                // tree and the extent tree disagree about where the group
+                // is. Carrying the old records would leave everything the
+                // plan allocates inside it recorded as free.
+                (true, None) => {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "the free-space tree records a group at {start} that no block group \
+                         item describes, and the plan allocates or releases inside it"
+                    )))
+                }
                 (true, Some(group)) => {
                     // What is free now, plus what the plan releases,
                     // minus what it takes.
@@ -1037,5 +1123,82 @@ mod needs_host {
         }
         assert!(taken.len() > 1000, "allocated only {} blocks", taken.len());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A touched group that no block group item describes is refused, not
+    /// carried through with its old records.
+    ///
+    /// SELF-CONSISTENCY ONLY, and it says so: no oracle can make this
+    /// input. The kernel removes a group's `FREE_SPACE_INFO` with the
+    /// group, and a stale one left by mkfs covers a range no chunk maps,
+    /// so no plan ever allocates or releases inside it. The refusal is
+    /// there because carrying the records would leave every block the
+    /// plan allocates in that range recorded as free, and this is the
+    /// only way to reach it: an INFO item one block past a real group's
+    /// start, so no group starts where it says, over addresses the plan
+    /// moves.
+    #[test]
+    fn a_touched_group_no_block_group_item_describes_is_refused() {
+        use crate::chunk::DiskKey;
+        use crate::leaf_edit::OwnedItem;
+        use crate::transaction::{Plan, Rewrite};
+
+        let dir = std::path::PathBuf::from(temp_path!("fst-no-group"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("fs.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(256 * 1024 * 1024)
+            .unwrap();
+        let made = oracle("mkfs.btrfs")
+            .args(["-q", "-f", "-s", "4096", "-n", "16384"])
+            .arg(&img)
+            .output();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+
+        let fs = Filesystem::mount(Arc::new(FileDevice::open(&img).unwrap())).unwrap();
+        let nodesize = fs.sb.nodesize as u64;
+        let group = fs
+            .block_groups()
+            .unwrap()
+            .into_iter()
+            .find(|g| g.holds_metadata())
+            .expect("a metadata block group");
+        let start = group.start + nodesize;
+        assert!(
+            fs.block_groups().unwrap().iter().all(|g| g.start != start),
+            "a block group starts at {start}, so the INFO item below would describe it"
+        );
+
+        let items = vec![OwnedItem {
+            key: DiskKey {
+                objectid: start,
+                key_type: super::FREE_SPACE_INFO_KEY,
+                offset: group.length - nodesize,
+            },
+            data: vec![0; crate::block_group::free_space_info::SIZE],
+        }];
+        let plan = Plan {
+            rewrites: vec![Rewrite {
+                old: start + nodesize,
+                new: start + 2 * nodesize,
+                owner: crate::chunk::objectid::FS_TREE,
+                level: 0,
+            }],
+        };
+        let outcome = fs.apply_free_space(items, &plan);
+        let _ = std::fs::remove_dir_all(&dir);
+        let error = outcome.expect_err(
+            "the plan moves blocks inside a group no block group item describes, and its \
+             records were carried through as if nothing inside it had changed",
+        );
+        assert!(
+            error.to_string().contains("no block group item describes"),
+            "refused, but not for the missing group: {error}"
+        );
     }
 }

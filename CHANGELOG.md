@@ -15,6 +15,16 @@ never does.
   extended fields (subvolume UUIDs and times). Found by the new
   crash-consistency test, the first to read the kernel's log after
   mounting a commit of this crate.
+- **A transaction touching a block group whose free-space records span two
+  leaves is refused, instead of recording that free space twice.** The
+  free-space tree rewrite wrote every run of a group into the leaf holding
+  its `FREE_SPACE_INFO`, and the next leaf kept its own copies of the
+  group's tail: `btrfs check` then found "free space extent ... overlaps
+  with previous". Where the group did not fit the first leaf the render was
+  refused by a message about leaf sizes. `render_plan` now refuses any plan
+  touching such a group, by name, before it renders a block. A touched
+  group that no block group item describes is refused as well, rather than
+  carried through with its old records (#177).
 
 ## [0.7.0] — 2026-09-27
 
