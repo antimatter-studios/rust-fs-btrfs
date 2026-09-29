@@ -10,7 +10,7 @@ OUT=/tmp/x177; mkdir -p $OUT
 variant() {
     local name=$1 size=$2 mkfs=$3 files=$4 kib=$5 k=$6 bal=${7:-no}
     local img=$OUT/$name.img
-    echo "::group::variant $name size=$size mkfs=[$mkfs] files=$files kib=$kib k=$k"
+    echo "::group::variant ${SRC:-urandom} $name size=$size mkfs=[$mkfs] files=$files kib=$kib k=$k"
     rm -f $img; truncate -s $size $img
     mkfs.btrfs -q -f $mkfs $img >/dev/null
     local m; m=$(mktemp -d)
@@ -21,7 +21,7 @@ variant() {
     fi
     sudo bash -c '
         m=$1 files=$2 kib=$3 k=$4
-        head -c $((kib * 1024)) /dev/urandom > /tmp/one
+        head -c $((kib * 1024)) /dev/${SRC:-urandom} > /tmp/one
         for ((f = 0; f < files; f++)); do cp /tmp/one "$m/f$f" 2>/dev/null || break; done
         sync
         for ((f = 0; f < files; f += k)); do rm -f "$m/f$f"; done
@@ -45,9 +45,23 @@ variant() {
     echo "::endgroup::"
 }
 
-variant m2g-k5 2G "-M -n 4096 -s 4096" 1300 1024 5 yes
-variant m2g-k6 2G "-M -n 4096 -s 4096" 1300 1024 6 yes
-variant m3g-k6 3G "-M -n 4096 -s 4096" 2000 1024 6 yes
-variant m4g-k8 4G "-M -n 4096 -s 4096" 2600 1024 8 yes
-variant m4g-k10 4G "-M -n 4096 -s 4096" 2600 1024 10 yes
-variant m2g-512k-k8 2G "-M -n 4096 -s 4096" 2600 512 8 yes
+control() {
+    echo "::group::control"
+    local img=$OUT/control.img
+    rm -f $img; truncate -s 256M $img
+    mkfs.btrfs -q -f -n 4096 -s 4096 $img >/dev/null
+    for mk in "" "-M"; do
+        rm -f $img; truncate -s 256M $img
+        mkfs.btrfs -q -f $mk -n 4096 -s 4096 $img >/dev/null
+        root=$(btrfs inspect-internal dump-tree -t 5 $img | awk '/^(leaf|node) /{print $2; exit}')
+        echo "control mkfs [$mk] dirtying fs root $root"
+        $EX $img $root | grep -v "^rewrite\|first diff" | cut -c1-200
+        btrfs check --readonly $img 2>&1 | grep -v "^\[\|^total\|^ referenced\|^file data\|^btree space\|^UUID\|^Opening\|^Checking" | head -10
+        echo "btrfs check exit ${PIPESTATUS[0]}"
+    done
+    echo "::endgroup::"
+}
+control
+SRC=zero variant z2g-k5 2G "-M -n 4096 -s 4096" 1300 1024 5 yes
+SRC=zero variant z2g-k4 2G "-M -n 4096 -s 4096" 1300 1024 4 yes
+SRC=zero variant z3g-k5 3G "-M -n 4096 -s 4096" 2000 1024 5 yes
