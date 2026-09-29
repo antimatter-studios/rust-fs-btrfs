@@ -108,10 +108,15 @@ chore_min_version: 0.10.0
 #                                                    compiling, clap's among
 #                                                    them. Was 368 / 24,411
 #     images      296 /  13,865      385 /  18,000   ~30%
-#     oracle      361 /  19,014      470 /  25,000   ~30%. --show-output is
+#     oracle      472 /  24,733      615 /  32,500   ~30%. --show-output is
 #                                                    most of it, and it is
 #                                                    the evidence, so it
-#                                                    stays -- in the log
+#                                                    stays -- in the log.
+#                                                    472 / 24,733 on CI with
+#                                                    #225's cli_oracle.rs,
+#                                                    cold (51 lines of
+#                                                    cargo), run 36616794750;
+#                                                    was 361 / 19,014
 #     kernel      245 /  21,227      320 /  27,600   ~30%. Up from 179 /
 #                                                    16,220 when
 #                                                    free_space_straddle added
@@ -467,7 +472,7 @@ tasks:
     cmds:
       - scripts/tools.sh --check
       - test-disks/build-fixtures.sh --check
-      - 'scripts/tier.sh test:oracle oracle 470 25000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
+      - 'scripts/tier.sh test:oracle oracle 615 32500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
 
   test:kernel:
     desc: 'The driver writes, THE KERNEL reads back: our images loop-mounted by Linux in the guest'
