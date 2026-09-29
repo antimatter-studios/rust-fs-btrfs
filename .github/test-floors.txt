@@ -59,6 +59,7 @@ extent_window_write       3
 extent_write_oracle       3
 fixtures_present          2
 free_space_oracle         4
+free_space_straddle       2
 fs_oracle                 13
 fstree_oracle             2
 getxattr_byte_names       1
