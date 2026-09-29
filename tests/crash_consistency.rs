@@ -166,6 +166,18 @@ fn parse_report(text: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// Every line of a `btrfs check` report that says it did not check
+/// something — except the qgroup pass on a filesystem with no qgroups,
+/// which has nothing to check. Anything else skipped means the verdict
+/// covers less than the image, and is not a pass.
+fn skipped(report: &str) -> Vec<&str> {
+    report
+        .lines()
+        .filter(|line| line.to_lowercase().contains("skip"))
+        .filter(|line| !line.contains("checking quota groups skipped (not enabled on this FS)"))
+        .collect()
+}
+
 /// Which side of the commit a view of the filesystem is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -518,7 +530,7 @@ fn sweep(fixture_name: &str, label: &str) -> usize {
                     verdict.complaints.join("\n    ")
                 ));
             }
-            if verdict.check_status != 0 || verdict.check_output.to_lowercase().contains("skip") {
+            if verdict.check_status != 0 || !skipped(&verdict.check_output).is_empty() {
                 fail(format!(
                     "btrfs check --readonly exited {} on an image the kernel mounted:\n{}",
                     verdict.check_status, verdict.check_output
