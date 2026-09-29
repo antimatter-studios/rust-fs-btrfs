@@ -264,14 +264,20 @@ fn a_transaction_on_a_straddling_group_keeps_the_free_space_tree_valid_or_is_ref
                 group.length,
                 group.leaves.len()
             );
-            match transaction(&copy, *dirty) {
-                Ok(()) => assert_btrfs_check_clean(&copy, &label),
-                Err(e) => assert!(
-                    e.to_string().contains(REFUSAL),
-                    "[{label}] refused, but not for the straddle: {e}"
-                ),
-            }
-            println!("[{label}] kept the free-space tree valid or was refused by name");
+            let outcome = match transaction(&copy, *dirty) {
+                Ok(()) => {
+                    assert_btrfs_check_clean(&copy, &label);
+                    "committed, and btrfs check accepts it".to_string()
+                }
+                Err(e) => {
+                    assert!(
+                        e.to_string().contains(REFUSAL),
+                        "[{label}] refused, but not for the straddle: {e}"
+                    );
+                    "refused by name".to_string()
+                }
+            };
+            println!("[{label}] {outcome}");
             let _ = std::fs::remove_file(&copy);
         }
         let _ = std::fs::remove_dir_all(&dir);
