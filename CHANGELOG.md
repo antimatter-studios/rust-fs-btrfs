@@ -29,6 +29,12 @@ never does.
   reaches a volume inside a whole-disk image. Tested against a volume the
   kernel populated (`test-disks/cli/`), with `get` held to `btrfs
   inspect-internal dump-super`.
+- **`fs.btrfs write`, for the one write this library can make** (#225):
+  an existing NODATACOW file overwritten in place with exactly as many
+  bytes from stdin as it holds. Every other write is refused with exit
+  status 3 and the library's reason, and creating a file, like `mkdir`,
+  is blocked on #61. After a write, `btrfs check --readonly` finds the
+  volume clean and the kernel reads back the bytes written.
 
 ### Fixed
 
