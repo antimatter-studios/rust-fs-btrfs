@@ -342,7 +342,10 @@ fn an_acl_the_kernel_did_not_store_is_absent() {
 ///
 /// The builder FOUND the largest ACL by asking the kernel; this checks
 /// that finding against that arithmetic, and that the largest — and the
-/// one below it — read back whole.
+/// one below it — read back whole. Measured by the builder in the
+/// guest: 489 entries at 4 KiB nodes and 2025 at 16 KiB, for access and
+/// default ACLs alike (the one-byte longer default name does not cross an
+/// 8-byte entry).
 #[test]
 fn the_largest_acl_the_node_size_admits_reads_back_and_the_next_was_refused() {
     const LEAF_HEADER: usize = 101;

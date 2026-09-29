@@ -35,7 +35,7 @@
 # to refuse.
 #
 # <target> <floor>
-acl_oracle                7
+acl_oracle                8
 backup_ring               1
 bootstrap_chain           2
 btree_oracle              4

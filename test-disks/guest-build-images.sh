@@ -576,7 +576,8 @@ acl_refused() {
         echo "guest-build-images.sh: the $2-entry ${3:-access} ACL was refused for another reason: $(cat "$WORK/acl-err")" >&2
         return 1
     fi
-    tr '\n' ' ' < "$WORK/acl-err" | sed 's/ *$//'
+    # Relative to the mount point, so the manifest names no temporary path.
+    tr '\n' ' ' < "$WORK/acl-err" | sed -e "s|$MNT/|/|g" -e 's/ *$//'
 }
 
 build_acl() {
