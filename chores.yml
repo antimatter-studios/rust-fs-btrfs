@@ -108,12 +108,20 @@ chore_min_version: 0.10.0
 #     suite       810 /  44,217    1,060 /  57,500   ~30%: every target
 #                                                    once, so it grows
 #                                                    with the suite
-#     scripts      72 /   3,400       95 /   4,450   ~30%: four tests. Up
-#                                                    from 60 / 2,728 when
-#                                                    output-budget.sh grew
-#                                                    the resolver's refusal
-#                                                    cases -- measured
-#                                                    2026-09-26
+#     scripts     102 /   4,952      135 /   6,450   ~30%: one line per
+#                                                    assertion, so it grows
+#                                                    with the guards. 90 /
+#                                                    4,256 measured on the
+#                                                    x86_64 CI run of #216
+#                                                    (logs-test artefact,
+#                                                    2026-09-29), plus 11 /
+#                                                    640 for #217's
+#                                                    siblings-fresh-clone.sh
+#                                                    and 1 / 56 for #218's
+#                                                    scratch-paths probe,
+#                                                    both measured locally.
+#                                                    Was 72 / 3,400 -> 95 /
+#                                                    4,450 on 2026-09-26
 #     vm          957 /  50,636    1,250 /  66,000   ~30%: the same suite,
 #                                                    plus the guest's own
 #                                                    build, from cold
@@ -527,7 +535,7 @@ tasks:
     cmds:
       - |
         set -eu
-        scripts/tier.sh test:scripts scripts 95 4450 -- bash -c '
+        scripts/tier.sh test:scripts scripts 135 6450 -- bash -c '
           set -eu
           for t in tests/scripts/*.sh; do
             echo "== $t"
