@@ -130,6 +130,21 @@ jobs:
         run: chore test:unit
       - name: The unit tier executed its tests
         run: bash scripts/test-floor.sh --log tmp/logs/unit.log 322
+      # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to
+      # tmp/logs/<tier>.log and prints one line naming it; without this the
+      # file goes away with the runner. `if: always()` because the failing
+      # run is the one whose log is wanted most, and a passing run's log is
+      # the evidence -- the `[oracle vm]` / `[kernel vm]` lines -- that the
+      # tools ran in the guest. tests/scripts/ci-tier-logs-uploaded.sh
+      # refuses a job that runs a tier without this step.
+      - name: Keep the tier logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-${{ github.job }}
+          path: tmp/logs/
+          if-no-files-found: error
+          retention-days: 7
 
   fixtures:
     name: fixtures (harness VM, x86_64 KVM)
@@ -272,6 +287,21 @@ jobs:
             echo "::error::only $assertions script assertions executed, floor is 45 — a run that asserts fewer stopped early rather than passed" >&2
             exit 1
           fi
+      # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to
+      # tmp/logs/<tier>.log and prints one line naming it; without this the
+      # file goes away with the runner. `if: always()` because the failing
+      # run is the one whose log is wanted most, and a passing run's log is
+      # the evidence -- the `[oracle vm]` / `[kernel vm]` lines -- that the
+      # tools ran in the guest. tests/scripts/ci-tier-logs-uploaded.sh
+      # refuses a job that runs a tier without this step.
+      - name: Keep the tier logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-${{ github.job }}
+          path: tmp/logs/
+          if-no-files-found: error
+          retention-days: 7
 
   test-arm64:
     name: test (aarch64, no KVM on this runner)
@@ -319,6 +349,21 @@ jobs:
           set -euo pipefail
           bash scripts/test-floor.sh --log tmp/logs/unit.log 322
           bash scripts/test-floor.sh --log tmp/logs/images.log 149
+      # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to
+      # tmp/logs/<tier>.log and prints one line naming it; without this the
+      # file goes away with the runner. `if: always()` because the failing
+      # run is the one whose log is wanted most, and a passing run's log is
+      # the evidence -- the `[oracle vm]` / `[kernel vm]` lines -- that the
+      # tools ran in the guest. tests/scripts/ci-tier-logs-uploaded.sh
+      # refuses a job that runs a tier without this step.
+      - name: Keep the tier logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-${{ github.job }}
+          path: tmp/logs/
+          if-no-files-found: error
+          retention-days: 7
 
   suite-in-vm:
     name: suite in the guest (the macOS path)
@@ -357,6 +402,21 @@ jobs:
         run: '! chore vm:status'
       - name: The in-guest suite executed its tests
         run: bash scripts/test-floor.sh --log tmp/logs/vm.log 500
+      # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to
+      # tmp/logs/<tier>.log and prints one line naming it; without this the
+      # file goes away with the runner. `if: always()` because the failing
+      # run is the one whose log is wanted most, and a passing run's log is
+      # the evidence -- the `[oracle vm]` / `[kernel vm]` lines -- that the
+      # tools ran in the guest. tests/scripts/ci-tier-logs-uploaded.sh
+      # refuses a job that runs a tier without this step.
+      - name: Keep the tier logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-${{ github.job }}
+          path: tmp/logs/
+          if-no-files-found: error
+          retention-days: 7
 
   # ONE CHECK GATES THIS REPOSITORY, AND IT STANDS FOR EVERY JOB (#187).
   #
