@@ -47,17 +47,29 @@ for i, line in enumerate(lines):
         leafbitmap.append(False)
         continue
     m = re.search(
-        r"item \d+ key \((\d+) (FREE_SPACE_INFO|FREE_SPACE_EXTENT|FREE_SPACE_BITMAP) (\d+)\)",
+        r"item (\d+) key \((\d+) (FREE_SPACE_INFO|FREE_SPACE_EXTENT|FREE_SPACE_BITMAP) (\d+)\)",
         line,
     )
     if not m:
         continue
-    objectid, kind, offset = int(m.group(1)), m.group(2), int(m.group(3))
+    itemno, objectid, kind, offset = (
+        int(m.group(1)),
+        int(m.group(2)),
+        m.group(3),
+        int(m.group(4)),
+    )
     if kind == "FREE_SPACE_BITMAP":
         leafbitmap[leaf] = True
     if kind == "FREE_SPACE_INFO":
         fl = re.search(r"extent.count (\d+) flags (\d+)", lines[i + 1])
-        groups[objectid] = [offset, int(fl.group(2)), [leaf], 0, int(fl.group(1))]
+        groups[objectid] = [
+            offset,
+            int(fl.group(2)),
+            [leaf],
+            0,
+            int(fl.group(1)),
+            itemno,
+        ]
         order.append(objectid)
         continue
     for start in reversed(order):
@@ -78,7 +90,7 @@ fs_blocks = [
 print("fs tree blocks:", len(fs_blocks), "root", fs_blocks[0] if fs_blocks else None)
 
 for start in order:
-    length, flags, leaves, records, count = groups[start]
+    length, flags, leaves, records, count, before = groups[start]
     b = bg.get(start, (None, "NO-BG-ITEM", -1))
     inside = [a for a, k in fs_blocks if start <= a < start + length and k == "leaf"]
     print(
@@ -86,4 +98,6 @@ for start in order:
         f"records {records} leaves {leaves} fs-leaves-inside {len(inside)}"
     )
     if "METADATA" in b[1] and flags == 0 and len(leaves) > 1 and inside:
-        print(f"CANDIDATE {start} {length} {inside[len(inside) // 2]}")
+        print(
+            f"CANDIDATE {start} {length} {inside[len(inside) // 2]} before-in-L1 {before} L1-items {leafaddr[leaves[0]][1]}"
+        )

@@ -33,7 +33,7 @@ variant() {
     btrfs inspect-internal dump-tree -t 10 $img | grep -m3 -A1 FREE_SPACE_INFO
     python3 $HERE/analyse.py $img | tee $OUT/$name.txt | head -80
     grep -c "^  leaf#" $OUT/$name.txt
-    grep ^CANDIDATE $OUT/$name.txt | while read -r _ g len blk; do
+    grep ^CANDIDATE $OUT/$name.txt | while read -r _ g len blk _rest; do
         set -- x $g $len $blk
         cp --sparse=always $img $OUT/$name-t.img
         echo "transaction dirtying $4 in group $2"
@@ -45,5 +45,6 @@ variant() {
     echo "::endgroup::"
 }
 
-variant mixed2g-bal-k2 2G "-M -n 4096 -s 4096" 1300 1024 2 yes
-variant mixed4g-bal-k2 4G "-M -n 4096 -s 4096" 2600 1024 2 yes
+variant mixed4g-bal-k4 4G "-M -n 4096 -s 4096" 2600 1024 4 yes
+variant mixed4g-bal-k6 4G "-M -n 4096 -s 4096" 2600 1024 6 yes
+variant mixed2g-bal-k4 2G "-M -n 4096 -s 4096" 1300 1024 4 yes
