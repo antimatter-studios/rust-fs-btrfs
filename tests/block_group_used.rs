@@ -15,16 +15,18 @@
 //! first relocates mkfs's small first group, which would otherwise be
 //! turned into free-space bitmaps (refused for its own reason). A second
 //! balance after the files are written packs every group, so no group
-//! has free space to speak of — and then the 64 files at the LOWEST
-//! addresses, by `filefrag`, are deleted. That opens one hole at the
-//! bottom of the first group, which is where the allocator looks first;
-//! it is a few free-space records rather than a scatter; and the extent
-//! items those files took out of the leaves covering the hole leave room
-//! for the records of the blocks moved into it. Every tree leaf outside
-//! that group then moves across groups. A plan touching a group whose
-//! records straddle a leaf (#177, read from btrfs-progs' own dump), or
-//! one needing an insert into a full extent-tree leaf, is still passed
-//! over rather than used.
+//! has free space to speak of — and then every other one of the 128
+//! files at the LOWEST addresses, by `filefrag`, is deleted. That opens
+//! 64 one-mebibyte holes at the bottom of the first group, which is where
+//! the allocator looks first, and each is one free-space record.
+//! Deleting the 64 lowest as one contiguous run was measured not to do:
+//! every one of the 22 plans that crossed groups then needed an insert
+//! into a full extent-tree leaf, the leaf an insert at the bottom of the
+//! hole lands in having no room. Alternate files leave items, and room,
+//! in every leaf over the holes. Every tree leaf outside that group then
+//! moves across groups. A plan touching a group whose records straddle a
+//! leaf (#177, read from btrfs-progs' own dump), or one needing an insert
+//! into a full extent-tree leaf, is still passed over rather than used.
 
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::super_write::Commit;
@@ -127,7 +129,7 @@ fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
          for f in $(seq 0 399); do\n\
            at=$(filefrag -v \"$MNT/f$f\" | awk '$1 == \"0:\" {sub(/\\.\\./, \"\", $4); print $4; exit}')\n\
            echo \"$at f$f\"\n\
-         done | sort -n | head -n 64 | while read -r _ f; do rm \"$MNT/$f\"; done\n\
+         done | sort -n | head -n 128 | awk 'NR % 2 == 1' | while read -r _ f; do rm \"$MNT/$f\"; done\n\
          sync",
     );
 
@@ -153,6 +155,7 @@ fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
     let tried = leaves.len().min(300);
     let mut chosen = None;
     let mut full_leaf = 0usize;
+    let mut first_full = None;
     for dirty in leaves.into_iter().take(tried) {
         let plan = fs
             .plan_transaction_closed(&[dirty], 64)
@@ -173,7 +176,10 @@ fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
                 chosen = Some((plan, blocks, released, allocated));
                 break;
             }
-            Err(e) if e.to_string().contains("does not fit") => full_leaf += 1,
+            Err(e) if e.to_string().contains("does not fit") => {
+                full_leaf += 1;
+                first_full.get_or_insert(format!("moving the leaf at {dirty}: {e}"));
+            }
             Err(e) => panic!("rendering a plan moving the leaf at {dirty}: {e}"),
         }
     }
@@ -181,7 +187,8 @@ fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
         panic!(
             "none of {tried} tree leaves moves across groups without touching a group whose \
              free-space records straddle a leaf ({straddling:?} do); {full_leaf} crossed \
-             groups but needed an insert into a full extent-tree leaf"
+             groups but needed an insert into a full extent-tree leaf (first: {})",
+            first_full.as_deref().unwrap_or("none")
         )
     });
     let root = fs
