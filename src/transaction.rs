@@ -1038,4 +1038,81 @@ mod needs_host {
         assert!(taken.len() > 1000, "allocated only {} blocks", taken.len());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A touched group that no block group item describes is refused, not
+    /// carried through with its old records.
+    ///
+    /// SELF-CONSISTENCY ONLY, and it says so: no oracle can make this
+    /// input. The kernel removes a group's `FREE_SPACE_INFO` with the
+    /// group, and a stale one left by mkfs covers a range no chunk maps,
+    /// so no plan ever allocates or releases inside it. The refusal is
+    /// there because carrying the records would leave every block the
+    /// plan allocates in that range recorded as free, and this is the
+    /// only way to reach it: an INFO item one block past a real group's
+    /// start, so no group starts where it says, over addresses the plan
+    /// moves.
+    #[test]
+    fn a_touched_group_no_block_group_item_describes_is_refused() {
+        use crate::chunk::DiskKey;
+        use crate::leaf_edit::OwnedItem;
+        use crate::transaction::{Plan, Rewrite};
+
+        let dir = std::path::PathBuf::from(temp_path!("fst-no-group"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("fs.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(256 * 1024 * 1024)
+            .unwrap();
+        let made = oracle("mkfs.btrfs")
+            .args(["-q", "-f", "-s", "4096", "-n", "16384"])
+            .arg(&img)
+            .output();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+
+        let fs = Filesystem::mount(Arc::new(FileDevice::open(&img).unwrap())).unwrap();
+        let nodesize = fs.sb.nodesize as u64;
+        let group = fs
+            .block_groups()
+            .unwrap()
+            .into_iter()
+            .find(|g| g.holds_metadata())
+            .expect("a metadata block group");
+        let start = group.start + nodesize;
+        assert!(
+            fs.block_groups().unwrap().iter().all(|g| g.start != start),
+            "a block group starts at {start}, so the INFO item below would describe it"
+        );
+
+        let items = vec![OwnedItem {
+            key: DiskKey {
+                objectid: start,
+                key_type: super::FREE_SPACE_INFO_KEY,
+                offset: group.length - nodesize,
+            },
+            data: vec![0; crate::block_group::free_space_info::SIZE],
+        }];
+        let plan = Plan {
+            rewrites: vec![Rewrite {
+                old: start + nodesize,
+                new: start + 2 * nodesize,
+                owner: crate::chunk::objectid::FS_TREE,
+                level: 0,
+            }],
+        };
+        let outcome = fs.apply_free_space(items, &plan);
+        let _ = std::fs::remove_dir_all(&dir);
+        let error = outcome.expect_err(
+            "the plan moves blocks inside a group no block group item describes, and its \
+             records were carried through as if nothing inside it had changed",
+        );
+        assert!(
+            error.to_string().contains("no block group item describes"),
+            "refused, but not for the missing group: {error}"
+        );
+    }
 }
