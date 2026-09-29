@@ -13,9 +13,10 @@
 //! mixed block groups, so metadata is allocated from the same groups data
 //! fills and tree blocks end up in every one of them. `btrfs balance`
 //! first relocates mkfs's small first group, which would otherwise be
-//! turned into free-space bitmaps (refused for its own reason). Nothing is
-//! deleted, so every group's free-space records stay in one leaf, which the
-//! test asserts from btrfs-progs' own dump before relying on it.
+//! turned into free-space bitmaps (refused for its own reason). A second
+//! balance after the files are written packs every group, so its free space
+//! is a few runs; a plan touching a group whose records still straddle a
+//! leaf (#177, read from btrfs-progs' own dump) is not the one used.
 
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::super_write::Commit;
@@ -113,6 +114,8 @@ fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
         "several groups of files",
         "btrfs balance start --full-balance \"$MNT\" >/dev/null\n\
          for f in $(seq 0 399); do head -c 1048576 /dev/zero > \"$MNT/f$f\"; done\n\
+         sync\n\
+         btrfs balance start --full-balance \"$MNT\" >/dev/null\n\
          sync",
     );
 
@@ -131,12 +134,13 @@ fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
     let fs = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>).expect("mount rw");
     let generation = fs.superblock().generation + 1;
 
-    // Tree leaves from the highest address down: the allocator fills the
-    // lowest group first, so moving a high one crosses groups.
-    let mut leaves = tree_leaves(&image);
-    leaves.sort_unstable_by(|a, b| b.cmp(a));
+    // Any tree leaf whose move crosses groups. The allocator takes the
+    // lowest free address, so which leaves do depends on where the
+    // kernel left free space; they are tried in turn.
+    let leaves = tree_leaves(&image);
+    let tried = leaves.len().min(300);
     let mut chosen = None;
-    for dirty in leaves.into_iter().take(40) {
+    for dirty in leaves.into_iter().take(tried) {
         let plan = fs
             .plan_transaction_closed(&[dirty], 64)
             .expect("planning the transaction");
@@ -151,10 +155,12 @@ fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
             break;
         }
     }
-    let (plan, released, allocated) = chosen.expect(
-        "no leaf among the forty highest moves across groups without touching a group whose \
-         free-space records straddle a leaf",
-    );
+    let (plan, released, allocated) = chosen.unwrap_or_else(|| {
+        panic!(
+            "none of {tried} tree leaves moves across groups without touching a group whose \
+             free-space records straddle a leaf ({straddling:?} do)"
+        )
+    });
     let blocks = fs.render_plan(&plan, generation).expect("rendering");
     let root = fs
         .planned_root(&plan)
