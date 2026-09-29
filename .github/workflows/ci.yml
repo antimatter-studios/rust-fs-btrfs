@@ -80,6 +80,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  OUTPUT_BUDGET_FAIL_TAIL: "150"  # TEMPORARY (#177): shows the red; removed before merge
   CHORE_VERSION: "0.11.0"
 
 jobs:
