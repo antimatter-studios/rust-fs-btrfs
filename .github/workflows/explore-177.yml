@@ -2,6 +2,8 @@ name: explore-177 (temporary)
 on:
   push:
     branches: ['fix/177-*']
+env:
+  CHORE_VERSION: "0.11.0"
 jobs:
   explore:
     runs-on: ubuntu-24.04
