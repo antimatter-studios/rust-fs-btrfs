@@ -156,8 +156,8 @@ chore_min_version: 0.10.0
 #     vm          957 /  50,636    1,250 /  66,000   ~30%: the same suite,
 #                                                    plus the guest's own
 #                                                    build, from cold
-#     cli          17 /     614       23 /     800   ~30%: 17 / 592 on macOS
-#                                                    with test-write.sh, plus
+#     cli          20 /     693       26 /     900   ~30%: 20 / 671 on macOS
+#                                                    with test-docs.sh, plus
 #                                                    the 22 bytes CI's longer
 #                                                    paths add. Every file is
 #                                                    three lines when it
@@ -607,10 +607,10 @@ tasks:
     #
     # FLOOR: each file prints a `test result: ok. N passed` line, which
     # test-floor.sh sums as it does cargo's. 34 checks executed when the
-    # tier was added, 158 with test-write.sh; the floor is about 95% of that.
+    # tier was added, 176 with test-docs.sh; the floor is about 95% of that.
     cmds:
-      - 'scripts/tier.sh test:cli cli 23 800 -- scripts/test-cli.sh'
-      - 'scripts/test-floor.sh --log tmp/logs/cli.log 150'
+      - 'scripts/tier.sh test:cli cli 26 900 -- scripts/test-cli.sh'
+      - 'scripts/test-floor.sh --log tmp/logs/cli.log 167'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
