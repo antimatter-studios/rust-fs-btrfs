@@ -189,12 +189,14 @@ same suite" came to disagree. There is one oracle now and it is the guest's.
 the **exact payload** this crate wrote, not a digest that merely differs from
 last round's.
 
-## A known hole in the contract tests
+## The contract tests read the trampoline, not what it carries
 
-**#200** — a test spawning `Command::new("sudo")` passes every contract gate
-here. The shell scan requires a trailing space after `sudo`, so it misses by one
-character, and `HARNESS` does not list `sudo`/`bash`/`sh`/`env`. Do not take a
-green contract run as proof a test stayed inside the VM.
+A test spawning `sudo`, `env` or another launcher, or a shell given `-c`, hides
+the oracle tool or mount it runs inside a later argument, which no scan reads.
+So `tests/test_contract.rs` refuses the trampoline itself, and
+`tests/scripts/scratch-paths.sh` matches `\bsudo\b` rather than `sudo ` — the
+trailing space once let `Command::new("sudo")` through by one character (#200).
+A repository script may still be run as `bash <script>`; a command line may not.
 
 ## What gates a merge
 

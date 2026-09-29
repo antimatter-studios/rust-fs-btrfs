@@ -79,7 +79,7 @@ subvol_oracle             8
 superblock_mirrors        4
 super_flags_refusals      3
 super_write_oracle        3
-test_contract             5
+test_contract             7
 transaction_oracle        5
 transaction_plan          7
 tree_write_oracle         6
