@@ -366,7 +366,12 @@ impl Filesystem {
     ///   block's old address and gains one naming the new;
     /// - a **free-space tree** leaf has the affected block groups' free
     ///   runs recomputed, since that tree is the complement of the
-    ///   extent tree.
+    ///   extent tree;
+    /// - an **extent tree** leaf holding a `BLOCK_GROUP_ITEM` has that
+    ///   group's `used` moved by what the plan allocates in it less what
+    ///   it releases there. The two ends of a move are often in different
+    ///   groups, so `bytes_used` can add up while every group's count is
+    ///   wrong (#223).
     ///
     /// This section previously said the opposite — that a relocation
     /// moves what is already there and records nothing — which was true
@@ -398,6 +403,11 @@ impl Filesystem {
         }
 
         let moved: BTreeMap<u64, u64> = plan.rewrites.iter().map(|r| (r.old, r.new)).collect();
+
+        // How far each block group's `used` moves, and which of them
+        // have had it written so far (#223).
+        let deltas = self.block_group_deltas(plan)?;
+        let mut used_written: BTreeSet<u64> = BTreeSet::new();
 
         let mut out = Vec::with_capacity(plan.rewrites.len());
         for rewrite in &plan.rewrites {
@@ -449,6 +459,7 @@ impl Filesystem {
                     // that no longer exists.
                     if rewrite.owner == objectid::EXTENT_TREE {
                         owned = self.apply_records(rewrite.old, owned, plan, generation)?;
+                        apply_block_group_used(&mut owned, &deltas, &mut used_written)?;
                     }
 
                     // The free-space tree is the complement of the
@@ -499,6 +510,18 @@ impl Filesystem {
                 logical: rewrite.new,
                 bytes,
             });
+        }
+
+        // NOT A SKIP. A group whose `used` moves but whose item was in no
+        // leaf the plan rewrites keeps the old count, and `btrfs check`
+        // then reports "block group [...] used X but extent items used
+        // Y". A plan closed by `plan_transaction_closed` always holds
+        // that leaf; one built another way may not.
+        if let Some((start, delta)) = deltas.iter().find(|(g, _)| !used_written.contains(g)) {
+            return Err(Error::UnsupportedFeature(format!(
+                "the plan moves the used count of the block group at {start} by {delta} bytes, \
+                 but the leaf holding its block group item is not one the plan rewrites"
+            )));
         }
         Ok(out)
     }
@@ -562,6 +585,11 @@ impl Filesystem {
             // The free-space tree tracks the same moves from the other
             // side, so its leaves for those addresses are dirty too.
             seed.extend(self.free_space_leaves_for(&touched)?);
+            // A group the plan takes more from than it gives back, or the
+            // reverse, has its BLOCK_GROUP_ITEM's `used` rewritten, so
+            // the leaf holding that item is dirty too (#223).
+            let groups: BTreeSet<u64> = self.block_group_deltas(&plan)?.into_keys().collect();
+            seed.extend(self.block_group_item_leaves(&groups)?.into_values());
             if seed.len() == before {
                 return Ok(plan);
             }
@@ -741,6 +769,112 @@ impl Filesystem {
     }
 }
 
+impl Filesystem {
+    /// How far each block group's `used` moves under `plan`, in bytes:
+    /// a node for every block allocated in it, less one for every block
+    /// released from it. Groups that come out even are left out.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] for an address no block group
+    /// holds, which a plan cannot have chosen and a live tree block
+    /// cannot be at.
+    fn block_group_deltas(&self, plan: &Plan) -> Result<BTreeMap<u64, i128>> {
+        let groups = self.block_groups()?;
+        let group_of = |at: u64| {
+            groups
+                .iter()
+                .find(|g| g.contains(at))
+                .map(|g| g.start)
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(format!(
+                        "the block at {at} is in no block group, so there is no used count \
+                         to move for it"
+                    ))
+                })
+        };
+        let nodesize = i128::from(self.sb.nodesize);
+        let mut out: BTreeMap<u64, i128> = BTreeMap::new();
+        for rewrite in &plan.rewrites {
+            *out.entry(group_of(rewrite.new)?).or_default() += nodesize;
+            *out.entry(group_of(rewrite.old)?).or_default() -= nodesize;
+        }
+        out.retain(|_, delta| *delta != 0);
+        Ok(out)
+    }
+
+    /// The extent tree leaf holding the `BLOCK_GROUP_ITEM` of each group
+    /// in `starts`, by group start.
+    ///
+    /// Found by the item itself rather than by the insert rule
+    /// `leaves_holding` uses: the item exists, and the leaf that holds it
+    /// is the one whose bytes change.
+    fn block_group_item_leaves(&self, starts: &BTreeSet<u64>) -> Result<BTreeMap<u64, u64>> {
+        let mut out = BTreeMap::new();
+        if starts.is_empty() {
+            return Ok(out);
+        }
+        let root = self.tree_root(objectid::EXTENT_TREE)?;
+        self.for_each_tree_block(root, &mut |at, block, _| {
+            let Some(items) = block.body.items() else {
+                return;
+            };
+            for item in items {
+                if item.key.key_type == BLOCK_GROUP_ITEM_KEY && starts.contains(&item.key.objectid)
+                {
+                    out.insert(item.key.objectid, at);
+                }
+            }
+        })?;
+        Ok(out)
+    }
+}
+
+/// Move the `used` of every `BLOCK_GROUP_ITEM` in `items` that `deltas`
+/// names, and note each group written in `written`.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] for an item too short to hold `used`, or
+/// a count the move would take below zero or past the group's length —
+/// either means the extent tree does not say what the plan believes.
+fn apply_block_group_used(
+    items: &mut [crate::leaf_edit::OwnedItem],
+    deltas: &BTreeMap<u64, i128>,
+    written: &mut BTreeSet<u64>,
+) -> Result<()> {
+    use crate::block_group::block_group_item::{SIZE, USED};
+    for item in items.iter_mut() {
+        if item.key.key_type != BLOCK_GROUP_ITEM_KEY {
+            continue;
+        }
+        let Some(&delta) = deltas.get(&item.key.objectid) else {
+            continue;
+        };
+        let start = item.key.objectid;
+        let whole = item.data.len() >= SIZE;
+        let field = item.data.get_mut(USED..USED + 8).filter(|_| whole);
+        let Some(field) = field else {
+            return Err(Error::UnsupportedFeature(format!(
+                "the block group item at {start} is shorter than the structure it declares"
+            )));
+        };
+        let used = u64::from_le_bytes((&*field).try_into().expect("8 bytes"));
+        let moved = i128::from(used) + delta;
+        if moved < 0 || moved > i128::from(item.key.offset) {
+            return Err(Error::UnsupportedFeature(format!(
+                "the block group at {start} records {used} bytes used, and the plan would move \
+                 that by {delta} to outside its {} bytes",
+                item.key.offset
+            )));
+        }
+        field.copy_from_slice(&(moved as u64).to_le_bytes());
+        written.insert(start);
+    }
+    Ok(())
+}
+
+use crate::chunk::key_type::BLOCK_GROUP_ITEM as BLOCK_GROUP_ITEM_KEY;
 use crate::chunk::key_type::{
     FREE_SPACE_BITMAP as FREE_SPACE_BITMAP_KEY, FREE_SPACE_EXTENT as FREE_SPACE_EXTENT_KEY,
     FREE_SPACE_INFO as FREE_SPACE_INFO_KEY,

@@ -40,7 +40,7 @@ use crate::fs::Filesystem;
 use crate::superblock::{le32, le64};
 
 /// Byte offsets within `struct btrfs_block_group_item`.
-mod block_group_item {
+pub(crate) mod block_group_item {
     /// Bytes in use within the group. Their sum over every group is the
     /// superblock's `bytes_used`.
     pub const USED: usize = 0;
