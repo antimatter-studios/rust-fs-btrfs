@@ -470,6 +470,15 @@ impl Filesystem {
                                     .copy_from_slice(&to.to_le_bytes());
                                 item.data[root_item::GENERATION..root_item::GENERATION + 8]
                                     .copy_from_slice(&generation.to_le_bytes());
+                                // An item long enough to carry the second
+                                // copy must carry the same value, or the
+                                // kernel discards the root's newer fields.
+                                if let Some(v2) = item
+                                    .data
+                                    .get_mut(root_item::GENERATION_V2..root_item::GENERATION_V2 + 8)
+                                {
+                                    v2.copy_from_slice(&generation.to_le_bytes());
+                                }
                             }
                         }
                     }

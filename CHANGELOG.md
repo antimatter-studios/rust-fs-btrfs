@@ -4,6 +4,18 @@ Notable changes to `am-fs-btrfs`, newest first. This is a `0.x` crate, so the
 **minor** is the compatibility boundary: a minor bump may break API, a patch
 never does.
 
+## [Unreleased]
+
+### Fixed
+
+- **A commit writes `ROOT_ITEM.generation_v2` with `generation`** (#195).
+  `render_plan` updated a moved root's `generation` and left its second
+  copy stale, so the kernel mounting the result logged "mismatching
+  generation and generation_v2" for every moved root and reset the root's
+  extended fields (subvolume UUIDs and times). Found by the new
+  crash-consistency test, the first to read the kernel's log after
+  mounting a commit of this crate.
+
 ## [0.7.0] — 2026-09-27
 
 ### Breaking

@@ -39,7 +39,7 @@ set -euo pipefail
 OUT="$1"
 shift
 
-TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool"
+TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog"
 
 # ARGUMENTS FIRST, ENVIRONMENT SECOND. A misspelt target is the caller's
 # mistake and should be named as one wherever it is made; the root and
@@ -1033,6 +1033,55 @@ build_pool() {
     done
     publish "$a" "$b" "$manifest"
     note "built btrfs-pool-a and btrfs-pool-b (two-device RAID1 with content)"
+}
+
+# ---------------------------------------------------------------------
+# dirtylog — a filesystem with a log tree the kernel has not replayed.
+#
+# `fsync` writes a log tree and points the superblock's `log_root` at it;
+# the NEXT mount replays it into the real trees. Until then the committed
+# trees hold durable.txt as it was before the fsync, and fsynced.txt not
+# at all — so a reader that ignored `log_root` would return exactly the
+# bytes an application was told had been durably replaced.
+#
+# The image is copied WHILE MOUNTED, after the fsyncs and before any
+# commit: the mount's commit interval is five minutes, and the unmount
+# that follows would replay nothing but commit everything, erasing the
+# very state being captured. The loop device writes through the backing
+# file's page cache, so the copy sees every write the fsyncs made.
+#
+# The copy's `log_root` is checked, not assumed: a kernel that chose a
+# full commit over a log would leave an ordinary image, and the test
+# reading it would be testing nothing.
+#
+# In its own directory, like the snapshot: the suites that walk every
+# image in test-disks/ mount each one, and this one is refused on
+# purpose.
+# ---------------------------------------------------------------------
+build_dirtylog() {
+    local img="$WORK/btrfs-dirty-log.img" copy="$WORK/btrfs-dirty-log-copy.img" log_root
+    rm -f "$img" "$copy"
+    truncate -s 256M "$img"
+    mkfs.btrfs -f "$img" >/dev/null
+    mount -o loop,commit=300 "$img" "$MNT"
+    printf 'committed by a sync\n' > "$MNT/durable.txt"
+    sync
+    printf 'fsynced, not synced\n' | dd of="$MNT/durable.txt" conv=notrunc,fsync status=none
+    printf 'created then fsynced\n' | dd of="$MNT/fsynced.txt" conv=fsync status=none
+    cp --sparse=always "$img" "$copy"
+    umount "$MNT"
+    rm -f "$img"
+    btrfs inspect-internal dump-super "$copy" > "$WORK/dirty-log.super"
+    log_root=$(awk '$1 == "log_root" { print $2 }' "$WORK/dirty-log.super")
+    if [ -z "$log_root" ] || [ "$log_root" = 0 ]; then
+        echo "guest-build-images: the dirty-log image has log_root '${log_root}' — the fsync did not leave a log tree" >&2
+        exit 1
+    fi
+    mkdir -p "$OUT/dirtylog"
+    cp --sparse=always "$copy" "$OUT/dirtylog/btrfs-dirty-log.img.partial"
+    mv -f "$OUT/dirtylog/btrfs-dirty-log.img.partial" "$OUT/dirtylog/btrfs-dirty-log.img"
+    rm -f "$copy" "$WORK/dirty-log.super"
+    note "built btrfs-dirty-log (log_root $log_root)"
 }
 
 # ---------------------------------------------------------------------
