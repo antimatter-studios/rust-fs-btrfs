@@ -23,7 +23,7 @@ def dump(*a):
 bg = {}
 lines = dump("-t", "extent").splitlines()
 for i, line in enumerate(lines):
-    m = re.search(r"key \((\d+) BLOCK_GROUP_ITEM (\d+)\)", line)
+    m = re.search(r"item \d+ key \((\d+) BLOCK_GROUP_ITEM (\d+)\)", line)
     if m and i + 1 < len(lines):
         f = re.search(r"flags (\S+)", lines[i + 1])
         u = re.search(r"used (\d+)", lines[i + 1])
@@ -47,7 +47,7 @@ for i, line in enumerate(lines):
         leafbitmap.append(False)
         continue
     m = re.search(
-        r"key \((\d+) (FREE_SPACE_INFO|FREE_SPACE_EXTENT|FREE_SPACE_BITMAP) (\d+)\)",
+        r"item \d+ key \((\d+) (FREE_SPACE_INFO|FREE_SPACE_EXTENT|FREE_SPACE_BITMAP) (\d+)\)",
         line,
     )
     if not m:
