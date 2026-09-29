@@ -104,7 +104,13 @@ chore_min_version: 0.10.0
 #                                                    most of it, and it is
 #                                                    the evidence, so it
 #                                                    stays -- in the log
-#     kernel       84 /   6,906      110 /   9,000   ~30%
+#     kernel      179 /  16,220      235 /  21,500   ~30%. Up from 84 /
+#                                                    6,906 when
+#                                                    hard_link_extref added
+#                                                    three sweeps of per-step
+#                                                    [oracle vm] / [kernel
+#                                                    vm] evidence -- measured
+#                                                    on CI 2026-09-29
 #     suite       810 /  44,217    1,060 /  57,500   ~30%: every target
 #                                                    once, so it grows
 #                                                    with the suite
@@ -440,7 +446,7 @@ tasks:
     # not a pass.
     cmds:
       - test-disks/build-fixtures.sh --check
-      - 'scripts/tier.sh test:kernel kernel 110 9000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - 'scripts/tier.sh test:kernel kernel 235 21500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
