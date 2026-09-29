@@ -251,9 +251,6 @@ jobs:
         run: chore lint
       - name: chore test
         run: chore test
-      - name: DEBUG-195 failing assertions
-        if: failure()
-        run: grep -a -n -B2 -A80 'panicked' tmp/logs/*.log | head -400 || true
       - name: chore vm:status (the VM is down again)
         run: '! chore vm:status'
       # THE FLOORS. Per target against the whole-suite log, which is the
