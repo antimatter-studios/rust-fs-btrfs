@@ -251,8 +251,16 @@ tasks:
               git init --quiet "$dir"
               git -C "$dir" remote add origin "$url"
               git -C "$dir" fetch --quiet origin "$ref"   # not --depth 1: merge-base needs history
-              git -C "$dir" checkout --quiet FETCH_HEAD
-              continue
+              # ON A BRANCH, AND THEN THROUGH THE SAME FLOOR CHECK AS EVERY OTHER
+              # CHECKOUT. This used to `checkout FETCH_HEAD` -- detached -- and
+              # `continue` past the check below. Nothing showed while the pin stood
+              # still; the moment it was raised, the sibling THIS TASK had created
+              # was below the floor on `HEAD` rather than `main`, and was refused as
+              # though a person had put it there (#202). Landing on `main` at the pin
+              # keeps the checkout exactly where CI needs it and lets a later raise
+              # fast-forward it like any other. -B, because `git init` may already
+              # have named an unborn `main`.
+              git -C "$dir" checkout --quiet -B main FETCH_HEAD
             fi
             if [ -n "$(git -C "$dir" status --porcelain)" ]; then
               echo "siblings: $name has uncommitted changes -- refusing to move it." >&2
