@@ -398,6 +398,9 @@ tasks:
       # a log tree the kernel has not replayed; its own directory, like
       # the snapshot, because every other reader refuses it on purpose
       - test-disks/dirtylog/btrfs-dirty-log.img
+      # the volume the command-line tools are tested against, labelled
+      # CLITEST, with a manifest of what the kernel wrote into it
+      - test-disks/cli/btrfs-cli.img
     # A hung boot must not hold the VM and the machine-wide slot for
     # ever. The split fixtures alone mount and unmount up to four hundred
     # times, and the populated pair writes eighty thousand files, so this

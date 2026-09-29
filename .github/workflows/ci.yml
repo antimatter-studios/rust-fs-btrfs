@@ -31,10 +31,11 @@ name: CI
 #   cli          `chore cli:install` then `chore test:cli`: the command-line
 #                tools built in release mode, staged under every name first
 #                on PATH, and tested AS INSTALLED -- `rust-fs-btrfs doctor`
-#                first, then tests/cli/*.sh. A change that breaks a tool
-#                fails the pull request, not the release. What btrfs-progs
-#                and the kernel make of the tools' work is judged in the
-#                oracle and kernel tiers (tests/cli_*.rs), where the VM is.
+#                first, then tests/cli/*.sh, against the kernel-made
+#                fixtures. A change that breaks a tool fails the pull
+#                request, not the release. What btrfs-progs and the kernel
+#                make of the tools' work is judged in the oracle and kernel
+#                tiers (tests/cli_*.rs), where the VM is.
 #   ci-ok        the one required check: green only when every job above
 #                ran and succeeded (failed, cancelled OR skipped fails it).
 #
@@ -430,6 +431,7 @@ jobs:
 
   cli:
     name: cli (the installed tools, on PATH)
+    needs: fixtures
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
@@ -452,6 +454,11 @@ jobs:
             target
           key: ${{ runner.os }}-cli-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cli-cargo-
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+      - name: Unpack the fixtures
+        run: tar --sparse -xzf fixtures.tar.gz -C test-disks
       - name: chore cli:install
         run: chore cli:install
       # FIRST on PATH, so what the tier tests is what this checkout built.

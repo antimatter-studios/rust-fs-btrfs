@@ -14,10 +14,15 @@
 //! file -- is refused, by the library's own reason where it has one.
 
 use std::ffi::OsString;
+use std::io::Write;
 
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command as Cmd};
 
-use crate::common::{CliError, Outcome, Tool};
+use super::device;
+use crate::common::{CliError, Json, Outcome, Tool};
+use fs_btrfs::inode::{FileType, Inode};
+use fs_btrfs::superblock::{compat_ro, incompat};
+use fs_btrfs::{ChecksumType, Error, Filesystem, Superblock};
 
 pub const TOOL: Tool = Tool {
     name: "fs.btrfs",
@@ -213,19 +218,419 @@ fn key_command(name: &'static str, about: &'static str) -> Cmd {
 }
 
 fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
+    let target = matches
+        .get_one::<OsString>("target")
+        .expect("clap requires the target");
     let (verb, sub) = matches.subcommand().expect("clap requires a verb");
+    let offset = sub
+        .get_one::<u64>("offset")
+        .or_else(|| matches.get_one::<u64>("offset"))
+        .copied()
+        .unwrap_or(0);
     match verb {
-        // The verbs this binary will carry, answering until they do.
-        "ls" | "read" | "write" | "get" | "info" => Err(CliError::not_implemented(format!(
-            "{verb}: not in this build of fs.btrfs yet"
-        ))),
+        "ls" => ls(&device::mount(target, offset)?, path_arg(sub)),
+        "read" => read(
+            &device::mount(target, offset)?,
+            path_arg(sub),
+            sub.get_one("output"),
+        ),
+        "write" => Err(CliError::not_implemented(
+            "write: not in this build of fs.btrfs yet",
+        )),
         "mkdir" => Err(CliError::not_implemented(format!("mkdir: {COW_BLOCKED}"))),
+        "get" | "info" => get(
+            target,
+            offset,
+            sub.get_one::<String>("key").map(String::as_str),
+        ),
         "set" => set(sub),
         "resize" => Err(CliError::not_implemented(
             "resize: this library cannot resize a Btrfs filesystem",
         )),
         other => unreachable!("clap knows no verb {other}"),
     }
+}
+
+fn path_arg(sub: &ArgMatches) -> &[u8] {
+    let path = sub
+        .get_one::<OsString>("path")
+        .expect("clap requires or defaults the path");
+    os_bytes(path)
+}
+
+#[cfg(unix)]
+fn os_bytes(s: &OsString) -> &[u8] {
+    use std::os::unix::ffi::OsStrExt;
+    s.as_bytes()
+}
+
+#[cfg(not(unix))]
+fn os_bytes(s: &OsString) -> &[u8] {
+    s.to_str().map(str::as_bytes).unwrap_or_default()
+}
+
+/// A byte string for a person to read. Never fed back into a lookup:
+/// two distinct names can show the same.
+fn show(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// A library error about `what`: exit 3 when the library refused (it
+/// cannot do this, or will not), exit 1 when something failed.
+fn btrfs_error(what: &[u8], e: Error) -> CliError {
+    let message = format!("{}: {e}", show(what));
+    match e {
+        Error::UnsupportedFeature(_) | Error::ReadOnly => CliError::refused(message),
+        _ => CliError::failed(message),
+    }
+}
+
+fn type_name(t: Option<FileType>) -> &'static str {
+    match t {
+        Some(FileType::Regular) => "file",
+        Some(FileType::Directory) => "dir",
+        Some(FileType::Symlink) => "symlink",
+        Some(FileType::CharDevice) => "char",
+        Some(FileType::BlockDevice) => "block",
+        Some(FileType::Fifo) => "fifo",
+        Some(FileType::Socket) => "socket",
+        None => "unknown",
+    }
+}
+
+fn type_char(name: &str) -> char {
+    match name {
+        "file" => '-',
+        "dir" => 'd',
+        "symlink" => 'l',
+        "char" => 'c',
+        "block" => 'b',
+        "fifo" => 'p',
+        "socket" => 's',
+        _ => '?',
+    }
+}
+
+/// `path` joined with one more component.
+fn child_path(path: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut full = path.to_vec();
+    if !full.ends_with(b"/") {
+        full.push(b'/');
+    }
+    full.extend_from_slice(name);
+    full
+}
+
+/// One `ls` entry: the fields every `fs.<fs>` reports, typed the same way
+/// everywhere -- name (string), type (string), size (number), mode (octal
+/// string), mtime (seconds since the epoch, number), inode (number) and
+/// target (string) for a symlink -- plus `subvolume` (boolean), which is
+/// Btrfs's own: the entry is the top directory of another subvolume or a
+/// snapshot. A name that is not UTF-8 is shown lossily, with its exact
+/// bytes in `name_hex`.
+fn entry(fs: &Filesystem, name: &[u8], inode: &Inode, subvolume: bool) -> Json {
+    let kind = type_name(inode.file_type());
+    let mut fields = vec![("name", Json::from(show(name)))];
+    if std::str::from_utf8(name).is_err() {
+        fields.push((
+            "name_hex",
+            Json::from(name.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        ));
+    }
+    fields.extend([
+        ("type", Json::from(kind)),
+        ("size", Json::from(inode.size)),
+        ("mode", Json::from(format!("{:04o}", inode.permissions()))),
+        ("mtime", Json::from(inode.mtime.sec)),
+        ("inode", Json::from(inode.ino)),
+        ("subvolume", Json::from(subvolume)),
+    ]);
+    if inode.is_symlink() {
+        fields.push((
+            "target",
+            Json::from(fs.read_link(inode.ino).map(|t| show(&t)).ok()),
+        ));
+    }
+    Json::object(fields)
+}
+
+fn entry_text(e: &Json) -> String {
+    let field = |k: &str| e.get(k).map(Json::to_text).unwrap_or_default();
+    let mut line = format!(
+        "{}{} {:>12} {}",
+        type_char(&field("type")),
+        field("mode"),
+        field("size"),
+        field("name")
+    );
+    if e.get("subvolume") == Some(&Json::Bool(true)) {
+        line.push_str(" (subvolume)");
+    }
+    if let Some(target) = e.get("target") {
+        line.push_str(&format!(" -> {}", target.to_text()));
+    }
+    line
+}
+
+/// List `path`. A path crossing into a subvolume or a snapshot is
+/// followed into it, as a mount would show it.
+fn ls(root: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
+    let found = root
+        .resolve_path_bytes(path)
+        .map_err(|e| btrfs_error(path, e))?;
+    let fs = found.fs(root);
+    let entries = if found.inode.is_dir() {
+        let mut listed = Vec::new();
+        for d in fs
+            .read_dir(found.inode.ino)
+            .map_err(|e| btrfs_error(path, e))?
+        {
+            let full = child_path(path, &d.name);
+            if d.is_inode() {
+                let child = fs.read_inode(d.ino).map_err(|e| btrfs_error(&full, e))?;
+                listed.push(entry(fs, &d.name, &child, false));
+            } else {
+                // A subvolume's entry names a tree, not an inode; its top
+                // directory is what a mount shows at this name.
+                let inner = root
+                    .resolve_path_bytes(&full)
+                    .map_err(|e| btrfs_error(&full, e))?;
+                listed.push(entry(inner.fs(root), &d.name, &inner.inode, true));
+            }
+        }
+        listed.sort_by(|a, b| {
+            a.get("name")
+                .map(Json::to_text)
+                .cmp(&b.get("name").map(Json::to_text))
+        });
+        listed
+    } else {
+        let name = path.rsplit(|b| *b == b'/').next().unwrap_or(path);
+        vec![entry(fs, name, &found.inode, false)]
+    };
+    let text = entries
+        .iter()
+        .map(entry_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(Outcome::report(Json::Arr(entries)).with_text(text))
+}
+
+/// Stream a regular file's bytes. Each chunk is read before it is
+/// written, so a file whose blocks turn out unreadable part-way stops with
+/// status 1 and what came before stays on stdout; everything that can be
+/// refused up front (no such path, a directory, a symlink) is refused
+/// before a byte is written. `-o FILE` writes `FILE.partial` and renames
+/// it, so FILE is never left half written.
+fn read(root: &Filesystem, path: &[u8], output: Option<&OsString>) -> Result<Outcome, CliError> {
+    let found = root
+        .resolve_path_bytes(path)
+        .map_err(|e| btrfs_error(path, e))?;
+    let fs = found.fs(root);
+    let inode = &found.inode;
+    if inode.is_dir() {
+        return Err(CliError::failed(format!("{}: is a directory", show(path))));
+    }
+    if inode.is_symlink() {
+        let target = fs
+            .read_link(inode.ino)
+            .map(|t| show(&t))
+            .unwrap_or_default();
+        return Err(CliError::failed(format!(
+            "{}: is a symlink to {target}; read the target instead",
+            show(path)
+        )));
+    }
+    if !inode.is_regular_file() {
+        return Err(CliError::failed(format!(
+            "{}: not a regular file",
+            show(path)
+        )));
+    }
+    const CHUNK: usize = 1 << 20;
+    let mut buf = vec![0u8; CHUNK];
+    let mut copy = |sink: &mut dyn Write| -> Result<(), CliError> {
+        let mut offset = 0u64;
+        while offset < inode.size {
+            let want = CHUNK.min((inode.size - offset) as usize);
+            let got = fs
+                .read_at(inode.ino, offset, &mut buf[..want])
+                .map_err(|e| btrfs_error(path, e))?;
+            if got == 0 {
+                return Err(CliError::failed(format!(
+                    "{}: short read at byte {offset} of {}",
+                    show(path),
+                    inode.size
+                )));
+            }
+            sink.write_all(&buf[..got])
+                .map_err(|e| CliError::failed(format!("write: {e}")))?;
+            offset += got as u64;
+        }
+        sink.flush()
+            .map_err(|e| CliError::failed(format!("write: {e}")))
+    };
+    match output {
+        None => copy(&mut std::io::stdout().lock())?,
+        Some(file) => {
+            let dest = std::path::Path::new(file);
+            let mut partial = dest.as_os_str().to_owned();
+            partial.push(".partial");
+            let partial = std::path::PathBuf::from(partial);
+            let mut f = std::fs::File::create(&partial)
+                .map_err(|e| CliError::failed(format!("create {}: {e}", partial.display())))?;
+            if let Err(e) = copy(&mut f) {
+                drop(f);
+                let _ = std::fs::remove_file(&partial);
+                return Err(e);
+            }
+            std::fs::rename(&partial, dest)
+                .map_err(|e| CliError::failed(format!("rename to {}: {e}", dest.display())))?;
+        }
+    }
+    Ok(Outcome::done())
+}
+
+/// A UUID in its standard 8-4-4-4-12 form.
+fn uuid_text(u: &[u8; 16]) -> String {
+    let hex: String = u.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// The checksum algorithm, by the name btrfs-progs gives it.
+pub fn csum_name(t: ChecksumType) -> &'static str {
+    match t {
+        ChecksumType::Crc32c => "crc32c",
+        ChecksumType::XxHash64 => "xxhash64",
+        ChecksumType::Sha256 => "sha256",
+        ChecksumType::Blake2b256 => "blake2b",
+    }
+}
+
+/// The names of the bits set in `bits`, lowercase, as btrfs-progs spells
+/// them; a bit this table does not know is given in hex.
+fn flag_names(bits: u64, table: &[(u64, &str)]) -> Json {
+    let mut names = Vec::new();
+    let mut known = 0u64;
+    for &(bit, name) in table {
+        known |= bit;
+        if bits & bit != 0 {
+            names.push(Json::from(name));
+        }
+    }
+    let unknown = bits & !known;
+    if unknown != 0 {
+        names.push(Json::from(format!("{unknown:#x}")));
+    }
+    Json::Arr(names)
+}
+
+const INCOMPAT: &[(u64, &str)] = &[
+    (incompat::MIXED_BACKREF, "mixed_backref"),
+    (incompat::DEFAULT_SUBVOL, "default_subvol"),
+    (incompat::MIXED_GROUPS, "mixed_groups"),
+    (incompat::COMPRESS_LZO, "compress_lzo"),
+    (incompat::COMPRESS_ZSTD, "compress_zstd"),
+    (incompat::BIG_METADATA, "big_metadata"),
+    (incompat::EXTENDED_IREF, "extended_iref"),
+    (incompat::RAID56, "raid56"),
+    (incompat::SKINNY_METADATA, "skinny_metadata"),
+    (incompat::NO_HOLES, "no_holes"),
+    (incompat::METADATA_UUID, "metadata_uuid"),
+    (incompat::RAID1C34, "raid1c34"),
+    (incompat::ZONED, "zoned"),
+    (incompat::EXTENT_TREE_V2, "extent_tree_v2"),
+    (incompat::RAID_STRIPE_TREE, "raid_stripe_tree"),
+    (incompat::SIMPLE_QUOTA, "simple_quota"),
+    (incompat::REMAP_TREE, "remap_tree"),
+];
+
+const COMPAT_RO: &[(u64, &str)] = &[
+    (compat_ro::FREE_SPACE_TREE, "free_space_tree"),
+    (compat_ro::FREE_SPACE_TREE_VALID, "free_space_tree_valid"),
+    (compat_ro::VERITY, "verity"),
+    (compat_ro::BLOCK_GROUP_TREE, "block_group_tree"),
+];
+
+/// Whether the volume needs attention before it can be trusted: a log
+/// tree waiting to be replayed, or the error flag the kernel sets when it
+/// forced the volume read-only.
+pub fn is_dirty(sb: &Superblock) -> bool {
+    sb.has_dirty_log() || sb.has_error_flag()
+}
+
+/// The envelope: the shared keys first, Btrfs's own under `btrfs`.
+///
+/// From the superblock alone, so a volume that will not mount -- a log
+/// waiting for replay -- still answers, and says it is dirty.
+pub fn envelope(sb: &Superblock) -> Json {
+    Json::object([
+        ("fs", Json::from("btrfs")),
+        (
+            "label",
+            if sb.label.is_empty() {
+                Json::Null
+            } else {
+                Json::from(sb.label.as_str())
+            },
+        ),
+        ("total_bytes", Json::from(sb.total_bytes)),
+        (
+            "free_bytes",
+            Json::from(sb.total_bytes.saturating_sub(sb.bytes_used)),
+        ),
+        ("block_size", Json::from(sb.sectorsize)),
+        ("dirty", Json::from(is_dirty(sb))),
+        (
+            "btrfs",
+            Json::object([
+                ("fsid", Json::from(uuid_text(&sb.fsid))),
+                ("metadata_uuid", Json::from(uuid_text(&sb.node_uuid()))),
+                ("node_size", Json::from(sb.nodesize)),
+                ("sector_size", Json::from(sb.sectorsize)),
+                ("csum_type", Json::from(csum_name(sb.csum_type))),
+                ("device_count", Json::from(sb.num_devices)),
+                ("bytes_used", Json::from(sb.bytes_used)),
+                ("generation", Json::from(sb.generation)),
+                ("log_root", Json::from(sb.log_root)),
+                (
+                    "features",
+                    Json::object([
+                        ("compat", Json::from(format!("{:#x}", sb.compat_flags))),
+                        ("compat_ro", flag_names(sb.compat_ro_flags, COMPAT_RO)),
+                        ("incompat", flag_names(sb.incompat_flags, INCOMPAT)),
+                    ]),
+                ),
+            ]),
+        ),
+    ])
+}
+
+fn get(target: &OsString, offset: u64, key: Option<&str>) -> Result<Outcome, CliError> {
+    let sb = device::superblock(target, offset)?;
+    let all = envelope(&sb);
+    let Some(key) = key else {
+        return Ok(Outcome::report(all));
+    };
+    let mut value = Some(&all);
+    for part in key.split('.') {
+        value = value.and_then(|v| v.get(part));
+    }
+    let Some(value) = value else {
+        return Err(CliError::usage(format!(
+            "no key {key:?}; the keys are {} (and btrfs.<field>)",
+            KEYS.join(", ")
+        )));
+    };
+    let text = value.to_text();
+    Ok(Outcome::report(Json::object([(key, value.clone())])).with_text(text))
 }
 
 fn set(sub: &ArgMatches) -> Result<Outcome, CliError> {

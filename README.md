@@ -81,14 +81,23 @@ Metadata is JSON on stdout by default, `--text` for people. A failure is
 
 | verb | state |
 |---|---|
+| `ls [PATH]` | JSON entries: name, type, size, mode, mtime, inode, `subvolume`, and a symlink's target. A path into a subvolume or a snapshot is followed, as a mount shows it |
+| `read PATH [-o FILE]` | the file's raw bytes: inline, compressed (zlib, LZO, zstd), sparse, inside a subvolume or through a snapshot |
+| `get [KEY]` / `info [KEY]` | `fs`, `label`, `total_bytes`, `free_bytes` (from `bytes_used`), `block_size` (the sector size), `dirty` (a log to replay, or the error flag), and `btrfs.*`: fsid, metadata UUID, node size, checksum type, device count, generation, feature names. From the superblock alone, so a volume that will not mount still answers |
 | `mkdir` | not implemented (exit 3): needs the copy-on-write write path, [#61][i61] |
 | `set label`, `resize` | not implemented (exit 3): no label writer, no resize |
 
 There is no `mkfs.btrfs` and no `fsck.btrfs`: this crate cannot build an initial
 layout or check a volume, so neither name is installed.
 
+`--offset BYTES` addresses a volume inside a whole-disk image.
+
 `chore test:cli` tests the tools **as installed**, whatever PATH resolves:
-`rust-fs-btrfs doctor` first, then `tests/cli/test-*.sh`.
+`rust-fs-btrfs doctor` first, then `tests/cli/test-*.sh`, against a volume the
+kernel populated in the harness VM (`test-disks/cli/`, with the kernel's own
+manifest of every path, size and SHA-256). `tests/cli_oracle.rs` holds `get` to
+`btrfs inspect-internal dump-super`, and checks that a volume `fs.btrfs` refuses
+as damaged is one `btrfs check --readonly` refuses too.
 
 [i61]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/61
 
