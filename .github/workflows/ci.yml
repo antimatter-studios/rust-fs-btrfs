@@ -28,6 +28,13 @@ name: CI
 #   suite-in-vm  `chore test:vm`: the whole suite COMPILED AND RUN INSIDE
 #                the guest. That is how a macOS host runs a Linux suite,
 #                and this job is what keeps that path working.
+#   cli          `chore cli:install` then `chore test:cli`: the command-line
+#                tools built in release mode, staged under every name first
+#                on PATH, and tested AS INSTALLED -- `rust-fs-btrfs doctor`
+#                first, then tests/cli/*.sh. A change that breaks a tool
+#                fails the pull request, not the release. What btrfs-progs
+#                and the kernel make of the tools' work is judged in the
+#                oracle and kernel tiers (tests/cli_*.rs), where the VM is.
 #   ci-ok        the one required check: green only when every job above
 #                ran and succeeded (failed, cancelled OR skipped fails it).
 #
@@ -68,8 +75,11 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+  # EVERY pull request, whatever its base. A stack of pull requests is based
+  # on each other's branches, and a filter on `main` gave every one but the
+  # bottom no run at all -- which a merge queue then reads as nothing
+  # failing.
   pull_request:
-    branches: [main]
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -418,6 +428,47 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  cli:
+    name: cli (the installed tools, on PATH)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cli-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cli-cargo-
+      - name: chore cli:install
+        run: chore cli:install
+      # FIRST on PATH, so what the tier tests is what this checkout built.
+      - name: The staged tools first on PATH
+        run: scripts/cli-install.sh --print-bin-dir >> "$GITHUB_PATH"
+      - name: chore test:cli
+        run: chore test:cli
+      # THE TIER LOGS OUTLIVE THE RUNNER, as in every job that runs a tier.
+      - name: Keep the tier logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-${{ github.job }}
+          path: tmp/logs/
+          if-no-files-found: error
+          retention-days: 7
+
   # ONE CHECK GATES THIS REPOSITORY, AND IT STANDS FOR EVERY JOB (#187).
   #
   # Branch protection names checks, and a check is a job name — so a list
@@ -438,7 +489,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [unit, fixtures, test, test-arm64, suite-in-vm]
+    needs: [unit, fixtures, test, test-arm64, suite-in-vm, cli]
     runs-on: ubuntu-latest
     steps:
       - name: Every job ran and succeeded
