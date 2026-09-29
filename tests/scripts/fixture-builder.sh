@@ -57,7 +57,7 @@ case "${1:-}" in
     *) exit 0 ;;
 esac
 STUB
-for tool in setfattr getfattr chattr lsattr losetup; do
+for tool in setfattr getfattr setfacl getfacl chattr lsattr losetup; do
     printf '#!/usr/bin/env bash\nexit 0\n' > "$sandbox/bin/$tool"
 done
 chmod +x "$sandbox"/bin/*
@@ -122,7 +122,7 @@ dumps=$(find "$sandbox/out" -name '*.superdump' | wc -l | tr -d ' ')
 # anything going red.
 targets="$("$DRIVER" --list | tr '\n' ' ')"
 case "$targets" in
-    *geometry*populated*rich*compression*subvol*xattr*nodatacow*commit*cow*split*pool*)
+    *geometry*populated*rich*compression*subvol*xattr*acl*nodatacow*commit*cow*split*pool*)
         ok "the driver lists every target in build order" ;;
     *) fail "the driver lists every target in build order: $targets" ;;
 esac

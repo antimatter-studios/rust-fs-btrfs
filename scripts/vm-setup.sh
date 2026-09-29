@@ -17,6 +17,9 @@
 #                sets attributes with and takes its reference answer
 #                from. Without it that fixture builds a filesystem with
 #                no attributes and a manifest saying so
+#   acl          setfacl/getfacl: the ACL fixture sets its ACLs, finds the
+#                largest one the node size admits, and takes the entry
+#                counts it records, through them
 #   e2fsprogs    chattr/lsattr, which is how a directory is marked
 #                NODATACOW — an ext2 tool that btrfs honours
 #   python3      the compressible payloads the compression fixtures need

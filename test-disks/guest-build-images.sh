@@ -39,7 +39,7 @@ set -euo pipefail
 OUT="$1"
 shift
 
-TARGETS="geometry populated rich compression subvol xattr nodatacow commit cow split pool"
+TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool"
 
 # ARGUMENTS FIRST, ENVIRONMENT SECOND. A misspelt target is the caller's
 # mistake and should be named as one wherever it is made; the root and
@@ -59,7 +59,7 @@ done
 
 [ "$(id -u)" -eq 0 ] || { echo "guest-build-images.sh runs as root in the guest." >&2; exit 1; }
 
-for tool in mkfs.btrfs btrfs setfattr getfattr chattr lsattr python3 sha256sum losetup; do
+for tool in mkfs.btrfs btrfs setfattr getfattr setfacl getfacl chattr lsattr python3 sha256sum losetup; do
     command -v "$tool" >/dev/null || {
         echo "guest-build-images.sh: $tool is not in the guest." >&2
         echo "  It is installed by scripts/vm-setup.sh; 'chore vm:provision' applies it again." >&2
@@ -469,6 +469,209 @@ build_xattr() {
     dump_super "$img"
     publish "$img" "${img%.img}.superdump" "$manifest"
     note "built btrfs-xattr"
+}
+
+# ---------------------------------------------------------------------
+# acl — POSIX ACLs, set by setfacl and inherited by the kernel, on a
+# 4 KiB-node and a 16 KiB-node filesystem, and the kernel's own account
+# of every one of them.
+#
+# An ACL is an extended attribute (`system.posix_acl_access`, or
+# `system.posix_acl_default` on a directory) whose value has a format of
+# its own: a 4-byte header carrying version 2, then one 8-byte entry per
+# ACL entry. The value is the kernel's to write, so everything here is
+# set through setfacl or created under a default ACL and left for the
+# kernel to fill in.
+#
+#   minimal.txt       an ACL setfacl was given that the mode bits already
+#                     say. The kernel stores NO attribute for it, and a
+#                     driver must not invent one.
+#   one-user.txt      the smallest ACL that is stored: one named user,
+#                     which brings a mask with it — five entries.
+#   mixed.txt         named users AND named groups, so the tags sort.
+#   sweep/            one file per entry count, from five up to the
+#                     largest the node size admits (see below).
+#   over.txt, over.d  one entry past that largest: the kernel refuses it,
+#                     so these carry no ACL at all.
+#   inherit/          a directory with access and default ACLs; the file,
+#                     the subdirectory and the file inside that were
+#                     CREATED under it, so their ACLs are the kernel's
+#                     inheritance, not anything setfacl was told.
+#   maxdir/           a directory whose access ACL AND default ACL are
+#                     both the largest the node size admits — two items
+#                     that cannot share a leaf on a 4 KiB node — and a
+#                     file and a directory created under it, which
+#                     inherit that largest default.
+#
+# THE BOUNDARY. Btrfs keeps every attribute inline, in one item of one
+# leaf; there is no out-of-line value to spill into. So the largest ACL
+# is set by the node size: the kernel refuses a value whose name and
+# value would not fit an item in an otherwise empty leaf, with ENOSPC.
+# That largest count is FOUND here, by bisecting on what setfacl is
+# allowed to set, rather than computed — the arithmetic is the test's
+# to check against it — and recorded in the manifest with the refusal
+# the next count up met.
+#
+# The manifest is `getfattr -R -d -m - -e hex`, as the xattr fixture's,
+# preceded by `#`-lines the xattr parser skips:
+#   # acl-nodesize: <bytes>
+#   # acl-max: <access|default> <largest accepted> refused <next>: <setfacl's error>
+#   # acl-count: <path> access <n> default <n>      (getfacl's entry counts)
+#   # acl-value: <path> <name> 0x<hex>              (getfattr -n <name>)
+# ---------------------------------------------------------------------
+
+# acl_spec <total> [default] — an ACL of exactly <total> entries for
+# `setfacl -M`: the four a named entry requires (owner, owning group,
+# mask, other) and <total - 4> named users with distinct ids.
+acl_spec() {
+    local total="$1" prefix="${2:+default:}" i
+    printf '%suser::rw-\n%sgroup::r--\n%smask::rw-\n%sother::r--\n' \
+        "$prefix" "$prefix" "$prefix" "$prefix"
+    for ((i = 0; i < total - 4; i++)); do
+        printf '%suser:%d:r--\n' "$prefix" $((10000 + i))
+    done
+}
+
+# acl_set <path> <total> [default] — set that ACL; setfacl's error, if
+# any, is left in $WORK/acl-err. `-n`: the spec's mask stands as given,
+# so the entry count is exactly <total>.
+acl_set() {
+    acl_spec "$2" "${3:-}" > "$WORK/acl-spec"
+    setfacl -n -M "$WORK/acl-spec" "$1" 2> "$WORK/acl-err"
+}
+
+# acl_max <path> [default] — the largest entry count the kernel accepts
+# on <path>, by bisection between a count it must accept and one it must
+# refuse. Either end behaving otherwise fails the build: the search
+# would then be measuring something other than the boundary.
+acl_max() {
+    local path="$1" kind="${2:-}" lo=5 hi=8200 mid
+    setfacl -b "$path"
+    if ! acl_set "$path" "$lo" "$kind"; then
+        echo "guest-build-images.sh: a $lo-entry ${kind:-access} ACL was refused: $(cat "$WORK/acl-err")" >&2
+        return 1
+    fi
+    setfacl -b "$path"
+    if acl_set "$path" "$hi" "$kind"; then
+        echo "guest-build-images.sh: a $hi-entry ${kind:-access} ACL was accepted — larger than any value an attribute can hold" >&2
+        return 1
+    fi
+    while (( hi - lo > 1 )); do
+        mid=$(( (lo + hi) / 2 ))
+        setfacl -b "$path"
+        if acl_set "$path" "$mid" "$kind"; then lo=$mid; else hi=$mid; fi
+    done
+    setfacl -b "$path"
+    echo "$lo"
+}
+
+# acl_refused <path> <total> [default] — the ACL must be refused, and
+# refused for want of room. Prints setfacl's error.
+acl_refused() {
+    if acl_set "$@"; then
+        echo "guest-build-images.sh: a $2-entry ${3:-access} ACL on $1 was accepted, one past the largest" >&2
+        return 1
+    fi
+    if ! grep -q 'No space left on device' "$WORK/acl-err"; then
+        echo "guest-build-images.sh: the $2-entry ${3:-access} ACL was refused for another reason: $(cat "$WORK/acl-err")" >&2
+        return 1
+    fi
+    # Relative to the mount point, so the manifest names no temporary path.
+    tr '\n' ' ' < "$WORK/acl-err" | sed -e "s|$MNT/|/|g" -e 's/ *$//'
+}
+
+build_acl() {
+    local geometry name nodesize img manifest max_access max_default
+    local refused_access refused_default n p a d attr v
+    for geometry in "node4k:4096" "node16k:16384"; do
+        name="${geometry%%:*}"
+        nodesize="${geometry#*:}"
+        img="$WORK/btrfs-acl-$name.img"
+        manifest="$WORK/btrfs-acl-$name.manifest"
+        rm -f "$img" "$manifest"
+        truncate -s 256M "$img"
+        mkfs.btrfs -f -n "$nodesize" "$img" >/dev/null
+        # `acl` is btrfs's default, named anyway so a changed default
+        # cannot quietly build a fixture with no ACLs in it.
+        mount -o loop,acl "$img" "$MNT"
+
+        # The boundary, measured on scratch paths removed afterwards.
+        touch "$MNT/scratch"
+        max_access="$(acl_max "$MNT/scratch")"
+        rm -f "$MNT/scratch"
+        mkdir "$MNT/scratch.d"
+        max_default="$(acl_max "$MNT/scratch.d" default)"
+        rmdir "$MNT/scratch.d"
+
+        echo minimal > "$MNT/minimal.txt"
+        setfacl -m u::rw-,g::r--,o::r-- "$MNT/minimal.txt"
+        echo one > "$MNT/one-user.txt"
+        setfacl -m u:1000:rw- "$MNT/one-user.txt"
+        echo mixed > "$MNT/mixed.txt"
+        setfacl -m u:1001:r--,u:1002:rw-,g:2001:r--,g:2002:rwx "$MNT/mixed.txt"
+
+        mkdir "$MNT/sweep"
+        n=5
+        while (( n < max_access - 1 )); do
+            echo "$n" > "$MNT/sweep/entries-$n.txt"
+            acl_set "$MNT/sweep/entries-$n.txt" "$n"
+            n=$(( n * 2 ))
+        done
+        for n in $(( max_access - 1 )) "$max_access"; do
+            echo "$n" > "$MNT/sweep/entries-$n.txt"
+            acl_set "$MNT/sweep/entries-$n.txt" "$n"
+        done
+
+        echo over > "$MNT/over.txt"
+        refused_access="$(acl_refused "$MNT/over.txt" $(( max_access + 1 )))"
+        mkdir "$MNT/over.d"
+        refused_default="$(acl_refused "$MNT/over.d" $(( max_default + 1 )) default)"
+
+        mkdir "$MNT/inherit"
+        setfacl -m u:1000:rwx,g:2000:r-x,d:u:1000:rwx,d:g:2000:r-x,d:o::--- "$MNT/inherit"
+        echo file > "$MNT/inherit/file.txt"
+        mkdir "$MNT/inherit/sub"
+        echo nested > "$MNT/inherit/sub/nested.txt"
+
+        mkdir "$MNT/maxdir"
+        acl_set "$MNT/maxdir" "$max_access"
+        acl_set "$MNT/maxdir" "$max_default" default
+        echo child > "$MNT/maxdir/child.txt"
+        mkdir "$MNT/maxdir/child.d"
+        sync
+
+        {
+            echo "# POSIX ACLs on a ${nodesize}-byte-node btrfs, as the kernel reports them."
+            echo "# acl-nodesize: $nodesize"
+            echo "# acl-max: access $max_access refused $(( max_access + 1 )): $refused_access"
+            echo "# acl-max: default $max_default refused $(( max_default + 1 )): $refused_default"
+            ( cd "$MNT" && find . -mindepth 1 | sort | while read -r p; do
+                a="$(getfacl -cnE "$p" | grep -cv -e '^default:' -e '^$' || true)"
+                d="$(getfacl -cnE "$p" | grep -c '^default:' || true)"
+                echo "# acl-count: ${p#.} access $a default $d"
+                for attr in system.posix_acl_access system.posix_acl_default; do
+                    v="$(getfattr -e hex -n "$attr" "$p" 2>/dev/null | sed -n "s/^$attr=//p" || true)"
+                    [ -z "$v" ] || echo "# acl-value: ${p#.} $attr $v"
+                done
+              done )
+            echo "# getfattr -R -d -m - -e hex, from the mounted filesystem."
+            (cd "$MNT" && getfattr -R -d -m - -e hex .)
+        } > "$manifest"
+
+        # The reference must actually carry ACLs, from BOTH readings of
+        # them, or every comparison against it compares nothing.
+        for attr in system.posix_acl_access system.posix_acl_default; do
+            grep -q "^# acl-value: .* $attr 0x" "$manifest" \
+                || { echo "guest-build-images.sh: getfattr -n reported no $attr on btrfs-acl-$name" >&2; exit 1; }
+            grep -q "^$attr=0x" "$manifest" \
+                || { echo "guest-build-images.sh: getfattr -d -m - listed no $attr on btrfs-acl-$name" >&2; exit 1; }
+        done
+
+        umount "$MNT"
+        dump_super "$img"
+        publish "$img" "${img%.img}.superdump" "$manifest"
+        note "built btrfs-acl-$name (largest ACL: $max_access access, $max_default default entries)"
+    done
 }
 
 # ---------------------------------------------------------------------

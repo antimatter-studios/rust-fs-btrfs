@@ -36,7 +36,7 @@ DISKS="$REPO/test-disks"
 
 # target -> the artefacts it produces, relative to test-disks/, in build
 # order. Every name here is checked by --check and named in chores.yml.
-TARGETS="geometry populated rich compression subvol xattr nodatacow commit cow split pool"
+TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool"
 
 artefacts_for() {
     case "$1" in
@@ -69,6 +69,14 @@ artefacts_for() {
             ;;
         xattr)
             echo btrfs-xattr.img; echo btrfs-xattr.superdump; echo btrfs-xattr.manifest
+            ;;
+        acl)
+            local node
+            for node in node4k node16k; do
+                echo "btrfs-acl-$node.img"
+                echo "btrfs-acl-$node.superdump"
+                echo "btrfs-acl-$node.manifest"
+            done
             ;;
         nodatacow)
             echo btrfs-nodatacow.img; echo btrfs-nodatacow.superdump
