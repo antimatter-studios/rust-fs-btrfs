@@ -46,6 +46,4 @@ variant() {
 }
 
 variant mixed2g-bal-k2 2G "-M -n 4096 -s 4096" 1300 1024 2 yes
-variant mixed2g-bal-k3 2G "-M -n 4096 -s 4096" 1300 1024 3 yes
 variant mixed4g-bal-k2 4G "-M -n 4096 -s 4096" 2600 1024 2 yes
-variant mixed4g-bal-k3 4G "-M -n 4096 -s 4096" 2600 1024 3 yes

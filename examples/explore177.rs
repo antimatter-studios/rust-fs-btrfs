@@ -31,6 +31,39 @@ fn main() {
             g(r.new)
         );
     }
+    for grp in groups.iter().filter(|x| {
+        plan.released()
+            .iter()
+            .chain(plan.allocated().iter())
+            .any(|a| x.contains(*a))
+    }) {
+        let ours = fs.free_extents(grp).unwrap();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for r in &ours {
+            match merged.last_mut() {
+                Some(p) if p.0 + p.1 == r.start => p.1 += r.len,
+                _ => merged.push((r.start, r.len)),
+            }
+        }
+        let cached = fs.cached_free_extents(grp).unwrap();
+        println!(
+            "touched group {} flags {:#x}: extent-tree gaps {} merged {} ; fst {:?}",
+            grp.start,
+            grp.flags,
+            ours.len(),
+            merged.len(),
+            cached.as_ref().map(|c| c.len())
+        );
+        if let Some(c) = cached {
+            let firstdiff = merged
+                .iter()
+                .zip(c.iter())
+                .position(|(a, b)| a.0 != b.start || a.1 != b.len);
+            if let Some(i) = firstdiff {
+                println!("   first diff at {i}: ours {:?} fst {:?}", merged[i], c[i]);
+            }
+        }
+    }
     let blocks = match fs.render_plan(&plan, generation) {
         Ok(b) => b,
         Err(e) => {
