@@ -130,9 +130,18 @@ chore_min_version: 0.10.0
 #     suite       810 /  44,217    1,060 /  57,500   ~30%: every target
 #                                                    once, so it grows
 #                                                    with the suite
-#     scripts     102 /   4,952      135 /   6,450   ~30%: one line per
+#     scripts     134 /   6,672      175 /   8,700   ~30%: one line per
 #                                                    assertion, so it grows
-#                                                    with the guards. 90 /
+#                                                    with the guards. 134 /
+#                                                    6,672 with #225's
+#                                                    test-cli-tier.sh (9 /
+#                                                    ~700) and
+#                                                    test-package-cli.sh (23
+#                                                    / ~1,500): every other
+#                                                    script run on macOS plus
+#                                                    fixture-builder.sh's
+#                                                    output on CI. 102 / 4,952
+#                                                    before them; 90 /
 #                                                    4,256 measured on the
 #                                                    x86_64 CI run of #216
 #                                                    (logs-test artefact,
@@ -611,7 +620,7 @@ tasks:
     cmds:
       - |
         set -eu
-        scripts/tier.sh test:scripts scripts 135 6450 -- bash -c '
+        scripts/tier.sh test:scripts scripts 175 8700 -- bash -c '
           set -eu
           for t in tests/scripts/*.sh; do
             echo "== $t"

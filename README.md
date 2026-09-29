@@ -93,6 +93,18 @@ layout or check a volume, so neither name is installed.
 
 `--offset BYTES` addresses a volume inside a whole-disk image.
 
+Every name has a man page (section 1; `man fs.btrfs`, `man fs.btrfs-ls`) and zsh,
+bash and fish completions, written by the binary itself from the arguments it
+parses (`rust-fs-btrfs generate man|completions SHARE`), so they cannot
+describe a flag it does not take.
+
+The release tarball, `am-fs-btrfs-<version>-<platform>.tar.gz`, is an install
+prefix: `bin/rust-fs-btrfs` and `bin/fs.btrfs` (a relative symlink to it),
+`share/man/man1/`, the completions under `share/zsh/site-functions/`,
+`share/bash-completion/completions/` and `share/fish/vendor_completions.d/`,
+`share/rust-fs-btrfs/CAVEATS`, and `LICENSE`. `scripts/package-cli.sh` builds and
+checks it; CI builds it on every pull request.
+
 `chore test:cli` tests the tools **as installed**, whatever PATH resolves:
 `rust-fs-btrfs doctor` first, then `tests/cli/test-*.sh`, against a volume the
 kernel populated in the harness VM (`test-disks/cli/`, with the kernel's own
