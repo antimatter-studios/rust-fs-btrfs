@@ -84,6 +84,7 @@ Metadata is JSON on stdout by default, `--text` for people. A failure is
 | `ls [PATH]` | JSON entries: name, type, size, mode, mtime, inode, `subvolume`, and a symlink's target. A path into a subvolume or a snapshot is followed, as a mount shows it |
 | `read PATH [-o FILE]` | the file's raw bytes: inline, compressed (zlib, LZO, zstd), sparse, inside a subvolume or through a snapshot |
 | `get [KEY]` / `info [KEY]` | `fs`, `label`, `total_bytes`, `free_bytes` (from `bytes_used`), `block_size` (the sector size), `dirty` (a log to replay, or the error flag), and `btrfs.*`: fsid, metadata UUID, node size, checksum type, device count, generation, feature names. From the superblock alone, so a volume that will not mount still answers |
+| `write PATH` | **only the in-place case**: an existing NODATACOW file (`chattr +C`), overwritten with exactly as many bytes from stdin as it holds. A new file, an ordinary copy-on-write file, a snapshotted, compressed or inline extent, a different length, or a path inside a subvolume is refused with exit 3 and the library's reason; everything copy-on-write waits on [#61][i61] |
 | `mkdir` | not implemented (exit 3): needs the copy-on-write write path, [#61][i61] |
 | `set label`, `resize` | not implemented (exit 3): no label writer, no resize |
 
@@ -97,7 +98,9 @@ layout or check a volume, so neither name is installed.
 kernel populated in the harness VM (`test-disks/cli/`, with the kernel's own
 manifest of every path, size and SHA-256). `tests/cli_oracle.rs` holds `get` to
 `btrfs inspect-internal dump-super`, and checks that a volume `fs.btrfs` refuses
-as damaged is one `btrfs check --readonly` refuses too.
+as damaged is one `btrfs check --readonly` refuses too; after `fs.btrfs write`,
+`tests/cli_write_kernel.rs` has `btrfs check --readonly` find the volume clean
+and the kernel read back exactly the bytes written.
 
 [i61]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/61
 

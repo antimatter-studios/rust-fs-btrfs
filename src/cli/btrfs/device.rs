@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::common::CliError;
 use fs_btrfs::{Filesystem, Superblock};
-use fs_core::{BlockRead, FileDevice, OwnedSlice};
+use fs_core::{BlockDevice, BlockRead, FileDevice, OwnedRwSlice, OwnedSlice};
 
 fn offset_past_end(target: &OsString, offset: u64, size: u64) -> CliError {
     CliError::failed(format!(
@@ -28,6 +28,25 @@ pub fn open(target: &OsString, offset: u64) -> Result<Arc<dyn BlockRead>, CliErr
         return Err(offset_past_end(target, offset, size));
     }
     Ok(Arc::new(OwnedSlice::new(
+        Arc::new(dev),
+        offset,
+        size - offset,
+    )))
+}
+
+/// Open `target` read-write, `offset` bytes in.
+pub fn open_rw(target: &OsString, offset: u64) -> Result<Arc<dyn BlockDevice>, CliError> {
+    let name = target.to_string_lossy();
+    let dev = FileDevice::open_rw(&*name)
+        .map_err(|e| CliError::failed(format!("open {name} read-write: {e}")))?;
+    let size = dev.size_bytes();
+    if offset == 0 {
+        return Ok(Arc::new(dev));
+    }
+    if offset >= size {
+        return Err(offset_past_end(target, offset, size));
+    }
+    Ok(Arc::new(OwnedRwSlice::new(
         Arc::new(dev),
         offset,
         size - offset,
