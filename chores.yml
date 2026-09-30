@@ -98,7 +98,15 @@ chore_min_version: 0.10.0
 #   warm, 957 on the first run in a fresh guest.
 #
 #     tier      measured          budget            headroom, and why
-#     unit        368 /  24,411      480 /  32,000   ~30%: tests get added
+#     unit        497 /  30,611      650 /  40,000   ~30%: tests get added.
+#                                                    497 / 30,611 is CI's
+#                                                    unit job on #225's
+#                                                    first run (36613265993):
+#                                                    COLD, because the lock
+#                                                    changed, so 99 lines are
+#                                                    cargo fetching and
+#                                                    compiling, clap's among
+#                                                    them. Was 368 / 24,411
 #     images      296 /  13,865      385 /  18,000   ~30%
 #     oracle      361 /  19,014      470 /  25,000   ~30%. --show-output is
 #                                                    most of it, and it is
@@ -134,6 +142,13 @@ chore_min_version: 0.10.0
 #     vm          957 /  50,636    1,250 /  66,000   ~30%: the same suite,
 #                                                    plus the guest's own
 #                                                    build, from cold
+#     cli          11 /     456       15 /     600   ~30%: CI's, on #225's
+#                                                    first run (36613265993).
+#                                                    Every
+#                                                    file is three lines when it
+#                                                    passes and every tool a
+#                                                    doctor line, so a new one
+#                                                    is a visible step
 #
 #   EVERY ONE OF THEM IS MEASURED, and none is a guess left wide "for
 #   now". A budget above what a tier prints still fails the run that
@@ -417,7 +432,7 @@ tasks:
     # rather than listed here. CI runs this job with no fixtures present,
     # which is what proves the split.
     cmds:
-      - 'EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 480 32000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
+      - 'EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 650 40000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
 
   test:images:
     desc: 'The tests that read a fixture but need no VM — what a host without KVM can still run'
@@ -546,8 +561,38 @@ tasks:
       - task: test:kernel
       - 'scripts/tier.sh "test:native (whole suite, release)" suite 1060 57500 -- scripts/test.sh --locked --release'
       - task: test:scripts
+      # The command-line tools, built and staged from this checkout, then
+      # tested as installed. A separate invocation because test:cli reads
+      # PATH, and the staged directory has to come first on it.
+      - task: cli:install
+      - 'PATH="$(scripts/cli-install.sh --print-bin-dir):$PATH" "{{.CHORE_EXE}}" test:cli'
       # THE LAST LINE: one number across the tiers, and where the detail is.
-      - scripts/test-verdict.sh unit oracle kernel suite
+      - scripts/test-verdict.sh unit oracle kernel suite cli
+
+  cli:install:
+    desc: 'Build the command-line tools (release, --features cli) and stage them in tmp/cli/bin under every name'
+    # The layout an install has: the multi-call binary as rust-fs-btrfs and
+    # each dotted name a relative symlink to it. It prints the PATH line;
+    # `test:cli` tests whatever PATH finds, so that directory goes first.
+    cmds: ['scripts/cli-install.sh']
+
+  test:cli:
+    desc: 'The command-line tools AS INSTALLED, found on PATH: doctor first, then every tests/cli/test-*.sh'
+    # Tests the installed artifact, not a cargo target: the same suite
+    # checks `chore cli:install`'s staging (test:native puts it first on
+    # PATH) and a Homebrew install. `rust-fs-btrfs doctor` runs before any
+    # tool is tested and fails the tier if a name is missing or shadowed,
+    # naming the fix. See scripts/test-cli.sh.
+    #
+    # What btrfs-progs and the kernel make of the tools' work is judged in
+    # the oracle and kernel tiers (tests/cli_*.rs), where the VM is.
+    #
+    # FLOOR: each file prints a `test result: ok. N passed` line, which
+    # test-floor.sh sums as it does cargo's. 34 checks executed when the
+    # tier was added; the floor is about 95% of that.
+    cmds:
+      - 'scripts/tier.sh test:cli cli 15 600 -- scripts/test-cli.sh'
+      - 'scripts/test-floor.sh --log tmp/logs/cli.log 32'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
@@ -626,7 +671,9 @@ tasks:
       - scripts/ci-gate.sh
       - scripts/agents-core-check.sh
       - cargo fmt --check
-      - cargo clippy --locked --all-targets -- -D warnings
+      # `--features cli`: the command-line tools' target requires it, and
+      # clippy silently leaves out a target whose features are off.
+      - cargo clippy --locked --all-targets --features cli -- -D warnings
 
   build:
     desc: Debug build

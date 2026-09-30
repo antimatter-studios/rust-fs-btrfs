@@ -168,10 +168,12 @@ chore testkernel   # against the in-kernel driver
 chore testvm       # the whole suite inside the harness VM
 chore lint         # fmt, the agent-core check, clippy
 chore staticlib    # what the app links
+chore cli:install  # the command-line tools, staged in tmp/cli/bin
+chore test:cli     # those tools as installed, first on PATH
 ```
 
-CI runs `unit`, `fixtures`, `test`, `test-arm64`, `suite-in-vm`, aggregated by
-`ci-ok`.
+CI runs `unit`, `fixtures`, `test`, `test-arm64`, `suite-in-vm`, `cli`,
+aggregated by `ci-ok`.
 
 ## The oracles, and why they are in a VM
 

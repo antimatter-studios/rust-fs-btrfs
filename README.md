@@ -57,6 +57,41 @@ not.
 | Write path: anything copy-on-write | planned — see `docs/transaction-format.md` |
 | C ABI (`fs_btrfs_*`) | done, including the write entry points |
 
+## Command-line tools
+
+`fs.btrfs` reads a Btrfs image or device **directly**: no mount, no kernel
+driver, no VM. It is an escape hatch for getting data off a disk that will not
+mount, not a place to do real filesystem work.
+
+```sh
+chore cli:install                     # build and stage them in tmp/cli/bin
+export PATH="$PWD/tmp/cli/bin:$PATH"   # the line cli:install prints
+rust-fs-btrfs doctor                  # is every name on PATH this program?
+```
+
+One multi-call binary, `rust-fs-btrfs`, behind the `cli` cargo feature (the
+static library gains nothing from it). Installed, `fs.btrfs` is a symlink to it;
+`rust-fs-btrfs fs ...` is the same tool under the one name nothing else can
+shadow, and `cargo run --features cli -- fs ...` works before anything is
+installed. `--version` prints `<name> (am-fs-btrfs) <version>`.
+
+Metadata is JSON on stdout by default, `--text` for people. A failure is
+`{"error": "...", "code": N}` on stderr and `N` is the exit status: 1 failed,
+2 the command line was wrong, 3 the verb exists and this library cannot do it.
+
+| verb | state |
+|---|---|
+| `mkdir` | not implemented (exit 3): needs the copy-on-write write path, [#61][i61] |
+| `set label`, `resize` | not implemented (exit 3): no label writer, no resize |
+
+There is no `mkfs.btrfs` and no `fsck.btrfs`: this crate cannot build an initial
+layout or check a volume, so neither name is installed.
+
+`chore test:cli` tests the tools **as installed**, whatever PATH resolves:
+`rust-fs-btrfs doctor` first, then `tests/cli/test-*.sh`.
+
+[i61]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/61
+
 ## Test contract
 
 Two layers, and only one of them can tell you the driver is right.

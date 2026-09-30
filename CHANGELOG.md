@@ -33,6 +33,15 @@ never does.
   attached to the GitHub release for its tag, checked first against the
   crates.io checksum, and verifiable with `gh attestation verify` (see the
   README, "Verifying a release").
+- **`rust-fs-btrfs`, the command-line tools, as one multi-call binary**
+  (#225). Behind the `cli` feature, so the static library gains no
+  dependency. Installed as `rust-fs-btrfs` with `fs.btrfs` linked to it;
+  `--version` names the crate, `rust-fs-btrfs doctor` says whether each
+  name on PATH is this program and how to fix one that is not, and every
+  failure is a structured JSON error whose code is the exit status.
+  `mkdir`, `set label` and `resize` answer `not implemented` (exit 3).
+  `chore cli:install` stages the tools and `chore test:cli` tests them as
+  installed; CI runs both on every pull request, whatever its base.
 
 ### Fixed
 

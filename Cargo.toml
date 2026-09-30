@@ -15,6 +15,27 @@ exclude = ["fuzz"]
 name = "fs_btrfs"
 crate-type = ["staticlib", "rlib"]
 
+# THE COMMAND-LINE TOOLS: one multi-call binary, named for the repository.
+# It dispatches on argv[0], the way busybox and e2fsprogs do, so the
+# release step installs it once as `rust-fs-btrfs` and links `fs.btrfs` to
+# it (cargo refuses a dot in a target name, so the dotted name is never
+# cargo's). `rust-fs-btrfs fs ...` is the form nothing else on PATH can
+# shadow, and `cargo run --features cli -- fs ...` works before anything
+# is installed.
+#
+# BEHIND THE `cli` FEATURE, so the static library a consumer links gains no
+# dependency from the tools: `required-features` keeps the target out of a
+# build that did not ask for it. scripts/test.sh and `chore lint` ask for
+# it, so the tests and clippy both reach it.
+[[bin]]
+name = "rust-fs-btrfs"
+path = "src/cli/main.rs"
+required-features = ["cli"]
+
+[features]
+# The command-line tools and nothing else. clap is MIT/Apache-2.0.
+cli = ["dep:clap"]
+
 [dependencies]
 # Btrfs lets the volume pick its metadata hash at mkfs time, so a reader
 # has to carry all four. Every crate below is permissive-licensed
@@ -54,6 +75,10 @@ miniz_oxide = "0.9.1"
 am-lzo1x = "0.1.0"
 # compression 3 — zstd. MIT.
 ruzstd = "0.9.0"
+# The command-line tools' argument parser, behind the `cli` feature (see
+# the `rust-fs-btrfs` target above). No derive: the builder API keeps each
+# tool's command a function the documentation can later be made from.
+clap = { version = "4.5", optional = true, default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
 
 [dev-dependencies]
 # The test suite's one way in to a fixture, to a btrfs-progs tool and to

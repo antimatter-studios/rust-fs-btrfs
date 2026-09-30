@@ -294,7 +294,7 @@ fn before_the_double_dash<'a>(arguments: &'a [&'a str]) -> &'a [&'a str] {
 /// and every word that decides the profile is on the far side of two
 /// scripts. `tier.sh` runs what follows its `--` under an output budget;
 /// `test.sh` makes a scratch directory inside the repository and ends in
-/// `cargo test "$@"`. Both pass their arguments through unchanged, so
+/// `cargo test --features cli "$@"`. Both pass their arguments through unchanged, so
 /// what reaches cargo is recoverable by walking the chain -- and a scan
 /// that knew only the words `cargo test` would read that line and find
 /// nothing at all.
@@ -317,7 +317,7 @@ fn cargo_test_arguments(command: &str) -> Option<Vec<String>> {
                 let at = rest.iter().position(|w| w == "--")?;
                 walk(rest.get(at + 1..)?)
             }
-            // test.sh's last line is `cargo test "$@"`.
+            // test.sh's last line is `cargo test --features cli "$@"`.
             "test.sh" => Some(rest.get(1..).unwrap_or_default().to_vec()),
             _ => None,
         }
@@ -1671,7 +1671,7 @@ mod shell_scan {
         assert_eq!(
             runs_covering_the_library_unit_tests(tier).len(),
             1,
-            "tier.sh runs what follows its `--`, and test.sh ends in `cargo test \"$@\"`; \
+            "tier.sh runs what follows its `--`, and test.sh ends in `cargo test --features cli \"$@\"`; \
              the arguments that reach cargo are what decides the profile"
         );
     }
