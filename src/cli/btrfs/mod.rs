@@ -7,4 +7,5 @@
 //! neither name is linked: a missing name reads as "not shipped", where a
 //! name that answered "not implemented" would shadow btrfs-progs' own.
 
+pub mod device;
 pub mod fs;
