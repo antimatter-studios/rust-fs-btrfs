@@ -199,7 +199,7 @@ vars:
   # so this pin cannot go back below v0.2.13 while it does.
   FS_CORE_REF: v0.2.13
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
-  LINUX_HARNESS_REF: v0.1.0
+  LINUX_HARNESS_REF: v0.2.0
 
 # The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
 # harness is a sibling that `chore siblings` itself checks out: without
