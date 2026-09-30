@@ -46,7 +46,8 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # them, reached four different ways, each repository internally consistent and
 # nothing comparing them. It used to be read from
 # ../fs-linux-test-harness/scripts/output-budget.sh, which made a harness the
-# owner of a rule that has nothing to do with VMs.
+# owner of a rule that has nothing to do with VMs. The harness deleted that copy
+# in v0.2.0, so core's is now the only one.
 #
 # THE ORDER, and why it is this way round:
 #

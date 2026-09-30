@@ -12,8 +12,9 @@
 #
 # WHAT CHANGED WHEN THE WRAPPER MOVED TO CORE. This file used to run
 # ../fs-linux-test-harness/scripts/output-budget.sh directly, which tested a
-# script no tier ran any more. Everything below goes through scripts/tier.sh,
-# so what is proved is the path the tiers actually take: resolution from core,
+# script no tier ran any more, and which the harness deleted in v0.2.0.
+# Everything below goes through scripts/tier.sh, so what is proved is the
+# path the tiers actually take: resolution from core,
 # verification by --version, and the four exit shapes.
 #
 # NOTHING SKIPS. A missing core is not a reason to stop early — it is the
