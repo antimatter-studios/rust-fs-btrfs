@@ -234,9 +234,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
             path_arg(sub),
             sub.get_one("output"),
         ),
-        "write" => Err(CliError::not_implemented(
-            "write: not in this build of fs.btrfs yet",
-        )),
+        "write" => write(target, offset, path_arg(sub)),
         "mkdir" => Err(CliError::not_implemented(format!("mkdir: {COW_BLOCKED}"))),
         "get" | "info" => get(
             target,
@@ -646,4 +644,66 @@ fn set(sub: &ArgMatches) -> Result<Outcome, CliError> {
             "no key {other:?}; the settable key is label"
         ))),
     }
+}
+
+/// Overwrite an existing NODATACOW file with everything on stdin, which
+/// must be exactly as long as the file. The whole input is read before the
+/// image is opened, so a failing producer (`false | fs.btrfs img write /f`)
+/// leaves the image as it was; the library writes the whole range or none
+/// of it.
+fn write(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome, CliError> {
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut data)
+        .map_err(|e| CliError::failed(format!("read stdin: {e}")))?;
+    let dev = device::open_rw(target, offset)?;
+    let fs = Filesystem::mount_rw(dev).map_err(|e| {
+        btrfs_error(
+            format!("{} (read-write)", target.to_string_lossy()).as_bytes(),
+            e,
+        )
+    })?;
+    let found = match fs.resolve_path_bytes(path) {
+        Ok(found) => found,
+        Err(Error::NotFound) => {
+            return Err(CliError::not_implemented(format!(
+                "write {}: creating a file is {COW_BLOCKED}",
+                show(path)
+            )))
+        }
+        Err(e) => return Err(btrfs_error(path, e)),
+    };
+    if found.tree.is_some() {
+        return Err(CliError::refused(format!(
+            "{}: is inside a subvolume or snapshot, which this library opens read-only",
+            show(path)
+        )));
+    }
+    let inode = &found.inode;
+    if inode.is_dir() {
+        return Err(CliError::failed(format!("{}: is a directory", show(path))));
+    }
+    if !inode.is_regular_file() {
+        return Err(CliError::failed(format!(
+            "{}: not a regular file",
+            show(path)
+        )));
+    }
+    if (data.len() as u64) < inode.size {
+        return Err(CliError::refused(format!(
+            "{}: {} bytes on stdin for a {}-byte file; making it shorter is {COW_BLOCKED}",
+            show(path),
+            data.len(),
+            inode.size
+        )));
+    }
+    let written = fs
+        .write_at(inode.ino, 0, &data)
+        .map_err(|e| btrfs_error(path, e))?;
+    let report = Json::object([
+        ("path", Json::from(show(path))),
+        ("bytes", Json::from(written as u64)),
+        ("created", Json::from(false)),
+    ]);
+    let text = format!("overwrote {} ({written} bytes, in place)", show(path));
+    Ok(Outcome::report(report).with_text(text))
 }
