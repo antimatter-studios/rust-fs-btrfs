@@ -206,7 +206,7 @@ vars:
   # quiet too -- a verdict naming the log, no tail unless asked. scripts/tier.sh
   # resolves that script from core and verifies it by --version on every run,
   # so this pin cannot go back below v0.2.13 while it does.
-  FS_CORE_REF: v0.2.13
+  FS_CORE_REF: v0.2.14
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   LINUX_HARNESS_REF: v0.1.0
 

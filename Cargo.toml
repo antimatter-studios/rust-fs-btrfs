@@ -33,9 +33,11 @@ path = "src/cli/main.rs"
 required-features = ["cli"]
 
 [features]
-# The command-line tools and nothing else. clap, clap_complete and
-# clap_mangen are MIT/Apache-2.0.
-cli = ["dep:clap", "dep:clap_complete", "dep:clap_mangen"]
+# The command-line tools and nothing else. The plumbing they share --
+# dispatch, --version, doctor, the output contract, man pages and
+# completions -- is am-fs-core's `cli` feature, turned on only here, so
+# the static library gains nothing. clap is MIT/Apache-2.0.
+cli = ["dep:clap", "am-fs-core/cli"]
 
 [dependencies]
 # Btrfs lets the volume pick its metadata hash at mkfs time, so a reader
@@ -61,11 +63,14 @@ blake2b_simd = "1.0"
 # wrapper that prints a transcript on failure. This cannot go back while the
 # tiers read the wrapper from core.
 #
+# The pin itself is v0.2.14, the first release with the `cli` feature the
+# command-line tools are built on (`fs_core::cli`).
+#
 # The path dependency is deliberate and stays: `chore test:vm` stages this
 # sibling onto the VM share and guest-suite.sh links it into place, so
 # ../rust-fs-core resolves inside the guest as well as on the host. An
 # absolute path written into a .cargo/config.toml override would not.
-am-fs-core = { path = "../rust-fs-core", version = "0.2.13" }
+am-fs-core = { path = "../rust-fs-core", version = "0.2.14" }
 # Decompressors, one per compression type Btrfs defines. All three are
 # pure Rust with no C bindings, and permissively licensed like the rest.
 #
@@ -80,12 +85,6 @@ ruzstd = "0.9.0"
 # the `rust-fs-btrfs` target above). No derive: the builder API keeps each
 # tool's command a function the man pages and completions can be made from.
 clap = { version = "4.5", optional = true, default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
-# Shell completions and man pages, generated from the same clap commands by
-# the binary itself (`rust-fs-btrfs generate ...`) when a release is
-# packaged, so the documentation cannot describe a flag the program does not
-# take. Both MIT/Apache-2.0, both behind `cli`.
-clap_complete = { version = "4.5", optional = true }
-clap_mangen = { version = "0.2", optional = true }
 
 [dev-dependencies]
 # The test suite's one way in to a fixture, to a btrfs-progs tool and to

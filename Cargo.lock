@@ -16,8 +16,6 @@ dependencies = [
  "am-lzo1x",
  "blake2b_simd",
  "clap",
- "clap_complete",
- "clap_mangen",
  "crc32c",
  "fs-btrfs-test-support",
  "miniz_oxide",
@@ -29,7 +27,12 @@ dependencies = [
 
 [[package]]
 name = "am-fs-core"
-version = "0.2.13"
+version = "0.2.14"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "clap_mangen",
+]
 
 [[package]]
 name = "am-lzo1x"

@@ -4,8 +4,8 @@
 use std::ffi::OsString;
 use std::sync::Arc;
 
-use crate::common::CliError;
 use fs_btrfs::{Filesystem, Superblock};
+use fs_core::cli::CliError;
 use fs_core::{BlockDevice, BlockRead, FileDevice, OwnedRwSlice, OwnedSlice};
 
 fn offset_past_end(target: &OsString, offset: u64, size: u64) -> CliError {
