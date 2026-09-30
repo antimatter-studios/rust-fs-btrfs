@@ -130,9 +130,18 @@ chore_min_version: 0.10.0
 #     suite       810 /  44,217    1,060 /  57,500   ~30%: every target
 #                                                    once, so it grows
 #                                                    with the suite
-#     scripts     102 /   4,952      135 /   6,450   ~30%: one line per
+#     scripts     134 /   6,672      175 /   8,700   ~30%: one line per
 #                                                    assertion, so it grows
-#                                                    with the guards. 90 /
+#                                                    with the guards. 134 /
+#                                                    6,672 with #225's
+#                                                    test-cli-tier.sh (9 /
+#                                                    ~700) and
+#                                                    test-package-cli.sh (23
+#                                                    / ~1,500): every other
+#                                                    script run on macOS plus
+#                                                    fixture-builder.sh's
+#                                                    output on CI. 102 / 4,952
+#                                                    before them; 90 /
 #                                                    4,256 measured on the
 #                                                    x86_64 CI run of #216
 #                                                    (logs-test artefact,
@@ -147,8 +156,8 @@ chore_min_version: 0.10.0
 #     vm          957 /  50,636    1,250 /  66,000   ~30%: the same suite,
 #                                                    plus the guest's own
 #                                                    build, from cold
-#     cli          17 /     614       23 /     800   ~30%: 17 / 592 on macOS
-#                                                    with test-write.sh, plus
+#     cli          20 /     693       26 /     900   ~30%: 20 / 671 on macOS
+#                                                    with test-docs.sh, plus
 #                                                    the 22 bytes CI's longer
 #                                                    paths add. Every file is
 #                                                    three lines when it
@@ -598,10 +607,10 @@ tasks:
     #
     # FLOOR: each file prints a `test result: ok. N passed` line, which
     # test-floor.sh sums as it does cargo's. 34 checks executed when the
-    # tier was added, 158 with test-write.sh; the floor is about 95% of that.
+    # tier was added, 176 with test-docs.sh; the floor is about 95% of that.
     cmds:
-      - 'scripts/tier.sh test:cli cli 23 800 -- scripts/test-cli.sh'
-      - 'scripts/test-floor.sh --log tmp/logs/cli.log 150'
+      - 'scripts/tier.sh test:cli cli 26 900 -- scripts/test-cli.sh'
+      - 'scripts/test-floor.sh --log tmp/logs/cli.log 167'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
@@ -611,7 +620,7 @@ tasks:
     cmds:
       - |
         set -eu
-        scripts/tier.sh test:scripts scripts 135 6450 -- bash -c '
+        scripts/tier.sh test:scripts scripts 175 8700 -- bash -c '
           set -eu
           for t in tests/scripts/*.sh; do
             echo "== $t"

@@ -56,6 +56,15 @@ never does.
   status 3 and the library's reason, and creating a file, like `mkdir`,
   is blocked on #61. After a write, `btrfs check --readonly` finds the
   volume clean and the kernel reads back the bytes written.
+- **Man pages and shell completions, and the release tarball's layout**
+  (#225). `rust-fs-btrfs generate man|completions SHARE` writes a section 1
+  page per name and per `fs.btrfs` subcommand, and zsh, bash and fish
+  completions, from the clap commands the tools parse with (clap_complete
+  and clap_mangen, MIT/Apache-2.0, behind `cli`). `scripts/package-cli.sh`
+  stages `am-fs-btrfs-<version>-<platform>.tar.gz` as an install prefix and
+  refuses it unless the layout, the links, the documentation and every
+  name's `--version` are right; the `cli` CI job builds it on every pull
+  request.
 
 ### Fixed
 

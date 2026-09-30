@@ -45,6 +45,7 @@ chore_manifest            15
 chunk_tree_items          3
 ci_profile                67
 cli_dispatch              13
+cli_docs                  2
 cli_oracle                3
 cli_write_kernel          1
 commit_order              3
