@@ -15,7 +15,9 @@
 //!    the caller owns one until it calls the matching release function.
 //!
 //! The error state is thread-local, so two threads failing at once do
-//! not overwrite each other's message.
+//! not overwrite each other's message. Every entry point except the two
+//! release functions clears it on entry, so it describes the calling
+//! thread's most recent call, never an older failure.
 //!
 //! # Safety contract for callers
 //!
@@ -37,7 +39,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 thread_local! {
-    /// Message and errno describing this thread's most recent failure.
+    /// Message and errno describing this thread's most recent call: the
+    /// failure it reported, or `("no error", 0)` if it succeeded.
     static LAST_ERROR: RefCell<(CString, c_int)> =
         RefCell::new((CString::new("no error").unwrap(), 0));
 }
@@ -100,13 +103,36 @@ fn record(e: &Error) {
     set_error(e.to_string(), errno_for(e));
 }
 
+/// The state a thread starts in, and the state every successful call
+/// leaves behind.
+fn clear_error() {
+    LAST_ERROR.with(|e| *e.borrow_mut() = (CString::new("no error").unwrap(), 0));
+}
+
+/// Run an entry point: clear the thread's error, then run `f` under
+/// [`release_guard`].
+///
+/// Clearing first is what makes the error describe *this* call. Without
+/// it a failure stays behind after every later success, and the header's
+/// promise that a clean end of directory reports errno 0 cannot hold for
+/// any thread that has ever failed (#232).
+fn guard<T>(fallback: T, f: impl FnOnce() -> T) -> T {
+    clear_error();
+    release_guard(fallback, f)
+}
+
 /// Run `f`, converting a panic into a recorded error and `fallback`.
+///
+/// Used directly only by the release functions, which leave the error
+/// state alone: a caller that closes an iterator after a failed
+/// `fs_btrfs_dir_next` and only then reads the errno must still find
+/// that failure.
 ///
 /// A panic here means a bug in this crate, not a malformed filesystem —
 /// parsers return errors for that. It is still caught, because unwinding
 /// into C is undefined behaviour and taking the process down is worse
 /// than an EIO the caller can report.
-fn guard<T>(fallback: T, f: impl FnOnce() -> T) -> T {
+fn release_guard<T>(fallback: T, f: impl FnOnce() -> T) -> T {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(v) => v,
         Err(_) => {
@@ -421,7 +447,7 @@ pub unsafe extern "C" fn fs_btrfs_umount(fs: *mut fs_btrfs_fs) {
     if fs.is_null() {
         return;
     }
-    guard((), || drop(unsafe { Box::from_raw(fs) }));
+    release_guard((), || drop(unsafe { Box::from_raw(fs) }));
 }
 
 /// # Safety
@@ -630,7 +656,7 @@ pub unsafe extern "C" fn fs_btrfs_dir_close(iter: *mut fs_btrfs_dir_iter) {
     if iter.is_null() {
         return;
     }
-    guard((), || drop(unsafe { Box::from_raw(iter) }));
+    release_guard((), || drop(unsafe { Box::from_raw(iter) }));
 }
 
 /// Read up to `length` bytes of `path` from `offset`.

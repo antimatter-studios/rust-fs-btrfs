@@ -59,6 +59,11 @@ never does.
 
 ### Fixed
 
+- `fs_btrfs_last_errno()` and `fs_btrfs_last_error()` describe the calling
+  thread's most recent call rather than its most recent failure (#232).
+  Every entry point except `fs_btrfs_umount` and `fs_btrfs_dir_close`
+  clears them on entry, so a clean end of directory after any earlier
+  failure on the thread reports errno 0, as the header always promised.
 - **A transaction keeps each block group's `used` count true** (#223).
   A plan releases every block it moves at its old address and allocates
   it at a new one, and the two are often in different block groups.

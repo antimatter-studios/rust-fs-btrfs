@@ -8,7 +8,10 @@
  * on failure; functions returning a pointer return NULL. In either case
  * fs_btrfs_last_error() gives a message for the calling thread and
  * fs_btrfs_last_errno() a POSIX errno suitable for returning to a
- * filesystem client.
+ * filesystem client. Every call except fs_btrfs_umount and
+ * fs_btrfs_dir_close clears both on entry, so after a success the errno
+ * is 0 and the message "no error"; they describe the thread's most
+ * recent call, not its most recent failure.
  *
  * The driver is read-only, and refuses rather than guesses. A compressed
  * extent fails with ENOTSUP rather than returning its undecoded bytes,
