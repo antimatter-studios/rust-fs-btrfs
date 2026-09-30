@@ -9,7 +9,7 @@
 // API is whole, and a piece Btrfs does not call yet is not dead, it is the
 // part another driver's tools will.
 mod btrfs;
-#[allow(dead_code, unused_imports)]
+#[allow(dead_code)]
 mod common;
 
 use std::process::ExitCode;

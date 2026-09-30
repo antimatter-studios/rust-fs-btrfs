@@ -39,7 +39,7 @@ set -euo pipefail
 OUT="$1"
 shift
 
-TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog"
+TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog cli"
 
 # ARGUMENTS FIRST, ENVIRONMENT SECOND. A misspelt target is the caller's
 # mistake and should be named as one wherever it is made; the root and
@@ -1082,6 +1082,112 @@ build_dirtylog() {
     mv -f "$OUT/dirtylog/btrfs-dirty-log.img.partial" "$OUT/dirtylog/btrfs-dirty-log.img"
     rm -f "$copy" "$WORK/dirty-log.super"
     note "built btrfs-dirty-log (log_root $log_root)"
+}
+
+# ---------------------------------------------------------------------
+# cli — the volume the command-line tools are tested against: labelled,
+# and holding one of every shape a user will point `fs.btrfs` at.
+#
+#   hello.txt           a few bytes, so it is stored inline in its item
+#   dir/random.bin      300 KiB of noise: an ordinary extent
+#   dir/sub/deep.txt    a file two directories down
+#   link                a symlink to hello.txt
+#   sparse.bin          a 256 KiB hole and then 4 KiB of data
+#   zstd/text.txt       compressible text under `compression=zstd`
+#   nocow/data.bin      64 KiB in a `chattr +C` directory: NODATACOW, the
+#                       one kind of file this crate can overwrite in place
+#   vol/                a subvolume, with inside.txt, and later.txt written
+#                       after the snapshot below was taken
+#   snap/               a read-only snapshot of vol/, so it lacks later.txt
+#
+# THE MANIFEST IS WHAT THE KERNEL SAYS IS THERE, read back through its own
+# driver on a read-only mount: one line per path, tab-separated --
+# `<f|d|l> <path> <size> <sha256|target|-> <subvol|->` -- so the tools'
+# listings and bytes are compared against Linux rather than against this
+# crate. Each shape the list promises is checked on the built image, and a
+# build where one did not happen (no inline extent, no zstd, no hole, no
+# NODATACOW flag) fails here rather than in a test that would read it as a
+# pass. Its own directory, like the snapshot fixture's: the suites that walk
+# every image in test-disks/ assume what an ordinary volume holds.
+# ---------------------------------------------------------------------
+build_cli() {
+    local img="$WORK/btrfs-cli.img" manifest="$WORK/btrfs-cli.manifest" dump="$WORK/cli-tree.txt"
+    rm -f "$img" "$manifest"
+    truncate -s 512M "$img"
+    mkfs.btrfs -f -L CLITEST "$img" >/dev/null
+    mount -o loop "$img" "$MNT"
+    printf 'hello from the kernel\n' > "$MNT/hello.txt"
+    mkdir -p "$MNT/dir/sub"
+    dd if=/dev/urandom of="$MNT/dir/random.bin" bs=1024 count=300 status=none
+    python3 -c "print('\n'.join('line %d of a file two directories down' % i for i in range(500)))" \
+        > "$MNT/dir/sub/deep.txt"
+    ln -s hello.txt "$MNT/link"
+    dd if=/dev/urandom of="$MNT/sparse.bin" bs=4096 count=1 seek=64 status=none
+    mkdir "$MNT/zstd"
+    btrfs property set "$MNT/zstd" compression zstd
+    python3 -c "print('the quick brown fox jumps over the lazy dog ' * 4000)" > "$MNT/zstd/text.txt"
+    mkdir "$MNT/nocow"
+    chattr +C "$MNT/nocow"
+    dd if=/dev/urandom of="$MNT/nocow/data.bin" bs=4096 count=16 status=none
+    btrfs subvolume create "$MNT/vol" >/dev/null
+    echo "inside the subvolume" > "$MNT/vol/inside.txt"
+    sync
+    btrfs subvolume snapshot -r "$MNT/vol" "$MNT/snap" >/dev/null
+    echo "written after the snapshot" > "$MNT/vol/later.txt"
+    lsattr "$MNT/nocow/data.bin" | grep -q '^[^ ]*C' || {
+        echo "guest-build-images: btrfs-cli's nocow/data.bin is not NODATACOW -- chattr +C did not take" >&2
+        umount "$MNT"
+        exit 1
+    }
+    sync
+    umount "$MNT"
+
+    mount -o loop,ro "$img" "$MNT"
+    ( cd "$MNT"
+      find . -mindepth 1 | sort | while read -r p; do
+          path="${p#.}"
+          subvol=-
+          if [ -d "$p" ] && [ ! -L "$p" ] && [ "$(stat -c %i "$p")" = 256 ]; then subvol=subvol; fi
+          if [ -L "$p" ]; then
+              printf 'l\t%s\t%s\t%s\t-\n' "$path" "$(stat -c %s "$p")" "$(readlink "$p")"
+          elif [ -d "$p" ]; then
+              printf 'd\t%s\t-\t-\t%s\n' "$path" "$subvol"
+          else
+              printf 'f\t%s\t%s\t%s\t-\n' "$path" "$(stat -c %s "$p")" "$(sha256sum "$p" | cut -d' ' -f1)"
+          fi
+      done
+    ) > "$manifest"
+    # The hole is a hole: fewer bytes allocated than the file's length.
+    [ "$(( $(stat -c %b "$MNT/sparse.bin") * 512 ))" -lt "$(stat -c %s "$MNT/sparse.bin")" ] || {
+        echo "guest-build-images: btrfs-cli's sparse.bin has no hole" >&2
+        umount "$MNT"
+        exit 1
+    }
+    umount "$MNT"
+    grep -q $'^d\t/vol\t-\t-\tsubvol$' "$manifest" && grep -q $'^d\t/snap\t-\t-\tsubvol$' "$manifest" || {
+        echo "guest-build-images: btrfs-cli's manifest does not show vol/ and snap/ as subvolumes" >&2
+        exit 1
+    }
+
+    btrfs inspect-internal dump-tree -t 5 "$img" > "$dump"
+    grep -q 'inline extent' "$dump" || {
+        echo "guest-build-images: btrfs-cli has no inline extent (hello.txt)" >&2
+        exit 1
+    }
+    grep -q 'extent compression 3 (zstd)' "$dump" || {
+        echo "guest-build-images: btrfs-cli has no zstd-compressed extent (zstd/text.txt)" >&2
+        exit 1
+    }
+    rm -f "$dump"
+    dump_super "$img"
+    mkdir -p "$OUT/cli"
+    local f
+    for f in "$img" "${img%.img}.superdump" "$manifest"; do
+        cp --sparse=always "$f" "$OUT/cli/$(basename "$f").partial"
+        mv -f "$OUT/cli/$(basename "$f").partial" "$OUT/cli/$(basename "$f")"
+        rm -f "$f"
+    done
+    note "built btrfs-cli"
 }
 
 # ---------------------------------------------------------------------

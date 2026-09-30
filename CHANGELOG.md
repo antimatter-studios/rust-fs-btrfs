@@ -21,6 +21,14 @@ never does.
   `mkdir`, `set label` and `resize` answer `not implemented` (exit 3).
   `chore cli:install` stages the tools and `chore test:cli` tests them as
   installed; CI runs both on every pull request, whatever its base.
+- **`fs.btrfs ls`, `read`, `get` and `info`** (#225). `ls` lists a
+  directory as typed JSON entries and marks subvolumes; a path into a
+  subvolume or a snapshot is followed. `read` streams a file's bytes to
+  stdout or `-o FILE`. `get`/`info` report the shared envelope with the
+  Btrfs specifics under `btrfs`, from the superblock alone. `--offset`
+  reaches a volume inside a whole-disk image. Tested against a volume the
+  kernel populated (`test-disks/cli/`), with `get` held to `btrfs
+  inspect-internal dump-super`.
 
 ### Fixed
 

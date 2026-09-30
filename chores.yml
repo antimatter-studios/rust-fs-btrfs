@@ -108,10 +108,15 @@ chore_min_version: 0.10.0
 #                                                    compiling, clap's among
 #                                                    them. Was 368 / 24,411
 #     images      296 /  13,865      385 /  18,000   ~30%
-#     oracle      361 /  19,014      470 /  25,000   ~30%. --show-output is
+#     oracle      472 /  24,733      615 /  32,500   ~30%. --show-output is
 #                                                    most of it, and it is
 #                                                    the evidence, so it
-#                                                    stays -- in the log
+#                                                    stays -- in the log.
+#                                                    472 / 24,733 on CI with
+#                                                    #225's cli_oracle.rs,
+#                                                    cold (51 lines of
+#                                                    cargo), run 36616794750;
+#                                                    was 361 / 19,014
 #     kernel      245 /  21,227      320 /  27,600   ~30%. Up from 179 /
 #                                                    16,220 when
 #                                                    free_space_straddle added
@@ -142,13 +147,15 @@ chore_min_version: 0.10.0
 #     vm          957 /  50,636    1,250 /  66,000   ~30%: the same suite,
 #                                                    plus the guest's own
 #                                                    build, from cold
-#     cli          11 /     456       15 /     600   ~30%: CI's, on #225's
-#                                                    first run (36613265993).
-#                                                    Every
-#                                                    file is three lines when it
-#                                                    passes and every tool a
-#                                                    doctor line, so a new one
-#                                                    is a visible step
+#     cli          14 /     533       19 /     700   ~30%: 14 / 511 on macOS
+#                                                    with test-read.sh, plus
+#                                                    the 22 bytes CI's longer
+#                                                    paths add (measured on
+#                                                    its first run). Every
+#                                                    file is three lines when
+#                                                    it passes and every tool
+#                                                    a doctor line, so a new
+#                                                    one is a visible step
 #
 #   EVERY ONE OF THEM IS MEASURED, and none is a guess left wide "for
 #   now". A budget above what a tier prints still fails the run that
@@ -398,6 +405,9 @@ tasks:
       # a log tree the kernel has not replayed; its own directory, like
       # the snapshot, because every other reader refuses it on purpose
       - test-disks/dirtylog/btrfs-dirty-log.img
+      # the volume the command-line tools are tested against, labelled
+      # CLITEST, with a manifest of what the kernel wrote into it
+      - test-disks/cli/btrfs-cli.img
     # A hung boot must not hold the VM and the machine-wide slot for
     # ever. The split fixtures alone mount and unmount up to four hundred
     # times, and the populated pair writes eighty thousand files, so this
@@ -462,7 +472,7 @@ tasks:
     cmds:
       - scripts/tools.sh --check
       - test-disks/build-fixtures.sh --check
-      - 'scripts/tier.sh test:oracle oracle 470 25000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
+      - 'scripts/tier.sh test:oracle oracle 615 32500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
 
   test:kernel:
     desc: 'The driver writes, THE KERNEL reads back: our images loop-mounted by Linux in the guest'
@@ -589,10 +599,10 @@ tasks:
     #
     # FLOOR: each file prints a `test result: ok. N passed` line, which
     # test-floor.sh sums as it does cargo's. 34 checks executed when the
-    # tier was added; the floor is about 95% of that.
+    # tier was added, 120 with test-read.sh; the floor is about 95% of that.
     cmds:
-      - 'scripts/tier.sh test:cli cli 15 600 -- scripts/test-cli.sh'
-      - 'scripts/test-floor.sh --log tmp/logs/cli.log 32'
+      - 'scripts/tier.sh test:cli cli 19 700 -- scripts/test-cli.sh'
+      - 'scripts/test-floor.sh --log tmp/logs/cli.log 114'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob

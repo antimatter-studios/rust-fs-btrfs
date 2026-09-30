@@ -28,6 +28,8 @@ test-disks/*.compression
 test-disks/*.super
 test-disks/btrfs-split*.txt
 test-disks/snapshot/
+test-disks/dirtylog/
+test-disks/cli/
 test-disks/[0-9]*/
 test-disks/test-run/
 !test-disks/.gitkeep
