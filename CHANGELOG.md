@@ -6,6 +6,27 @@ never does.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-09-30
+
+### Breaking
+
+- **In-image paths cross the C ABI as bytes, not UTF-8 (#214).**
+  `fs_btrfs_stat`, `_dir_open`, `_read_file`, `_readlink`, `_listxattr`,
+  `_getxattr`, `_can_write_in_place` and `_write_file` read their
+  `const char *` as the bytes up to the NUL and compare them byte for byte
+  against the names in the image, across subvolume boundaries too; they no
+  longer decode it. `fs_btrfs_dir_next` already reported names as raw
+  bytes, so the library handed out names it then refused with "not valid
+  UTF-8". A path naming no file is now reported as missing (`ENOENT`), not
+  as a bad argument.
+
+  **Source-compatible for every caller passing UTF-8**, because UTF-8 is a
+  byte string too. `lookup_path_bytes`, `resolve_path_bytes` and
+  `list_path_bytes` carry the resolution and the `&str` forms wrap them, so
+  the Rust API is unchanged. `fs_btrfs_mount` and `fs_btrfs_mount_rw` keep
+  their UTF-8 decode: their argument is a path on the host filesystem, not
+  an in-image name.
+
 ### Added
 
 - Releases carry a build-provenance attestation: the published `.crate` is
@@ -277,6 +298,7 @@ never does.
   the path silently.
 - Both `metadata_uuid` renderings the reference tooling emits are tolerated.
 
+[0.8.0]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.6.0...v0.6.1
