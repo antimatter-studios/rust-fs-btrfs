@@ -336,6 +336,85 @@ const LINK_SHORT_TARGET: &[u8] = b"inline.txt";
 /// compared as `c_char` rather than converted.
 const UNTOUCHED: c_char = 0x7F;
 
+/// A failure earlier on the same thread must not survive into a later
+/// clean end of directory: the header promises errno 0 there, and a
+/// caller following it reads a stale ENOENT as a failed listing (#232).
+#[test]
+fn a_clean_end_of_directory_after_a_failure_reports_errno_zero() {
+    let fs = mount();
+    let mut attr = zeroed_attr();
+    let missing = cstr("/does-not-exist");
+    assert_eq!(
+        unsafe { fs_btrfs_stat(fs, missing.as_ptr(), &mut attr) },
+        -1
+    );
+    assert_eq!(fs_btrfs_last_errno(), ENOENT);
+
+    let iter = unsafe { fs_btrfs_dir_open(fs, cstr("/").as_ptr()) };
+    assert!(!iter.is_null(), "opening the root failed: {}", last_error());
+    let mut entries = 0;
+    while !unsafe { fs_btrfs_dir_next(iter) }.is_null() {
+        entries += 1;
+    }
+    assert!(entries > 0, "the root of the fixture listed nothing");
+    assert_eq!(
+        fs_btrfs_last_errno(),
+        0,
+        "a clean end of directory reported the earlier failure: {}",
+        last_error()
+    );
+    unsafe { fs_btrfs_dir_close(iter) };
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+/// A call that succeeds leaves no error behind, so errno always describes
+/// the most recent call rather than the most recent failure (#232).
+#[test]
+fn a_successful_call_clears_the_previous_error() {
+    let fs = mount();
+    let mut attr = zeroed_attr();
+    let missing = cstr("/does-not-exist");
+    assert_eq!(
+        unsafe { fs_btrfs_stat(fs, missing.as_ptr(), &mut attr) },
+        -1
+    );
+    assert_eq!(fs_btrfs_last_errno(), ENOENT);
+
+    assert_eq!(
+        unsafe { fs_btrfs_stat(fs, cstr("/").as_ptr(), &mut attr) },
+        0
+    );
+    assert_eq!(
+        fs_btrfs_last_errno(),
+        0,
+        "stat succeeded but errno is stale"
+    );
+    assert_eq!(last_error(), "no error");
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+/// The release functions are the exception: they leave the error alone,
+/// so a caller that tidies up before reading errno still finds the
+/// failure it is about to report (#232).
+#[test]
+fn releasing_an_iterator_keeps_the_previous_error() {
+    let fs = mount();
+    let iter = unsafe { fs_btrfs_dir_open(fs, cstr("/").as_ptr()) };
+    assert!(!iter.is_null(), "opening the root failed: {}", last_error());
+    let mut attr = zeroed_attr();
+    let missing = cstr("/does-not-exist");
+    assert_eq!(
+        unsafe { fs_btrfs_stat(fs, missing.as_ptr(), &mut attr) },
+        -1
+    );
+    assert_eq!(fs_btrfs_last_errno(), ENOENT);
+
+    unsafe { fs_btrfs_dir_close(iter) };
+    assert_eq!(fs_btrfs_last_errno(), ENOENT, "dir_close cleared the error");
+    unsafe { fs_btrfs_umount(fs) };
+    assert_eq!(fs_btrfs_last_errno(), ENOENT, "umount cleared the error");
+}
+
 fn readlink_into(fs: *mut fs_btrfs_fs, path: &str, buf: &mut [c_char], bufsize: usize) -> i32 {
     assert!(bufsize <= buf.len());
     unsafe { fs_btrfs_readlink(fs, cstr(path).as_ptr(), buf.as_mut_ptr(), bufsize) }
