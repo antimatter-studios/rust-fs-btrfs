@@ -102,13 +102,17 @@ jobs:
       attestations: write
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: clone am-fs-core sibling
         shell: bash
         run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09-27
+        with:
+          toolchain: stable
 
       # A version already on crates.io cannot be published again, and a
       # re-tag — or a release published by hand — would otherwise fail
@@ -142,7 +146,7 @@ jobs:
         shell: bash
         run: cargo package --no-verify
 
-      - uses: rust-lang/crates-io-auth-action@v1.0.4
+      - uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
         if: steps.already.outputs.published == 'false'
         id: auth
 
