@@ -67,7 +67,7 @@ blake2b_simd = "1.0"
 # sibling onto the VM share and guest-suite.sh links it into place, so
 # ../rust-fs-core resolves inside the guest as well as on the host. An
 # absolute path written into a .cargo/config.toml override would not.
-am-fs-core = { path = "../rust-fs-core", version = "0.2.16" }
+am-fs-core = { path = "../rust-fs-core", version = "0.2.18" }
 # Decompressors, one per compression type Btrfs defines. All three are
 # pure Rust with no C bindings, and permissively licensed like the rest.
 #
