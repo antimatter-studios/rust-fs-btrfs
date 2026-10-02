@@ -1,7 +1,7 @@
 # test-floors.txt — one floor per integration target, checked by
-# scripts/test-floor.sh against the whole-suite tier log:
+# rust-fs-core's floor against the whole-suite tier log:
 #
-#   bash scripts/test-floor.sh --targets .github/test-floors.txt --log tmp/logs/suite.log
+#   bash scripts/core.sh test-floor --targets .github/test-floors.txt suite
 #
 # A FLOOR, BECAUSE THE FAILURE MODE HERE IS AN ABSENCE. `cargo test`
 # exits 0 on "0 passed; 0 failed", so a target that selected nothing
@@ -67,6 +67,7 @@ free_space_oracle         4
 free_space_straddle       2
 fs_oracle                 13
 fstree_oracle             2
+fuzz_decoders             5
 getxattr_byte_names       1
 hard_link_extref          5
 kernel_readback           2
@@ -80,6 +81,7 @@ prealloc_extent_write     1
 read_file_huge_size       1
 read_path_cost            1
 readlink_kernel_oracle    1
+release_attestation       2
 render_plan               4
 shared_tree_block_release 1
 snapshot_shared_write     1
