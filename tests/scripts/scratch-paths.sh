@@ -133,6 +133,27 @@ check "no test or fixture recipe needs root" \
         --glob '!**/*.md' \
         --glob "!$(basename "$SELF")" || true)"
 
+# --- 6. The VM is the harness's, and this repository keeps none. ---------
+#
+# This repository used to carry its own Debian VM — a Vagrantfile, a
+# vm.sh, a vm-slot.sh — and a sister repository carried another copy of
+# the same machine; the two drifted until a fix made in one reached
+# nothing in the other (#109). The machine now lives once, in
+# fs-linux-test-harness, which keeps its state OUTSIDE this tree
+# (FLTH_CACHE_DIR/machines/<project>/), so nothing a run makes here
+# needs ignoring. A rule that ignores a VM's state would only hide a
+# local copy brought back: its `.vagrant/` would never show in
+# `git status`.
+if tracked="$(git -C "$REPO" ls-files)"; then
+    check "no VM definition or orchestrator is kept in this repository" \
+        "$(printf '%s\n' "$tracked" |
+            rg -n '(^|/)(Vagrantfile|vm-slot\.sh|vm-session\.sh|vm\.sh|cloud-init[^/]*|user-data)$|^tests/vagrant/' || true)"
+else
+    fail "git ls-files ran, so the tracked tree could be searched for a VM copy"
+fi
+check "no ignore rule hides a local VM's state" \
+    "$(rg -n '^[^#]*(\.vagrant|\.qemu|\.vm-cache)' "$REPO/.gitignore" || true)"
+
 if [ "$fails" -gt 0 ]; then
     echo "FAIL  $fails violation(s) of where the tests may reach" >&2
     exit 1
