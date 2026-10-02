@@ -300,7 +300,7 @@ pub(crate) fn required_root_item_target(
 /// against the format documentation when the fields between them are
 /// named too.
 #[allow(dead_code)]
-mod file_extent {
+pub(crate) mod file_extent {
     /// Generation of the transaction that created it.
     pub const GENERATION: usize = 0;
     /// Decoded size of the extent's data.
@@ -329,7 +329,7 @@ mod file_extent {
 
 /// Extent storage kinds.
 const EXTENT_INLINE: u8 = 0;
-const EXTENT_REGULAR: u8 = 1;
+pub(crate) const EXTENT_REGULAR: u8 = 1;
 const EXTENT_PREALLOC: u8 = 2;
 
 /// One resolved piece of a file's contents.
