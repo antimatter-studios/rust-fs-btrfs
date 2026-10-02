@@ -6,6 +6,16 @@ never does.
 
 ## [Unreleased]
 
+### Changed
+
+- **The command-line plumbing comes from am-fs-core's `cli` feature.**
+  The hand-kept copy in `src/cli/common/` is deleted and `fs.btrfs` uses
+  `fs_core::cli` (antimatter-studios/rust-fs-core#177), as every other
+  driver's tools now do. This crate's `cli` feature turns on
+  `am-fs-core/cli`, so the static library still gains nothing, and
+  `clap_complete` and `clap_mangen` are no longer direct dependencies.
+  The tools' names, output, man pages and completions are unchanged.
+
 ## [0.8.0] — 2026-09-30
 
 ### Breaking
