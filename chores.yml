@@ -474,9 +474,11 @@ tasks:
     # NO `vm:up` HERE, deliberately. The first oracle call in each test
     # process brings the VM up (idempotent, milliseconds when it is
     # already running) and every later call rides one shared SSH
-    # connection. Nothing holds it, so the `after_all` reaper stops it
-    # when this invocation ends — one boot for the tier, and no VM left
-    # behind by a run that was interrupted.
+    # connection. scripts/test.sh runs cargo inside a harness session,
+    # so the VM comes down and the machine-wide slot is released when the
+    # tier ends, passed, failed or killed — and run any way at all, not
+    # only through chore (#141). One boot per tier; the `after_all` reaper
+    # is the net for a run that never reached scripts/test.sh.
     cmds:
       - scripts/tools.sh --check
       - test-disks/build-fixtures.sh --check
