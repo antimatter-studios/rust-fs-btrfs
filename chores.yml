@@ -206,7 +206,7 @@ vars:
   # quiet too -- a verdict naming the log, no tail unless asked. scripts/tier.sh
   # resolves that script from core and verifies it by --version on every run,
   # so this pin cannot go back below v0.2.13 while it does.
-  FS_CORE_REF: v0.2.13
+  FS_CORE_REF: v0.2.16
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   LINUX_HARNESS_REF: v0.2.0
 
@@ -610,7 +610,7 @@ tasks:
     # tier was added, 176 with test-docs.sh; the floor is about 95% of that.
     cmds:
       - 'scripts/tier.sh test:cli cli 26 900 -- scripts/test-cli.sh'
-      - 'scripts/test-floor.sh --log tmp/logs/cli.log 167'
+      - 'bash scripts/core.sh test-floor cli 167'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
@@ -687,6 +687,9 @@ tasks:
     # ever differ, this is the copy that is wrong.
     cmds:
       - scripts/ci-gate.sh
+      # The family scripts are rust-fs-core's alone: fails on a committed copy,
+      # a scripts/core.sh that differs from core's, or a call to a local copy.
+      - bash scripts/core.sh family-check
       - scripts/agents-core-check.sh
       - cargo fmt --check
       # `--features cli`: the command-line tools' target requires it, and
@@ -740,7 +743,7 @@ tasks:
     # room for a warning block without hiding a flood. No floor: it is one
     # check, not a suite.
     cmds:
-      - 'scripts/tier.sh semver semver 40 4000 -- scripts/semver-check.sh'
+      - 'scripts/tier.sh semver semver 40 4000 -- bash scripts/core.sh semver-check'
 
   check:ci-gate:
     desc: The one required check stands for every job in ci.yml

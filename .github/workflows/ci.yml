@@ -61,7 +61,7 @@ name: CI
 # "0 passed; 0 failed" and a suite that empties from the inside reports
 # green having stopped checking. Those numbers now live in
 # .github/test-floors.txt, one per integration target, and
-# scripts/test-floor.sh checks each of them against that target's own
+# scripts/core.sh test-floor checks each of them against that target's own
 # `test result:` line in the tier log. Same guard, one file, and it no
 # longer requires the workflow to name every suite.
 #
@@ -140,7 +140,7 @@ jobs:
         # running this task.
         run: chore test:unit
       - name: The unit tier executed its tests
-        run: bash scripts/test-floor.sh --log tmp/logs/unit.log 322
+        run: bash scripts/core.sh test-floor unit 322
       # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to
       # tmp/logs/<tier>.log and prints one line naming it; without this the
       # file goes away with the runner. `if: always()` because the failing
@@ -269,7 +269,7 @@ jobs:
       # each tier that runs on its own. A target missing from the log
       # counts as zero, so a suite that stopped being built fails here.
       - name: Every suite executed its tests
-        run: bash scripts/test-floor.sh --targets .github/test-floors.txt --log tmp/logs/suite.log
+        run: bash scripts/core.sh test-floor --targets .github/test-floors.txt suite
       # Each of these is what that tier executed on a green `chore test`
       # of this branch, exactly. A tier runs on its own in some job here
       # and inside the whole-suite run in others, so it needs a total of
@@ -277,10 +277,10 @@ jobs:
       - name: The tiers executed their tests
         run: |
           set -euo pipefail
-          bash scripts/test-floor.sh --log tmp/logs/unit.log 322
-          bash scripts/test-floor.sh --log tmp/logs/oracle.log 30
-          bash scripts/test-floor.sh --log tmp/logs/kernel.log 6
-          bash scripts/test-floor.sh --log tmp/logs/suite.log 500
+          bash scripts/core.sh test-floor unit 322
+          bash scripts/core.sh test-floor oracle 30
+          bash scripts/core.sh test-floor kernel 6
+          bash scripts/core.sh test-floor suite 500
       # The shell tests are counted by their own `ok` lines rather than
       # by libtest's summary, but the failure is identical in shape:
       # `tests/scripts/*.sh` matching fewer files, or a script that
@@ -358,8 +358,8 @@ jobs:
       - name: Both tiers executed their tests
         run: |
           set -euo pipefail
-          bash scripts/test-floor.sh --log tmp/logs/unit.log 322
-          bash scripts/test-floor.sh --log tmp/logs/images.log 149
+          bash scripts/core.sh test-floor unit 322
+          bash scripts/core.sh test-floor images 149
       # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to
       # tmp/logs/<tier>.log and prints one line naming it; without this the
       # file goes away with the runner. `if: always()` because the failing
@@ -412,7 +412,7 @@ jobs:
       - name: chore vm:status (the VM is down again)
         run: '! chore vm:status'
       - name: The in-guest suite executed its tests
-        run: bash scripts/test-floor.sh --log tmp/logs/vm.log 500
+        run: bash scripts/core.sh test-floor vm 500
       # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to
       # tmp/logs/<tier>.log and prints one line naming it; without this the
       # file goes away with the runner. `if: always()` because the failing
