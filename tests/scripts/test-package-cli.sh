@@ -102,7 +102,11 @@ fi
 # fall silent, since a check that does not run reads like one that passed.
 if [ -f "$tarball" ]; then
     ok "the packaged tarball exists"
-    files="$(tar -tzf "$tarball" | sed 's|^\./||' | grep -v '/$' | sort | tr '\n' ' ')"
+    # LC_ALL=C because `want` below is written in byte order, LICENSE before
+    # bin/. A bare `sort` collates by the caller's locale, and en_GB/en_US
+    # put LICENSE after bin/, so the check failed on a correct tarball
+    # everywhere but a C-locale CI runner (#237).
+    files="$(tar -tzf "$tarball" | sed 's|^\./||' | grep -v '/$' | LC_ALL=C sort | tr '\n' ' ')"
     want="LICENSE bin/fs.btrfs bin/rust-fs-btrfs share/bash-completion/completions/fs.btrfs share/bash-completion/completions/rust-fs-btrfs share/fish/vendor_completions.d/fs.btrfs.fish share/fish/vendor_completions.d/rust-fs-btrfs.fish share/man/man1/fs.btrfs.1 share/man/man1/rust-fs-btrfs.1 share/rust-fs-btrfs/CAVEATS share/zsh/site-functions/_fs.btrfs share/zsh/site-functions/_rust-fs-btrfs "
     [ "$files" = "$want" ] && ok "the tarball holds exactly the install prefix" \
         || fail "the tarball holds exactly the install prefix, got: $files"
