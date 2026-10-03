@@ -573,3 +573,194 @@ fn the_reader_discriminates() {
         "does not attach the attested .crate",
     );
 }
+
+/// The action that keeps a job's files after the runner goes, up to its `@`.
+const UPLOAD: &str = "actions/upload-artifact@";
+
+/// The major version of `actions/upload-artifact` that ci.yml uses, read
+/// from its `uses:` lines, so the release keeps its logs with the same
+/// action the branch gate does.
+fn ci_upload_major() -> String {
+    let ci = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml");
+    let text = std::fs::read_to_string(&ci).expect("read ci.yml");
+    let majors: Vec<String> = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter_map(|l| l.split_once(UPLOAD).map(|(_, r)| r))
+        .map(|r| {
+            // `@v4`, or `@<sha> # v4.6.2`: the major either way.
+            let version = r.split_once("# ").map_or(r, |(_, c)| c).trim();
+            version
+                .trim_start_matches('v')
+                .split(['.', ' '])
+                .next()
+                .unwrap_or("")
+                .to_owned()
+        })
+        .collect();
+    let first = majors
+        .first()
+        .cloned()
+        .expect("ci.yml uses actions/upload-artifact");
+    assert!(
+        majors.iter().all(|m| *m == first),
+        "ci.yml uses more than one major of {UPLOAD}: {majors:?}"
+    );
+    first
+}
+
+/// Everything wrong with how `yaml` keeps the tier logs of the jobs that
+/// run a tier; empty when nothing is.
+///
+/// Each tier writes its whole run to `tmp/logs/<tier>.log` and prints one
+/// verdict line naming it, with no tail on failure. On a runner that file
+/// goes with the runner unless it is uploaded, so a failed tag release
+/// once left only a line count and an exit status to diagnose from
+/// (#255). ci.yml has always uploaded it; release.yml did not.
+///
+/// So every job that runs `chore test` must, after it, upload `tmp/logs/`
+/// with `if: always()` -- exactly that, since an upload that runs only on
+/// success uploads nothing on the run it was wanted for -- through
+/// `actions/upload-artifact` pinned to a full commit SHA (a release
+/// workflow takes no moved tag) whose `# v<major>` comment matches the
+/// major ci.yml uses.
+fn tier_log_gaps(yaml: &str, major: &str) -> Vec<String> {
+    let doc = load(yaml);
+    let jobs = doc
+        .as_mapping_get("jobs")
+        .and_then(Yaml::as_mapping)
+        .expect("the workflow has jobs");
+    let mut gaps = Vec::new();
+    let mut tier_jobs = 0;
+    for (name, job) in jobs {
+        let name = name.as_str().unwrap_or("?");
+        let steps = steps_of(job);
+        let Some(tier_at) = steps.iter().position(|s| runs(s, "chore test")) else {
+            continue;
+        };
+        tier_jobs += 1;
+        let uploads: Vec<&Yaml> = steps[tier_at + 1..]
+            .iter()
+            .copied()
+            .filter(|s| {
+                s.as_mapping_get("uses")
+                    .and_then(Yaml::as_str)
+                    .is_some_and(|u| u.starts_with(UPLOAD))
+            })
+            .filter(|s| {
+                s.as_mapping_get("with")
+                    .and_then(|w| w.as_mapping_get("path"))
+                    .and_then(Yaml::as_str)
+                    .is_some_and(|p| {
+                        p.split_whitespace()
+                            .any(|p| p.trim_end_matches('/') == "tmp/logs")
+                    })
+            })
+            .collect();
+        let Some(upload) = uploads.first() else {
+            gaps.push(format!(
+                "job {name} runs a tier and does not upload tmp/logs/ after it"
+            ));
+            continue;
+        };
+        let cond = upload
+            .as_mapping_get("if")
+            .and_then(Yaml::as_str)
+            .unwrap_or("")
+            .replace("${{", "")
+            .replace("}}", "");
+        if cond.trim() != "always()" {
+            gaps.push(format!(
+                "job {name} uploads tmp/logs/ with if: {cond:?}, not always(), so a failed \
+                 run keeps nothing"
+            ));
+        }
+        let uses = upload
+            .as_mapping_get("uses")
+            .and_then(Yaml::as_str)
+            .unwrap_or("");
+        let pin = &uses[UPLOAD.len()..];
+        if !is_full_sha(pin) {
+            gaps.push(format!(
+                "job {name} uses {uses}, which a moved tag can redirect; pin a full commit SHA"
+            ));
+            continue;
+        }
+        // The YAML loses comments, so the version is read from the line.
+        let line = yaml
+            .lines()
+            .find(|l| l.contains(&format!("{UPLOAD}{pin}")))
+            .unwrap_or("");
+        let commented = line
+            .split_once("# v")
+            .map(|(_, v)| v.split(['.', ' ']).next().unwrap_or("").to_owned())
+            .unwrap_or_default();
+        if commented != major {
+            gaps.push(format!(
+                "job {name} pins {uses} as v{commented:?}, not v{major}, the major ci.yml uses"
+            ));
+        }
+    }
+    if tier_jobs == 0 {
+        gaps.push("no job in the workflow runs `chore test`".to_owned());
+    }
+    gaps
+}
+
+#[test]
+fn the_release_workflow_keeps_its_tier_logs() {
+    let gaps = tier_log_gaps(&workflow(), &ci_upload_major());
+    assert!(
+        gaps.is_empty(),
+        "{WORKFLOW} must upload tmp/logs/ with if: always() after `chore test`, as ci.yml \
+         does, so a failed release can be read rather than inferred (#255): {gaps:#?}"
+    );
+}
+
+/// The tier-log reader answers for the shapes it is meant to catch.
+#[test]
+fn the_tier_log_reader_discriminates() {
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    let good = format!(
+        "jobs:\n  test:\n    steps:\n      - run: chore test\n\
+         \x20     - name: Keep the tier logs\n        uses: {UPLOAD}{sha} # v4.6.2\n\
+         \x20       if: ${{{{ always() }}}}\n        with:\n          path: tmp/logs/\n"
+    );
+    let gaps = |yaml: &str| tier_log_gaps(yaml, "4");
+    assert_eq!(gaps(&good), Vec::<String>::new(), "{good}");
+    let expect = |yaml: String, want: &str| {
+        let found = gaps(&yaml);
+        assert!(
+            found.iter().any(|g| g.contains(want)),
+            "expected a gap mentioning {want:?}, got {found:#?} for\n{yaml}"
+        );
+    };
+    expect(
+        good.replace("chore test", "chore lint"),
+        "no job in the workflow runs",
+    );
+    expect(
+        good.replace("path: tmp/logs/", "path: target/"),
+        "does not upload tmp/logs/",
+    );
+    // Uploaded before the tier ran, so it holds nothing.
+    expect(
+        good.replace("      - run: chore test\n", "")
+            .replace("tmp/logs/\n", "tmp/logs/\n      - run: chore test\n"),
+        "does not upload tmp/logs/",
+    );
+    expect(good.replace("always()", "success()"), "not always()");
+    expect(
+        good.replace("        if: ${{ always() }}\n", ""),
+        "not always()",
+    );
+    expect(
+        good.replace(&format!("{sha} # v4.6.2"), "v4"),
+        "pin a full commit SHA",
+    );
+    expect(
+        good.replace("# v4.6.2", "# v7.0.1"),
+        "the major ci.yml uses",
+    );
+    expect(good.replace(" # v4.6.2", ""), "the major ci.yml uses");
+}

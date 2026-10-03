@@ -88,6 +88,22 @@ jobs:
       - name: chore vm:status (the VM is down again)
         run: '! chore vm:status'
 
+      # THE TIER LOGS OUTLIVE THE RUNNER, as in every ci.yml job that runs
+      # a tier. tier.sh prints one verdict line naming tmp/logs/<tier>.log
+      # and no tail, so without this a failed release keeps nothing but a
+      # line count and an exit status (#255). `if: always()` because the
+      # failed run is the one the log is wanted for. Pinned by SHA, as
+      # every action a release runs should be; the major is ci.yml's.
+      # tests/release_attestation.rs refuses a release.yml without it.
+      - name: Keep the tier logs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: logs-${{ github.job }}
+          path: tmp/logs/
+          if-no-files-found: error
+          retention-days: 7
+
   # THE COMMAND-LINE TOOLS, AS A DOWNLOADABLE PREFIX. The CLI rides the
   # library's release, at the same version: one tag, one CHANGELOG, and no
   # binary that could wrap a library other than the one it was tagged with.
