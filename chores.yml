@@ -206,7 +206,7 @@ vars:
   # quiet too -- a verdict naming the log, no tail unless asked. scripts/tier.sh
   # resolves that script from core and verifies it by --version on every run,
   # so this pin cannot go back below v0.2.13 while it does.
-  FS_CORE_REF: v0.2.16
+  FS_CORE_REF: v0.2.18
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   LINUX_HARNESS_REF: v0.2.0
 
@@ -688,7 +688,7 @@ tasks:
     # This exists so the CI gate can be reproduced locally. If the two
     # ever differ, this is the copy that is wrong.
     cmds:
-      - scripts/ci-gate.sh
+      - bash scripts/core.sh ci-gate
       # The family scripts are rust-fs-core's alone: fails on a committed copy,
       # a scripts/core.sh that differs from core's, or a call to a local copy.
       - bash scripts/core.sh family-check
@@ -758,4 +758,4 @@ tasks:
     # floor the gate itself enforces -- so the suite could satisfy its floor
     # partly by checking its own CI config.
     cmds:
-      - scripts/ci-gate.sh
+      - bash scripts/core.sh ci-gate
