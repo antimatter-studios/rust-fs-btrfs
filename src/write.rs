@@ -320,7 +320,7 @@ impl Filesystem {
     /// A writable mount writes only the default subvolume (a subvolume
     /// handle never carries the write capability), so this is the tree
     /// every write edits.
-    fn fs_tree_last_snapshot(&self) -> Result<u64> {
+    pub(crate) fn fs_tree_last_snapshot(&self) -> Result<u64> {
         use crate::fs::{root_item, FS_TREE_OBJECTID, ROOT_ITEM_KEY};
         let reader = self.pool_reader();
         let mut found = None;

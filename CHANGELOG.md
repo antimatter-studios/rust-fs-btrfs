@@ -14,6 +14,20 @@ never does.
   attaches them to the GitHub release beside the `.crate`; v0.8.0 shipped
   the crate alone. `tests/release_attestation.rs` fails a workflow that
   stops doing so.
+- **A copy-on-write file can be written (#61, first slice).**
+  `Filesystem::write(&mut self, ino, offset, data)` writes a regular file
+  and commits the result. A `nodatacow` file is written in place, as
+  `write_at` does; any other file has each extent the range touches copied
+  into a newly allocated data extent with the write applied, the file's
+  `EXTENT_DATA` items repointed, the extent tree, free-space tree, block
+  group `used` and `bytes_used` updated, the inode stamped, and the whole
+  committed as one transaction, after which the mount is reopened on the
+  new generation. Verified by `btrfs check` and a kernel readback in
+  `tests/cow_write_oracle.rs`. Still refused, by name: checksummed files
+  (the checksum tree is not written yet), writes that grow a file or fill
+  a hole, inline, preallocated and compressed extents, and extents a
+  snapshot or another file shares. The C ABI and the command-line tools
+  still call `write_at`.
 
 ### Changed
 

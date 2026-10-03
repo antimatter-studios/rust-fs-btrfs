@@ -579,6 +579,113 @@ impl Filesystem {
     }
 }
 
+impl Filesystem {
+    /// Find room for new data extents, one of each length in `lens`.
+    ///
+    /// [`Filesystem::find_metadata_block`]'s counterpart for file data:
+    /// first fit across the data block groups, aligned to the sector,
+    /// clear of every superblock copy's stripe row, and clear of every
+    /// extent chosen earlier in the same call — the extent tree does not
+    /// record any of them until the transaction commits, so it cannot
+    /// say they are taken.
+    ///
+    /// A MIXED GROUP IS NOT USED. It holds tree blocks too, and the tree
+    /// block allocator chooses from it without knowing what this chose;
+    /// keeping data to data-only groups keeps the two from meeting.
+    ///
+    /// Nothing returned overlaps anything allocated now, including the
+    /// extents a write is about to release: those are still referenced
+    /// until the commit lands, and reusing them would overwrite what a
+    /// crash before the superblock write leaves the file reading.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] when some length does not fit in
+    /// any data group's free space. Allocating a new block group is not
+    /// implemented.
+    pub(crate) fn find_data_extents(&self, lens: &[u64]) -> Result<Vec<u64>> {
+        let sectorsize = u64::from(self.sb.sectorsize).max(1);
+        let groups: Vec<BlockGroup> = self
+            .block_groups()?
+            .into_iter()
+            .filter(|g| g.holds_data() && !g.holds_metadata())
+            .collect();
+        let mut runs: Vec<FreeExtent> = self
+            .free_extents_by_group(&groups)?
+            .into_iter()
+            .flatten()
+            .collect();
+
+        let mut out = Vec::with_capacity(lens.len());
+        'next: for &len in lens {
+            if len == 0 || len % sectorsize != 0 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "a data extent of {len} bytes is not a whole number of {sectorsize}-byte \
+                     sectors"
+                )));
+            }
+            for i in 0..runs.len() {
+                let run = runs[i];
+                let mut at = run.start.next_multiple_of(sectorsize);
+                while at.checked_add(len).is_some_and(|end| end <= run.end()) {
+                    // Past the row a copy is in, not one sector on: a
+                    // long extent would otherwise re-ask about every row
+                    // it covers once for each sector it steps.
+                    if let Some(row_end) = self.superblock_row_in(at, len)? {
+                        at = row_end.next_multiple_of(sectorsize);
+                        continue;
+                    }
+                    // Taken: what is left of the run either side of it.
+                    runs.splice(
+                        i..=i,
+                        [
+                            FreeExtent {
+                                start: run.start,
+                                len: at - run.start,
+                            },
+                            FreeExtent {
+                                start: at + len,
+                                len: run.end() - (at + len),
+                            },
+                        ],
+                    );
+                    out.push(at);
+                    continue 'next;
+                }
+            }
+            return Err(Error::UnsupportedFeature(format!(
+                "no data block group has {len} contiguous free bytes clear of the superblock \
+                 copies; allocating a new block group is not implemented"
+            )));
+        }
+        Ok(out)
+    }
+
+    /// Where the first superblock copy's stripe row inside
+    /// `[at, at + len)` ends, in logical address space, or `None` when
+    /// no part of the range lies in one.
+    ///
+    /// [`Filesystem::on_superblock_copy`] maps only the range's first
+    /// byte, which answers for a tree block — one node, never across a
+    /// stripe — and not for a data extent of many stripes, whose later
+    /// rows can land on another device offset entirely. So the range is
+    /// asked about one stripe row at a time.
+    fn superblock_row_in(&self, at: u64, len: u64) -> Result<Option<u64>> {
+        let chunk = self.map.chunk_for(at).ok_or(Error::UnmappedLogical(at))?;
+        let row = chunk.stripe_len.max(1);
+        let end = at.saturating_add(len);
+        let mut pos = at;
+        while pos < end {
+            let row_end = (chunk.logical + (pos - chunk.logical) / row * row + row).min(end);
+            if self.on_superblock_copy(pos, row_end - pos)? {
+                return Ok(Some(row_end));
+            }
+            pos = row_end;
+        }
+        Ok(None)
+    }
+}
+
 /// How much of a free run is usable once alignment is paid for.
 ///
 /// A run starting mid-block loses the remainder of that block, so the

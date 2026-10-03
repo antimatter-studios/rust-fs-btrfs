@@ -94,6 +94,57 @@ impl Plan {
     }
 }
 
+/// One file extent a write replaces with a newly allocated copy (#61).
+///
+/// The copy holds exactly the bytes the file's item covers, so the new
+/// item references the whole of it — offset zero, `num_bytes` equal to
+/// the extent's length — whatever window of the old extent the old item
+/// referenced. The old extent is released whole, which is right only
+/// because its one reference is this item; the planner refuses anything
+/// else before a `DataMove` is made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DataMove {
+    /// The extent being released.
+    pub old: u64,
+    /// Its length, as the extent tree's `EXTENT_ITEM` key records it.
+    pub old_len: u64,
+    /// The offset in the old extent's `EXTENT_DATA_REF`: the file offset
+    /// at which the extent's first byte would sit, which is the item's
+    /// key offset less its offset into the extent.
+    pub old_ref_offset: u64,
+    /// Where the copy goes.
+    pub new: u64,
+    /// The copy's length: the item's `num_bytes`.
+    pub len: u64,
+    /// The key offset of the file's `EXTENT_DATA` item.
+    pub file_offset: u64,
+}
+
+/// The file-data half of a transaction: one file whose extents move.
+///
+/// Empty for a transaction that only relocates tree blocks, which is
+/// what [`Filesystem::plan_transaction_closed`] and
+/// [`Filesystem::render_plan`] produce.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DataWrite {
+    /// The tree holding the file.
+    pub root: u64,
+    /// The file.
+    pub ino: u64,
+    /// Each extent replaced.
+    pub moves: Vec<DataMove>,
+    /// The modification time stamped on the inode, as seconds and
+    /// nanoseconds since the epoch.
+    pub time: (u64, u32),
+}
+
+impl DataWrite {
+    /// Every address whose extent-tree record changes.
+    fn addresses(&self) -> Vec<u64> {
+        self.moves.iter().flat_map(|m| [m.old, m.new]).collect()
+    }
+}
+
 /// What a tree walk hands to its visitor: a block's address, its bytes,
 /// its level, and the node that points at it — `None` for a root.
 /// What [`Filesystem::for_each_tree_block`] hands a visitor: the
@@ -391,6 +442,30 @@ impl Filesystem {
         plan: &Plan,
         generation: u64,
     ) -> Result<Vec<crate::commit::PlacedBlock>> {
+        self.render_plan_with(plan, &DataWrite::default(), generation)
+    }
+
+    /// [`Filesystem::render_plan`] for a transaction that also moves a
+    /// file's data extents.
+    ///
+    /// Besides what a relocation renders, the leaves holding the file's
+    /// `EXTENT_DATA` items are pointed at the new extents and its inode
+    /// item is stamped with the transaction; the extent tree drops each
+    /// old data extent's record and gains one for each new; the
+    /// free-space tree and the block groups' `used` count the data
+    /// extents as well as the tree blocks.
+    ///
+    /// # Errors
+    ///
+    /// As [`Filesystem::render_plan`], and [`Error::UnsupportedFeature`]
+    /// when an item the write changes is not in any leaf the plan
+    /// rewrites, or is not the shape the planner saw.
+    pub(crate) fn render_plan_with(
+        &self,
+        plan: &Plan,
+        data: &DataWrite,
+        generation: u64,
+    ) -> Result<Vec<crate::commit::PlacedBlock>> {
         use crate::commit::PlacedBlock;
         use crate::leaf_edit::OwnedItem;
         use crate::tree_write::{build_leaf, build_node, chunk_tree_uuid_of, BlockIdentity};
@@ -399,15 +474,18 @@ impl Filesystem {
         // Before any block is rendered, so the answer does not depend on
         // which leaf the loop below happens to reach first.
         if plan.trees().contains(&objectid::FREE_SPACE_TREE) {
-            self.refuse_free_space_straddle(plan)?;
+            self.refuse_free_space_straddle(plan, data)?;
         }
 
         let moved: BTreeMap<u64, u64> = plan.rewrites.iter().map(|r| (r.old, r.new)).collect();
 
         // How far each block group's `used` moves, and which of them
         // have had it written so far (#223).
-        let deltas = self.block_group_deltas(plan)?;
+        let deltas = self.block_group_deltas(plan, data)?;
         let mut used_written: BTreeSet<u64> = BTreeSet::new();
+        // How much of the file write has been applied, so a part that
+        // landed in no rewritten leaf is an error rather than a loss.
+        let mut applied = DataApplied::default();
 
         let mut out = Vec::with_capacity(plan.rewrites.len());
         for rewrite in &plan.rewrites {
@@ -458,7 +536,14 @@ impl Filesystem {
                     // correct and the extent tree describes a filesystem
                     // that no longer exists.
                     if rewrite.owner == objectid::EXTENT_TREE {
-                        owned = self.apply_records(rewrite.old, owned, plan, generation)?;
+                        owned = self.apply_records(
+                            rewrite.old,
+                            owned,
+                            plan,
+                            data,
+                            generation,
+                            &mut applied,
+                        )?;
                         apply_block_group_used(&mut owned, &deltas, &mut used_written)?;
                     }
 
@@ -467,7 +552,12 @@ impl Filesystem {
                     // left saying where things used to be is what `btrfs
                     // check` calls "cache appears valid but isn't".
                     if rewrite.owner == objectid::FREE_SPACE_TREE {
-                        owned = self.apply_free_space(owned, plan)?;
+                        owned = self.apply_free_space(owned, plan, data)?;
+                    }
+
+                    // The file's own items: its extents now live elsewhere.
+                    if !data.moves.is_empty() && rewrite.owner == data.root {
+                        apply_file_write(&mut owned, data, generation, &mut applied)?;
                     }
 
                     // A root tree leaf names other trees' roots.
@@ -523,6 +613,26 @@ impl Filesystem {
                  but the leaf holding its block group item is not one the plan rewrites"
             )));
         }
+        // NOR IS A FILE WRITE. Every part of it is in a leaf the plan was
+        // closed over, so a part not applied means the leaf it is in was
+        // missed — and committing without it leaves an extent nothing
+        // references, or an item naming one nothing records.
+        let n = data.moves.len();
+        let inode = usize::from(n > 0);
+        if applied.items != n || applied.inodes != inode {
+            return Err(Error::UnsupportedFeature(format!(
+                "the write moves {n} extents of inode {}, and the plan rewrote {} of its \
+                 extent items and {} of its inode items",
+                data.ino, applied.items, applied.inodes
+            )));
+        }
+        if applied.released != n || applied.recorded != n {
+            return Err(Error::UnsupportedFeature(format!(
+                "the write moves {n} data extents, and the plan released the records of {} and \
+                 recorded {}",
+                applied.released, applied.recorded
+            )));
+        }
         Ok(out)
     }
 
@@ -569,6 +679,19 @@ impl Filesystem {
     /// one that needs the kernel's reservation machinery, not another
     /// turn of the loop.
     pub fn plan_transaction_closed(&self, dirty: &[u64], rounds: usize) -> Result<Plan> {
+        self.plan_transaction_closed_with(dirty, &DataWrite::default(), rounds)
+    }
+
+    /// [`Filesystem::plan_transaction_closed`], closed over a file
+    /// write's data extents as well: the extent tree leaves holding their
+    /// records, the free-space tree leaves describing their groups, and
+    /// the leaves of those groups' `BLOCK_GROUP_ITEM`s are dirty too.
+    pub(crate) fn plan_transaction_closed_with(
+        &self,
+        dirty: &[u64],
+        data: &DataWrite,
+        rounds: usize,
+    ) -> Result<Plan> {
         let mut seed: BTreeSet<u64> = dirty.iter().copied().collect();
 
         for _ in 0..rounds {
@@ -576,9 +699,11 @@ impl Filesystem {
             let plan = self.plan_transaction(&list)?;
 
             // Every address whose record changes: the old ones lose a
-            // METADATA_ITEM, the new ones gain one.
+            // METADATA_ITEM, the new ones gain one -- and each data
+            // extent the write moves loses or gains an EXTENT_ITEM.
             let mut touched: Vec<u64> = plan.released();
             touched.extend(plan.allocated());
+            touched.extend(data.addresses());
 
             let before = seed.len();
             seed.extend(self.extent_leaves_for(&touched)?);
@@ -588,7 +713,7 @@ impl Filesystem {
             // A group the plan takes more from than it gives back, or the
             // reverse, has its BLOCK_GROUP_ITEM's `used` rewritten, so
             // the leaf holding that item is dirty too (#223).
-            let groups: BTreeSet<u64> = self.block_group_deltas(&plan)?.into_keys().collect();
+            let groups: BTreeSet<u64> = self.block_group_deltas(&plan, data)?.into_keys().collect();
             seed.extend(self.block_group_item_leaves(&groups)?.into_values());
             if seed.len() == before {
                 return Ok(plan);
@@ -681,7 +806,9 @@ impl Filesystem {
         leaf: u64,
         items: Vec<crate::leaf_edit::OwnedItem>,
         plan: &Plan,
+        data: &DataWrite,
         generation: u64,
+        applied: &mut DataApplied,
     ) -> Result<Vec<crate::leaf_edit::OwnedItem>> {
         use crate::extent_write::{record_tree_block, TreeBlockAllocation};
         use crate::leaf_edit::{delete, insert, OwnedItem};
@@ -742,6 +869,39 @@ impl Filesystem {
             out = delete(&out, &key)?;
         }
 
+        // Each data extent the write releases: its record goes, but only
+        // once it is shown to be the record the planner refused
+        // everything else for -- one reference, held inline by this very
+        // file item. Anything else would free bytes another file or a
+        // snapshot still reads.
+        for m in &data.moves {
+            if !mine(m.old)? {
+                continue;
+            }
+            let key = DiskKey {
+                objectid: m.old,
+                key_type: key_type::EXTENT_ITEM,
+                offset: m.old_len,
+            };
+            let body = out.iter().find(|i| i.key == key).map(|i| i.data.as_slice());
+            let expected = data_extent_body(1, None, data.root, data.ino, m.old_ref_offset);
+            let held = body.is_some_and(|b| {
+                b.len() == expected.len()
+                    && b[..8] == expected[..8]
+                    && b[extent_body::FLAGS..] == expected[extent_body::FLAGS..]
+            });
+            if !held {
+                return Err(Error::UnsupportedFeature(format!(
+                    "the data extent at {} is not recorded as one reference held inline by \
+                     inode {} at {} in tree {}, so releasing it could free bytes something \
+                     else reads",
+                    m.old, data.ino, m.old_ref_offset, data.root
+                )));
+            }
+            out = delete(&out, &key)?;
+            applied.released += 1;
+        }
+
         for rewrite in &plan.rewrites {
             if !mine(rewrite.new)? {
                 continue;
@@ -765,9 +925,176 @@ impl Filesystem {
                 },
             )?;
         }
+
+        // And each copy the write allocated: one reference, inline, from
+        // the file item that now names it at offset zero.
+        for m in &data.moves {
+            if !mine(m.new)? {
+                continue;
+            }
+            out = insert(
+                self.sb.nodesize,
+                &out,
+                OwnedItem {
+                    key: DiskKey {
+                        objectid: m.new,
+                        key_type: key_type::EXTENT_ITEM,
+                        offset: m.len,
+                    },
+                    data: data_extent_body(1, Some(generation), data.root, data.ino, m.file_offset)
+                        .to_vec(),
+                },
+            )?;
+            applied.recorded += 1;
+        }
         Ok(out)
     }
 }
+
+/// How much of a [`DataWrite`] the rendered leaves carried.
+#[derive(Debug, Default)]
+struct DataApplied {
+    /// `EXTENT_DATA` items pointed at their new extent.
+    items: usize,
+    /// Inode items stamped.
+    inodes: usize,
+    /// Old data extents whose record was removed.
+    released: usize,
+    /// New data extents recorded.
+    recorded: usize,
+}
+
+/// Offsets within a data extent's `EXTENT_ITEM` body carrying one inline
+/// `EXTENT_DATA_REF` — the 53-byte shape `docs/transaction-format.md`
+/// measured.
+mod extent_body {
+    /// `u64` reference count.
+    pub const REFS: usize = 0;
+    /// `u64` the transaction that allocated the extent.
+    pub const GENERATION: usize = 8;
+    /// `u64` `EXTENT_FLAG_DATA`.
+    pub const FLAGS: usize = 16;
+    /// `u8` the inline reference's type, `EXTENT_DATA_REF`.
+    pub const REF_TYPE: usize = 24;
+    /// `u64` the tree holding the referencing item.
+    pub const REF_ROOT: usize = 25;
+    /// `u64` the inode.
+    pub const REF_OBJECTID: usize = 33;
+    /// `u64` the file offset of the extent's first byte.
+    pub const REF_OFFSET: usize = 41;
+    /// `u32` how many of that inode's items reference the extent there.
+    pub const REF_COUNT: usize = 49;
+    /// The whole item.
+    pub const SIZE: usize = 53;
+}
+
+/// `BTRFS_EXTENT_DATA_REF_KEY`, as an inline reference type.
+const EXTENT_DATA_REF: u8 = 178;
+
+/// A data extent's `EXTENT_ITEM` body with one inline `EXTENT_DATA_REF`
+/// of count one. The generation is left zero when `None`, for a caller
+/// comparing everything else.
+fn data_extent_body(
+    refs: u64,
+    generation: Option<u64>,
+    root: u64,
+    ino: u64,
+    offset: u64,
+) -> [u8; extent_body::SIZE] {
+    use crate::extent_write::EXTENT_FLAG_DATA;
+    use extent_body::*;
+    let mut out = [0u8; SIZE];
+    out[REFS..REFS + 8].copy_from_slice(&refs.to_le_bytes());
+    out[GENERATION..GENERATION + 8].copy_from_slice(&generation.unwrap_or(0).to_le_bytes());
+    out[FLAGS..FLAGS + 8].copy_from_slice(&EXTENT_FLAG_DATA.to_le_bytes());
+    out[REF_TYPE] = EXTENT_DATA_REF;
+    out[REF_ROOT..REF_ROOT + 8].copy_from_slice(&root.to_le_bytes());
+    out[REF_OBJECTID..REF_OBJECTID + 8].copy_from_slice(&ino.to_le_bytes());
+    out[REF_OFFSET..REF_OFFSET + 8].copy_from_slice(&offset.to_le_bytes());
+    out[REF_COUNT..REF_COUNT + 4].copy_from_slice(&1u32.to_le_bytes());
+    out
+}
+
+/// Point the file's `EXTENT_DATA` items at their new extents and stamp
+/// its inode item, in one fs tree leaf.
+///
+/// Every field is rewritten in place: an item keeps its size, so the
+/// leaf cannot overflow. Each item is checked against what the planner
+/// saw before it is changed — a regular, uncompressed extent at the old
+/// address covering exactly the moved length — because a leaf that says
+/// something else is not the file the plan was made for.
+fn apply_file_write(
+    items: &mut [crate::leaf_edit::OwnedItem],
+    data: &DataWrite,
+    generation: u64,
+    applied: &mut DataApplied,
+) -> Result<()> {
+    use crate::fs::file_extent as fe;
+    use crate::inode::{offsets as io, INODE_ITEM_KEY, INODE_ITEM_SIZE};
+    let le64 = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().expect("8"));
+    let put64 = |b: &mut [u8], at: usize, v: u64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+
+    for item in items.iter_mut() {
+        if item.key.objectid != data.ino {
+            continue;
+        }
+        let d = &mut item.data;
+        match item.key.key_type {
+            INODE_ITEM_KEY => {
+                if d.len() < INODE_ITEM_SIZE {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "inode {}'s item is {} bytes, shorter than an inode",
+                        data.ino,
+                        d.len()
+                    )));
+                }
+                // What the kernel changes when it writes a file's data:
+                // the transaction that last touched it, its change
+                // counter, and its change and modification times.
+                put64(d, io::TRANSID, generation);
+                let sequence = le64(d, io::SEQUENCE).wrapping_add(1);
+                put64(d, io::SEQUENCE, sequence);
+                for at in [io::CTIME, io::MTIME] {
+                    put64(d, at, data.time.0);
+                    d[at + 8..at + 12].copy_from_slice(&data.time.1.to_le_bytes());
+                }
+                applied.inodes += 1;
+            }
+            EXTENT_DATA_KEY => {
+                let Some(m) = data.moves.iter().find(|m| m.file_offset == item.key.offset) else {
+                    continue;
+                };
+                let regular = d.len() == fe::REGULAR_SIZE
+                    && d[fe::TYPE] == EXTENT_REGULAR
+                    && d[fe::COMPRESSION] == 0
+                    && d[fe::ENCRYPTION] == 0
+                    && d[fe::OTHER_ENCODING..fe::OTHER_ENCODING + 2] == [0, 0];
+                if !regular
+                    || le64(d, fe::DISK_BYTENR) != m.old
+                    || le64(d, fe::NUM_BYTES) != m.len
+                    || item.key.offset.checked_sub(le64(d, fe::OFFSET)) != Some(m.old_ref_offset)
+                {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "inode {}'s extent item at {} is not the regular extent of {} bytes at \
+                         {} the write was planned against",
+                        data.ino, item.key.offset, m.len, m.old
+                    )));
+                }
+                put64(d, fe::GENERATION, generation);
+                put64(d, fe::RAM_BYTES, m.len);
+                put64(d, fe::DISK_BYTENR, m.new);
+                put64(d, fe::DISK_NUM_BYTES, m.len);
+                put64(d, fe::OFFSET, 0);
+                applied.items += 1;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+use crate::chunk::{key_type, DiskKey};
+use crate::fs::{EXTENT_DATA_KEY, EXTENT_REGULAR};
 
 impl Filesystem {
     /// How far each block group's `used` moves under `plan`, in bytes:
@@ -779,7 +1106,7 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] for an address no block group
     /// holds, which a plan cannot have chosen and a live tree block
     /// cannot be at.
-    fn block_group_deltas(&self, plan: &Plan) -> Result<BTreeMap<u64, i128>> {
+    fn block_group_deltas(&self, plan: &Plan, data: &DataWrite) -> Result<BTreeMap<u64, i128>> {
         let groups = self.block_groups()?;
         let group_of = |at: u64| {
             groups
@@ -798,6 +1125,11 @@ impl Filesystem {
         for rewrite in &plan.rewrites {
             *out.entry(group_of(rewrite.new)?).or_default() += nodesize;
             *out.entry(group_of(rewrite.old)?).or_default() -= nodesize;
+        }
+        // A data extent counts its own length, not a node's.
+        for m in &data.moves {
+            *out.entry(group_of(m.new)?).or_default() += i128::from(m.len);
+            *out.entry(group_of(m.old)?).or_default() -= i128::from(m.old_len);
         }
         out.retain(|_, delta| *delta != 0);
         Ok(out)
@@ -924,7 +1256,7 @@ impl Filesystem {
     /// Measured on a kernel-made 4 KiB-node volume: with ~160 records to
     /// a leaf, a boundary lands inside some group as soon as a few groups
     /// are fragmented (`tests/free_space_straddle.rs`).
-    fn refuse_free_space_straddle(&self, plan: &Plan) -> Result<()> {
+    fn refuse_free_space_straddle(&self, plan: &Plan, data: &DataWrite) -> Result<()> {
         let Ok(root) = self.tree_root(objectid::FREE_SPACE_TREE) else {
             return Ok(());
         };
@@ -932,6 +1264,7 @@ impl Filesystem {
             .released()
             .into_iter()
             .chain(plan.allocated())
+            .chain(data.addresses())
             .collect();
         let touched: Vec<crate::block_group::BlockGroup> = self
             .block_groups()?
@@ -1009,6 +1342,7 @@ impl Filesystem {
         &self,
         items: Vec<crate::leaf_edit::OwnedItem>,
         plan: &Plan,
+        data: &DataWrite,
     ) -> Result<Vec<crate::leaf_edit::OwnedItem>> {
         use crate::block_group::FreeExtent;
         use crate::chunk::DiskKey;
@@ -1026,9 +1360,21 @@ impl Filesystem {
         }
 
         let groups = self.block_groups()?;
-        let released: Vec<u64> = plan.released();
-        let allocated: Vec<u64> = plan.allocated();
+        // Each range the transaction frees or takes: a node for every
+        // tree block, and a data extent's own length for each of those.
         let nodesize = self.sb.nodesize as u64;
+        let released: Vec<(u64, u64)> = plan
+            .released()
+            .into_iter()
+            .map(|at| (at, nodesize))
+            .chain(data.moves.iter().map(|m| (m.old, m.old_len)))
+            .collect();
+        let allocated: Vec<(u64, u64)> = plan
+            .allocated()
+            .into_iter()
+            .map(|at| (at, nodesize))
+            .chain(data.moves.iter().map(|m| (m.new, m.len)))
+            .collect();
 
         let mut out: Vec<OwnedItem> = Vec::with_capacity(items.len());
         let mut i = 0usize;
@@ -1055,7 +1401,7 @@ impl Filesystem {
             let touched = released
                 .iter()
                 .chain(allocated.iter())
-                .any(|a| *a >= start && *a < end);
+                .any(|(a, _)| *a >= start && *a < end);
             let group = groups.iter().find(|g| g.start == start);
 
             match (touched, group) {
@@ -1077,11 +1423,8 @@ impl Filesystem {
                     // What is free now, plus what the plan releases,
                     // minus what it takes.
                     let mut free = self.free_extents(group)?;
-                    for at in released.iter().filter(|a| group.contains(**a)) {
-                        free.push(FreeExtent {
-                            start: *at,
-                            len: nodesize,
-                        });
+                    for &(start, len) in released.iter().filter(|(a, _)| group.contains(*a)) {
+                        free.push(FreeExtent { start, len });
                     }
                     free.sort();
 
@@ -1090,11 +1433,8 @@ impl Filesystem {
                     // become one" is two places for it to stop being
                     // true.
                     let mut runs: Vec<FreeExtent> = crate::block_group::merge_adjacent(free);
-                    for at in allocated.iter().filter(|a| group.contains(**a)) {
-                        runs = runs
-                            .into_iter()
-                            .flat_map(|r| carve(r, *at, nodesize))
-                            .collect();
+                    for &(at, len) in allocated.iter().filter(|(a, _)| group.contains(*a)) {
+                        runs = runs.into_iter().flat_map(|r| carve(r, at, len)).collect();
                     }
                     runs.retain(|r| r.len > 0);
 
@@ -1324,7 +1664,7 @@ mod needs_host {
                 level: 0,
             }],
         };
-        let outcome = fs.apply_free_space(items, &plan);
+        let outcome = fs.apply_free_space(items, &plan, &super::DataWrite::default());
         let _ = std::fs::remove_dir_all(&dir);
         let error = outcome.expect_err(
             "the plan moves blocks inside a group no block group item describes, and its \
