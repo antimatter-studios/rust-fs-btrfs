@@ -467,7 +467,8 @@ jobs:
       - name: chore test:cli
         run: chore test:cli
       # THE RELEASE TARBALL, built here so a release is not the first time
-      # it is put together: scripts/package-cli.sh stages the install prefix
+      # it is put together, by the same rust-fs-core script release.yml's
+      # release-cli call runs: `scripts/core.sh package-cli` stages the install prefix
       # from the binary cli:install built, then refuses it unless it holds
       # exactly that, every dotted name is a relative symlink to
       # bin/rust-fs-btrfs, every name has its man page and completions,
@@ -479,7 +480,7 @@ jobs:
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           mkdir -p tmp/package
           cd tmp/package
-          tarball="$(../../scripts/package-cli.sh "$version" linux-x86_64 ../../target/release)"
+          tarball="$(bash ../../scripts/core.sh package-cli "$version" linux-x86_64 ../../target/release | tail -n 1)"
           tar -tzvf "$tarball"
       # THE TIER LOGS OUTLIVE THE RUNNER, as in every job that runs a tier.
       - name: Keep the tier logs
