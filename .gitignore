@@ -39,11 +39,6 @@ test-disks/test-run/
 # the host (tests/support/src/lib.rs). The tier logs live here too.
 tmp/
 
-# VM harness scratch (per-VM Vagrant state, cached boot assets).
-# Re-runnable, never in source control.
-.qemu/
-**/.vagrant/
-test-disks/.vm-cache/
 .claude/
 # The harness's shared directory: what a run hands across to the guest
 # and back. No trailing slash: `.vm-share/` matches a directory only, so
