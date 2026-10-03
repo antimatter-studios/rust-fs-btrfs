@@ -6,6 +6,8 @@ never does.
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-10-03
+
 ### Added
 
 - **A release attaches the command-line tools.** A `v*` tag now builds
@@ -345,6 +347,7 @@ never does.
   the path silently.
 - Both `metadata_uuid` renderings the reference tooling emits are tolerated.
 
+[0.8.1]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.6.1...v0.6.2
