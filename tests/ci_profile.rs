@@ -2653,6 +2653,11 @@ fn am_fs_core_versions_declared(text: &str) -> Vec<(String, String)> {
                 found.push(("`FS_CORE_REF`".to_string(), v));
             }
         }
+        if let Some(rest) = line.split_once("core-ref:") {
+            if let Some(v) = as_version(rest.1) {
+                found.push(("the release-cli call's `core-ref`".to_string(), v));
+            }
+        }
         if line.contains("rust-fs-core") {
             if let Some(rest) = line.split_once("--branch ") {
                 if let Some(v) = as_version(rest.1.split_whitespace().next().unwrap_or("")) {
@@ -2706,13 +2711,16 @@ const FILES_THAT_PIN_AM_FS_CORE: &[&str] = &[
     ".github/workflows/fuzz.yml",
 ];
 
-/// How many declarations the files above carry between them: one each.
+/// How many declarations the files above carry between them: one each,
+/// and a second in `release.yml`, whose call to rust-fs-core's
+/// release-cli workflow passes the core tag as `core-ref` -- a literal,
+/// because a reusable workflow's `with:` cannot read `env`.
 ///
 /// Asserted as a number as well as file by file, so a second pin
 /// appearing in one of them -- a second clone step, a duplicated
 /// lockfile entry -- is a failure to look at rather than a count that
 /// quietly grew.
-const AM_FS_CORE_DECLARATIONS: usize = 6;
+const AM_FS_CORE_DECLARATIONS: usize = 7;
 
 /// Every file that names the `am-fs-core` this crate is built against
 /// names the same one.
@@ -2812,6 +2820,19 @@ mod core_pin_parser {
         assert_eq!(
             am_fs_core_versions_declared("  FS_CORE_REF: v0.2.13\n"),
             vec![("`FS_CORE_REF`".to_string(), "0.2.13".to_string())],
+        );
+    }
+
+    /// The reusable-workflow spelling, which is how release.yml's call to
+    /// rust-fs-core's release-cli carries its pin.
+    #[test]
+    fn a_core_ref_input_declares_its_version() {
+        assert_eq!(
+            am_fs_core_versions_declared("      core-ref: v0.2.23\n"),
+            vec![(
+                "the release-cli call's `core-ref`".to_string(),
+                "0.2.23".to_string()
+            )],
         );
     }
 

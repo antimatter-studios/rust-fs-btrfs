@@ -11,6 +11,15 @@ repository = "https://github.com/antimatter-studios/rust-fs-btrfs"
 # try to include it and fail on the nightly-only dependency.
 exclude = ["fuzz"]
 
+# What the release tarball ships, read by rust-fs-core's package-cli
+# (`scripts/core.sh package-cli`, run by the release-cli workflow
+# release.yml calls and by ci.yml's `cli` job): every dotted name with its
+# man section -- which must agree with `rust-fs-btrfs generate names` --
+# and the licence files. CAVEATS is the default, packaging/CAVEATS.
+[package.metadata.package-cli]
+names = { "fs.btrfs" = 1 }
+licenses = ["LICENSE"]
+
 [lib]
 name = "fs_btrfs"
 crate-type = ["staticlib", "rlib"]
@@ -67,7 +76,7 @@ blake2b_simd = "1.0"
 # sibling onto the VM share and guest-suite.sh links it into place, so
 # ../rust-fs-core resolves inside the guest as well as on the host. An
 # absolute path written into a .cargo/config.toml override would not.
-am-fs-core = { path = "../rust-fs-core", version = "0.2.18" }
+am-fs-core = { path = "../rust-fs-core", version = "0.2.23" }
 # Decompressors, one per compression type Btrfs defines. All three are
 # pure Rust with no C bindings, and permissively licensed like the rest.
 #

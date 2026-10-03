@@ -102,8 +102,9 @@ The release tarball, `am-fs-btrfs-<version>-<platform>.tar.gz`, is an install
 prefix: `bin/rust-fs-btrfs` and `bin/fs.btrfs` (a relative symlink to it),
 `share/man/man1/`, the completions under `share/zsh/site-functions/`,
 `share/bash-completion/completions/` and `share/fish/vendor_completions.d/`,
-`share/rust-fs-btrfs/CAVEATS`, and `LICENSE`. `scripts/package-cli.sh` builds and
-checks it; CI builds it on every pull request.
+`share/rust-fs-btrfs/CAVEATS`, and `LICENSE`. rust-fs-core's `package-cli`
+(`scripts/core.sh package-cli`), reading `[package.metadata.package-cli]` in
+`Cargo.toml`, builds and checks it; CI builds it on every pull request.
 
 `chore test:cli` tests the tools **as installed**, whatever PATH resolves:
 `rust-fs-btrfs doctor` first, then `tests/cli/test-*.sh`, against a volume the
