@@ -6,6 +6,15 @@ never does.
 
 ## [Unreleased]
 
+### Added
+
+- **A release attaches the command-line tools.** A `v*` tag now builds
+  `am-fs-btrfs-<version>-darwin-arm64.tar.gz` and `…-linux-x86_64.tar.gz`
+  with `scripts/package-cli.sh`, attests their build provenance and
+  attaches them to the GitHub release beside the `.crate`; v0.8.0 shipped
+  the crate alone. `tests/release_attestation.rs` fails a workflow that
+  stops doing so.
+
 ### Changed
 
 - **The command-line plumbing comes from am-fs-core's `cli` feature.**
