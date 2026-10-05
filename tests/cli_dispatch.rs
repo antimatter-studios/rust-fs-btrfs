@@ -76,6 +76,10 @@ fn every_tool_help_carries_an_example_for_every_verb() {
             "{name} --help has no example:\n{}",
             stdout(&out)
         );
+        // fs.btrfs is a set of verbs; mkfs.btrfs is one command.
+        if name != "fs.btrfs" {
+            continue;
+        }
         for verb in [
             "ls", "read", "write", "mkdir", "get", "info", "set", "resize",
         ] {
