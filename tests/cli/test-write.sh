@@ -66,19 +66,19 @@ head -c "$hello_size" /dev/urandom >"$SANDBOX/hello-sized.bin"
 head -c "$random_size" /dev/urandom >"$SANDBOX/random-sized.bin"
 
 refused 3 "grow the file" /nocow/data.bin "$SANDBOX/longer.bin"
-refused 3 "shorter is blocked on rust-fs-btrfs#61" /nocow/data.bin "$SANDBOX/shorter.bin"
+refused 3 "shorter is not something this library does yet" /nocow/data.bin "$SANDBOX/shorter.bin"
 refused 3 "copy-on-write" /dir/random.bin "$SANDBOX/random-sized.bin"
 refused 3 "copy-on-write|inline" /hello.txt "$SANDBOX/hello-sized.bin"
-refused 3 "^not implemented: .*creating a file is blocked on rust-fs-btrfs#61" /new.txt "$SANDBOX/shorter.bin"
+refused 3 "^not implemented: .*creating a file is not something this library does yet" /new.txt "$SANDBOX/shorter.bin"
 refused 3 "^not implemented: .*creating a file" /dir/new.txt "$SANDBOX/shorter.bin"
 refused 3 "subvolume or snapshot" /vol/inside.txt "$SANDBOX/shorter.bin"
 refused 1 "is a directory" /dir "$SANDBOX/shorter.bin"
 refused 1 "not a regular file" /link "$SANDBOX/shorter.bin"
 check "the refusals left the image as it was" cmp -s "$img" "$SANDBOX/before.img"
 
-# mkdir is the other half of what #61 blocks.
+# mkdir waits on the same namespace work, #262.
 fs.btrfs "$img" mkdir /newdir >"$SANDBOX/m.out" 2>"$SANDBOX/m.err"
 check "mkdir exits 3" test $? -eq 3
-jq_check "mkdir names what blocks it" '.code == 3 and (.error | test("rust-fs-btrfs#61"))' "$SANDBOX/m.err"
+jq_check "mkdir names what blocks it" '.code == 3 and (.error | test("rust-fs-btrfs#262"))' "$SANDBOX/m.err"
 
 finish

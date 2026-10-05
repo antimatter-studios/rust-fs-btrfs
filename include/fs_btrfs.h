@@ -13,7 +13,10 @@
  * is 0 and the message "no error"; they describe the thread's most
  * recent call, not its most recent failure.
  *
- * The driver is read-only, and refuses rather than guesses. A compressed
+ * The driver reads, and writes within narrow limits: fs_btrfs_mount_rw
+ * opens a volume for writing and fs_btrfs_write_file overwrites a
+ * nodatacow file in place; everything else is refused. It refuses rather
+ * than guesses, when reading as well: a compressed
  * extent fails with ENOTSUP rather than returning its undecoded bytes,
  * because a caller cannot distinguish those from a corrupt file.
  */
