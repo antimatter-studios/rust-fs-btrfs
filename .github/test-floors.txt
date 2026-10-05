@@ -57,6 +57,7 @@ cow_write_oracle          3
 crash_consistency         3
 csum_oracle               6
 csum_width_populated      1
+docs_describe_the_code    5
 dup_data_writes           1
 dup_mirror_fallback       7
 extent_record_missing     1
