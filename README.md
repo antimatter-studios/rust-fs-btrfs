@@ -34,7 +34,7 @@ not.
 | Area | Support |
 |------|---------|
 | Superblock (primary at 64 KiB) | done — 216 field comparisons against dump-super |
-| Superblock mirrors (64 MiB, 256 GiB) | parsed; mirror-selection policy pending |
+| Superblock mirrors (64 MiB, 256 GiB) | done — every copy is read and the valid one with the highest generation is used; a read-write mount refuses unless that is the primary (#90) |
 | Checksum: **crc32c** | done |
 | Checksum: **xxhash64**, **sha256**, **blake2b** | done — all four verified against real media |
 | System chunk array → chunk tree bootstrap | done |
@@ -51,10 +51,10 @@ not.
 | Mixed block groups (`mkfs.btrfs -M`) | reads; covered by the fixture matrix |
 | Subvolumes and snapshots: listing | done — id, path, parent, snapshot and read-only flags, checked against `btrfs subvolume list` |
 | Subvolumes and snapshots: reading inside one | done — `open_subvolume` gives a handle over that tree; read-only |
-| A path that crosses into a subvolume | not yet — `lookup_path("/sub/x")` stops at the boundary and says which subvolume to open. An inode number means nothing without its tree, so crossing has to hand back both |
+| A path that crosses into a subvolume | done in `resolve_path`, which hands back the subvolume and the inode in it; `lookup_path` stops at the boundary and says which subvolume to open, because an inode number means nothing without its tree |
 | Compression (zlib / lzo / zstd extents) | done — all three, verified against files the kernel wrote |
 | Write path: overwrite in place | done — `nodatacow` files only, no journal needed |
-| Write path: anything copy-on-write | planned — see `docs/transaction-format.md` |
+| Write path: anything copy-on-write | partial — `Filesystem::write` overwrites bytes inside a file's existing extents and commits the transaction (#61). It refuses a write that grows a file or lands in a hole, a checksummed file (most files: the checksum tree is not written yet), and inline, preallocated, compressed and shared extents (#261). The CLI and the C ABI do not use it yet (#274) |
 | C ABI (`fs_btrfs_*`) | done, including the write entry points |
 
 ## Command-line tools
@@ -84,8 +84,8 @@ Metadata is JSON on stdout by default, `--text` for people. A failure is
 | `ls [PATH]` | JSON entries: name, type, size, mode, mtime, inode, `subvolume`, and a symlink's target. A path into a subvolume or a snapshot is followed, as a mount shows it |
 | `read PATH [-o FILE]` | the file's raw bytes: inline, compressed (zlib, LZO, zstd), sparse, inside a subvolume or through a snapshot |
 | `get [KEY]` / `info [KEY]` | `fs`, `label`, `total_bytes`, `free_bytes` (from `bytes_used`), `block_size` (the sector size), `dirty` (a log to replay, or the error flag), and `btrfs.*`: fsid, metadata UUID, node size, checksum type, device count, generation, feature names. From the superblock alone, so a volume that will not mount still answers |
-| `write PATH` | **only the in-place case**: an existing NODATACOW file (`chattr +C`), overwritten with exactly as many bytes from stdin as it holds. A new file, an ordinary copy-on-write file, a snapshotted, compressed or inline extent, a different length, or a path inside a subvolume is refused with exit 3 and the library's reason; everything copy-on-write waits on [#61][i61] |
-| `mkdir` | not implemented (exit 3): needs the copy-on-write write path, [#61][i61] |
+| `write PATH` | **only the in-place case**: an existing NODATACOW file (`chattr +C`), overwritten with exactly as many bytes from stdin as it holds. A new file, an ordinary copy-on-write file, a snapshotted, compressed or inline extent, a different length, or a path inside a subvolume is refused with exit 3 and the library's reason. An ordinary file waits on the CLI using the library's copy-on-write writes ([#274][i274]); creating, removing and resizing wait on [#262][i262] |
+| `mkdir` | not implemented (exit 3): needs directory edits, [#262][i262] |
 | `set label`, `resize` | not implemented (exit 3): no label writer, no resize |
 
 There is no `mkfs.btrfs` and no `fsck.btrfs`: this crate cannot build an initial
@@ -115,7 +115,8 @@ as damaged is one `btrfs check --readonly` refuses too; after `fs.btrfs write`,
 `tests/cli_write_kernel.rs` has `btrfs check --readonly` find the volume clean
 and the kernel read back exactly the bytes written.
 
-[i61]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/61
+[i262]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/262
+[i274]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/274
 
 ## Test contract
 

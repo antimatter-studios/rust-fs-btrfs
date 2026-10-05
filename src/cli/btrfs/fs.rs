@@ -46,9 +46,9 @@ pub const KEYS: &[&str] = &[
     "btrfs",
 ];
 
-/// Why every copy-on-write change is refused: the one issue it waits on.
-const COW_BLOCKED: &str =
-    "blocked on rust-fs-btrfs#61: this library has no copy-on-write write path yet";
+/// Why creating, removing or resizing anything is refused: the library
+/// changes the bytes of files that exist, and nothing else yet.
+const COW_BLOCKED: &str = "not something this library does yet (rust-fs-btrfs#262)";
 
 fn command() -> Cmd {
     Cmd::new("fs.btrfs")
@@ -148,7 +148,7 @@ fn command() -> Cmd {
         )
         .subcommand(
             Cmd::new("mkdir")
-                .about("Create a directory (not implemented: needs copy-on-write writes)")
+                .about("Create a directory (not implemented: needs directory edits)")
                 .arg(
                     Arg::new("path")
                         .value_name("PATH")
@@ -157,8 +157,8 @@ fn command() -> Cmd {
                 )
                 .after_help(
                     "Examples:\n  fs.btrfs disk.img mkdir /backup\n\n\
-                     Answers `not implemented` (exit 3) until this library can make a \
-                     copy-on-write change (rust-fs-btrfs#61).",
+                     Answers `not implemented` (exit 3) until this library can add a \
+                     directory entry (rust-fs-btrfs#262).",
                 ),
         )
         .subcommand(key_command(
