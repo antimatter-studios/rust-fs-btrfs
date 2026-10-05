@@ -124,7 +124,7 @@ fn a_wrong_command_line_is_a_structured_error_on_stderr_with_status_2() {
 fn the_verbs_this_library_cannot_do_answer_not_implemented_with_status_3() {
     // None of these opens the image: the answer does not depend on it.
     for (args, why) in [
-        (vec!["mkdir", "/d"], "rust-fs-btrfs#61"),
+        (vec!["mkdir", "/d"], "rust-fs-btrfs#262"),
         (vec!["set", "label", "X"], "label"),
         (vec!["resize", "1G"], "resize"),
     ] {

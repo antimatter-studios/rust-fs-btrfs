@@ -19,7 +19,7 @@ blocked() {
         "$SANDBOX/b.err"
 }
 
-blocked mkdir /d -- "rust-fs-btrfs#61"
+blocked mkdir /d -- "rust-fs-btrfs#262"
 blocked set label BACKUP -- "label"
 blocked resize 20G -- "resize"
 blocked resize 20G --force -- "resize"
