@@ -4,9 +4,9 @@
 source "$(dirname "$0")/lib.sh"
 
 # The names are written here, not read from the binary: a binary that
-# forgot one would otherwise agree with itself. fs.btrfs and mkfs.btrfs:
-# there is no fsck.btrfs, and none may appear.
-EXPECTED="fs.btrfs mkfs.btrfs"
+# forgot one would otherwise agree with itself. fs.btrfs, mkfs.btrfs and
+# fsck.btrfs (#260).
+EXPECTED="fs.btrfs mkfs.btrfs fsck.btrfs"
 
 version="$(rust-fs-btrfs --version | sed -n "s/^rust-fs-btrfs ($CRATE) //p")"
 check "rust-fs-btrfs --version names a version" test -n "$version"
@@ -29,13 +29,6 @@ for name in $EXPECTED rust-fs-btrfs; do
     done
     help="$("$name" --help 2>&1)"
     check "$name --help carries no example" grep -q '^Examples:' <<<"$help"
-done
-
-# Beside the staged tools, the names this repository does not ship are
-# absent: a stray fsck.btrfs of ours would shadow btrfs-progs' for no gain.
-bin_dir="$(dirname "$(command -v rust-fs-btrfs)")"
-for absent in fsck.btrfs; do
-    check "$bin_dir holds no $absent" test ! -e "$bin_dir/$absent"
 done
 
 # The repository-named form reaches every tool, and nothing can shadow it.

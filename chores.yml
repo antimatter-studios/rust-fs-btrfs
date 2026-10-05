@@ -614,8 +614,11 @@ tasks:
     # FLOOR: each file prints a `test result: ok. N passed` line, which
     # test-floor.sh sums as it does cargo's. 34 checks executed when the
     # tier was added, 176 with test-docs.sh; the floor is about 95% of that.
+    #
+    # BUDGET: 26 lines and 1047 bytes measured with fsck.btrfs's checks in
+    # the tier (#260, run 37378163675), so 26 lines and 1200 bytes.
     cmds:
-      - 'scripts/tier.sh test:cli cli 26 900 -- scripts/test-cli.sh'
+      - 'scripts/tier.sh test:cli cli 26 1200 -- scripts/test-cli.sh'
       - 'bash scripts/core.sh test-floor cli 167'
 
   test:scripts:

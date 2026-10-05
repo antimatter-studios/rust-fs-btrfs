@@ -68,6 +68,7 @@
 pub mod block_group;
 pub mod btree;
 pub mod capi;
+pub mod check;
 pub mod chunk;
 pub mod commit;
 pub mod compression;

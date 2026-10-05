@@ -89,9 +89,6 @@ Metadata is JSON on stdout by default, `--text` for people. A failure is
 | `set label VALUE` | writes the label (at most 255 bytes) into every superblock copy, each with a fresh checksum; a pool of several devices is refused |
 | `resize` | not implemented (exit 3): no resize |
 
-There is no `fsck.btrfs`: this crate cannot check a volume, so the name is not
-installed.
-
 `mkfs.btrfs` makes a single-device filesystem with the standard formatter's
 defaults (metadata and system DUP, data single, the free-space tree, skinny
 metadata, no-holes) on a device or image of at least 128 MiB:
@@ -108,6 +105,21 @@ is refused by name rather than ignored. The layout is the standard formatter's,
 measured from its output at sizes from 300 MiB to 300 GiB, written once at
 generation 1; `tests/cli_mkfs_kernel.rs` has `btrfs check` and the kernel accept
 it.
+
+`fsck.btrfs` checks a volume without changing it, as `btrfs check --readonly`
+does: every tree block's checksum and keys, the extent tree against the trees
+that use the extents, block groups against their extents, chunks against device
+extents, the free-space tree against the space nothing uses, and the namespace
+(link counts, directory sizes, entries naming no inode).
+
+```sh
+fsck.btrfs disk.img          # exit 0 clean, 4 problems found, 8 could not check
+fsck.btrfs --text disk.img   # one line per finding
+```
+
+It repairs nothing: `-y` and `-p` are refused (exit 16) rather than
+accepted and ignored. `tests/cli_fsck_oracle.rs` holds it to `btrfs check` on
+twelve clean fixtures and eight kinds of damage.
 
 `--offset BYTES` addresses a volume inside a whole-disk image.
 

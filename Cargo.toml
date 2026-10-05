@@ -17,7 +17,7 @@ exclude = ["fuzz"]
 # man section -- which must agree with `rust-fs-btrfs generate names` --
 # and the licence files. CAVEATS is the default, packaging/CAVEATS.
 [package.metadata.package-cli]
-names = { "fs.btrfs" = 1, "mkfs.btrfs" = 8 }
+names = { "fs.btrfs" = 1, "mkfs.btrfs" = 8, "fsck.btrfs" = 8 }
 licenses = ["LICENSE"]
 
 [lib]
