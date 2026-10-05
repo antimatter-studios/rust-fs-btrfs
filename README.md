@@ -86,7 +86,8 @@ Metadata is JSON on stdout by default, `--text` for people. A failure is
 | `get [KEY]` / `info [KEY]` | `fs`, `label`, `total_bytes`, `free_bytes` (from `bytes_used`), `block_size` (the sector size), `dirty` (a log to replay, or the error flag), and `btrfs.*`: fsid, metadata UUID, node size, checksum type, device count, generation, feature names. From the superblock alone, so a volume that will not mount still answers |
 | `write PATH` | **only the in-place case**: an existing NODATACOW file (`chattr +C`), overwritten with exactly as many bytes from stdin as it holds. A new file, an ordinary copy-on-write file, a snapshotted, compressed or inline extent, a different length, or a path inside a subvolume is refused with exit 3 and the library's reason. An ordinary file waits on the CLI using the library's copy-on-write writes ([#274][i274]); creating, removing and resizing wait on [#262][i262] |
 | `mkdir` | not implemented (exit 3): needs directory edits, [#262][i262] |
-| `set label`, `resize` | not implemented (exit 3): no label writer, no resize |
+| `set label VALUE` | writes the label (at most 255 bytes) into every superblock copy, each with a fresh checksum; a pool of several devices is refused |
+| `resize` | not implemented (exit 3): no resize |
 
 There is no `fsck.btrfs`: this crate cannot check a volume, so the name is not
 installed.
