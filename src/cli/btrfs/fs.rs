@@ -171,12 +171,12 @@ fn command() -> Cmd {
         ))
         .subcommand(
             Cmd::new("set")
-                .about("Change a property (label: not implemented)")
+                .about("Change a property: the label")
                 .arg(Arg::new("key").value_name("KEY").required(true))
                 .arg(Arg::new("value").value_name("VALUE").required(true))
                 .after_help(
                     "Examples:\n  fs.btrfs disk.img set label BACKUP\n\n\
-                     Answers `not implemented` (exit 3): this library has no label writer.",
+                     The label is written to every superblock copy; at most 255 bytes.",
                 ),
         )
         .subcommand(
@@ -241,7 +241,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
             offset,
             sub.get_one::<String>("key").map(String::as_str),
         ),
-        "set" => set(sub),
+        "set" => set(target, offset, sub),
         "resize" => Err(CliError::not_implemented(
             "resize: this library cannot resize a Btrfs filesystem",
         )),
@@ -631,12 +631,28 @@ fn get(target: &OsString, offset: u64, key: Option<&str>) -> Result<Outcome, Cli
     Ok(Outcome::report(Json::object([(key, value.clone())])).with_text(text))
 }
 
-fn set(sub: &ArgMatches) -> Result<Outcome, CliError> {
+fn set(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Outcome, CliError> {
     let key = sub.get_one::<String>("key").expect("clap requires the key");
     match key.as_str() {
-        "label" => Err(CliError::not_implemented(
-            "set label: this library has no writer for the Btrfs label",
-        )),
+        "label" => {
+            let value = sub
+                .get_one::<String>("value")
+                .expect("clap requires the value");
+            if value.len() > fs_btrfs::super_write::MAX_LABEL_BYTES {
+                return Err(CliError::failed(format!(
+                    "set label: {} bytes, and a Btrfs label holds at most {}",
+                    value.len(),
+                    fs_btrfs::super_write::MAX_LABEL_BYTES
+                )));
+            }
+            let dev = device::open_rw(target, offset)?;
+            fs_btrfs::super_write::set_label(&*dev, value)
+                .map_err(|e| btrfs_error(target.to_string_lossy().as_bytes(), e))?;
+            Ok(
+                Outcome::report(Json::object([("label", Json::from(value.as_str()))]))
+                    .with_text(format!("label set to {value:?}")),
+            )
+        }
         k if KEYS.contains(&k) || k.starts_with("btrfs.") => {
             Err(CliError::refused(format!("{k} is read-only")))
         }

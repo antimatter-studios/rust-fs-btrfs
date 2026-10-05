@@ -323,6 +323,65 @@ pub fn stamp_checksum(raw: &mut [u8], csum_type: ChecksumType) {
     raw[..CSUM_SIZE].copy_from_slice(&digest);
 }
 
+/// The longest label: the field is 256 bytes and keeps a terminator.
+pub const MAX_LABEL_BYTES: usize = 255;
+
+/// Set the label on `dev`: every superblock copy of this filesystem gets
+/// it, each with a fresh checksum, the mirrors first and the primary last.
+///
+/// The label is the superblock's and nothing else's, so this is the whole
+/// change: no tree holds it and no transaction is needed. Nothing else in
+/// a copy changes, its generation included.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] for a label longer than
+/// [`MAX_LABEL_BYTES`], or one holding a NUL, and for a filesystem that
+/// spans more than one device, whose other devices carry the label too;
+/// whatever reading or writing the device returns.
+pub fn set_label(dev: &dyn fs_core::BlockDevice, label: &str) -> Result<()> {
+    use crate::superblock::{offsets as o, Superblock};
+    if label.len() > MAX_LABEL_BYTES || label.contains('\0') {
+        return Err(Error::UnsupportedFeature(format!(
+            "a label is at most {MAX_LABEL_BYTES} bytes, with no NUL; this one is {}",
+            label.len()
+        )));
+    }
+    const COPIES: [u64; 3] = [64 << 10, 64 << 20, 256 << 30];
+    let mut primary = vec![0u8; SUPERBLOCK_SIZE];
+    dev.read_at(COPIES[0], &mut primary)?;
+    let sb = Superblock::parse(&primary)?;
+    if sb.num_devices > 1 {
+        return Err(Error::UnsupportedFeature(format!(
+            "this filesystem spans {} devices, and every one of them carries the label",
+            sb.num_devices
+        )));
+    }
+    let size = dev.size_bytes();
+    let mut copies = Vec::new();
+    for &at in &COPIES {
+        if at + SUPERBLOCK_SIZE as u64 > size {
+            continue;
+        }
+        let mut raw = vec![0u8; SUPERBLOCK_SIZE];
+        dev.read_at(at, &mut raw)?;
+        // Only a copy of THIS filesystem: a stale superblock from an
+        // earlier one at a mirror's offset is not ours to rewrite.
+        match Superblock::parse(&raw) {
+            Ok(copy) if copy.fsid == sb.fsid => copies.push((at, raw)),
+            _ => {}
+        }
+    }
+    for (at, raw) in copies.iter_mut().rev() {
+        raw[o::LABEL..o::LABEL + 256].fill(0);
+        raw[o::LABEL..o::LABEL + label.len()].copy_from_slice(label.as_bytes());
+        stamp_checksum(raw, sb.csum_type);
+        dev.write_at(*at, raw)?;
+        dev.flush()?;
+    }
+    Ok(())
+}
+
 fn put64(raw: &mut [u8], at: usize, value: u64) {
     raw[at..at + 8].copy_from_slice(&value.to_le_bytes());
 }
