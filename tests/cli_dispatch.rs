@@ -49,7 +49,7 @@ fn every_name_answers_version_with_itself_the_crate_and_the_version() {
 
 #[test]
 fn the_repository_name_reaches_a_tool_by_verb_and_by_full_name() {
-    let args = ["image.img", "set", "label", "X"];
+    let args = ["image.img", "resize", "1G"];
     let dotted = tool("fs.btrfs").args(args).output().unwrap();
     assert_eq!(dotted.status.code(), Some(3), "{}", stderr(&dotted));
     for word in ["fs", "fs.btrfs"] {
@@ -129,7 +129,6 @@ fn the_verbs_this_library_cannot_do_answer_not_implemented_with_status_3() {
     // None of these opens the image: the answer does not depend on it.
     for (args, why) in [
         (vec!["mkdir", "/d"], "rust-fs-btrfs#262"),
-        (vec!["set", "label", "X"], "label"),
         (vec!["resize", "1G"], "resize"),
     ] {
         let message = refused(tool("fs.btrfs").arg("never-opened.img").args(&args), 3);

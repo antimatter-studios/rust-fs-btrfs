@@ -46,6 +46,7 @@ chunk_tree_items          3
 ci_profile                67
 cli_dispatch              13
 cli_docs                  2
+cli_label_kernel          2
 cli_mkfs_kernel           5
 cli_oracle                3
 cli_write_kernel          1
