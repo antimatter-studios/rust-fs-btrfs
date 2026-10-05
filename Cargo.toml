@@ -1,6 +1,6 @@
 [package]
 name = "am-fs-btrfs"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2021"
 license = "MIT"
 description = "Pure-Rust Btrfs filesystem driver. Exposes a C ABI (fs_btrfs_*) suitable for FFI from C/C++/Swift/Go."
@@ -17,7 +17,7 @@ exclude = ["fuzz"]
 # man section -- which must agree with `rust-fs-btrfs generate names` --
 # and the licence files. CAVEATS is the default, packaging/CAVEATS.
 [package.metadata.package-cli]
-names = { "fs.btrfs" = 1 }
+names = { "fs.btrfs" = 1, "mkfs.btrfs" = 8 }
 licenses = ["LICENSE"]
 
 [lib]

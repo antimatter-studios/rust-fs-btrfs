@@ -15,12 +15,12 @@ const CRATE: &str = env!("CARGO_PKG_NAME");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[test]
-fn the_binary_installs_exactly_one_dotted_name() {
+fn the_binary_installs_exactly_its_dotted_names() {
     // Written here, not read from the binary: a binary that grew or lost a
-    // name would otherwise agree with itself. No mkfs.btrfs and no
-    // fsck.btrfs: this library cannot make a filesystem or check one, and
-    // a name that answered "not implemented" would shadow btrfs-progs'.
-    assert_eq!(dotted_names(), ["fs.btrfs"]);
+    // name would otherwise agree with itself. No fsck.btrfs: this library
+    // cannot check a filesystem, and a name that answered "not
+    // implemented" would shadow btrfs-progs'.
+    assert_eq!(dotted_names(), ["fs.btrfs", "mkfs.btrfs"]);
 }
 
 #[test]
@@ -76,6 +76,10 @@ fn every_tool_help_carries_an_example_for_every_verb() {
             "{name} --help has no example:\n{}",
             stdout(&out)
         );
+        // fs.btrfs is a set of verbs; mkfs.btrfs is one command.
+        if name != "fs.btrfs" {
+            continue;
+        }
         for verb in [
             "ls", "read", "write", "mkdir", "get", "info", "set", "resize",
         ] {

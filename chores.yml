@@ -493,9 +493,12 @@ tasks:
     # kernel accept the result, and scrape the guest's own kernel log —
     # because a mount that succeeds while the kernel logs a warning is
     # not a pass.
+    #
+    # Budget: 386 lines, 32615 bytes measured with cli_mkfs_kernel in the
+    # tier (#259, run 37332257259), so 395 lines and 33500 bytes.
     cmds:
       - test-disks/build-fixtures.sh --check
-      - 'scripts/tier.sh test:kernel kernel 320 27600 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - 'scripts/tier.sh test:kernel kernel 395 33500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
