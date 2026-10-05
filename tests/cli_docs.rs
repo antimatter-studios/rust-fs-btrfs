@@ -50,15 +50,10 @@ fn every_name_has_a_man_page_in_its_section_naming_its_subcommands() {
             assert!(text.contains(verb), "{name}'s page does not mention {verb}");
         }
     }
-    // Section 8 holds mkfs.btrfs and nothing else: no fsck.* is shipped.
-    assert!(
-        share.join("man/man8/mkfs.btrfs.8").is_file(),
-        "no mkfs.btrfs.8"
-    );
-    assert!(
-        !share.join("man/man8/fsck.btrfs.8").exists(),
-        "a section 8 page was written for fsck.btrfs, which is not shipped"
-    );
+    // Section 8 holds the two system-administration tools (#260).
+    for page in ["mkfs.btrfs.8", "fsck.btrfs.8"] {
+        assert!(share.join("man/man8").join(page).is_file(), "no {page}");
+    }
     // fs.btrfs's subcommands have pages of their own, which its list names.
     for verb in [
         "ls", "read", "write", "mkdir", "get", "info", "set", "resize",

@@ -17,10 +17,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[test]
 fn the_binary_installs_exactly_its_dotted_names() {
     // Written here, not read from the binary: a binary that grew or lost a
-    // name would otherwise agree with itself. No fsck.btrfs: this library
-    // cannot check a filesystem, and a name that answered "not
-    // implemented" would shadow btrfs-progs'.
-    assert_eq!(dotted_names(), ["fs.btrfs", "mkfs.btrfs"]);
+    // name would otherwise agree with itself. fsck.btrfs checks a volume
+    // as btrfs check --readonly does (#260).
+    assert_eq!(dotted_names(), ["fs.btrfs", "mkfs.btrfs", "fsck.btrfs"]);
 }
 
 #[test]
