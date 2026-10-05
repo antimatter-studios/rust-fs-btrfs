@@ -99,6 +99,10 @@ pub enum Error {
     /// The requested operation would write, but the volume is mounted
     /// read-only or the driver has no write path for this structure.
     ReadOnly,
+
+    /// A format was asked for that cannot be made: a device too small, a
+    /// node size out of range, a label too long. Nothing was written.
+    InvalidGeometry(String),
 }
 
 impl fmt::Display for Error {
@@ -131,6 +135,7 @@ impl fmt::Display for Error {
             Error::NotADirectory => f.write_str("not a directory"),
             Error::NotAFile => f.write_str("not a regular file"),
             Error::ReadOnly => f.write_str("filesystem is read-only"),
+            Error::InvalidGeometry(m) => write!(f, "cannot format: {m}"),
         }
     }
 }

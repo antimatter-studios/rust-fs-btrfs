@@ -19,7 +19,7 @@ static FAMILY: cli::Family = cli::Family {
         "`chore cli:install` from a checkout of this repository",
         "`brew install antimatter-studios/tap/rust-fs-btrfs`",
     ],
-    tools: &[btrfs::fs::TOOL],
+    tools: &[btrfs::fs::TOOL, btrfs::mkfs::TOOL],
 };
 
 fn main() -> ExitCode {

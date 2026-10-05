@@ -6,6 +6,21 @@ never does.
 
 ## [Unreleased]
 
+**Breaking:** `Error` gains the variant `InvalidGeometry`, so this release is
+0.9.0. A `match` over `Error` without a wildcard arm needs one more arm.
+
+### Added
+
+- **`mkfs.btrfs`, and `fs_btrfs::mkfs` under it (#259).** A single-device
+  filesystem with the standard formatter's defaults, laid out as it lays one
+  out: three chunks and the nine trees a fresh filesystem has, every item in
+  its encoding, measured from its output. `btrfs check --readonly` and the
+  kernel accept the result at node sizes from 16 to 32 KiB, with each of the
+  four checksum types, from 128 MiB to 60 GiB (`tests/cli_mkfs_kernel.rs`).
+- **`Error::InvalidGeometry`**, for a format that cannot be made: a device too
+  small, a node size out of range, a label too long. `EINVAL` through the C
+  ABI.
+
 ## [0.8.1] — 2026-10-03
 
 ### Added

@@ -88,8 +88,25 @@ Metadata is JSON on stdout by default, `--text` for people. A failure is
 | `mkdir` | not implemented (exit 3): needs directory edits, [#262][i262] |
 | `set label`, `resize` | not implemented (exit 3): no label writer, no resize |
 
-There is no `mkfs.btrfs` and no `fsck.btrfs`: this crate cannot build an initial
-layout or check a volume, so neither name is installed.
+There is no `fsck.btrfs`: this crate cannot check a volume, so the name is not
+installed.
+
+`mkfs.btrfs` makes a single-device filesystem with the standard formatter's
+defaults (metadata and system DUP, data single, the free-space tree, skinny
+metadata, no-holes) on a device or image of at least 128 MiB:
+
+```sh
+mkfs.btrfs --size 1G -L BACKUP disk.img
+truncate -s 4G disk.img && mkfs.btrfs -n 32768 --csum xxhash disk.img
+```
+
+It takes `-L`, `-n` (4 KiB to 64 KiB), `--csum` (crc32c, xxhash, sha256,
+blake2), `-U`, `-f`, `-q` and `--size`, and accepts `-s 4096`, `-m dup`,
+`-d single` and `-K`, which name what it makes. Any other sector size or profile
+is refused by name rather than ignored. The layout is the standard formatter's,
+measured from its output at sizes from 300 MiB to 300 GiB, written once at
+generation 1; `tests/cli_mkfs_kernel.rs` has `btrfs check` and the kernel accept
+it.
 
 `--offset BYTES` addresses a volume inside a whole-disk image.
 
