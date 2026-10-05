@@ -80,7 +80,9 @@ fn accepted(name: &str, bytes: u64, args: &[&str], label: &str, nodesize: u32, c
         "{name}: the filesystem does not cover the device:\n{sb}"
     );
 
-    let hello = pattern(100_000, bytes as u32);
+    // Small enough that its base64 fits in one argument of the guest
+    // command: the kernel caps a single argument at 128 KiB.
+    let hello = pattern(20_000, bytes as u32);
     let path = image.to_str().expect("a UTF-8 scratch path").to_string();
     guest_kernel_write_ok(
         &path,
