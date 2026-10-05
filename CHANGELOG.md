@@ -11,6 +11,13 @@ never does.
 
 ### Added
 
+- **`fsck.btrfs`, and `fs_btrfs::check` under it (#260).** Checks a volume
+  without changing it, as `btrfs check --readonly` does: tree-block checksums
+  and keys, extents against the trees that reference them, block groups,
+  chunks against device extents, the free-space tree, and the namespace. Exit 0
+  clean, 4 problems found, 8 could not check, 16 usage (a repair request is
+  refused). Agrees with `btrfs check` on twelve clean fixtures and eight kinds
+  of damage.
 - **`mkfs.btrfs`, and `fs_btrfs::mkfs` under it (#259).** A single-device
   filesystem with the standard formatter's defaults, laid out as it lays one
   out: three chunks and the nine trees a fresh filesystem has, every item in
