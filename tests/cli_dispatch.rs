@@ -15,12 +15,12 @@ const CRATE: &str = env!("CARGO_PKG_NAME");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[test]
-fn the_binary_installs_exactly_one_dotted_name() {
+fn the_binary_installs_exactly_its_dotted_names() {
     // Written here, not read from the binary: a binary that grew or lost a
-    // name would otherwise agree with itself. No mkfs.btrfs and no
-    // fsck.btrfs: this library cannot make a filesystem or check one, and
-    // a name that answered "not implemented" would shadow btrfs-progs'.
-    assert_eq!(dotted_names(), ["fs.btrfs"]);
+    // name would otherwise agree with itself. No fsck.btrfs: this library
+    // cannot check a filesystem, and a name that answered "not
+    // implemented" would shadow btrfs-progs'.
+    assert_eq!(dotted_names(), ["fs.btrfs", "mkfs.btrfs"]);
 }
 
 #[test]

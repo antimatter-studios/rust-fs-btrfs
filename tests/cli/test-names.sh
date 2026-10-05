@@ -4,9 +4,9 @@
 source "$(dirname "$0")/lib.sh"
 
 # The names are written here, not read from the binary: a binary that
-# forgot one would otherwise agree with itself. Only fs.btrfs: there is no
-# mkfs.btrfs or fsck.btrfs, and none may appear.
-EXPECTED="fs.btrfs"
+# forgot one would otherwise agree with itself. fs.btrfs and mkfs.btrfs:
+# there is no fsck.btrfs, and none may appear.
+EXPECTED="fs.btrfs mkfs.btrfs"
 
 version="$(rust-fs-btrfs --version | sed -n "s/^rust-fs-btrfs ($CRATE) //p")"
 check "rust-fs-btrfs --version names a version" test -n "$version"
@@ -32,10 +32,9 @@ for name in $EXPECTED rust-fs-btrfs; do
 done
 
 # Beside the staged tools, the names this repository does not ship are
-# absent: a stray mkfs.btrfs or fsck.btrfs of ours would shadow
-# btrfs-progs' for no gain.
+# absent: a stray fsck.btrfs of ours would shadow btrfs-progs' for no gain.
 bin_dir="$(dirname "$(command -v rust-fs-btrfs)")"
-for absent in mkfs.btrfs fsck.btrfs; do
+for absent in fsck.btrfs; do
     check "$bin_dir holds no $absent" test ! -e "$bin_dir/$absent"
 done
 
