@@ -155,8 +155,12 @@ fn the_node_size_and_checksum_asked_for_are_the_ones_made() {
         32768,
         "crc32c",
     );
-    for csum in ["xxhash64", "sha256", "blake2b"] {
-        let short = if csum == "xxhash64" { "xxhash" } else { csum };
+    // The names dump-super prints, and the option each is asked for by.
+    for (csum, short) in [
+        ("xxhash64", "xxhash"),
+        ("sha256", "sha256"),
+        ("blake2", "blake2"),
+    ] {
         accepted(
             &format!("csum-{short}"),
             1024 * MIB,
