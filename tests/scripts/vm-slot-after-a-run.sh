@@ -9,7 +9,7 @@
 # boot takes is ONE SLOT FOR THE WHOLE MACHINE. Nothing the run owned
 # gave it back: release was left to chore's `after_all` reaper, which
 # only runs inside a chore invocation of THIS repository. A run that
-# reached cargo any other way — scripts/test.sh, scripts/tier.sh, by hand
+# reached cargo any other way — scripts/test.sh, ../rust-fs-core/scripts/tier.sh, by hand
 # — exited 0 with the VM idle and the slot recorded as held, and every
 # other repository's VM work then queued behind it at 0% CPU, up to the
 # guest's eight-hour idle deadline. That is a slow test to anyone

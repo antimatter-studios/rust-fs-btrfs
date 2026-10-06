@@ -399,7 +399,7 @@ fn no_local_copy_of_the_tarball_packaging_remains() {
     ] {
         assert!(
             !root.join(copy).exists(),
-            "{copy} is a copy of rust-fs-core's packaging; run `scripts/core.sh package-cli`"
+            "{copy} is a copy of rust-fs-core's packaging; run `../rust-fs-core/scripts/package-cli.sh`"
         );
     }
     let workflows = root.join(".github/workflows");
@@ -409,7 +409,10 @@ fn no_local_copy_of_the_tarball_packaging_remains() {
         let calls: Vec<&str> = text
             .lines()
             .filter(|l| !l.trim_start().starts_with('#'))
-            .filter(|l| l.contains("scripts/package-cli.sh"))
+            .filter(|l| {
+                l.contains("scripts/package-cli.sh")
+                    && !l.contains("rust-fs-core/scripts/package-cli.sh")
+            })
             .collect();
         assert!(
             calls.is_empty(),

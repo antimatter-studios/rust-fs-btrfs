@@ -13,7 +13,7 @@
 //!
 //! `ci.yml` used to run `cargo test` itself. It does not any more:
 //! every job in it runs chore tasks and nothing else, and the cargo
-//! invocations live in `chores.yml`, wrapped in `scripts/tier.sh` (the
+//! invocations live in `chores.yml`, wrapped in `../rust-fs-core/scripts/tier.sh` (the
 //! output budget) around `scripts/test.sh` (the scratch directory),
 //! with the target list produced by `scripts/test-targets.sh`. So the
 //! one step this guard used to read has become a chain, and a chain is
@@ -287,7 +287,7 @@ fn before_the_double_dash<'a>(arguments: &'a [&'a str]) -> &'a [&'a str] {
 /// spelled
 ///
 /// ```text
-///   EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 400 21000 \
+///   EXPECT_OVERFLOW_CHECKS=1 ../rust-fs-core/scripts/tier.sh test:unit unit 400 21000 \
 ///       -- scripts/test.sh --locked $(scripts/test-targets.sh unit)
 /// ```
 ///
@@ -1119,7 +1119,7 @@ jobs:
     // nothing else. No `--release`, the handshake set, and still not one
     // library unit test built.
     let another_tiers_target_list = "\
-EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 400 21000 -- \
+EXPECT_OVERFLOW_CHECKS=1 ../rust-fs-core/scripts/tier.sh test:unit unit 400 21000 -- \
 scripts/test.sh --locked $(scripts/test-targets.sh oracle)
 ";
     assert!(
@@ -1132,7 +1132,7 @@ scripts/test.sh --locked $(scripts/test-targets.sh oracle)
     // And the control, so the exclusion is about the target list rather
     // than about the wrapper chain the tier is written in.
     let the_real_tier = "\
-EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 400 21000 -- \
+EXPECT_OVERFLOW_CHECKS=1 ../rust-fs-core/scripts/tier.sh test:unit unit 400 21000 -- \
 scripts/test.sh --locked $(scripts/test-targets.sh unit)
 ";
     assert_eq!(
@@ -1293,7 +1293,7 @@ fn cargo_test_runs_outside(manifest: &str, exempt: &[&str]) -> Vec<String> {
 }
 
 /// A command's lines with backslash continuations joined, so
-/// `scripts/tier.sh ... \` followed by what it wraps is one command
+/// `../rust-fs-core/scripts/tier.sh ... \` followed by what it wraps is one command
 /// (Greptile on #159). `chores.yml` writes the `test:vm` tier that way.
 fn logical_lines(run: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -1358,21 +1358,21 @@ mod locked {
 tasks:
   test:unit:
     cmds:
-      - 'scripts/tier.sh test:unit unit 400 21000 -- scripts/test.sh --locked --lib'
+      - '../rust-fs-core/scripts/tier.sh test:unit unit 400 21000 -- scripts/test.sh --locked --lib'
   test:images:
     cmds:
       - cmd: 'scripts/test.sh --locked --release --test fixtures_present'
 ";
 
     const UNIT_CMD: &str =
-        "      - 'scripts/tier.sh test:unit unit 400 21000 -- scripts/test.sh --locked --lib'\n";
+        "      - '../rust-fs-core/scripts/tier.sh test:unit unit 400 21000 -- scripts/test.sh --locked --lib'\n";
 
     #[test]
     fn the_control_finds_both_runs_through_their_wrappers() {
         assert_eq!(
             cargo_test_runs_outside(MANIFEST, LOCKED_EXEMPT_TASKS),
             vec![
-                "scripts/tier.sh test:unit unit 400 21000 -- scripts/test.sh --locked --lib"
+                "../rust-fs-core/scripts/tier.sh test:unit unit 400 21000 -- scripts/test.sh --locked --lib"
                     .to_string(),
                 "scripts/test.sh --locked --release --test fixtures_present".to_string(),
             ],
@@ -1444,7 +1444,7 @@ tasks:
     fn runs_are_split_at_separators_and_joined_across_continuations() {
         let yaml = MANIFEST.replace(
             UNIT_CMD,
-            "      - |\n          scripts/test.sh --lib && cargo test --locked --release\n          scripts/tier.sh t u 1 1 -- \\\n            scripts/test.sh --locked --lib\n",
+            "      - |\n          scripts/test.sh --lib && cargo test --locked --release\n          ../rust-fs-core/scripts/tier.sh t u 1 1 -- \\\n            scripts/test.sh --locked --lib\n",
         );
         assert_ne!(yaml, MANIFEST, "the mutation must actually apply");
         let runs = cargo_test_runs_outside(&yaml, LOCKED_EXEMPT_TASKS);
@@ -1453,7 +1453,8 @@ tasks:
             vec![
                 "scripts/test.sh --lib".to_string(),
                 "cargo test --locked --release".to_string(),
-                "scripts/tier.sh t u 1 1 -- scripts/test.sh --locked --lib".to_string(),
+                "../rust-fs-core/scripts/tier.sh t u 1 1 -- scripts/test.sh --locked --lib"
+                    .to_string(),
                 "scripts/test.sh --locked --release --test fixtures_present".to_string(),
             ],
             "each run on its own, the continued one whole"
@@ -1666,7 +1667,8 @@ mod shell_scan {
     /// correct tree -- the fastest way to get a guard deleted.
     #[test]
     fn the_tier_shape_this_repository_uses_counts() {
-        let tier = "EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 400 21000 -- \
+        let tier =
+            "EXPECT_OVERFLOW_CHECKS=1 ../rust-fs-core/scripts/tier.sh test:unit unit 400 21000 -- \
                     scripts/test.sh --locked $(scripts/test-targets.sh unit)\n";
         assert_eq!(
             runs_covering_the_library_unit_tests(tier).len(),
@@ -1680,7 +1682,7 @@ mod shell_scan {
     /// tiers are and what must never satisfy this guard.
     #[test]
     fn the_same_chain_with_release_does_not_count() {
-        let tier = "scripts/tier.sh test:images images 760 36000 -- \
+        let tier = "../rust-fs-core/scripts/tier.sh test:images images 760 36000 -- \
                     scripts/test.sh --locked --release $(scripts/test-targets.sh images)\n";
         assert_eq!(
             runs_covering_the_library_unit_tests(tier),
@@ -1695,7 +1697,7 @@ mod shell_scan {
     /// arguments of, and so not this repository's debug run.
     #[test]
     fn a_tier_wrapping_something_that_is_not_cargo_does_not_count() {
-        let tier = "scripts/tier.sh test:vm vm 2860 136000 -- \
+        let tier = "../rust-fs-core/scripts/tier.sh test:vm vm 2860 136000 -- \
                     ../fs-linux-test-harness/scripts/vm.sh guest-test\n";
         assert_eq!(
             runs_covering_the_library_unit_tests(tier),

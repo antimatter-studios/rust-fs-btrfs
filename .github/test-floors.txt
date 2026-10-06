@@ -1,7 +1,7 @@
 # test-floors.txt — one floor per integration target, checked by
 # rust-fs-core's floor against the whole-suite tier log:
 #
-#   bash scripts/core.sh test-floor --targets .github/test-floors.txt suite
+#   bash ../rust-fs-core/scripts/test-floor.sh --targets .github/test-floors.txt suite
 #
 # A FLOOR, BECAUSE THE FAILURE MODE HERE IS AN ABSENCE. `cargo test`
 # exits 0 on "0 passed; 0 failed", so a target that selected nothing

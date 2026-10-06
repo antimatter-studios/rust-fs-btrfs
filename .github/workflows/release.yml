@@ -17,7 +17,7 @@ env:
   # this one is for the publish job below, which clones by hand because it
   # needs nothing else chore provides. Bump the two in lockstep with the
   # rust-fs-core version constraint in Cargo.toml.
-  FS_CORE_REF: v0.3.0
+  FS_CORE_REF: v0.3.3
 
 jobs:
   test:
@@ -110,10 +110,10 @@ jobs:
   #
   # Packaged, attested and attached by rust-fs-core's reusable release-cli
   # workflow, the family's one copy (this repository's own package-cli
-  # matrix, attest-and-attach job and scripts/package-cli.sh drifted from
+  # matrix, attest-and-attach job and ../rust-fs-core/scripts/package-cli.sh drifted from
   # the others', #251). It builds `--features cli --bin rust-fs-btrfs`
   # natively on darwin-arm64 and linux-x86_64, runs
-  # `scripts/core.sh package-cli`, which lays the tarball out as the install
+  # `../rust-fs-core/scripts/package-cli.sh`, which lays the tarball out as the install
   # prefix [package.metadata.package-cli] in Cargo.toml declares and checks
   # it, and then attests both tarballs and attaches them to the release
   # `publish` made, from the one job of its own that holds write grants.
@@ -139,9 +139,9 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-    uses: antimatter-studios/rust-fs-core/.github/workflows/release-cli.yml@9e900154a7dff2a6c8f136db31def33bed9f09cc # v0.3.0
+    uses: antimatter-studios/rust-fs-core/.github/workflows/release-cli.yml@6615915c4c1625f64efc8d7ea618284f48b87499 # v0.3.3
     with:
-      core-ref: v0.3.0
+      core-ref: v0.3.3
       toolchain: 1.95.0
 
   publish:
@@ -198,6 +198,12 @@ jobs:
       # whose attestation did not can still finish the job. The same
       # packaging `cargo publish` does, and cargo's archive is
       # reproducible: the file `cargo publish` uploads is this one.
+      # A tag the CHANGELOG does not describe stops before crates.io has
+      # anything (rust-fs-core#209).
+      - name: the CHANGELOG describes this version
+        shell: bash
+        run: bash ../rust-fs-core/scripts/release-notes.sh "$GITHUB_REF_NAME" >/dev/null
+
       - name: package the crate
         shell: bash
         run: cargo package --no-verify
@@ -256,8 +262,11 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
-              --notes "See CHANGELOG.md. The .crate attached here is the file published to crates.io for this version, with a build-provenance attestation from this repository's release workflow."
+          # The release body is this version's CHANGELOG section (rust-fs-core#209).
+          bash ../rust-fs-core/scripts/release-notes.sh "$GITHUB_REF_NAME" > "$RUNNER_TEMP/release-notes.md"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md"
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md"
           fi
           gh release upload "$GITHUB_REF_NAME" target/package/*.crate --clobber

@@ -6,14 +6,14 @@
 #
 # Quiet-by-default is a convention, and a convention rots in a week. This
 # is the number that fails the build instead: a tier added later without
-# going through scripts/tier.sh, or given a budget of zero (which
+# going through ../rust-fs-core/scripts/tier.sh, or given a budget of zero (which
 # output-budget.sh reads as "no budget"), fails here rather than being
 # noticed the next time somebody scrolls past three thousand lines.
 #
 # WHAT CHANGED WHEN THE WRAPPER MOVED TO CORE. This file used to run
 # ../fs-linux-test-harness/scripts/output-budget.sh directly, which tested a
 # script no tier ran any more, and which the harness deleted in v0.2.0.
-# Everything below goes through scripts/tier.sh, so what is proved is the
+# Everything below goes through ../rust-fs-core/scripts/tier.sh, so what is proved is the
 # path the tiers actually take: resolution from core,
 # verification by --version, and the four exit shapes.
 #
@@ -46,8 +46,8 @@ for tier in test:unit test:images test:oracle test:kernel test:vm test:scripts; 
         continue
     fi
     case "$block" in
-        *scripts/tier.sh*) ok "$tier runs through scripts/tier.sh" ;;
-        *) fail "$tier runs through scripts/tier.sh, so its output is bounded" ;;
+        *../rust-fs-core/scripts/tier.sh*) ok "$tier runs through ../rust-fs-core/scripts/tier.sh" ;;
+        *) fail "$tier runs through ../rust-fs-core/scripts/tier.sh, so its output is bounded" ;;
     esac
     # tier.sh LABEL LOG MAX-LINES MAX-BYTES: a zero in either position is
     # "no budget" to output-budget.sh, which is the shape this refuses.
@@ -60,19 +60,10 @@ done
 
 # --- 2. The wrapper a tier uses comes from rust-fs-core. ----------------
 #
-# tier.sh resolves it — the ../rust-fs-core sibling first, then the
-# rust-fs-core package root cargo reports — and holds whatever it finds to
-# `--version`. This asserts the source rather than a checksum: a digest
-# recorded here would have to be updated here for every edit to core, in
-# every repository that records one, which is the lockstep moving the
-# wrapper into core removed.
-tier="$REPO/scripts/tier.sh"
-if [ ! -x "$tier" ]; then
-    fail "scripts/tier.sh is executable"
-else
-    ok "scripts/tier.sh is executable"
-fi
-
+# Both the runner and the wrapper are rust-fs-core's, run in place from the
+# sibling at the pinned version; this repository keeps no copy of either.
+# This asserts the source rather than a checksum: a digest recorded here
+# would have to be updated here for every edit to core.
 sibling="$REPO/../rust-fs-core/scripts/output-budget.sh"
 if [ -f "$sibling" ]; then
     got="$(bash "$sibling" --version 2>/dev/null)"
@@ -85,20 +76,12 @@ else
     fail "../rust-fs-core/scripts/output-budget.sh is present -- run 'chore siblings' (pin: v0.2.13 or later)"
 fi
 
-# Comments stripped first: tier.sh's header names the old harness path on
-# purpose, to tell a reader where it went. A CODE line naming it is the defect.
-if grep -v '^[[:space:]]*#' "$tier" | grep -q 'fs-linux-test-harness'; then
-    fail "tier.sh no longer reads the wrapper out of the harness"
-else
-    ok "tier.sh no longer reads the wrapper out of the harness"
-fi
-
 # --- 3. The four exit shapes, THROUGH tier.sh. --------------------------
 mkdir -p "$REPO/tmp"
 work="$(mktemp -d "$REPO/tmp/output-budget-test.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
-run_tier() { ( cd "$REPO" && bash scripts/tier.sh "$@" ) 2>&1; }
+run_tier() { ( cd "$REPO" && bash ../rust-fs-core/scripts/tier.sh "$@" ) 2>&1; }
 
 # Passed, but printed too much: status 65, distinct from a failing suite.
 out="$(run_tier ob-loud ob-loud 5 0 -- \
@@ -162,53 +145,6 @@ case "$out" in
     *hello*) ok "OUTPUT_BUDGET_VERBOSE=1 streams the run" ;;
     *) fail "OUTPUT_BUDGET_VERBOSE=1 streams the run: $out" ;;
 esac
-
-# --- 4. The resolver REFUSES, rather than falling back. -----------------
-#
-# FS_CORE_ROOT exists for these two cases and only for them: an explicit,
-# authoritative root, so a refusal can be driven without moving the sibling
-# checkout that every crate on the machine shares.
-empty="$work/no-core"
-mkdir -p "$empty"
-out="$(FS_CORE_ROOT="$empty" run_tier ob-none ob-none 50 5000 -- echo x)"
-rc=$?
-[ "$rc" = 1 ] && ok "a core with no wrapper is refused (exit 1)" \
-              || fail "a core with no wrapper is refused (exit 1, got $rc)"
-case "$out" in
-    *"rust-fs-core-output-budget 1"*) ok "the refusal names the expected API string" ;;
-    *) fail "the refusal names the expected API string: $out" ;;
-esac
-case "$out" in
-    *"v0.2.13"*) ok "the refusal names the minimum core version" ;;
-    *) fail "the refusal names the minimum core version: $out" ;;
-esac
-case "$out" in
-    *"rust-fs-core/scripts/output-budget.sh"*) ok "the refusal names the sibling path it looked for" ;;
-    *) fail "the refusal names the sibling path it looked for: $out" ;;
-esac
-
-# A present-but-wrong wrapper is fatal. If this ever passed, a tier could run
-# against an unknown script while reporting green.
-wrong="$work/wrong-core"
-mkdir -p "$wrong/scripts"
-printf '#!/usr/bin/env bash\necho "rust-fs-core-output-budget 99"\n' > "$wrong/scripts/output-budget.sh"
-out="$(FS_CORE_ROOT="$wrong" run_tier ob-wrong ob-wrong 50 5000 -- echo x)"
-rc=$?
-[ "$rc" = 1 ] && ok "a wrapper at the wrong API version is refused (exit 1)" \
-              || fail "a wrapper at the wrong API version is refused (exit 1, got $rc)"
-case "$out" in
-    *"answered 'rust-fs-core-output-budget 99'"*) ok "the refusal quotes what it got" ;;
-    *) fail "the refusal quotes what it got: $out" ;;
-esac
-# It must NOT have fallen through to the good sibling and run the command.
-case "$out" in
-    *"ob-wrong: ok"*) fail "a wrong wrapper does not fall back to a working one" ;;
-    *) ok "a wrong wrapper does not fall back to a working one" ;;
-esac
-
-rm -f "$REPO/tmp/logs/ob-loud.log" "$REPO/tmp/logs/ob-quiet.log" \
-      "$REPO/tmp/logs/ob-bad.log" "$REPO/tmp/logs/ob-tail.log" \
-      "$REPO/tmp/logs/ob-v.log"
 
 if [ "$fails" -gt 0 ]; then
     echo "FAIL  $fails output-budget violation(s)" >&2
