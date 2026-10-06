@@ -331,7 +331,7 @@ The latest releases; every release, with the reasoning behind each change, is in
 ### v0.10.1 — 2026-10-06
 
 - The tools are released again.
-- The family's scripts run in place from rust-fs-core 0.3.6.
+- The family's scripts run in place from rust-fs-core 0.3.7.
 - A release's notes are its CHANGELOG section.
 
 ### v0.10.0 — 2026-10-06
