@@ -56,7 +56,7 @@ descends — and it is now the dominant cost of every operation.
 
 ## Why there is no block cache
 
-`am-fs-core`'s `CachingDevice` was wired in and then deliberately turned
+`rust-fs-core`'s `CachingDevice` was wired in and then deliberately turned
 off; `DEFAULT_CACHE_BLOCKS` is `0`. Two measured reasons:
 
 1. **There is nothing for it to serve.** The repeat metadata reads a

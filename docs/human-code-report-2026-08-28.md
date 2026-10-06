@@ -101,7 +101,7 @@ covers the claim.
 
 `src/fs.rs:37` imports `crate::compression::{self, Compression}`; `read_file` at `:911`
 matches `Piece::Compressed` and calls `compression::decompress` at `:927`; `Cargo.toml`
-carries `miniz_oxide`, `am-lzo1x` and `ruzstd` with a comment naming one per Btrfs
+carries `miniz_oxide`, `rust-lzo1x` and `ruzstd` with a comment naming one per Btrfs
 compression type. Three algorithms are implemented and cross-validated.
 
 This is in the "what is deliberately refused" list — the section a consumer reads to

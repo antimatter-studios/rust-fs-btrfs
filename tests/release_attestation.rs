@@ -331,7 +331,7 @@ fn release_cli_gaps(yaml: &str, pin: &str, toolchain: &str) -> Vec<String> {
         let core_ref = input("core-ref");
         if core_ref != format!("v{pin}") {
             gaps.push(format!(
-                "job {name} passes core-ref {core_ref:?}, not v{pin}, the am-fs-core Cargo.toml pins"
+                "job {name} passes core-ref {core_ref:?}, not v{pin}, the rust-fs-core Cargo.toml pins"
             ));
         }
         let called_with = input("toolchain");
@@ -350,20 +350,20 @@ fn release_cli_gaps(yaml: &str, pin: &str, toolchain: &str) -> Vec<String> {
     gaps
 }
 
-/// The `version` of the `am-fs-core` dependency in Cargo.toml.
+/// The `version` of the `rust-fs-core` dependency in Cargo.toml.
 fn am_fs_core_pin() -> String {
     let manifest =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
             .expect("read Cargo.toml");
     manifest
         .lines()
-        .filter(|l| l.trim_start().starts_with("am-fs-core"))
+        .filter(|l| l.trim_start().starts_with("rust-fs-core"))
         .find_map(|l| {
             l.split_once("version = \"")
                 .and_then(|(_, r)| r.split_once('"'))
         })
         .map(|(v, _)| v.to_owned())
-        .expect("Cargo.toml pins am-fs-core by version")
+        .expect("Cargo.toml pins rust-fs-core by version")
 }
 
 /// The `channel` rust-toolchain.toml pins.

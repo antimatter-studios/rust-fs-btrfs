@@ -153,7 +153,7 @@ it**. Do not silence output to fit, and do not route around `tier.sh`.
 <!-- END SHARED BLOCK: agent-core v2 -->
 ## What this is
 
-Pure-Rust Btrfs driver over `am-fs-core`, exposing a C ABI (`tests/capi.rs`) and
+Pure-Rust Btrfs driver over `rust-fs-core`, exposing a C ABI (`tests/capi.rs`) and
 linked into the app as a staticlib. It is the largest suite in the family after
 ext4 — 50 test files.
 
