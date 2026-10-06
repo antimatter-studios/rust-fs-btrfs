@@ -1,5 +1,19 @@
 # rust-fs-btrfs
 
+> **Renamed to [`rust-fs-btrfs`](https://crates.io/crates/rust-fs-btrfs).**
+> `am-fs-btrfs` 0.9.0 is the last version published under this name. New versions
+> are published only as `rust-fs-btrfs`, starting at 0.10.0. To move, change one line
+> in `Cargo.toml`:
+>
+> ```toml
+> # before
+> am-fs-btrfs = "0.9"
+> # after
+> rust-fs-btrfs = "0.10"
+> ```
+>
+> The import is unchanged: `use fs_btrfs::...` keeps working.
+
 Pure-Rust, clean-room [Btrfs](https://btrfs.readthedocs.io/) driver. A reader for
 the Btrfs on-disk format built over the shared
 [`am-fs-core`](https://github.com/antimatter-studios/rust-fs-core) block-device

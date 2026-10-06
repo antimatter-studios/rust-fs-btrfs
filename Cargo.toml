@@ -3,7 +3,7 @@ name = "am-fs-btrfs"
 version = "0.9.0"
 edition = "2021"
 license = "MIT"
-description = "Pure-Rust Btrfs filesystem driver. Exposes a C ABI (fs_btrfs_*) suitable for FFI from C/C++/Swift/Go."
+description = "Renamed to rust-fs-btrfs: this crate receives no further versions. Depend on rust-fs-btrfs instead; the import is unchanged (use fs_btrfs)."
 repository = "https://github.com/antimatter-studios/rust-fs-btrfs"
 
 # The fuzz crate is its own package, on its own toolchain, and is not
