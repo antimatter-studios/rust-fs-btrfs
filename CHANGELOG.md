@@ -6,14 +6,25 @@ never does.
 
 ## [Unreleased]
 
+## [0.10.1] — 2026-10-06
+
+A tooling release: the library and its C ABI are unchanged.
+
+### Fixed
+
+- **The tools are released again.** 0.10.0's GitHub release has no tarballs:
+  its crate was published by hand, CI's repackaged `.crate` did not match the
+  published one, and the release stopped at the attestation check. 0.10.1 is
+  published by CI through crates.io trusted publishing, and its release carries
+  the darwin-arm64 and linux-x86_64 tarballs with their attestations.
+
 ### Changed
 
-- **The family's scripts run in place from rust-fs-core, and this repository
-  keeps no copy.** `scripts/core.sh` and `scripts/tier.sh` are gone; CI and
-  chores run `../rust-fs-core/scripts/NAME.sh` at the pinned version
-  (rust-fs-core 0.3.3, #212).
-- **A release's notes are its CHANGELOG section**, and a tag the CHANGELOG
-  does not describe stops before anything is published (rust-fs-core#209).
+- **The family's scripts run in place from rust-fs-core 0.3.6**, and this
+  repository keeps no copy of them (rust-fs-core#212).
+- **A release's notes are its CHANGELOG section**, written by github-guard's
+  changelog extraction through agent-skills' `changelog-notes` action, and a
+  tag the CHANGELOG does not describe stops before anything is published.
 
 ## [0.10.0] — 2026-10-06
 
@@ -396,6 +407,7 @@ never does.
   the path silently.
 - Both `metadata_uuid` renderings the reference tooling emits are tolerated.
 
+[0.10.1]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.8.0...v0.8.1

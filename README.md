@@ -324,6 +324,79 @@ The workflow refuses to attest a `.crate` whose sha256 differs from the
 checksum crates.io records for that version, so the file on the release
 page and the crates.io download are the same bytes.
 
+## Changelog
+
+The latest releases; every release, with the reasoning behind each change, is in [CHANGELOG.md](CHANGELOG.md).
+
+### v0.10.1 — 2026-10-06
+
+- The tools are released again.
+- The family's scripts run in place from rust-fs-core 0.3.6.
+- A release's notes are its CHANGELOG section.
+
+### v0.10.0 — 2026-10-06
+
+- Published as `rust-fs-btrfs`, the repository's name.
+- Depends on `rust-fs-core` 0.3.0.
+
+### v0.9.0 — 2026-10-06
+
+- The last version published as `am-fs-btrfs`.
+- `fsck.btrfs`, and `fs_btrfs::check` under it (#260).
+- `mkfs.btrfs`, and `fs_btrfs::mkfs` under it (#259).
+- `Error::InvalidGeometry`.
+
+### v0.8.1 — 2026-10-03
+
+- A release attaches the command-line tools.
+- A copy-on-write file can be written (#61, first slice).
+- The command-line plumbing comes from am-fs-core's `cli` feature.
+
+### v0.8.0 — 2026-09-30
+
+- In-image paths cross the C ABI as bytes, not UTF-8 (#214).
+- `rust-fs-btrfs`, the command-line tools, as one multi-call binary.
+- `fs.btrfs ls`, `read`, `get` and `info`.
+- `fs.btrfs write`, for the one write this library can make.
+- Man pages and shell completions, and the release tarball's layout.
+- A transaction keeps each block group's `used` count true.
+- A commit writes `ROOT_ITEM.generation_v2` with `generation`.
+- A transaction touching a block group whose free-space records span two leaves is refused, instead of recording that free space twice.
+
+### v0.7.0 — 2026-09-27
+
+- `fs_btrfs_readlink` follows the family readlink contract.
+- The parsers are fuzzed, on two tiers.
+- A path can cross into subvolumes.
+- Extended attributes can be read.
+- Mounting no longer reads the whole filesystem tree.
+- A lookup fetches the name by key.
+- A read cannot follow an extent item's window outside its extent.
+- A compressed stream that decodes short is refused anywhere but the file's last extent.
+- A new tree block is never placed on a superblock copy.
+- A commit fills its backup-root slot.
+- An in-place write no longer overwrites data a snapshot still reads.
+
+### v0.6.2 — 2026-09-06
+
+- - A tree walk visits each block once. Without a visited set, a chunk
+
+### v0.6.1 — 2026-09-04
+
+- "Find a tree's root" means one thing.
+- One definition of the endian readers.
+
+### v0.6.0 — 2026-08-29
+
+- A whole transaction is written and the kernel judges it.
+- The free-space tree is kept in step.
+- Pool reads: every device is opened and each mapping is answered from the right one.
+- One device of a multi-device pool is refused rather than read as the whole thing.
+
+### v0.5.0 — 2026-08-26
+
+- The write path, exposed through the C ABI.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
