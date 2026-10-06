@@ -9,38 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "am-fs-btrfs"
-version = "0.9.0"
-dependencies = [
- "am-fs-core",
- "am-lzo1x",
- "blake2b_simd",
- "clap",
- "crc32c",
- "fs-btrfs-test-support",
- "miniz_oxide",
- "ruzstd",
- "saphyr",
- "sha2",
- "twox-hash",
-]
-
-[[package]]
-name = "am-fs-core"
-version = "0.2.23"
-dependencies = [
- "clap",
- "clap_complete",
- "clap_mangen",
-]
-
-[[package]]
-name = "am-lzo1x"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "762388655758a7548847ae271a4ec6b0552a53a8b4bec1fa68e7f2064312d042"
-
-[[package]]
 name = "anstyle"
 version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -323,6 +291,38 @@ name = "roff"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "323c417e1d9665a65b263ec744ba09030cfb277e9daa0b018a4ab62e57bc8189"
+
+[[package]]
+name = "rust-fs-btrfs"
+version = "0.10.0"
+dependencies = [
+ "blake2b_simd",
+ "clap",
+ "crc32c",
+ "fs-btrfs-test-support",
+ "miniz_oxide",
+ "rust-fs-core",
+ "rust-lzo1x",
+ "ruzstd",
+ "saphyr",
+ "sha2",
+ "twox-hash",
+]
+
+[[package]]
+name = "rust-fs-core"
+version = "0.3.0"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "clap_mangen",
+]
+
+[[package]]
+name = "rust-lzo1x"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fd08cac3694f478b11379ad5e198d839827d6f0d8fa3b5c3a593e95cf6e8522"
 
 [[package]]
 name = "rustc_version"

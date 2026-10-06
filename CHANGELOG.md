@@ -1,8 +1,17 @@
 # Changelog
 
-Notable changes to `am-fs-btrfs`, newest first. This is a `0.x` crate, so the
+Notable changes to `rust-fs-btrfs` (published as `am-fs-btrfs` until its last version), newest first. This is a `0.x` crate, so the
 **minor** is the compatibility boundary: a minor bump may break API, a patch
 never does.
+
+## [0.10.0] — 2026-10-06
+
+### Changed
+
+- **Published as `rust-fs-btrfs`, the repository's name.** The crate was `am-fs-btrfs`
+  until its last version, which stays on crates.io pointing here. A
+  dependent changes one line in `Cargo.toml`; the import (`fs_btrfs`) and the C symbols are unchanged.
+- **Depends on `rust-fs-core` 0.3.0**, the same library under its new name.
 
 ## [Unreleased]
 
@@ -378,6 +387,7 @@ never does.
   the path silently.
 - Both `metadata_uuid` renderings the reference tooling emits are tolerated.
 
+[0.10.0]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/antimatter-studios/rust-fs-btrfs/compare/v0.7.0...v0.8.0

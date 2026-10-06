@@ -59,7 +59,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 #      wrapper is made in the sibling checkout, so the sibling is what has to
 #      be exercised; resolving the packaged copy first would run the pinned
 #      release and report green on a change nobody ran.
-#   3. cargo metadata for the am-fs-core package root, so a checkout with no
+#   3. cargo metadata for the rust-fs-core package root, so a checkout with no
 #      sibling beside it — a `cargo install`-shaped tree, or a registry
 #      dependency — still resolves. `scripts/` is inside the published
 #      .crate: core's Cargo.toml excludes only `fuzz`.
@@ -94,7 +94,7 @@ try:
 except Exception:
     sys.exit(0)
 root = next((p["manifest_path"].rsplit("/", 1)[0]
-             for p in packages if p["name"] == "am-fs-core"), "")
+             for p in packages if p["name"] == "rust-fs-core"), "")
 if root:
     print(root + "/scripts/output-budget.sh")
 '
@@ -104,7 +104,7 @@ refuse() {
     echo "tier.sh: no usable output-budget wrapper from rust-fs-core." >&2
     echo "         $1" >&2
     echo "         Looked for: $SIBLING/scripts/output-budget.sh" >&2
-    echo "         then the am-fs-core package root cargo resolves." >&2
+    echo "         then the rust-fs-core package root cargo resolves." >&2
     echo "         It must answer --version with exactly: $OUTPUT_BUDGET_API" >&2
     echo "         This repository needs rust-fs-core v0.2.13 or later;" >&2
     echo "         'chore siblings' checks the sibling out at the pinned ref." >&2
@@ -113,7 +113,7 @@ refuse() {
 
 WRAPPER="$(core_wrapper)"
 if [ -z "$WRAPPER" ]; then
-    refuse "Nothing resolved: no sibling, and cargo named no am-fs-core root."
+    refuse "Nothing resolved: no sibling, and cargo named no rust-fs-core root."
 elif [ ! -f "$WRAPPER" ]; then
     refuse "$WRAPPER does not exist."
 fi

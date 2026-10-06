@@ -1,25 +1,11 @@
 # rust-fs-btrfs
 
-> **Renamed to [`rust-fs-btrfs`](https://crates.io/crates/rust-fs-btrfs).**
-> `am-fs-btrfs` 0.9.0 is the last version published under this name. New versions
-> are published only as `rust-fs-btrfs`, starting at 0.10.0. To move, change one line
-> in `Cargo.toml`:
->
-> ```toml
-> # before
-> am-fs-btrfs = "0.9"
-> # after
-> rust-fs-btrfs = "0.10"
-> ```
->
-> The import is unchanged: `use fs_btrfs::...` keeps working.
-
 Pure-Rust, clean-room [Btrfs](https://btrfs.readthedocs.io/) driver. A reader for
 the Btrfs on-disk format built over the shared
-[`am-fs-core`](https://github.com/antimatter-studios/rust-fs-core) block-device
+[`rust-fs-core`](https://github.com/antimatter-studios/rust-fs-core) block-device
 trait, exposing a stable C ABI (`fs_btrfs_*`) for FFI from C/C++, Swift or Go.
 
-Published on crates.io as `am-fs-btrfs`; the library name is `fs_btrfs`.
+Published on crates.io as `rust-fs-btrfs`; the library name is `fs_btrfs`.
 
 Btrfs is a copy-on-write filesystem: nothing is overwritten in place, every
 structure is a B-tree, and the physical location of any byte is resolved through
@@ -87,7 +73,7 @@ One multi-call binary, `rust-fs-btrfs`, behind the `cli` cargo feature (the
 static library gains nothing from it). Installed, `fs.btrfs` is a symlink to it;
 `rust-fs-btrfs fs ...` is the same tool under the one name nothing else can
 shadow, and `cargo run --features cli -- fs ...` works before anything is
-installed. `--version` prints `<name> (am-fs-btrfs) <version>`.
+installed. `--version` prints `<name> (rust-fs-btrfs) <version>`.
 
 Metadata is JSON on stdout by default, `--text` for people. A failure is
 `{"error": "...", "code": N}` on stderr and `N` is the exit status: 1 failed,
@@ -142,7 +128,7 @@ bash and fish completions, written by the binary itself from the arguments it
 parses (`rust-fs-btrfs generate man|completions SHARE`), so they cannot
 describe a flag it does not take.
 
-The release tarball, `am-fs-btrfs-<version>-<platform>.tar.gz`, is an install
+The release tarball, `rust-fs-btrfs-<version>-<platform>.tar.gz`, is an install
 prefix: `bin/rust-fs-btrfs` and `bin/fs.btrfs` (a relative symlink to it),
 `share/man/man1/`, the completions under `share/zsh/site-functions/`,
 `share/bash-completion/completions/` and `share/fish/vendor_completions.d/`,
@@ -310,7 +296,7 @@ chore lint       # cargo fmt --check, and clippy with -D warnings
 
 ## Building
 
-The crate has a path dependency on the sibling `am-fs-core` repository. Clone it
+The crate has a path dependency on the sibling `rust-fs-core` repository. Clone it
 alongside this one:
 
 ```sh
@@ -328,8 +314,8 @@ repository, not uploaded from someone's machine. To check the crates.io
 download of version `X.Y.Z`:
 
 ```sh
-curl -sSfLo am-fs-btrfs-X.Y.Z.crate https://static.crates.io/crates/am-fs-btrfs/am-fs-btrfs-X.Y.Z.crate
-gh attestation verify am-fs-btrfs-X.Y.Z.crate \
+curl -sSfLo rust-fs-btrfs-X.Y.Z.crate https://static.crates.io/crates/rust-fs-btrfs/rust-fs-btrfs-X.Y.Z.crate
+gh attestation verify rust-fs-btrfs-X.Y.Z.crate \
   --repo antimatter-studios/rust-fs-btrfs \
   --signer-workflow antimatter-studios/rust-fs-btrfs/.github/workflows/release.yml
 ```

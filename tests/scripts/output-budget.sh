@@ -61,7 +61,7 @@ done
 # --- 2. The wrapper a tier uses comes from rust-fs-core. ----------------
 #
 # tier.sh resolves it — the ../rust-fs-core sibling first, then the
-# am-fs-core package root cargo reports — and holds whatever it finds to
+# rust-fs-core package root cargo reports — and holds whatever it finds to
 # `--version`. This asserts the source rather than a checksum: a digest
 # recorded here would have to be updated here for every edit to core, in
 # every repository that records one, which is the lockstep moving the

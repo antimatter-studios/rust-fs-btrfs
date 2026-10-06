@@ -1,9 +1,9 @@
 [package]
-name = "am-fs-btrfs"
-version = "0.9.0"
+name = "rust-fs-btrfs"
+version = "0.10.0"
 edition = "2021"
 license = "MIT"
-description = "Renamed to rust-fs-btrfs: this crate receives no further versions. Depend on rust-fs-btrfs instead; the import is unchanged (use fs_btrfs)."
+description = "Pure-Rust Btrfs filesystem driver. Exposes a C ABI (fs_btrfs_*) suitable for FFI from C/C++/Swift/Go."
 repository = "https://github.com/antimatter-studios/rust-fs-btrfs"
 
 # The fuzz crate is its own package, on its own toolchain, and is not
@@ -19,6 +19,11 @@ exclude = ["fuzz"]
 [package.metadata.package-cli]
 names = { "fs.btrfs" = 1, "mkfs.btrfs" = 8, "fsck.btrfs" = 8 }
 licenses = ["LICENSE"]
+
+# The name this crate had on crates.io: the semver check's baseline until
+# a release exists under the new one (rust-fs-core's semver-check.sh).
+[package.metadata.semver]
+former-name = "am-fs-btrfs"
 
 [lib]
 name = "fs_btrfs"
@@ -44,9 +49,9 @@ required-features = ["cli"]
 [features]
 # The command-line tools and nothing else. The plumbing they share --
 # dispatch, --version, doctor, the output contract, man pages and
-# completions -- is am-fs-core's `cli` feature, turned on only here, so
+# completions -- is rust-fs-core's `cli` feature, turned on only here, so
 # the static library gains nothing. clap is MIT/Apache-2.0.
-cli = ["dep:clap", "am-fs-core/cli"]
+cli = ["dep:clap", "rust-fs-core/cli"]
 
 [dependencies]
 # Btrfs lets the volume pick its metadata hash at mkfs time, so a reader
@@ -76,7 +81,7 @@ blake2b_simd = "1.0"
 # sibling onto the VM share and guest-suite.sh links it into place, so
 # ../rust-fs-core resolves inside the guest as well as on the host. An
 # absolute path written into a .cargo/config.toml override would not.
-am-fs-core = { path = "../rust-fs-core", version = "0.2.23" }
+rust-fs-core = { path = "../rust-fs-core", version = "0.3.0" }
 # Decompressors, one per compression type Btrfs defines. All three are
 # pure Rust with no C bindings, and permissively licensed like the rest.
 #
@@ -84,7 +89,7 @@ am-fs-core = { path = "../rust-fs-core", version = "0.2.23" }
 miniz_oxide = "0.9.1"
 # compression 2 — LZO1X, in the segmented framing Btrfs wraps it in. MIT,
 # and ours: see src/compression.rs for the framing.
-am-lzo1x = "0.1.0"
+rust-lzo1x = "0.4.0"
 # compression 3 — zstd. MIT.
 ruzstd = "0.9.0"
 # The command-line tools' argument parser, behind the `cli` feature (see

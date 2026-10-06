@@ -9,30 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "am-fs-btrfs"
-version = "0.8.1"
-dependencies = [
- "am-fs-core",
- "am-lzo1x",
- "blake2b_simd",
- "crc32c",
- "miniz_oxide",
- "ruzstd",
- "sha2",
- "twox-hash",
-]
-
-[[package]]
-name = "am-fs-core"
-version = "0.2.23"
-
-[[package]]
-name = "am-lzo1x"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afeed3f997dd51cba5185a0a6bbb08c4307278e48a917ecb7a71ef8183dacd54"
-
-[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -135,8 +111,8 @@ checksum = "ef25905e51abafe4dcea6c15fec58c57b601cdbd0ee53d22ea1d3016c587d39b"
 name = "fs-btrfs-fuzz"
 version = "0.0.0"
 dependencies = [
- "am-fs-btrfs",
  "libfuzzer-sys",
+ "rust-fs-btrfs",
 ]
 
 [[package]]
@@ -200,6 +176,30 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "rust-fs-btrfs"
+version = "0.10.0"
+dependencies = [
+ "blake2b_simd",
+ "crc32c",
+ "miniz_oxide",
+ "rust-fs-core",
+ "rust-lzo1x",
+ "ruzstd",
+ "sha2",
+ "twox-hash",
+]
+
+[[package]]
+name = "rust-fs-core"
+version = "0.3.0"
+
+[[package]]
+name = "rust-lzo1x"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fd08cac3694f478b11379ad5e198d839827d6f0d8fa3b5c3a593e95cf6e8522"
 
 [[package]]
 name = "rustc_version"

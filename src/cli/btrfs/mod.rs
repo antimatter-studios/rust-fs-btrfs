@@ -1,6 +1,6 @@
 //! The Btrfs tools: what this repository fills the shared contract in
 //! with. Everything filesystem-specific lives here, and nothing here is
-//! plumbing (that is `fs_core::cli`, in am-fs-core).
+//! plumbing (that is `fs_core::cli`, in rust-fs-core).
 //!
 //! Two tools, `fs.btrfs` and `mkfs.btrfs`. There is no `fsck.btrfs` (this
 //! crate has no checker), so that name is not linked: a missing name reads
