@@ -4,15 +4,6 @@ Notable changes to `rust-fs-btrfs` (published as `am-fs-btrfs` until its last ve
 **minor** is the compatibility boundary: a minor bump may break API, a patch
 never does.
 
-## [0.10.0] — 2026-10-06
-
-### Changed
-
-- **Published as `rust-fs-btrfs`, the repository's name.** The crate was `am-fs-btrfs`
-  until its last version, which stays on crates.io pointing here. A
-  dependent changes one line in `Cargo.toml`; the import (`fs_btrfs`) and the C symbols are unchanged.
-- **Depends on `rust-fs-core` 0.3.0**, the same library under its new name.
-
 ## [Unreleased]
 
 ### Changed
@@ -23,6 +14,15 @@ never does.
   (rust-fs-core 0.3.3, #212).
 - **A release's notes are its CHANGELOG section**, and a tag the CHANGELOG
   does not describe stops before anything is published (rust-fs-core#209).
+
+## [0.10.0] — 2026-10-06
+
+### Changed
+
+- **Published as `rust-fs-btrfs`, the repository's name.** The crate was `am-fs-btrfs`
+  until its last version, which stays on crates.io pointing here. A
+  dependent changes one line in `Cargo.toml`; the import (`fs_btrfs`) and the C symbols are unchanged.
+- **Depends on `rust-fs-core` 0.3.0**, the same library under its new name.
 
 ## [0.9.0] — 2026-10-06
 
