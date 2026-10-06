@@ -328,10 +328,15 @@ page and the crates.io download are the same bytes.
 
 The latest releases; every release, with the reasoning behind each change, is in [CHANGELOG.md](CHANGELOG.md).
 
+### v0.10.2 — 2026-10-07
+
+- The release's tarballs are packaged again, by rust-fs-core 0.3.7's release workflow.
+- Depends on `rust-fs-core` 0.3.7.
+
 ### v0.10.1 — 2026-10-06
 
 - The tools are released again.
-- The family's scripts run in place from rust-fs-core 0.3.7.
+- The family's scripts run in place from rust-fs-core 0.3.6.
 - A release's notes are its CHANGELOG section.
 
 ### v0.10.0 — 2026-10-06
@@ -392,10 +397,6 @@ The latest releases; every release, with the reasoning behind each change, is in
 - The free-space tree is kept in step.
 - Pool reads: every device is opened and each mapping is answered from the right one.
 - One device of a multi-device pool is refused rather than read as the whole thing.
-
-### v0.5.0 — 2026-08-26
-
-- The write path, exposed through the C ABI.
 
 ## License
 
