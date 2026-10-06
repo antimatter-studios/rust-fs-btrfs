@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "rust-fs-core"
-version = "0.3.0"
+version = "0.3.3"
 
 [[package]]
 name = "rust-lzo1x"

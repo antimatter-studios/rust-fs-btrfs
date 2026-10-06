@@ -61,7 +61,7 @@ name: CI
 # "0 passed; 0 failed" and a suite that empties from the inside reports
 # green having stopped checking. Those numbers now live in
 # .github/test-floors.txt, one per integration target, and
-# scripts/core.sh test-floor checks each of them against that target's own
+# ../rust-fs-core/scripts/test-floor.sh checks each of them against that target's own
 # `test result:` line in the tier log. Same guard, one file, and it no
 # longer requires the workflow to name every suite.
 #
@@ -140,7 +140,7 @@ jobs:
         # running this task.
         run: chore test:unit
       - name: The unit tier executed its tests
-        run: bash scripts/core.sh test-floor unit 322
+        run: bash ../rust-fs-core/scripts/test-floor.sh unit 322
       # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to
       # tmp/logs/<tier>.log and prints one line naming it; without this the
       # file goes away with the runner. `if: always()` because the failing
@@ -269,7 +269,7 @@ jobs:
       # each tier that runs on its own. A target missing from the log
       # counts as zero, so a suite that stopped being built fails here.
       - name: Every suite executed its tests
-        run: bash scripts/core.sh test-floor --targets .github/test-floors.txt suite
+        run: bash ../rust-fs-core/scripts/test-floor.sh --targets .github/test-floors.txt suite
       # Each of these is what that tier executed on a green `chore test`
       # of this branch, exactly. A tier runs on its own in some job here
       # and inside the whole-suite run in others, so it needs a total of
@@ -277,10 +277,10 @@ jobs:
       - name: The tiers executed their tests
         run: |
           set -euo pipefail
-          bash scripts/core.sh test-floor unit 322
-          bash scripts/core.sh test-floor oracle 30
-          bash scripts/core.sh test-floor kernel 6
-          bash scripts/core.sh test-floor suite 500
+          bash ../rust-fs-core/scripts/test-floor.sh unit 322
+          bash ../rust-fs-core/scripts/test-floor.sh oracle 30
+          bash ../rust-fs-core/scripts/test-floor.sh kernel 6
+          bash ../rust-fs-core/scripts/test-floor.sh suite 500
       # The shell tests are counted by their own `ok` lines rather than
       # by libtest's summary, but the failure is identical in shape:
       # `tests/scripts/*.sh` matching fewer files, or a script that
@@ -358,8 +358,8 @@ jobs:
       - name: Both tiers executed their tests
         run: |
           set -euo pipefail
-          bash scripts/core.sh test-floor unit 322
-          bash scripts/core.sh test-floor images 149
+          bash ../rust-fs-core/scripts/test-floor.sh unit 322
+          bash ../rust-fs-core/scripts/test-floor.sh images 149
       # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to
       # tmp/logs/<tier>.log and prints one line naming it; without this the
       # file goes away with the runner. `if: always()` because the failing
@@ -412,7 +412,7 @@ jobs:
       - name: chore vm:status (the VM is down again)
         run: '! chore vm:status'
       - name: The in-guest suite executed its tests
-        run: bash scripts/core.sh test-floor vm 500
+        run: bash ../rust-fs-core/scripts/test-floor.sh vm 500
       # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to
       # tmp/logs/<tier>.log and prints one line naming it; without this the
       # file goes away with the runner. `if: always()` because the failing
@@ -468,7 +468,7 @@ jobs:
         run: chore test:cli
       # THE RELEASE TARBALL, built here so a release is not the first time
       # it is put together, by the same rust-fs-core script release.yml's
-      # release-cli call runs: `scripts/core.sh package-cli` stages the install prefix
+      # release-cli call runs: `../rust-fs-core/scripts/package-cli.sh` stages the install prefix
       # from the binary cli:install built, then refuses it unless it holds
       # exactly that, every dotted name is a relative symlink to
       # bin/rust-fs-btrfs, every name has its man page and completions,
@@ -480,7 +480,7 @@ jobs:
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           mkdir -p tmp/package
           cd tmp/package
-          tarball="$(bash ../../scripts/core.sh package-cli "$version" linux-x86_64 ../../target/release | tail -n 1)"
+          tarball="$(bash ../../../rust-fs-core/scripts/package-cli.sh "$version" linux-x86_64 ../../target/release | tail -n 1)"
           tar -tzvf "$tarball"
       # THE TIER LOGS OUTLIVE THE RUNNER, as in every job that runs a tier.
       - name: Keep the tier logs
@@ -513,12 +513,12 @@ jobs:
     # `chore check:semver`: this tree's public API against the newest
     # version on crates.io, refusing a break the version in Cargo.toml does
     # not declare. Why, and what it cannot see, is at the top of
-    # scripts/semver-check.sh.
+    # ../rust-fs-core/scripts/semver-check.sh.
     name: semver (public API against crates.io)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # The version scripts/semver-check.sh expects. A prebuilt binary,
+      # The version ../rust-fs-core/scripts/semver-check.sh expects. A prebuilt binary,
       # checksum-verified by the action, rather than a ten-minute build.
       CARGO_SEMVER_CHECKS_VERSION: "0.50.0"
       # A failing tier prints only its verdict by default. Here the tail IS

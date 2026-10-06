@@ -399,7 +399,7 @@ fn no_local_copy_of_the_tarball_packaging_remains() {
     ] {
         assert!(
             !root.join(copy).exists(),
-            "{copy} is a copy of rust-fs-core's packaging; run `scripts/core.sh package-cli`"
+            "{copy} is a copy of rust-fs-core's packaging; run `../rust-fs-core/scripts/package-cli.sh`"
         );
     }
     let workflows = root.join(".github/workflows");

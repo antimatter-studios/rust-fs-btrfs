@@ -3,7 +3,7 @@
 # executed-test-floors.sh — the per-target floors name real targets, and CI
 # holds the suite to them.
 #
-# rust-fs-core's floor (`scripts/core.sh test-floor --targets FILE TIER`)
+# rust-fs-core's floor (`../rust-fs-core/scripts/test-floor.sh --targets FILE TIER`)
 # refuses a suite that emptied from the inside: it pairs cargo's `Running
 # tests/<name>.rs` line with libtest's `test result: ok. N passed`, and a
 # target below its floor -- or missing from the log -- fails the run. How it
@@ -49,9 +49,9 @@ done
 [ -z "$unlisted" ] && ok "every integration target has a floor" \
     || fail "integration targets with no floor, which could empty unnoticed:$unlisted"
 
-grep -qE 'core\.sh test-floor --targets \.github/test-floors\.txt [a-z]+' "$REPO/.github/workflows/ci.yml" \
+grep -qE 'test-floor\.sh --targets \.github/test-floors\.txt [a-z]+' "$REPO/.github/workflows/ci.yml" \
     && ok "ci.yml applies the floors file through rust-fs-core's floor" \
-    || fail "nothing in ci.yml runs scripts/core.sh test-floor --targets .github/test-floors.txt"
+    || fail "nothing in ci.yml runs ../rust-fs-core/scripts/test-floor.sh --targets .github/test-floors.txt"
 
 [ "$fails" = 0 ] || exit 1
 echo "PASS  every integration target has a floor, and CI holds the suite to them"

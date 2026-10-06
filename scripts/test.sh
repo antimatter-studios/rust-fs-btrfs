@@ -56,7 +56,7 @@ fi
 # takes the slot -- ONE for the whole machine, shared by every
 # repository. Left to chore's `after_all` reaper, which runs only inside
 # a chore invocation of this repository, a run that reached cargo any
-# other way (this script, scripts/tier.sh, by hand) exited 0 with the VM
+# other way (this script, ../rust-fs-core/scripts/tier.sh, by hand) exited 0 with the VM
 # idle and the slot held, and every other repository's VM work queued
 # behind it at 0% CPU until the guest's idle deadline.
 #

@@ -133,7 +133,7 @@ prefix: `bin/rust-fs-btrfs` and `bin/fs.btrfs` (a relative symlink to it),
 `share/man/man1/`, the completions under `share/zsh/site-functions/`,
 `share/bash-completion/completions/` and `share/fish/vendor_completions.d/`,
 `share/rust-fs-btrfs/CAVEATS`, and `LICENSE`. rust-fs-core's `package-cli`
-(`scripts/core.sh package-cli`), reading `[package.metadata.package-cli]` in
+(`../rust-fs-core/scripts/package-cli.sh`), reading `[package.metadata.package-cli]` in
 `Cargo.toml`, builds and checks it; CI builds it on every pull request.
 
 `chore test:cli` tests the tools **as installed**, whatever PATH resolves:
@@ -283,10 +283,10 @@ tier is one line as well — its status and its log — unless
 carries a **measured output budget**, and a tier that prints more than it is
 allowed to fails the build (exit 65) — the table is at the top of `chores.yml`.
 
-The wrapper enforcing that is `scripts/output-budget.sh` from **rust-fs-core**,
-resolved at run time by `scripts/tier.sh` — the sibling checkout first, then the
-packaged crate — and verified by `--version` before it is used. It is not copied
-into this repository, because a copy is something that drifts.
+The runner and the wrapper enforcing that are `scripts/tier.sh` and
+`scripts/output-budget.sh` from **rust-fs-core**, run in place from the sibling
+checkout at the pinned version. They are not copied into this repository,
+because a copy is something that drifts.
 
 ## Lint
 
