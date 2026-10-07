@@ -91,7 +91,7 @@ read_path_cost            1
 readlink_kernel_oracle    1
 release_attestation       2
 render_plan               4
-send_stream_kernel        1
+send_stream_kernel        2
 shared_tree_block_release 1
 snapshot_shared_write     1
 split_oracle              4
