@@ -46,7 +46,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use super::{attr, cmd, StreamWriter, SEND_WRITE_CHUNK};
+use super::{
+    attr, cmd, SendOptions, StreamWriter, EXTENT_INLINE, EXTENT_PREALLOC, SEND_WRITE_CHUNK,
+};
 use crate::error::{Error, Result};
 use crate::fs::{file_extent, Filesystem, EXTENT_DATA_KEY};
 use crate::inode::Inode;
@@ -57,10 +59,6 @@ type Id = (u64, u64);
 
 /// The top directory of the subvolume, whatever its generation.
 const TOP: Id = (0, 0);
-
-/// A file extent item's type byte: inline, regular, preallocated.
-const EXTENT_INLINE: u8 = 0;
-const EXTENT_PREALLOC: u8 = 2;
 
 /// One snapshot's namespace, read whole.
 struct Snapshot {
@@ -401,6 +399,26 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] for one that is not read-only, and
     /// whatever reading the trees returns.
     pub fn send_subvolume_incremental(&self, id: u64, parent: u64) -> Result<Vec<u8>> {
+        self.send_subvolume_incremental_with(id, parent, SendOptions::default())
+    }
+
+    /// [`Filesystem::send_subvolume_incremental`] with the version and
+    /// options `opts` names. What version 2 changes is in
+    /// [`Filesystem::send_subvolume_with`]; it applies to the inodes the
+    /// child adds, and a kept file's changed ranges are written plainly in
+    /// either version.
+    ///
+    /// # Errors
+    ///
+    /// As [`Filesystem::send_subvolume_incremental`], and
+    /// [`Error::UnsupportedFeature`] for options no stream can carry.
+    pub fn send_subvolume_incremental_with(
+        &self,
+        id: u64,
+        parent: u64,
+        opts: SendOptions,
+    ) -> Result<Vec<u8>> {
+        opts.check()?;
         let child_id = self.send_identity(id)?;
         let parent_id = self.send_identity(parent)?;
         let ctree = self.open_subvolume_at(child_id.bytenr)?;
@@ -408,7 +426,7 @@ impl Filesystem {
         let p = Snapshot::read(&ptree)?;
         let c = Snapshot::read(&ctree)?;
 
-        let mut w = StreamWriter::new();
+        let mut w = StreamWriter::with_version(opts.version);
         w.begin(cmd::SNAPSHOT);
         w.attr(attr::PATH, &child_id.name)?;
         w.attr(attr::UUID, &child_id.uuid)?;
@@ -439,7 +457,7 @@ impl Filesystem {
                     w.attr(attr::PATH_LINK, existing)?;
                 }
                 NameOp::Create { path, id } => {
-                    self.send_create(&ctree, &mut w, path, &c.inodes[id])?;
+                    self.send_create(&ctree, &mut w, path, &c.inodes[id], opts)?;
                 }
                 NameOp::Rmdir(path) => {
                     w.begin(cmd::RMDIR);
@@ -573,7 +591,7 @@ impl Filesystem {
                 w.begin(cmd::WRITE);
                 w.attr(attr::PATH, path)?;
                 w.attr_u64(attr::FILE_OFFSET, pos)?;
-                w.attr(attr::DATA, &buf)?;
+                w.attr_data(&buf)?;
                 pos += buf.len() as u64;
             }
         }

@@ -1789,7 +1789,12 @@ impl Filesystem {
     /// first sector whose digest does not match — the address, not the
     /// file offset, because that is what a caller comparing against
     /// `btrfs inspect-internal` or the kernel's own message will see.
-    fn read_data_verified(&self, logical: u64, dst: &mut [u8], verify: bool) -> Result<()> {
+    pub(crate) fn read_data_verified(
+        &self,
+        logical: u64,
+        dst: &mut [u8],
+        verify: bool,
+    ) -> Result<()> {
         if !verify || dst.is_empty() {
             return Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, dst);
         }

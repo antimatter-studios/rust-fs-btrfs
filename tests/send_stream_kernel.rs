@@ -28,6 +28,15 @@
 //! on top of the parent (received from this crate's full stream) to give
 //! exactly the child the kernel shows.
 //!
+//! **Version 2.** The kernel sends a snapshot holding zlib, LZO and zstd
+//! extents and a preallocated range as a version-2 stream with its
+//! compressed data passed through (`--proto 2 --compressed-data`). This
+//! crate parses it against `btrfs receive --dump`, and writes its own:
+//! every encoded write in it must be the kernel's -- the same offsets,
+//! lengths, compression and on-disk bytes -- and `btrfs receive` must
+//! rebuild the snapshot from it with the extents still compressed and the
+//! preallocated range still allocated.
+//!
 //! The snapshot holds what a stream has to carry: inline and multi-chunk
 //! data, a hole, a preallocated range, an empty file, nested directories,
 //! a hard link, symbolic links (one dangling), a FIFO, a character
@@ -39,7 +48,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fs_btrfs::fs::Filesystem;
-use fs_btrfs::send::{attr, cmd, command_name, parse_send_stream, Command, SendStream};
+use fs_btrfs::send::{
+    attr, cmd, command_name, parse_send_stream, Command, SendOptions, SendStream,
+};
 use fs_btrfs_test_support::{
     fixture, guest_kernel_read_ok, guest_kernel_write_ok, guest_quote, sha256_hex,
 };
@@ -208,6 +219,50 @@ report "$MNT/snap2" > "$OUT/source.report"
 report "$work/mnt/snap2" > "$OUT/received.report"
 btrfs subvolume show "$MNT/snap2" > "$OUT/source.show"
 btrfs subvolume show "$work/mnt/snap2" > "$OUT/received.show"
+"#;
+
+/// The guest builds a snapshot holding compressed extents of every
+/// algorithm and a preallocated range, sends it as a version-2 stream with
+/// the compressed data passed through, and reports it.
+const POPULATE_V2: &str = r#"
+btrfs subvolume create "$MNT/src" >/dev/null
+cd "$MNT/src"
+for algo in zlib lzo zstd; do
+    mkdir "$algo"
+    btrfs property set "$algo" compression "$algo"
+    printf "a line that $algo squeezes well, number %s\n" $(seq 1 12000) > "$algo/text"
+done
+head -c 100000 /dev/urandom > plain.bin
+fallocate -l 64K prealloc.bin
+printf 'hello\n' > small.txt
+cd /
+sync
+btrfs subvolume snapshot -r "$MNT/src" "$MNT/snap" >/dev/null
+btrfs send -q --proto 2 --compressed-data -f "$OUT/kernel.stream" "$MNT/snap"
+btrfs receive --dump -f "$OUT/kernel.stream" > "$OUT/kernel.dump"
+report "$MNT/snap" > "$OUT/kernel.report"
+"#;
+
+/// The guest receives this crate's version-2 stream, reports both trees,
+/// and counts what stayed compressed and preallocated.
+const RECEIVE_V2: &str = r#"
+work="$(mktemp -d /var/tmp/fs-btrfs-receive.XXXXXX)"
+truncate -s 512M "$work/img"
+mkfs.btrfs -q "$work/img"
+mkdir "$work/mnt"
+mount -o loop "$work/img" "$work/mnt"
+trap 'umount "$work/mnt" 2>/dev/null || true; rm -rf "$work"' EXIT
+btrfs receive -f "$OUT/ours.stream" "$work/mnt"
+report "$MNT/snap" > "$OUT/source.report"
+report "$work/mnt/snap" > "$OUT/received.report"
+for side in source received; do
+    if [ "$side" = source ]; then top="$MNT/snap"; else top="$work/mnt/snap"; fi
+    for algo in zlib lzo zstd; do
+        n="$(filefrag -v "$top/$algo/text" | grep -c encoded || true)"
+        echo "$algo encoded extents: $n"
+    done > "$OUT/$side.extents"
+    echo "prealloc.bin blocks: $(stat -c %b "$top/prealloc.bin")" >> "$OUT/$side.extents"
+done
 "#;
 
 fn scratch(tag: &str) -> PathBuf {
@@ -682,5 +737,138 @@ fn incremental_streams_agree_with_btrfs_send_and_btrfs_receive() {
         show_field(&read(&out.join("received.show")), "Received UUID:"),
         show_field(&read(&out.join("source.show")), "UUID:"),
         "the received child does not name the source as where it came from"
+    );
+}
+
+/// A command's attributes but its path, in type order.
+type Attrs = Vec<(u16, Vec<u8>)>;
+
+/// The `ENCODED_WRITE`s in a stream, by path and offset, with every other
+/// attribute as it came.
+fn encoded_writes(stream: &SendStream) -> BTreeMap<(String, u64), Attrs> {
+    stream
+        .commands
+        .iter()
+        .filter(|c| c.cmd == cmd::ENCODED_WRITE)
+        .map(|c| {
+            let path = String::from_utf8_lossy(c.path().unwrap()).into_owned();
+            let offset = c.u64(attr::FILE_OFFSET).unwrap();
+            let mut attrs: Attrs = c
+                .attrs
+                .iter()
+                .filter(|(t, _)| *t != attr::PATH)
+                .cloned()
+                .collect();
+            attrs.sort();
+            ((path, offset), attrs)
+        })
+        .collect()
+}
+
+/// An encoded write's attributes for a person: numbers as numbers, the
+/// data as its length and digest.
+fn shown_attrs(attrs: &[(u16, Vec<u8>)]) -> String {
+    attrs
+        .iter()
+        .map(|(t, v)| {
+            if *t == attr::DATA {
+                format!("data={}B/{}", v.len(), &sha256_hex(v)[..12])
+            } else if v.len() == 8 {
+                format!("{t}={}", u64::from_le_bytes(v[..].try_into().unwrap()))
+            } else if v.len() == 4 {
+                format!("{t}={}", u32::from_le_bytes(v[..].try_into().unwrap()))
+            } else {
+                format!("{t}={v:02x?}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn version_two_streams_pass_compressed_data_through_as_the_kernel_does() {
+    let out = scratch("v2");
+    let image = out.join("btrfs-send-v2.img");
+    std::fs::copy(fixture("btrfs-default.img"), &image).expect("copy the fixture");
+    let image_str = image.to_str().expect("a UTF-8 scratch path").to_string();
+
+    guest_kernel_write_ok(
+        &image_str,
+        "populate and send a version-2 stream",
+        &guest_script(&out, POPULATE_V2),
+    );
+
+    // --- Reading what the kernel wrote ---
+    let kernel_bytes = std::fs::read(out.join("kernel.stream")).expect("the kernel's stream");
+    let kernel = parse_send_stream(&kernel_bytes).expect("parse the kernel's version-2 stream");
+    assert_eq!(kernel.version, 2);
+    assert_matches_dump(&kernel, &read(&out.join("kernel.dump")), "snap");
+    let theirs = encoded_writes(&kernel);
+    assert!(
+        theirs.len() >= 3,
+        "the kernel passed {} compressed extents through; the snapshot has one file per algorithm",
+        theirs.len()
+    );
+
+    // --- Writing one ---
+    let dev = FileDevice::open(&image).expect("open the image");
+    let fs = Filesystem::mount(Arc::new(dev)).expect("mount the image");
+    let ours_bytes = fs
+        .send_subvolume_with(
+            subvolume_id(&fs, b"snap"),
+            SendOptions::v2().with_compressed_data(true),
+        )
+        .expect("send the snapshot");
+    std::fs::write(out.join("ours.stream"), &ours_bytes).expect("write our stream");
+    let parsed = parse_send_stream(&ours_bytes).expect("our version-2 stream parses");
+    assert_eq!(parsed.version, 2);
+
+    let ours = encoded_writes(&parsed);
+    let mut differences = Vec::new();
+    for key in theirs
+        .keys()
+        .chain(ours.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        match (theirs.get(key), ours.get(key)) {
+            (Some(t), Some(o)) if t == o => {}
+            (t, o) => differences.push(format!(
+                "{key:?}\n  kernel: {}\n  ours:   {}",
+                t.map_or("-".into(), |a| shown_attrs(a)),
+                o.map_or("-".into(), |a| shown_attrs(a)),
+            )),
+        }
+    }
+    assert!(
+        differences.is_empty(),
+        "this crate's encoded writes are not the kernel's:\n{}",
+        differences.join("\n")
+    );
+
+    guest_kernel_read_ok(
+        &image_str,
+        "receive our version-2 stream",
+        &guest_script(&out, RECEIVE_V2),
+    );
+    let source = read(&out.join("source.report"));
+    assert_eq!(
+        source,
+        read(&out.join("kernel.report")),
+        "the source snapshot changed between mounts"
+    );
+    assert_eq!(
+        read(&out.join("received.report")),
+        source,
+        "btrfs receive rebuilt something other than the snapshot from this crate's version-2 stream"
+    );
+    let source_extents = read(&out.join("source.extents"));
+    assert!(
+        !source_extents.contains("encoded extents: 0"),
+        "the source has a file that did not compress:\n{source_extents}"
+    );
+    assert_eq!(
+        read(&out.join("received.extents")),
+        source_extents,
+        "the received files are not compressed and preallocated as the source's are"
     );
 }
