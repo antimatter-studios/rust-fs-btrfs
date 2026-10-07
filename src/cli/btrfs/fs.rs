@@ -61,8 +61,9 @@ fn command() -> Cmd {
              bytes. A failure is {\"error\": \"...\", \"code\": N} on stderr, N being the \
              exit status: 1 failed, 2 wrong command line, 3 not implemented or refused.\n\n\
              Writing is limited to what this library can do safely: `write` overwrites \
-             an existing NODATACOW file in place, at the same length. Everything that \
-             needs a copy-on-write transaction answers with exit status 3.",
+             an existing file at the same length, a NODATACOW file in place and any other \
+             copy-on-write, committed as one transaction. What that cannot do yet answers \
+             with exit status 3.",
         )
         .arg(
             Arg::new("target")
@@ -127,8 +128,8 @@ fn command() -> Cmd {
         .subcommand(
             Cmd::new("write")
                 .about(
-                    "Overwrite an existing NODATACOW file in place with the same number of \
-                     bytes from stdin",
+                    "Overwrite an existing file with the same number of bytes from stdin",
+
                 )
                 .arg(
                     Arg::new("path")
@@ -139,11 +140,12 @@ fn command() -> Cmd {
                 .after_help(
                     "Examples:\n  fs.btrfs disk.img write /vm/disk.raw < disk.raw\n  \
                      fs.btrfs disk.img read /db/data | fix-up | fs.btrfs disk.img write /db/data\n\n\
-                     Only a file marked NODATACOW (chattr +C) can be written, and only with \
-                     exactly as many bytes as it already holds: this library cannot allocate. \
-                     A new file, an ordinary copy-on-write file, a snapshotted or compressed \
-                     extent, or a different length is refused with exit status 3 and the \
-                     reason.",
+                     The file must exist and get exactly as many bytes as it already holds. \
+                     A NODATACOW file (chattr +C) is overwritten in place; any other is written \
+                     copy-on-write into new extents and committed as one transaction. A new \
+                     file, a different length, a checksummed file, or a snapshotted, inline, \
+                     preallocated or compressed extent is refused with exit status 3 and the \
+                     reason (rust-fs-btrfs#261).",
                 ),
         )
         .subcommand(
@@ -662,17 +664,18 @@ fn set(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Outcome, CliE
     }
 }
 
-/// Overwrite an existing NODATACOW file with everything on stdin, which
-/// must be exactly as long as the file. The whole input is read before the
-/// image is opened, so a failing producer (`false | fs.btrfs img write /f`)
-/// leaves the image as it was; the library writes the whole range or none
-/// of it.
+/// Overwrite an existing file with everything on stdin, which must be
+/// exactly as long as the file: a NODATACOW file in place, any other one
+/// copy-on-write through `Filesystem::write`. The whole input is read
+/// before the image is opened, so a failing producer
+/// (`false | fs.btrfs img write /f`) leaves the image as it was; the
+/// library writes the whole range or none of it.
 fn write(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome, CliError> {
     let mut data = Vec::new();
     std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut data)
         .map_err(|e| CliError::failed(format!("read stdin: {e}")))?;
     let dev = device::open_rw(target, offset)?;
-    let fs = Filesystem::mount_rw(dev).map_err(|e| {
+    let mut fs = Filesystem::mount_rw(dev).map_err(|e| {
         btrfs_error(
             format!("{} (read-write)", target.to_string_lossy()).as_bytes(),
             e,
@@ -712,14 +715,26 @@ fn write(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome, CliErro
             inode.size
         )));
     }
-    let written = fs
-        .write_at(inode.ino, 0, &data)
-        .map_err(|e| btrfs_error(path, e))?;
+    let in_place = inode.flags & fs_btrfs::write::INODE_NODATACOW != 0;
+    let ino = inode.ino;
+    let written = fs.write(ino, 0, &data).map_err(|e| match e {
+        // Each refusal is a case the copy-on-write path does not cover
+        // yet; say where that work is tracked.
+        Error::UnsupportedFeature(why) => {
+            CliError::refused(format!("{}: {why} (rust-fs-btrfs#261)", show(path)))
+        }
+        e => btrfs_error(path, e),
+    })?;
     let report = Json::object([
         ("path", Json::from(show(path))),
         ("bytes", Json::from(written as u64)),
         ("created", Json::from(false)),
     ]);
-    let text = format!("overwrote {} ({written} bytes, in place)", show(path));
+    let how = if in_place {
+        "in place"
+    } else {
+        "copy-on-write"
+    };
+    let text = format!("overwrote {} ({written} bytes, {how})", show(path));
     Ok(Outcome::report(report).with_text(text))
 }

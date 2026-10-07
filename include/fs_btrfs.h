@@ -14,8 +14,9 @@
  * recent call, not its most recent failure.
  *
  * The driver reads, and writes within narrow limits: fs_btrfs_mount_rw
- * opens a volume for writing and fs_btrfs_write_file overwrites a
- * nodatacow file in place; everything else is refused. It refuses rather
+ * opens a volume for writing and fs_btrfs_write_file overwrites an
+ * existing file's bytes -- a nodatacow file in place, any other one
+ * copy-on-write; everything else is refused. It refuses rather
  * than guesses, when reading as well: a compressed
  * extent fails with ENOTSUP rather than returning its undecoded bytes,
  * because a caller cannot distinguish those from a corrupt file.
@@ -245,14 +246,15 @@ int64_t fs_btrfs_getxattr(fs_btrfs_fs_t *fs, const char *path,
 /* ---- writing ---- */
 
 /*
- * Btrfs is copy-on-write: a change normally allocates a new block,
- * records a new checksum, rewrites the B-tree path to the root and
- * commits a new generation. None of that is possible without a
- * transaction engine, so almost nothing here can be written in place.
+ * Btrfs is copy-on-write: a change allocates a new extent, points the
+ * file at it, releases the old one and commits a new generation, so a
+ * crash leaves the old contents or the new and never a mixture.
+ * fs_btrfs_write_file does that for an existing, unchecksummed file
+ * whose extents are unshared, uncompressed and really allocated.
  *
- * The exception is a file marked NODATACOW -- `chattr +C` -- whose
- * blocks are overwritten where they lie and carry no checksums. Those,
- * and only those, can be written.
+ * A file marked NODATACOW -- `chattr +C` -- is the exception: its
+ * blocks are overwritten where they lie, carry no checksums, and need
+ * no commit. fs_btrfs_can_write_in_place answers for that case alone.
  *
  * NODATACOW is not on its own enough. It promises in-place writes only
  * while the extent belongs to one file; a snapshot makes it shared, and
@@ -287,8 +289,11 @@ int fs_btrfs_can_write_in_place(fs_btrfs_fs_t *fs, const char *path);
  * Overwrite `length` bytes of an existing file at `offset`. Returns the
  * number written, or -1. The whole range is written or none of it is.
  *
- * Refused with ENOTSUP for an ordinary copy-on-write file, a snapshotted
- * extent, a compressed or inline one, a hole, or a write past the end.
+ * A NODATACOW file is written in place; any other is written
+ * copy-on-write and committed. Refused with ENOTSUP, the case named,
+ * for a checksummed file, a snapshotted or otherwise shared extent, a
+ * compressed, inline or preallocated one, a hole, or a write past the
+ * end (rust-fs-btrfs#261).
  */
 int64_t fs_btrfs_write_file(fs_btrfs_fs_t *fs, const char *path,
                             const void *buf, uint64_t offset, uint64_t length);

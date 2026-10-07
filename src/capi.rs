@@ -1132,11 +1132,13 @@ pub unsafe extern "C" fn fs_btrfs_can_write_in_place(
 /// Returns the number of bytes written, or −1 with the error recorded.
 /// The whole range is written or none of it is.
 ///
-/// Only a NODATACOW file can be written, and only where its extents are
-/// unshared, uncompressed and really allocated. Everything else — an
-/// ordinary copy-on-write file, a snapshotted extent, a compressed or
-/// inline one, a hole, or a write past the end — is refused with
-/// ENOTSUP, because each needs a transaction this driver cannot make.
+/// A NODATACOW file is overwritten in place. Any other file is written
+/// copy-on-write: the bytes land in newly allocated extents and the
+/// change is committed as one transaction, so a crash leaves the old
+/// contents or the new and never a mixture. What that path cannot write
+/// yet — a checksummed file, a write that grows the file or fills a
+/// hole, an inline, preallocated, compressed or shared extent
+/// (rust-fs-btrfs#261) — is refused with ENOTSUP and the case named.
 ///
 /// # Safety
 ///
@@ -1158,7 +1160,10 @@ pub unsafe extern "C" fn fs_btrfs_write_file(
         let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
-        let fs = &unsafe { &*fs }.fs;
+        // Mutable: a copy-on-write commit reopens the mount on the new
+        // generation. The header already forbids sharing a handle across
+        // threads without the caller's own lock.
+        let fs = &mut unsafe { &mut *fs }.fs;
         let found = match fs.lookup_path_bytes(path) {
             Ok(i) => i,
             Err(e) => {
@@ -1167,7 +1172,7 @@ pub unsafe extern "C" fn fs_btrfs_write_file(
             }
         };
         let data = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), length as usize) };
-        match fs.write_at(found.ino, offset, data) {
+        match fs.write(found.ino, offset, data) {
             Ok(n) => n as i64,
             Err(e) => {
                 record(&e);

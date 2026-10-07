@@ -63,7 +63,7 @@ Metadata is JSON on stdout by default, `--text` for people. A failure is
 | `ls [PATH]` | JSON entries: name, type, size, mode, mtime, inode, `subvolume`, and a symlink's target. A path into a subvolume or a snapshot is followed, as a mount shows it |
 | `read PATH [-o FILE]` | the file's raw bytes: inline, compressed (zlib, LZO, zstd), sparse, inside a subvolume or through a snapshot |
 | `get [KEY]` / `info [KEY]` | `fs`, `label`, `total_bytes`, `free_bytes` (from `bytes_used`), `block_size` (the sector size), `dirty` (a log to replay, or the error flag), and `btrfs.*`: fsid, metadata UUID, node size, checksum type, device count, generation, feature names. From the superblock alone, so a volume that will not mount still answers |
-| `write PATH` | **only the in-place case**: an existing NODATACOW file (`chattr +C`), overwritten with exactly as many bytes from stdin as it holds. A new file, an ordinary copy-on-write file, a snapshotted, compressed or inline extent, a different length, or a path inside a subvolume is refused with exit 3 and the library's reason. An ordinary file waits on the CLI using the library's copy-on-write writes ([#274][i274]); creating, removing and resizing wait on [#262][i262] |
+| `write PATH` | an existing file, overwritten with exactly as many bytes from stdin as it holds: a NODATACOW file (`chattr +C`) in place, any other one copy-on-write into new extents, committed as one transaction. A new file, a different length, a path inside a subvolume, a checksummed file, or a snapshotted, inline, preallocated or compressed extent is refused with exit 3 and the library's reason; the copy-on-write cases wait on [#261][i261], creating, removing and resizing on [#262][i262] |
 | `mkdir` | not implemented (exit 3): needs directory edits, [#262][i262] |
 | `set label VALUE` | writes the label (at most 255 bytes) into every superblock copy, each with a fresh checksum; a pool of several devices is refused |
 | `resize` | not implemented (exit 3): no resize |
@@ -125,7 +125,7 @@ as damaged is one `btrfs check --readonly` refuses too; after `fs.btrfs write`,
 and the kernel read back exactly the bytes written.
 
 [i262]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/262
-[i274]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/274
+[i261]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/261
 
 ## Test contract
 

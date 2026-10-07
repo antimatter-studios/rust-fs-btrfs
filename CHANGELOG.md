@@ -26,6 +26,16 @@ never does.
 - **`send::StreamError`**, its own error type. A malformed stream is bytes
   handed in, not a damaged volume, so it is kept out of the crate's `Error`.
 
+### Changed
+
+- **`fs.btrfs write` and `fs_btrfs_write_file` write ordinary copy-on-write
+  files.** Both went through the in-place path, which writes only NODATACOW
+  files, so the library's copy-on-write writes were unreachable from the tool
+  and the C ABI. They now go through `Filesystem::write`: a NODATACOW file is
+  still overwritten in place, and any other unchecksummed file is written into
+  new extents and committed as one transaction. What that path cannot write yet
+  is refused with the case named and #261 cited (#274).
+
 ### Fixed
 
 - **The block-group used-count test picks a block whose move really crosses
