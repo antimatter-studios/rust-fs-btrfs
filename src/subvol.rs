@@ -354,38 +354,54 @@ impl Filesystem {
     /// [`resolve_path`]: Self::resolve_path
     pub fn resolve_path_bytes(&self, path: &[u8]) -> Result<PathTarget> {
         use crate::error::Error;
-        let mut tree: Option<Filesystem> = None;
-        let mut inode = self.root_inode()?;
+        // Every subvolume crossed into, and the walk so far as (the tree
+        // it is in, the directory). `..` pops the walk, which is how
+        // climbing out of a subvolume's top lands back in the parent
+        // tree's directory, as it does on a mount (#271). The trees stay
+        // in `trees` until the end because a later step may climb back
+        // into one already opened.
+        let mut trees: Vec<Option<Filesystem>> = Vec::new();
+        let mut walked: Vec<(Option<usize>, crate::inode::Inode)> =
+            vec![(None, self.root_inode()?)];
         for component in path
             .split(|&b| b == b'/')
             .filter(|c| !c.is_empty() && *c != b".")
         {
-            if component == b".." {
-                return Err(Error::UnsupportedFeature(
-                    "`..` in a path is not resolved by resolve_path".into(),
-                ));
-            }
+            let (tree, inode) = walked.last().expect("the top is never popped").clone();
             if !inode.is_dir() {
                 return Err(Error::NotADirectory);
+            }
+            if component == b".." {
+                if walked.len() > 1 {
+                    walked.pop();
+                }
+                continue;
             }
             if inode.ino == EMPTY_SUBVOL_DIR_OBJECTID {
                 return Err(Error::NotFound);
             }
-            let here = tree.as_ref().unwrap_or(self);
+            let here = match tree {
+                Some(i) => trees[i].as_ref().expect("taken only at the end"),
+                None => self,
+            };
             let entry = here.lookup_entry(inode.ino, component)?;
             if entry.is_inode() {
-                inode = here.read_inode(entry.ino)?;
+                let next = here.read_inode(entry.ino)?;
+                walked.push((tree, next));
                 continue;
             }
             match here.subvolume_behind(inode.ino, &entry)? {
                 Some((bytenr, dirid)) => {
                     let child = here.reroot(bytenr)?;
-                    inode = child.read_inode(dirid)?;
-                    tree = Some(child);
+                    let top = child.read_inode(dirid)?;
+                    trees.push(Some(child));
+                    walked.push((Some(trees.len() - 1), top));
                 }
-                None => inode = empty_subvolume_dir(&inode),
+                None => walked.push((tree, empty_subvolume_dir(&inode))),
             }
         }
+        let (tree, inode) = walked.pop().expect("the top is never popped");
+        let tree = tree.map(|i| trees[i].take().expect("taken once"));
         Ok(PathTarget { tree, inode })
     }
 

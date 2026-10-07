@@ -388,6 +388,17 @@ build_subvol() {
             find "$MNT/$s" -maxdepth 1 -type f -printf ' %f' 2>/dev/null || true
             echo
         done
+        # What the kernel reads at paths that climb with `..`, including
+        # out of a subvolume into its parent and out of the empty
+        # directory a snapshot shows for a nested subvolume (#271). None
+        # climbs above the mount's top, where the kernel would leave the
+        # filesystem altogether.
+        echo "# --- what the kernel reads at a path with .. in it"
+        for s in sub/inner/../b.txt sub/inner/../../top/a.txt \
+                 top/../sub/inner/c.txt snap/inner/../b.txt \
+                 sub/./inner/.././inner/c.txt; do
+            printf 'resolves %s\t%s\n' "$s" "$(cat "$MNT/$s")"
+        done
     } > "$manifest"
 
     umount "$MNT"
