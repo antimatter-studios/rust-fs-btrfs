@@ -500,3 +500,77 @@ fn a_path_crosses_into_subvolumes() {
         "the nested subvolume's file must not be reachable through the snapshot"
     );
 }
+
+/// The `resolves` lines of the manifest: a path with `..` in it, and what
+/// the kernel read there.
+fn kernel_resolutions() -> Vec<(String, String)> {
+    let out: Vec<(String, String)> = manifest()
+        .lines()
+        .filter_map(|line| line.strip_prefix("resolves "))
+        .map(|rest| {
+            let (path, read) = rest
+                .split_once('\t')
+                .unwrap_or_else(|| panic!("a resolves line with no tab: {rest:?}"));
+            (format!("/{path}"), read.to_string())
+        })
+        .collect();
+    assert!(
+        out.len() >= 5,
+        "the manifest records {} paths with `..` in them; the fixture builder writes five",
+        out.len()
+    );
+    out
+}
+
+/// A path that climbs with `..` reads what the kernel read there, out of
+/// a subvolume into its parent included (#271).
+///
+/// Paths are resolved without following symbolic links, so `..` is the
+/// parent of the directory the walk is in: the one it came from. Climbing
+/// out of a subvolume's top directory lands in the directory holding the
+/// subvolume's entry, in the parent tree, as it does on a mount.
+#[test]
+fn dot_dot_reads_what_the_kernel_read() {
+    let fs = mount();
+    for (path, want) in kernel_resolutions() {
+        let got = fs
+            .read_path(&path)
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert_eq!(String::from_utf8_lossy(&got).trim_end(), want, "{path}");
+    }
+}
+
+/// `lookup_path`, which stays in one tree, resolves `..` too (#271).
+#[test]
+fn lookup_path_resolves_dot_dot_within_its_tree() {
+    let fs = mount();
+    let direct = fs.lookup_path("/top/a.txt").expect("/top/a.txt");
+    for path in ["/top/../top/a.txt", "/top/./../top/a.txt", "/../top/a.txt"] {
+        let climbed = fs
+            .lookup_path(path)
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert_eq!(climbed.ino, direct.ino, "{path}");
+    }
+    let root = fs.root_inode().expect("root");
+    assert_eq!(
+        fs.lookup_path("/..").expect("/..").ino,
+        root.ino,
+        "the parent of the top directory is the top directory"
+    );
+}
+
+/// `..` after a file is refused, as path resolution refuses it: a file
+/// has no entries, `..` included.
+#[test]
+fn dot_dot_after_a_file_is_not_a_directory() {
+    let fs = mount();
+    for result in [
+        fs.lookup_path("/top/a.txt/..").map(|_| ()),
+        fs.resolve_path("/sub/b.txt/../b.txt").map(|_| ()),
+    ] {
+        assert!(
+            matches!(result, Err(fs_btrfs::error::Error::NotADirectory)),
+            "a file has no parent entry to climb"
+        );
+    }
+}
