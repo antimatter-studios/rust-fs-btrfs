@@ -1026,6 +1026,13 @@ build_pool() {
     # item, so the chunk mapping is actually exercised on a read.
     dd if=/dev/urandom of="$MNT/big.bin" bs=1M count=4 status=none
     sync
+    # A file with no data checksums, which is what the copy-on-write
+    # write path takes so far, so a pool can be written through it and
+    # handed back to the kernel (#298). A remount with `nodatasum` marks
+    # every inode created under it NODATASUM for good.
+    mount -o remount,nodatasum "$MNT"
+    dd if=/dev/urandom of="$MNT/nosum.bin" bs=64K count=2 status=none
+    sync
 
     # Size AND content. A size alone is a weak check on a mirrored pool:
     # reading four megabytes of the WRONG bytes has the right length.

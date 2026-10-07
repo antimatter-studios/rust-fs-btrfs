@@ -572,3 +572,118 @@ echo done > "$res/finished""#,
     );
     verdicts
 }
+
+/// What [`guest_kernel_pool_read`] found.
+pub struct PoolRead {
+    /// `btrfs check --readonly`'s exit status over the whole pool.
+    pub check_status: i32,
+    /// What `btrfs check` printed, both streams.
+    pub check: String,
+    /// The script's output, run against the read-only mount of the pool.
+    pub out: Output,
+}
+
+/// Attach every member of a pool in the guest, read-only, and ask the
+/// two oracles about it: `btrfs check --readonly` over the whole pool,
+/// then the kernel, mounting it read-only and running `script` against
+/// it as [`guest_kernel_read`] does for one image.
+///
+/// A pool cannot be loop-mounted one file at a time: the kernel has to
+/// be told about every member first, which is what `btrfs device scan`
+/// over the loop devices does. The registry is told to forget before and
+/// after, so a member it remembers from another copy of the same pool
+/// (the same fsid, the same devids) cannot stand in for one of these.
+#[track_caller]
+pub fn guest_kernel_pool_read(images: &[&str], script: &str) -> PoolRead {
+    let _bracket = GUEST_MOUNT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    session();
+    for image in images {
+        assert!(
+            std::path::Path::new(image).starts_with(repo()),
+            "the kernel oracle was given {image}, which is outside {}. The guest sees this \
+             repository and nothing else of the host.",
+            repo().display()
+        );
+    }
+    let run = Run::new();
+    let check = run.dir.join(format!(
+        "{}.check",
+        run.status.file_stem().unwrap_or_default().to_string_lossy()
+    ));
+    let check_status = check.with_extension("check-status");
+    let members: Vec<String> = images.iter().map(|i| guest_quote(i)).collect();
+    let guest = format!(
+        r#"set -euo pipefail
+mkdir -p {dir}
+work="$(mktemp -d /var/tmp/fs-btrfs-pool.XXXXXX)"
+mnt="$work/mnt"
+mkdir -p "$mnt"
+loops=()
+cleanup() {{
+    mountpoint -q "$mnt" && umount "$mnt" || true
+    for l in "${{loops[@]}}"; do losetup -d "$l" 2>/dev/null || true; done
+    btrfs device scan --forget >/dev/null 2>&1 || true
+    rm -rf "$work"
+}}
+trap cleanup EXIT
+btrfs device scan --forget >/dev/null 2>&1 || true
+i=0
+for img in {members}; do
+    cp --sparse=always "$img" "$work/member-$i"
+    loops+=("$(losetup --find --show --read-only "$work/member-$i")")
+    i=$((i + 1))
+done
+btrfs device scan "${{loops[@]}}" >/dev/null
+c=0
+btrfs check --readonly "${{loops[0]}}" > {check} 2>&1 || c=$?
+printf %s "$c" > {check_status}
+mount -t btrfs -o ro "${{loops[0]}}" "$mnt"
+status=0
+MNT="$mnt" bash -euo pipefail -c {script} > {stdout} 2> {stderr} || status=$?
+umount "$mnt"
+printf %s "$status" > {status}"#,
+        dir = guest_quote(&run.dir.to_string_lossy()),
+        members = members.join(" "),
+        check = guest_quote(&check.to_string_lossy()),
+        check_status = guest_quote(&check_status.to_string_lossy()),
+        script = guest_quote(script),
+        stdout = guest_quote(&run.stdout.to_string_lossy()),
+        stderr = guest_quote(&run.stderr.to_string_lossy()),
+        status = guest_quote(&run.status.to_string_lossy()),
+    );
+    let out = guest_shell(&guest)
+        .unwrap_or_else(|error| panic!("cannot run the kernel oracle in the guest: {error}"));
+    let Some(code) = run.code() else {
+        panic!(
+            "the pool oracle could not run in the fs-linux-test-harness VM (the harness \
+             exited {:?}). `chore vm:status` shows the VM.\n{}{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let (stdout, stderr) = run.streams();
+    let check_text = std::fs::read_to_string(&check).unwrap_or_default();
+    let check_code = std::fs::read_to_string(&check_status)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .expect("the guest ran btrfs check before the mount, and recorded its status");
+    let _ = std::fs::remove_file(&check);
+    let _ = std::fs::remove_file(&check_status);
+    println!(
+        "[kernel vm] btrfs check + mount -t btrfs -o ro, a pool of {} -> check {check_code}, \
+         script {code}",
+        images.len()
+    );
+    PoolRead {
+        check_status: check_code,
+        check: check_text,
+        out: Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(code << 8),
+            stdout,
+            stderr,
+        },
+    }
+}

@@ -121,19 +121,18 @@ impl Filesystem {
         // against the device. Resolving every mirror of every piece
         // before the first write keeps "nothing is written unless the
         // whole range can be".
-        let device = self.writable.as_ref().expect("checked above");
         let mut done = 0usize;
         for &(logical, len) in &plan {
-            Self::mirror_spans(device, &self.map, logical, len)?;
+            self.mirror_spans(logical, len)?;
             done += len;
         }
         debug_assert_eq!(done, data.len());
         done = 0;
         for (logical, len) in plan {
-            Self::write_logical_all_mirrors(device, &self.map, logical, &data[done..done + len])?;
+            self.write_logical_all_mirrors(logical, &data[done..done + len])?;
             done += len;
         }
-        device.flush()?;
+        self.flush_writable()?;
         Ok(done)
     }
 

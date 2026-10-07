@@ -60,6 +60,11 @@ use crate::fs::Filesystem;
 use crate::super_write::SUPERBLOCK_SIZE;
 use crate::super_write::{self, Commit};
 use crate::superblock::SUPER_OFFSETS;
+use fs_core::BlockDevice;
+use std::sync::Arc;
+
+/// A device and the superblock image a commit writes to it.
+type SuperblockImage = (Arc<dyn BlockDevice>, Vec<u8>);
 
 /// One tree block, built and placed, waiting to be written.
 #[derive(Debug, Clone)]
@@ -94,15 +99,16 @@ impl Filesystem {
     /// copy exists to resolve, and a reader picks the newest copy that
     /// verifies.
     pub fn commit(&self, blocks: &[PlacedBlock], commit: &Commit) -> Result<()> {
-        let Some(device) = self.writable.as_ref() else {
+        if self.writable.is_none() {
             return Err(Error::ReadOnly);
-        };
+        }
 
-        // 0. The superblock image, backup slot included, before anything is
-        //    written: its roots are read out of the new root tree, and a
-        //    root tree that does not parse is refused while refusing is
-        //    still free.
-        let raw = self.superblock_image(blocks, commit)?;
+        // 0. The superblock images, backup slot included, before anything
+        //    is written: their roots are read out of the new root tree, and
+        //    a root tree that does not parse is refused while refusing is
+        //    still free. One per device: each device's superblock carries
+        //    its own `dev_item`, which the commit does not change (#298).
+        let images = self.superblock_images(blocks, commit)?;
 
         // 1. Every tree block, to every mirror. Nothing points at these
         //    yet, so their order among themselves does not matter --
@@ -116,7 +122,7 @@ impl Filesystem {
                     block.bytes.len()
                 )));
             }
-            Self::write_logical_all_mirrors(device, &self.map, block.logical, &block.bytes)?;
+            self.write_logical_all_mirrors(block.logical, &block.bytes)?;
         }
 
         // Blocks at these addresses may be cached from before they were
@@ -125,25 +131,29 @@ impl Filesystem {
 
         // 2. The barrier. Everything above must be on the device before
         //    anything below reaches it, because what follows is the
-        //    pointer to it.
-        device.flush()?;
+        //    pointer to it. On a pool, on every device: a tree block's
+        //    second copy is on the other disk.
+        self.flush_writable()?;
 
-        // 3. The superblocks, in address order. Each copy carries its
-        //    own address, so they are not identical images.
-        for &offset in &SUPER_OFFSETS {
-            if !self.superblock_copy_fits(offset) {
-                continue;
+        // 3. The superblocks, in address order, device by device. Each
+        //    copy carries its own address, so they are not identical
+        //    images.
+        for (device, raw) in &images {
+            for &offset in &SUPER_OFFSETS {
+                if !Self::superblock_copy_fits(device, offset) {
+                    continue;
+                }
+                let mut image = raw.clone();
+                super_write::set_bytenr(&mut image, offset);
+                super_write::stamp_checksum(&mut image, self.sb.csum_type);
+                device.write_at(offset, &image)?;
             }
-            let mut image = raw.clone();
-            super_write::set_bytenr(&mut image, offset);
-            super_write::stamp_checksum(&mut image, self.sb.csum_type);
-            device.write_at(offset, &image)?;
         }
 
         // 4. The second flush -- the commit point. The superblock writes
         //    carry no FUA, so this is what makes them durable rather
         //    than merely issued. Without it the commit is not a commit.
-        device.flush()?;
+        self.flush_writable()?;
         Ok(())
     }
 
@@ -153,8 +163,8 @@ impl Filesystem {
     /// fewer copies -- the traced commit wrote two, not three. Writing a
     /// copy past the end would either fail or, on a sparse file, silently
     /// extend it.
-    fn superblock_copy_fits(&self, offset: u64) -> bool {
-        offset + SUPERBLOCK_SIZE as u64 <= self.device.size_bytes()
+    fn superblock_copy_fits(device: &Arc<dyn BlockDevice>, offset: u64) -> bool {
+        offset + SUPERBLOCK_SIZE as u64 <= device.size_bytes()
     }
 
     /// The current superblock with `commit` applied.
@@ -163,14 +173,31 @@ impl Filesystem {
     /// struct: the superblock holds fields this driver does not model,
     /// and rebuilding it from what it understands would silently drop
     /// them.
-    fn superblock_image(&self, blocks: &[PlacedBlock], commit: &Commit) -> Result<Vec<u8>> {
-        let mut raw = vec![0u8; SUPERBLOCK_SIZE];
-        self.device.read_at(SUPER_OFFSETS[0], &mut raw)?;
-        super_write::apply(&mut raw, self.sb.csum_type, commit)?;
-        let roots = self.backup_roots(&raw, blocks, commit)?;
-        super_write::write_backup(&mut raw, commit.generation, &roots);
-        super_write::stamp_checksum(&mut raw, self.sb.csum_type);
-        Ok(raw)
+    ///
+    /// One per device written, each read from that device: a pool
+    /// member's superblock differs from the others' in its `dev_item`,
+    /// and only there, so the same commit applied to each keeps each
+    /// device's own.
+    fn superblock_images(
+        &self,
+        blocks: &[PlacedBlock],
+        commit: &Commit,
+    ) -> Result<Vec<SuperblockImage>> {
+        let mut roots = None;
+        let mut images = Vec::new();
+        for device in self.write_devices() {
+            let mut raw = vec![0u8; SUPERBLOCK_SIZE];
+            device.read_at(SUPER_OFFSETS[0], &mut raw)?;
+            super_write::apply(&mut raw, self.sb.csum_type, commit)?;
+            if roots.is_none() {
+                roots = Some(self.backup_roots(&raw, blocks, commit)?);
+            }
+            let roots = roots.as_ref().expect("filled above");
+            super_write::write_backup(&mut raw, commit.generation, roots);
+            super_write::stamp_checksum(&mut raw, self.sb.csum_type);
+            images.push((device, raw));
+        }
+        Ok(images)
     }
 
     /// The roots the commit leaves, for its backup slot (#78).

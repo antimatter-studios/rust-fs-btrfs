@@ -389,6 +389,10 @@ pub(crate) struct FileExtent {
     pub compressed: bool,
 }
 
+/// One piece of a write: the device, the physical offset on it, and
+/// the `[from, from + length)` of the caller's buffer that goes there.
+pub(crate) type WriteSpan = (Arc<dyn BlockDevice>, u64, usize, usize);
+
 /// A mounted Btrfs filesystem.
 pub struct Filesystem {
     pub(crate) device: Arc<dyn BlockRead>,
@@ -406,6 +410,14 @@ pub struct Filesystem {
     /// property of the type: the write path cannot compile without
     /// going through this field.
     pub(crate) writable: Option<Arc<dyn BlockDevice>>,
+    /// Every device of a pool opened for writing, by devid, the one in
+    /// [`Self::writable`] included.
+    ///
+    /// Empty unless [`Filesystem::mount_pool_rw`] opened the mount. A
+    /// write follows the `devid` each chunk stripe names to the device in
+    /// here, which is the whole difference between writing a pool and
+    /// writing the same offsets of one of its disks.
+    pub(crate) writable_pool: BTreeMap<u64, Arc<dyn BlockDevice>>,
     pub(crate) sb: Superblock,
     pub(crate) map: ChunkMap,
     pub(crate) fs_tree_root: u64,
@@ -597,29 +609,125 @@ impl Filesystem {
             return Err(Error::ReadOnly);
         }
         let fs = Self::open(device.clone(), Some(device))?;
-        crate::superblock::refuse_unmaintained_compat_ro(fs.sb.compat_ro_flags)?;
-        // Parity is read and rebuilt from, never updated: a write into a
-        // RAID5/6 chunk would leave its full stripe's parity describing
-        // bytes that are no longer there (#268).
-        if fs.sb.incompat_flags & crate::superblock::incompat::RAID56 != 0 {
-            return Err(Error::UnsupportedFeature(
-                "this volume uses RAID5/6, which can be read but not written: a write \
-                 would have to update parity"
-                    .into(),
-            ));
-        }
+        fs.refuse_unwritable()?;
+        Ok(fs)
+    }
+
+    /// What every read-write mount refuses, a pool's as one device's.
+    fn refuse_unwritable(&self) -> Result<()> {
+        crate::superblock::refuse_unmaintained_compat_ro(self.sb.compat_ro_flags)?;
         // A SEED DEVICE IS READ-ONLY BY CONSTRUCTION (#76). Another
         // filesystem is layered on it, and writes belong to that sprout;
         // writing the seed changes blocks the sprout depends on being
         // immutable. It still mounts read-only.
-        if fs.sb.is_seeding() {
+        if self.sb.is_seeding() {
             return Err(Error::UnsupportedFeature(
                 "this device is a seed for another filesystem, which can be read but not \
                  written; write to the filesystem sprouted from it"
                     .into(),
             ));
         }
+        // A PARITY CHUNK IS NOT A MIRROR. Writing one element of a RAID5
+        // or RAID6 stripe without recomputing P and Q leaves parity that
+        // rebuilds the wrong bytes the day a device is lost, and nothing
+        // here recomputes it yet (#299).
+        if self.sb.incompat_flags & crate::superblock::incompat::RAID56 != 0 {
+            return Err(Error::UnsupportedFeature(
+                "this filesystem has RAID5/6 chunks, which can be read but not written: a \
+                 write would leave their parity stale"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Open every device of a pool for reading **and writing**.
+    ///
+    /// [`Filesystem::mount_pool`] with the write capability, and
+    /// [`Filesystem::mount_rw`]'s refusals. A write lands on the device
+    /// each chunk stripe names, every copy of a mirrored chunk on its own
+    /// disk, and a commit writes every device's superblocks, each keeping
+    /// its own `dev_item` (#298). A single device is accepted, and is
+    /// [`Filesystem::mount_rw`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] when a device cannot be written;
+    /// [`Error::UnsupportedFeature`] for an incomplete set, devices of
+    /// different filesystems or two claiming one devid, as
+    /// [`Filesystem::mount_pool`] refuses them; and for a member whose
+    /// newest superblock is not its primary copy or is not of the same
+    /// generation as the rest. Such a member missed a commit the others
+    /// saw, and writing on top of it is a decision for `btrfs check`.
+    pub fn mount_pool_rw(devices: Vec<Arc<dyn BlockDevice>>) -> Result<Self> {
+        if devices.is_empty() {
+            return Err(Error::UnsupportedFeature(
+                "a pool needs at least one device".to_string(),
+            ));
+        }
+        if devices.iter().any(|d| !d.is_writable()) {
+            return Err(Error::ReadOnly);
+        }
+        let mut by_id: BTreeMap<u64, Arc<dyn BlockDevice>> = BTreeMap::new();
+        let mut first: Option<(crate::superblock::Superblock, usize)> = None;
+        for dev in devices {
+            let (sb, copy) = crate::superblock::read_superblock(&*dev)?;
+            let id = sb.dev_item.devid;
+            if let Some((seen, _)) = &first {
+                if seen.fsid != sb.fsid {
+                    return Err(Error::UnsupportedFeature(
+                        "these devices belong to different filesystems".to_string(),
+                    ));
+                }
+                if seen.generation != sb.generation {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "device {id} is at generation {} and the pool at {}: it missed a \
+                         commit, and the pool can be mounted read-only and should be checked \
+                         before it is written",
+                        sb.generation, seen.generation
+                    )));
+                }
+            }
+            if copy != 0 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "device {id}'s primary superblock is damaged or older than copy {copy}; \
+                     the pool can be mounted read-only, and should be checked before it is \
+                     written"
+                )));
+            }
+            first.get_or_insert((sb, copy));
+            if by_id.insert(id, dev).is_some() {
+                return Err(Error::UnsupportedFeature(format!(
+                    "two devices both claim to be device {id}"
+                )));
+            }
+        }
+        let (lowest, primary) = by_id
+            .iter()
+            .next()
+            .map(|(id, d)| (*id, Arc::clone(d)))
+            .expect("at least one device, checked above");
+        if by_id.len() == 1 {
+            return Self::mount_rw(primary);
+        }
+        let readers: BTreeMap<u64, Arc<dyn BlockRead>> = by_id
+            .iter()
+            .map(|(id, d)| (*id, Arc::clone(d) as Arc<dyn BlockRead>))
+            .collect();
+        let mut fs = Self::open_pool(Arc::clone(&readers[&lowest]), readers, Some(primary), None)?;
+        fs.refuse_unwritable()?;
+        fs.writable_pool = by_id;
         Ok(fs)
+    }
+
+    /// The same devices opened again, for the generation a commit just
+    /// wrote: the trees this mount holds are the previous one's.
+    pub(crate) fn remount_rw(&self) -> Result<Self> {
+        if !self.writable_pool.is_empty() {
+            return Self::mount_pool_rw(self.writable_pool.values().cloned().collect());
+        }
+        let device = self.writable.as_ref().ok_or(Error::ReadOnly)?;
+        Self::mount_rw(Arc::clone(device))
     }
 
     /// Whether this mount can write.
@@ -657,26 +765,56 @@ impl Filesystem {
         Ok(())
     }
 
-    /// Every `(physical, length)` a write of `len` bytes at `logical`
-    /// lands on: each mirror, split at chunk-stripe boundaries, each span
-    /// checked against the device before anything is written.
-    pub(crate) fn mirror_spans(
-        device: &Arc<dyn BlockDevice>,
-        map: &ChunkMap,
-        logical: u64,
-        len: usize,
-    ) -> Result<Vec<(u64, usize, usize)>> {
+    /// The device a stripe on `devid` is written to.
+    ///
+    /// On one device that is the device, whatever the stripe says, as on
+    /// the read path. On a pool it is the member with that devid, and a
+    /// stripe naming one that was not given is refused rather than
+    /// written to the offset it names on some other disk.
+    fn write_device(&self, devid: u64) -> Result<&Arc<dyn BlockDevice>> {
+        if self.writable_pool.is_empty() {
+            return self.writable.as_ref().ok_or(Error::ReadOnly);
+        }
+        self.writable_pool.get(&devid).ok_or_else(|| {
+            Error::UnsupportedFeature(format!(
+                "a chunk stripe names device {devid}, which is not in this pool"
+            ))
+        })
+    }
+
+    /// Every device this mount writes, each once.
+    pub(crate) fn write_devices(&self) -> Vec<Arc<dyn BlockDevice>> {
+        if self.writable_pool.is_empty() {
+            return self.writable.iter().cloned().collect();
+        }
+        self.writable_pool.values().cloned().collect()
+    }
+
+    /// Flush every device this mount writes.
+    pub(crate) fn flush_writable(&self) -> Result<()> {
+        for device in self.write_devices() {
+            device.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Every [`WriteSpan`] a write of `len` bytes at
+    /// `logical` lands on: each mirror, on the device its stripe names,
+    /// split at chunk-stripe boundaries, each span checked against its
+    /// device before anything is written.
+    pub(crate) fn mirror_spans(&self, logical: u64, len: usize) -> Result<Vec<WriteSpan>> {
         let mut spans = Vec::new();
-        for mirror in 0..map.mirrors_at(logical)? {
+        for mirror in 0..self.map.mirrors_at(logical)? {
             let mut done = 0usize;
             while done < len {
-                let m = map.map_mirror(logical + done as u64, mirror)?;
+                let m = self.map.map_mirror(logical + done as u64, mirror)?;
                 let n = (m.len as usize).min(len - done);
                 if n == 0 {
                     return Err(Error::UnmappedLogical(logical + done as u64));
                 }
+                let device = self.write_device(m.devid)?;
                 Self::writable_span(device, m.physical, n)?;
-                spans.push((m.physical, done, n));
+                spans.push((Arc::clone(device), m.physical, done, n));
                 done += n;
             }
         }
@@ -707,13 +845,8 @@ impl Filesystem {
     /// is possible and not cleaned up: some mirrors may hold the new
     /// contents and some the old, which is the same state a power loss
     /// produces and is what the commit ordering exists to survive.
-    pub(crate) fn write_logical_all_mirrors(
-        device: &Arc<dyn BlockDevice>,
-        map: &ChunkMap,
-        logical: u64,
-        buf: &[u8],
-    ) -> Result<()> {
-        for (physical, from, n) in Self::mirror_spans(device, map, logical, buf.len())? {
+    pub(crate) fn write_logical_all_mirrors(&self, logical: u64, buf: &[u8]) -> Result<()> {
+        for (device, physical, from, n) in self.mirror_spans(logical, buf.len())? {
             device.write_at(physical, &buf[from..from + n])?;
         }
         Ok(())
@@ -924,6 +1057,7 @@ impl Filesystem {
             device,
             devices,
             writable,
+            writable_pool: BTreeMap::new(),
             sb,
             map,
             fs_tree_root,
@@ -1222,6 +1356,7 @@ impl Filesystem {
             device: self.device.clone(),
             devices: self.devices.clone(),
             writable: None,
+            writable_pool: BTreeMap::new(),
             sb: self.sb.clone(),
             map: self.map.clone(),
             fs_tree_root,
