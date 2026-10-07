@@ -55,6 +55,14 @@ never does.
   copy-on-write write replaces, a change can give up extents with no copy
   taking their place, with the same refusal of any extent held by more than
   the item being removed.
+- **A file that asks for compression is written compressed.** A
+  copy-on-write copy of up to 128 KiB in a file marked `chattr +c`, or whose
+  compression property names zlib, is stored as one zlib stream padded to a
+  sector when that saves a sector, with its extent record, free space, block
+  group `used` and digests counting the on-disk length. A compressed extent
+  can now be overwritten too: the copy is made from its decoded bytes. zstd
+  and LZO are not written; a file asking for them is stored uncompressed
+  (#265).
 - **A transaction can put and delete fs tree items.** The planner renders item
   edits into the leaves they land in, and a leaf whose first key changes has
   its parent's key follow it.

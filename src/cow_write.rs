@@ -16,7 +16,11 @@
 //!    covers, and filled with them — the old contents with the write
 //!    applied. The copy is the item's window of the old extent, not the
 //!    whole of it, so the new item references all of its extent from
-//!    offset zero.
+//!    offset zero. A file that asks for compression (`chattr +c`, or the
+//!    compression property naming zlib) has a copy of up to 128 KiB
+//!    stored as one zlib stream padded to a sector, when that saves a
+//!    sector (#265); the old extent may be compressed or not, since the
+//!    copy is made from its decoded bytes.
 //! 2. **The file's `EXTENT_DATA` item** is pointed at it, in place: the
 //!    item keeps its size, so its leaf cannot overflow.
 //! 3. **The extent tree** loses the old extent's `EXTENT_ITEM` and gains
@@ -46,8 +50,8 @@
 //!   are not written yet;
 //! - a write that **grows** the file, or lands in a **hole**: both
 //!   allocate where the file has no extent item to repoint;
-//! - an **inline**, **preallocated** or **compressed** extent: each
-//!   changes the item's kind, not only where it points;
+//! - an **inline** or **preallocated** extent: each changes the item's
+//!   kind, not only where it points;
 //! - a **shared** extent — more than one reference, or one the last
 //!   snapshot could still be reading: releasing it would free bytes
 //!   another reader holds.
@@ -143,14 +147,14 @@ impl Filesystem {
         // Every refusal before anything is allocated.
         let targets = self.plan_cow_targets(ino, offset, end)?;
 
-        let lens: Vec<u64> = targets.iter().map(|t| t.len).collect();
-        let news = self.find_data_extents(&lens)?;
-
         // Each copy: the item's bytes as they read now, with the write
         // laid over them. Past the end of the file the last sector reads
-        // as zeros, and that is what the copy holds there.
-        let mut contents: Vec<(u64, Vec<u8>)> = Vec::with_capacity(targets.len());
-        for (t, &at) in targets.iter().zip(&news) {
+        // as zeros, and that is what the copy holds there. Then the bytes
+        // it is stored as: compressed, for a file that asks for it, when
+        // that saves a sector (#265).
+        let zlib = self.compresses_with_zlib(inode)?;
+        let mut encoded: Vec<(Vec<u8>, u8)> = Vec::with_capacity(targets.len());
+        for t in &targets {
             let size = usize::try_from(t.len)
                 .map_err(|_| Error::UnsupportedFeature(format!("an extent of {} bytes", t.len)))?;
             let mut buf = vec![0u8; size];
@@ -159,8 +163,17 @@ impl Filesystem {
             let to = end.min(t.start + t.len);
             buf[(from - t.start) as usize..(to - t.start) as usize]
                 .copy_from_slice(&data[(from - offset) as usize..(to - offset) as usize]);
-            contents.push((at, buf));
+            encoded.push(self.encode_copy(buf, zlib));
         }
+
+        let lens: Vec<u64> = encoded.iter().map(|(b, _)| b.len() as u64).collect();
+        let news = self.find_data_extents(&lens)?;
+        let compression: Vec<u8> = encoded.iter().map(|(_, c)| *c).collect();
+        let contents: Vec<(u64, Vec<u8>)> = news
+            .iter()
+            .copied()
+            .zip(encoded.into_iter().map(|(b, _)| b))
+            .collect();
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -174,13 +187,16 @@ impl Filesystem {
             ino,
             moves: targets
                 .iter()
-                .zip(&news)
-                .map(|(t, &new)| DataMove {
+                .zip(&contents)
+                .zip(&compression)
+                .map(|((t, (new, bytes)), &compression)| DataMove {
                     old: t.extent_start,
                     old_len: t.extent_len,
                     old_ref_offset: t.start - t.extent_offset,
-                    new,
+                    new: *new,
                     len: t.len,
+                    disk_len: bytes.len() as u64,
+                    compression,
                     file_offset: t.start,
                 })
                 .collect(),
@@ -233,7 +249,7 @@ impl Filesystem {
             + write
                 .moves
                 .iter()
-                .map(|m| i128::from(m.len) - i128::from(m.old_len))
+                .map(|m| i128::from(m.disk_len) - i128::from(m.old_len))
                 .sum::<i128>();
         let bytes_used = match delta {
             0 => None,
@@ -295,25 +311,28 @@ impl Filesystem {
                      rather than replacing one"
                 )));
             };
-            if piece.compressed {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino}: offset {pos} is in a compressed extent, and replacing one \
-                     is not implemented"
-                )));
-            }
-            let Some(logical) = piece.logical else {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino}: offset {pos} is inline or preallocated, and writing it \
-                     changes the item's kind, which is not implemented"
-                )));
+            // A compressed extent's window is in its decoded bytes, which
+            // reading it already bounds by `ram_bytes`; on disk the whole
+            // extent is released, so there is no window to check there.
+            let logical = if piece.compressed {
+                None
+            } else {
+                Some(piece.logical.ok_or_else(|| {
+                    Error::UnsupportedFeature(format!(
+                        "inode {ino}: offset {pos} is inline or preallocated, and writing it \
+                         changes the item's kind, which is not implemented"
+                    ))
+                })?)
             };
             let (refs, extent_len, generation) = self.extent_item(piece.extent_start)?;
-            if !window_inside_extent(logical, piece.len, piece.extent_start, extent_len) {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino}: offset {pos} maps to [{logical}, +{}), outside the \
-                     {extent_len}-byte extent the extent tree records at {}",
-                    piece.len, piece.extent_start
-                )));
+            if let Some(logical) = logical {
+                if !window_inside_extent(logical, piece.len, piece.extent_start, extent_len) {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "inode {ino}: offset {pos} maps to [{logical}, +{}), outside the \
+                         {extent_len}-byte extent the extent tree records at {}",
+                        piece.len, piece.extent_start
+                    )));
+                }
             }
             if refs != 1 {
                 return Err(Error::UnsupportedFeature(format!(
@@ -336,11 +355,49 @@ impl Filesystem {
                 len: piece.len,
                 extent_start: piece.extent_start,
                 extent_len,
-                extent_offset: logical - piece.extent_start,
+                extent_offset: piece.ref_offset,
             });
             pos = piece.start + piece.len;
         }
         Ok(out)
+    }
+
+    /// Whether copies of `inode` are stored zlib-compressed (#265).
+    ///
+    /// A file asks for compression with the `COMPRESS` inode flag
+    /// (`chattr +c`, or `btrfs property set ... compression`, which sets
+    /// it too) and declines it with `NOCOMPRESS`. The property names the
+    /// algorithm; zlib is the only one written here, so a file whose
+    /// property names zstd or LZO is stored uncompressed, which every
+    /// reader accepts — compression is the file's preference, not part
+    /// of its contents.
+    fn compresses_with_zlib(&self, inode: &Inode) -> Result<bool> {
+        if inode.flags & INODE_COMPRESS == 0 || inode.flags & INODE_NOCOMPRESS != 0 {
+            return Ok(false);
+        }
+        Ok(match self.get_xattr(inode.ino, b"btrfs.compression")? {
+            None => true,
+            Some(algorithm) => algorithm.starts_with(b"zlib"),
+        })
+    }
+
+    /// The bytes a copy is stored as, and its compression type: one zlib
+    /// stream padded to a sector when `zlib` and that saves at least a
+    /// sector, as the kernel requires before it keeps a compressed
+    /// extent; otherwise the bytes as they are. A copy longer than a
+    /// compressed extent may hold (128 KiB) is never compressed.
+    fn encode_copy(&self, plain: Vec<u8>, zlib: bool) -> (Vec<u8>, u8) {
+        let sector = self.sb.sectorsize as usize;
+        if !zlib || plain.len() > crate::compression::MAX_UNCOMPRESSED {
+            return (plain, COMPRESS_NONE);
+        }
+        let mut packed = crate::compression::compress_zlib(&plain);
+        let on_disk = packed.len().next_multiple_of(sector);
+        if on_disk + sector > plain.len() {
+            return (plain, COMPRESS_NONE);
+        }
+        packed.resize(on_disk, 0);
+        (packed, COMPRESS_ZLIB)
     }
 
     /// The checksum tree edits a write makes (#261), or a truncate
@@ -470,6 +527,14 @@ impl Filesystem {
         Ok(deletes)
     }
 }
+
+/// `BTRFS_INODE_NOCOMPRESS` and `BTRFS_INODE_COMPRESS`.
+const INODE_NOCOMPRESS: u64 = 1 << 3;
+const INODE_COMPRESS: u64 = 1 << 11;
+
+/// An extent item's `compression` byte: none, and zlib.
+const COMPRESS_NONE: u8 = 0;
+const COMPRESS_ZLIB: u8 = 1;
 
 /// A leaf's header, and the header of each item in it.
 const LEAF_HEADER: usize = 101;
