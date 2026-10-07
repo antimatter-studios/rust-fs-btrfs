@@ -51,6 +51,15 @@ never does.
   directory whose leaf has no room, and the last name of a file still holding
   data extents, are refused with nothing written; `rename` and `truncate` are
   still to come (#262).
+- **Extended attributes, ACLs, mode, owner and times can be written.**
+  `Filesystem::set_xattr`, `remove_xattr`, `set_mode`, `set_owner` and
+  `set_times` each commit one transaction on the top-level subvolume and move
+  the inode's change time, as Linux does; an ACL is the
+  `system.posix_acl_access` or `system.posix_acl_default` attribute in the
+  kernel's encoding. The C ABI gains `fs_btrfs_setxattr`,
+  `fs_btrfs_removexattr`, `fs_btrfs_chmod`, `fs_btrfs_chown` and
+  `fs_btrfs_utimens` (with `FS_BTRFS_UTIME_OMIT`). A leaf with no room for a
+  new attribute item is refused with nothing written (#263).
 - **A transaction can put and delete fs tree items.** The planner renders item
   edits into the leaves they land in, and a leaf whose first key changes has
   its parent's key follow it.
