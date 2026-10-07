@@ -143,8 +143,16 @@ impl Filesystem {
     /// Propagates a tree read failure. An empty result is not an error
     /// here but is close to impossible — a filesystem with no block
     /// group has nowhere for its own root tree to live.
+    ///
+    /// From the block group tree when the volume has one, and the extent
+    /// tree otherwise: with the `block_group_tree` feature the extent tree
+    /// holds none, and reading it there found an empty list (#270).
     pub fn block_groups(&self) -> Result<Vec<BlockGroup>> {
-        let root = self.tree_root(objectid::EXTENT_TREE)?;
+        let root = self.tree_root(if self.superblock().has_block_group_tree() {
+            objectid::BLOCK_GROUP_TREE
+        } else {
+            objectid::EXTENT_TREE
+        })?;
         let reader = self.pool_reader();
         let tree = reader.tree();
 

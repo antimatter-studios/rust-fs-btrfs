@@ -110,6 +110,10 @@ pub mod objectid {
     /// `BTRFS_FREE_SPACE_TREE_OBJECTID` — the tree recording what is
     /// free, as opposed to the extent tree recording what is not.
     pub const FREE_SPACE_TREE: u64 = 10;
+    /// `BTRFS_BLOCK_GROUP_TREE_OBJECTID` — where the block group items
+    /// are on a volume with the `block_group_tree` feature, instead of
+    /// the extent tree.
+    pub const BLOCK_GROUP_TREE: u64 = 11;
     /// `BTRFS_FIRST_CHUNK_TREE_OBJECTID` — the objectid every chunk item
     /// is filed under.
     pub const FIRST_CHUNK_TREE: u64 = 256;
