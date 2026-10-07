@@ -490,12 +490,15 @@ tasks:
     # because a mount that succeeds while the kernel logs a warning is
     # not a pass.
     #
-    # Budget: 406 lines, 33643 bytes measured with cli_mkfs_kernel and
-    # cli_label_kernel both in the tier (#259, #264; run 37376331688), so 415
-    # lines and 34500 bytes.
+    # Budget: 424 lines, 34480 bytes measured with send_stream_kernel in
+    # the tier (#294; run 37616775408, every test passing), past the old
+    # 415. The row is sized once for the kernel tests the open send-stream
+    # and subvolume pull requests add, each section measured at 17 to 21
+    # lines and 0.7 to 1.4 KB (runs 37604852088, 37609289817): about 476
+    # lines and 37900 bytes with all of them, so 500 lines and 40000 bytes.
     cmds:
       - test-disks/build-fixtures.sh --check
-      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 415 34500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 500 40000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
