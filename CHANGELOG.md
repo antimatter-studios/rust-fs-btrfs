@@ -143,6 +143,12 @@ never does.
   still overwritten in place, and any other unchecksummed file is written into
   new extents and committed as one transaction. What that path cannot write yet
   is refused with the case named and #261 cited (#274).
+- **A volume with simple quotas is read.** The `simple_quota` incompat bit
+  refused the mount; it moves no file's bytes, so a read-only mount now
+  accepts it, checked against a volume btrfs-progs 7.1 formatted with
+  `-O squota --rootdir`, which `btrfs check` finds clean. An extent carrying an
+  owner reference, which only a kernel of 6.7 or later writes, is not covered
+  yet. A read-write mount is refused, naming simple quotas (#270).
 
 ### Fixed
 
