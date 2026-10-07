@@ -11,9 +11,16 @@
 //! on by btrfs-progs' own `mkfs.btrfs --rootdir` from a directory tree in
 //! the harness VM (the guest's kernel predates simple quotas, so it
 //! cannot fill one); the builder refuses to publish it unless the
-//! superblock carries the bit, the extent tree holds an owner reference,
-//! and that btrfs-progs' `btrfs check` finds it clean. Its manifest is
-//! every file's size and SHA-256 as they were in the directory.
+//! superblock carries the bit and that btrfs-progs' `btrfs check` finds it
+//! clean. Its manifest is every file's size and SHA-256 as they were in
+//! the directory.
+//!
+//! WHAT THIS DOES NOT COVER: an extent with an owner reference. mkfs
+//! writes none for the files it copies in, as the kernel writes none for
+//! an extent older than the feature's enabling; only a kernel of 6.7 or
+//! later, writing under simple quotas, does. Reading a file never looks
+//! at the extent tree, but `fsck.btrfs` does, and its handling of that
+//! inline reference waits for a guest that can make one.
 
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs_test_support::{fixture, sha256_hex, temp_path};

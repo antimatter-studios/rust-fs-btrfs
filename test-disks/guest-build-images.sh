@@ -1685,9 +1685,9 @@ build_seed() {
 }
 
 # ---------------------------------------------------------------------
-# squota — simple quotas (`-O squota`), with content, so its data
-# extents carry the owner references simple quotas add (#270). The
-# manifest is every file's size and SHA-256.
+# squota — simple quotas (`-O squota`), with content (#270). The
+# manifest is every file's size and SHA-256, then a comment line counting
+# the owner references in the extent tree.
 #
 # MADE BY MKFS, NOT FILLED BY THE KERNEL. Simple quotas arrived in Linux
 # and btrfs-progs 6.7; the guest runs Debian 12's 6.1 kernel, which
@@ -1695,8 +1695,9 @@ build_seed() {
 # does not know the feature (CI run 37610992432). So the static
 # btrfs-progs scripts/vm-setup.sh installs formats it with `--rootdir`,
 # copying a directory tree in as it builds the filesystem, and its own
-# `btrfs check` and `dump-tree` are the oracles that it is sound and
-# carries the owner references.
+# `btrfs check` and `dump-super` are the oracles that it is sound and
+# carries the feature. Its extents carry no owner references; a volume
+# with them needs a guest kernel of 6.7 or later.
 #
 # In its own directory: it is refused for writing on purpose, and the
 # suites that walk every image in test-disks/ try to write each one.
@@ -1722,11 +1723,12 @@ build_squota() {
         echo "guest-build-images: btrfs-squota does not carry SIMPLE_QUOTA" >&2
         exit 1
     }
-    "$STATIC_PROGS/btrfs" inspect-internal dump-tree -t extent "$img" \
-        | grep -q 'EXTENT_OWNER_REF' || {
-        echo "guest-build-images: btrfs-squota has no owner reference in its extent tree" >&2
-        exit 1
-    }
+    # Recorded, not required: mkfs adds no owner reference to the extents
+    # it copies in (CI run 37619450394), as the kernel adds none to an
+    # extent that predates simple quotas being enabled. Only a kernel
+    # that knows the feature writes them, and this guest's does not.
+    printf '# owner references: %s\n' "$("$STATIC_PROGS/btrfs" inspect-internal \
+        dump-tree -t extent "$img" | grep -c 'EXTENT_OWNER_REF' || true)" >> "$manifest"
     "$STATIC_PROGS/btrfs" check --readonly "$img" >/dev/null 2>&1 || {
         echo "guest-build-images: btrfs check does not find btrfs-squota clean" >&2
         "$STATIC_PROGS/btrfs" check --readonly "$img" >&2 || true
