@@ -1444,3 +1444,42 @@ unsafe fn remove(fs: *mut fs_btrfs_fs, path: *const c_char, dir: bool) -> c_int 
         }
     }
 }
+
+/// Set the length of the regular file at `path` to `size`, as one
+/// committed transaction. Shrinking releases the extents wholly past the
+/// new end; growing needs the volume's no-holes feature.
+///
+/// Returns 0, or -1 with the error recorded: ENOENT for no such path,
+/// EISDIR for anything but a regular file, EROFS on a read-only handle,
+/// and ENOTSUP for what cannot be written yet — an extent a snapshot or a
+/// reflink shares, or growing a file whose last sector is partly past its
+/// end.
+///
+/// # Safety
+///
+/// `fs` must be a live handle and `path` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_truncate(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+    size: u64,
+) -> c_int {
+    guard(-1, || {
+        let Some(fs) = (unsafe { handle_mut(fs) }) else {
+            return -1;
+        };
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
+            return -1;
+        };
+        let changed = fs
+            .lookup_path_bytes(path)
+            .and_then(|inode| fs.truncate(inode.ino, size));
+        match changed {
+            Ok(()) => 0,
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
+}

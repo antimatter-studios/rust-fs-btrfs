@@ -60,6 +60,7 @@
 //! - [`write`](mod@write) — the in-place file write, which commits nothing
 //! - [`cow_write`] — the copy-on-write file write, which commits a transaction
 //! - [`namespace`] — names in a directory: create, mkdir, symlink, link, unlink, rmdir
+//! - [`truncate`] — a regular file's length, shrunk or grown
 //! - [`transaction`], [`extent_write`], [`block_group`] and [`commit`] — tree
 //!   rewrites and the commit of a new generation, separate from file writes
 //! - [`send`] — send streams: parsed, and written from a read-only subvolume
@@ -90,6 +91,7 @@ pub mod super_write;
 pub mod superblock;
 pub mod transaction;
 pub mod tree_write;
+pub mod truncate;
 pub mod write;
 pub mod xattr;
 

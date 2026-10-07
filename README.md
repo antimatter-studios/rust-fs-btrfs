@@ -67,6 +67,7 @@ Metadata is JSON on stdout by default, `--text` for people. A failure is
 | `mkdir PATH` / `create PATH` | an empty directory (mode 0755) or regular file (0644), `--mode OCTAL` to choose, owned like its directory; one transaction each |
 | `rm PATH` / `rmdir PATH` | removes a name, and the file with its last one, or an empty directory. The last name of a file still holding data is refused with exit 3 ([#262][i262]) |
 | `ln [-s] TARGET PATH` | a hard link to an existing file, or with `-s` a symbolic link whose target is TARGET as given |
+| `truncate PATH BYTES` | sets a file's length: shorter releases what lies past the end, longer needs the no-holes feature. A shared extent, or growing a file whose last sector is partly past its end, is refused with exit 3 ([#262][i262]) |
 | `set label VALUE` | writes the label (at most 255 bytes) into every superblock copy, each with a fresh checksum; a pool of several devices is refused |
 | `resize` | not implemented (exit 3): no resize |
 
