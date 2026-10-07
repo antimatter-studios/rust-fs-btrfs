@@ -39,7 +39,7 @@ set -euo pipefail
 OUT="$1"
 shift
 
-TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog cli features"
+TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog cli features scrub"
 
 # ARGUMENTS FIRST, ENVIRONMENT SECOND. A misspelt target is the caller's
 # mistake and should be named as one wherever it is made; the root and
@@ -1326,6 +1326,92 @@ build_features() {
         rm -f "$f"
     done
     note "built features/btrfs-bgt"
+}
+
+# ---------------------------------------------------------------------
+# scrub — a DUP volume with three copies damaged on purpose, and what the
+# kernel's own read-only scrub said about it (#268).
+#
+#   the second copy of the first data sector of a.bin
+#   the first copy of its second data sector
+#   the second copy of the fs tree's root block
+#
+# Each copy is found with btrfs-map-logical and overwritten with dd while
+# the volume is not mounted, then the volume is mounted read-only and
+# `btrfs scrub start -B -R -r` run over it. The manifest records the
+# damaged addresses (logical, and the copy as the kernel numbers them,
+# from 1), the scrub's counters, and the kernel's log lines about it.
+#
+# In its own directory: it is damaged on purpose, and the suites that
+# walk every image in test-disks/ would rightly complain about it.
+# ---------------------------------------------------------------------
+build_scrub() {
+    local img="$WORK/btrfs-scrub.img" manifest="$WORK/btrfs-scrub.manifest"
+    local data tree p
+    command -v btrfs-map-logical >/dev/null || {
+        echo "guest-build-images.sh: btrfs-map-logical (btrfs-progs) is not in the guest." >&2
+        exit 1
+    }
+    rm -f "$img" "$manifest"
+    truncate -s 512M "$img"
+    mkfs.btrfs -f -d dup -m dup "$img" >/dev/null
+    mount -o loop "$img" "$MNT"
+    dd if=/dev/urandom of="$MNT/a.bin" bs=64K count=4 status=none
+    echo "small" > "$MNT/small.txt"
+    sync
+    umount "$MNT"
+
+    data=$(btrfs inspect-internal dump-tree -t 5 "$img" \
+        | awk '/extent data disk byte/ && $5 != 0 { print $5; exit }')
+    tree=$(btrfs inspect-internal dump-tree -t 5 "$img" \
+        | awk '/^(leaf|node) [0-9]+ / { print $2; exit }')
+    [ -n "$data" ] && [ -n "$tree" ] || {
+        echo "guest-build-images: btrfs-scrub: no data extent or fs tree root found" >&2
+        exit 1
+    }
+    # copy <logical> <mirror from 1>: the physical offset of that copy.
+    copy() {
+        btrfs-map-logical -l "$1" -b 4096 "$img" 2>/dev/null \
+            | awk -v m="$2" '$1 == "mirror" && $2 == m { print $6; exit }'
+    }
+    {
+        echo "# damaged: <what> <logical> <copy, from 1>"
+        for spec in "data $data 2" "data $((data + 4096)) 1" "tree $tree 2"; do
+            set -- $spec
+            p=$(copy "$2" "$3")
+            [ -n "$p" ] || {
+                echo "guest-build-images: btrfs-scrub: no copy $3 of $2" >&2
+                exit 1
+            }
+            # 64 bytes inside the sector, past a tree block's checksum
+            # field: the block no longer verifies, and is still one.
+            dd if=/dev/urandom of="$img" bs=1 seek=$((p + 512)) count=64 \
+                conv=notrunc status=none
+            echo "damaged $1 $2 $3"
+        done
+    } > "$manifest"
+
+    dmesg -C 2>/dev/null || true
+    mount -o loop,ro "$img" "$MNT"
+    {
+        echo "# btrfs scrub start -B -R -r"
+        btrfs scrub start -B -R -r "$MNT" 2>&1 || true
+        echo "# kernel log"
+        dmesg 2>/dev/null | grep -i 'btrfs' || true
+    } >> "$manifest"
+    umount "$MNT"
+    grep -q 'csum_errors' "$manifest" || {
+        echo "guest-build-images: btrfs-scrub: the scrub printed no counters" >&2
+        exit 1
+    }
+    mkdir -p "$OUT/scrub"
+    local f
+    for f in "$img" "$manifest"; do
+        cp --sparse=always "$f" "$OUT/scrub/$(basename "$f").partial"
+        mv -f "$OUT/scrub/$(basename "$f").partial" "$OUT/scrub/$(basename "$f")"
+        rm -f "$f"
+    done
+    note "built scrub/btrfs-scrub"
 }
 
 # ---------------------------------------------------------------------

@@ -432,6 +432,9 @@ tasks:
       # one volume per optional on-disk feature; its own directory, as
       # some are refused for writing on purpose
       - test-disks/features/btrfs-bgt.img
+      # a DUP volume with three copies damaged on purpose, and the
+      # kernel's read-only scrub of it
+      - test-disks/scrub/btrfs-scrub.img
     # A hung boot must not hold the VM and the machine-wide slot for
     # ever. The split fixtures alone mount and unmount up to four hundred
     # times, and the populated pair writes eighty thousand files, so this
@@ -447,7 +450,7 @@ tasks:
     cmds:
       - |
         set -eu
-        rm -rf test-disks/snapshot test-disks/dirtylog test-disks/features
+        rm -rf test-disks/snapshot test-disks/dirtylog test-disks/features test-disks/scrub
         rm -f test-disks/btrfs-*.img test-disks/*.superdump test-disks/*.manifest \
               test-disks/*.compression test-disks/*.super test-disks/btrfs-split*.txt
 
