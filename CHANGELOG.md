@@ -59,6 +59,15 @@ never does.
 - **A data sector that fails its checksum is read from the next copy.** The
   second copy of a DUP or RAID1 chunk was used for tree blocks only; a file's
   data now falls back the same way before it is refused (#268).
+- **A subvolume can be made read-only or writable again (#267, first
+  slice).** `Filesystem::set_subvolume_read_only` sets or clears bit 0 of the
+  subvolume's `ROOT_ITEM` flags and commits it as one copy-on-write
+  transaction, as `btrfs property set <subvol> ro` does. A received subvolume is
+  refused when made writable, because its received UUID would have to be
+  cleared. `tests/subvol_readonly_kernel.rs` has `btrfs check` find the volume
+  clean, `btrfs property get` report the new flags, and the kernel refuse a
+  write into the newly read-only subvolume and accept one into the newly
+  writable snapshot.
 
 ### Changed
 

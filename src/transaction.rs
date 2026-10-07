@@ -136,6 +136,10 @@ pub(crate) struct DataWrite {
     /// The modification time stamped on the inode, as seconds and
     /// nanoseconds since the epoch.
     pub time: (u64, u32),
+    /// A subvolume whose `ROOT_ITEM` flags change, and the flags it gets:
+    /// `(objectid, flags)`. The item keeps its size, so the root tree leaf
+    /// holding it is rewritten in place.
+    pub root_flags: Option<(u64, u64)>,
 }
 
 impl DataWrite {
@@ -287,7 +291,7 @@ impl Filesystem {
     }
 
     /// The root tree leaf holding the `ROOT_ITEM` for `objectid`.
-    fn root_item_leaf(&self, objectid: u64) -> Result<Option<u64>> {
+    pub(crate) fn root_item_leaf(&self, objectid: u64) -> Result<Option<u64>> {
         let mut found = None;
         self.for_each_tree_block(self.sb.root, &mut |at, block, _| {
             if found.is_some() {
@@ -575,6 +579,18 @@ impl Filesystem {
 
                     // A root tree leaf names other trees' roots.
                     if rewrite.owner == objectid::ROOT_TREE {
+                        if let Some((id, flags)) = data.root_flags {
+                            for item in &mut owned {
+                                if item.key.objectid == id
+                                    && item.key.key_type == ROOT_ITEM_KEY
+                                    && item.data.len() >= root_item::MIN_SIZE
+                                {
+                                    item.data[root_item::FLAGS..root_item::FLAGS + 8]
+                                        .copy_from_slice(&flags.to_le_bytes());
+                                    applied.root_flags += 1;
+                                }
+                            }
+                        }
                         for item in &mut owned {
                             if item.key.key_type != ROOT_ITEM_KEY
                                 || item.data.len() < root_item::LEVEL + 1
@@ -625,6 +641,17 @@ impl Filesystem {
                 "the plan moves the used count of the block group at {start} by {delta} bytes, \
                  but the leaf holding its block group item is not one the plan rewrites"
             )));
+        }
+        // NOR IS A FLAG CHANGE: a plan that missed the leaf holding the
+        // subvolume's root item would commit nothing and report success.
+        if let Some((id, _)) = data.root_flags {
+            if applied.root_flags != 1 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "the plan rewrote {} root items of subvolume {id}, not the one whose \
+                     flags change",
+                    applied.root_flags
+                )));
+            }
         }
         // NOR IS A FILE WRITE. Every part of it is in a leaf the plan was
         // closed over, so a part not applied means the leaf it is in was
@@ -1278,6 +1305,8 @@ struct DataApplied {
     released: usize,
     /// New data extents recorded.
     recorded: usize,
+    /// `ROOT_ITEM`s whose flags were set.
+    root_flags: usize,
 }
 
 /// Offsets within a data extent's `EXTENT_ITEM` body carrying one inline
