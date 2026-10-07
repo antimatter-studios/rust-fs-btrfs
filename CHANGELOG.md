@@ -28,6 +28,9 @@ never does.
   `fs_btrfs_readlink`, `fs_btrfs_listxattr` and `fs_btrfs_getxattr` stopped at
   a subvolume's boundary while `fs_btrfs_dir_open` listed what was beyond it;
   every reading call now crosses (#271).
+- **A transient HTTP 5xx from the chore release download no longer fails a CI
+  job.** `scripts/ci-install-chore.sh` retries both downloads up to five times
+  on any error; the checksum check still guards what was fetched.
 
 ## [0.10.2] — 2026-10-07
 
