@@ -181,6 +181,56 @@ pub mod attr {
     pub const CLONE_LEN: u16 = 24;
 }
 
+/// What is wrong with a send stream.
+///
+/// Separate from the crate's [`Error`]: a stream is bytes handed in, not
+/// a volume read, and "malformed" here says nothing about any filesystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StreamError {
+    /// The stream is malformed: a wrong magic, a command or attribute that
+    /// runs past its end, a missing or misshapen attribute, or no end
+    /// command. Names the byte offset where it can.
+    Malformed(String),
+    /// A command's checksum disagrees with its bytes.
+    ChecksumMismatch {
+        /// Where the command starts in the stream.
+        offset: u64,
+    },
+    /// A stream version this does not read.
+    UnsupportedVersion(u32),
+}
+
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamError::Malformed(m) => write!(f, "malformed send stream: {m}"),
+            StreamError::ChecksumMismatch { offset } => {
+                write!(
+                    f,
+                    "the send stream command at byte {offset} failed its checksum"
+                )
+            }
+            StreamError::UnsupportedVersion(v) => {
+                write!(f, "send stream version {v}; versions 1 and 2 are read")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StreamError {}
+
+impl From<StreamError> for Error {
+    /// Writing a stream fails this way only for a value no attribute can
+    /// hold, which is a case the format cannot carry.
+    fn from(e: StreamError) -> Self {
+        Error::UnsupportedFeature(e.to_string())
+    }
+}
+
+/// A result whose error is a [`StreamError`].
+pub type StreamResult<T> = std::result::Result<T, StreamError>;
+
 /// The name `btrfs receive --dump` prints for a command number.
 pub fn command_name(cmd: u16) -> Option<&'static str> {
     Some(match cmd {
@@ -236,10 +286,10 @@ impl Command {
     ///
     /// # Errors
     ///
-    /// [`Error::BadSendStream`] when it is absent.
-    pub fn require(&self, ty: u16) -> Result<&[u8]> {
+    /// [`StreamError::Malformed`] when it is absent.
+    pub fn require(&self, ty: u16) -> StreamResult<&[u8]> {
         self.attr(ty).ok_or_else(|| {
-            Error::BadSendStream(format!(
+            StreamError::Malformed(format!(
                 "a {} command has no attribute {ty}",
                 command_name(self.cmd).unwrap_or("unknown")
             ))
@@ -250,11 +300,11 @@ impl Command {
     ///
     /// # Errors
     ///
-    /// [`Error::BadSendStream`] when it is absent or not eight bytes.
-    pub fn u64(&self, ty: u16) -> Result<u64> {
+    /// [`StreamError::Malformed`] when it is absent or not eight bytes.
+    pub fn u64(&self, ty: u16) -> StreamResult<u64> {
         let v = self.require(ty)?;
         let bytes: [u8; 8] = v.try_into().map_err(|_| {
-            Error::BadSendStream(format!(
+            StreamError::Malformed(format!(
                 "attribute {ty} of a {} command is {} bytes, not 8",
                 command_name(self.cmd).unwrap_or("unknown"),
                 v.len()
@@ -267,11 +317,11 @@ impl Command {
     ///
     /// # Errors
     ///
-    /// [`Error::BadSendStream`] when it is absent or not twelve bytes.
-    pub fn timestamp(&self, ty: u16) -> Result<Timestamp> {
+    /// [`StreamError::Malformed`] when it is absent or not twelve bytes.
+    pub fn timestamp(&self, ty: u16) -> StreamResult<Timestamp> {
         let v = self.require(ty)?;
         if v.len() != 12 {
-            return Err(Error::BadSendStream(format!(
+            return Err(StreamError::Malformed(format!(
                 "timestamp attribute {ty} is {} bytes, not 12",
                 v.len()
             )));
@@ -286,8 +336,8 @@ impl Command {
     ///
     /// # Errors
     ///
-    /// [`Error::BadSendStream`] when it is absent.
-    pub fn path(&self) -> Result<&[u8]> {
+    /// [`StreamError::Malformed`] when it is absent.
+    pub fn path(&self) -> StreamResult<&[u8]> {
         self.require(attr::PATH)
     }
 }
@@ -318,13 +368,14 @@ pub fn stream_crc(bytes: &[u8]) -> u32 {
 ///
 /// # Errors
 ///
-/// [`Error::BadSendStream`] naming the offset of what is wrong,
-/// [`Error::ChecksumMismatch`] for a command whose checksum disagrees,
-/// and [`Error::UnsupportedFeature`] for a version this does not read.
-pub fn parse_send_stream(bytes: &[u8]) -> Result<SendStream> {
+/// [`StreamError::Malformed`] naming the offset of what is wrong,
+/// [`StreamError::ChecksumMismatch`] for a command whose checksum
+/// disagrees, and [`StreamError::UnsupportedVersion`] for a version this
+/// does not read.
+pub fn parse_send_stream(bytes: &[u8]) -> StreamResult<SendStream> {
     let header_len = SEND_STREAM_MAGIC.len() + 4;
     if bytes.len() < header_len || &bytes[..SEND_STREAM_MAGIC.len()] != SEND_STREAM_MAGIC {
-        return Err(Error::BadSendStream(
+        return Err(StreamError::Malformed(
             "the stream does not open with \"btrfs-stream\\0\"".into(),
         ));
     }
@@ -334,21 +385,19 @@ pub fn parse_send_stream(bytes: &[u8]) -> Result<SendStream> {
             .expect("4 bytes"),
     );
     if version != 1 && version != 2 {
-        return Err(Error::UnsupportedFeature(format!(
-            "send stream version {version}; versions 1 and 2 are read"
-        )));
+        return Err(StreamError::UnsupportedVersion(version));
     }
 
     let mut commands = Vec::new();
     let mut at = header_len;
     loop {
         if at == bytes.len() {
-            return Err(Error::BadSendStream(format!(
+            return Err(StreamError::Malformed(format!(
                 "the stream stops at byte {at} without an end command"
             )));
         }
         if bytes.len() - at < COMMAND_HEADER_LEN {
-            return Err(Error::BadSendStream(format!(
+            return Err(StreamError::Malformed(format!(
                 "a command header at byte {at} is cut short"
             )));
         }
@@ -360,7 +409,7 @@ pub fn parse_send_stream(bytes: &[u8]) -> Result<SendStream> {
             .checked_add(len)
             .filter(|&e| e <= bytes.len())
             .ok_or_else(|| {
-                Error::BadSendStream(format!(
+                StreamError::Malformed(format!(
                     "the command at byte {at} claims {len} bytes, past the end of the stream"
                 ))
             })?;
@@ -368,10 +417,7 @@ pub fn parse_send_stream(bytes: &[u8]) -> Result<SendStream> {
         let mut framed = bytes[at..end].to_vec();
         framed[6..10].fill(0);
         if stream_crc(&framed) != crc {
-            return Err(Error::ChecksumMismatch {
-                what: "send stream command",
-                offset: at as u64,
-            });
+            return Err(StreamError::ChecksumMismatch { offset: at as u64 });
         }
 
         let attrs = parse_attrs(&bytes[body_start..end], body_start, version)?;
@@ -382,7 +428,7 @@ pub fn parse_send_stream(bytes: &[u8]) -> Result<SendStream> {
         }
     }
     if at != bytes.len() {
-        return Err(Error::BadSendStream(format!(
+        return Err(StreamError::Malformed(format!(
             "{} bytes follow the end command at byte {at}",
             bytes.len() - at
         )));
@@ -392,12 +438,12 @@ pub fn parse_send_stream(bytes: &[u8]) -> Result<SendStream> {
 
 /// The attributes of one command. `base` is where `body` starts in the
 /// stream, for the error messages.
-fn parse_attrs(body: &[u8], base: usize, version: u32) -> Result<Vec<(u16, Vec<u8>)>> {
+fn parse_attrs(body: &[u8], base: usize, version: u32) -> StreamResult<Vec<(u16, Vec<u8>)>> {
     let mut out = Vec::new();
     let mut at = 0;
     while at < body.len() {
         if body.len() - at < 2 {
-            return Err(Error::BadSendStream(format!(
+            return Err(StreamError::Malformed(format!(
                 "an attribute header at byte {} is cut short",
                 base + at
             )));
@@ -409,7 +455,7 @@ fn parse_attrs(body: &[u8], base: usize, version: u32) -> Result<Vec<(u16, Vec<u
             break;
         }
         if body.len() - at < ATTR_HEADER_LEN {
-            return Err(Error::BadSendStream(format!(
+            return Err(StreamError::Malformed(format!(
                 "an attribute header at byte {} is cut short",
                 base + at
             )));
@@ -418,7 +464,7 @@ fn parse_attrs(body: &[u8], base: usize, version: u32) -> Result<Vec<(u16, Vec<u
         let start = at + ATTR_HEADER_LEN;
         let end = start + len;
         if end > body.len() {
-            return Err(Error::BadSendStream(format!(
+            return Err(StreamError::Malformed(format!(
                 "attribute {ty} at byte {} claims {len} bytes, past the end of its command",
                 base + at
             )));
@@ -462,10 +508,10 @@ impl StreamWriter {
     ///
     /// # Errors
     ///
-    /// [`Error::BadSendStream`] for a value longer than a `u16` counts.
-    pub fn attr(&mut self, ty: u16, value: &[u8]) -> Result<()> {
+    /// [`StreamError::Malformed`] for a value longer than a `u16` counts.
+    pub fn attr(&mut self, ty: u16, value: &[u8]) -> StreamResult<()> {
         let len = u16::try_from(value.len()).map_err(|_| {
-            Error::BadSendStream(format!(
+            StreamError::Malformed(format!(
                 "attribute {ty} is {} bytes, more than an attribute holds",
                 value.len()
             ))
@@ -477,12 +523,12 @@ impl StreamWriter {
     }
 
     /// Add a `u64` attribute.
-    pub fn attr_u64(&mut self, ty: u16, value: u64) -> Result<()> {
+    pub fn attr_u64(&mut self, ty: u16, value: u64) -> StreamResult<()> {
         self.attr(ty, &value.to_le_bytes())
     }
 
     /// Add a timestamp attribute.
-    pub fn attr_time(&mut self, ty: u16, t: Timestamp) -> Result<()> {
+    pub fn attr_time(&mut self, ty: u16, t: Timestamp) -> StreamResult<()> {
         let mut v = [0u8; 12];
         v[..8].copy_from_slice(&t.sec.to_le_bytes());
         v[8..].copy_from_slice(&t.nsec.to_le_bytes());
@@ -801,7 +847,7 @@ mod tests {
         bytes[last_path_byte] ^= 1;
         assert!(matches!(
             parse_send_stream(&bytes),
-            Err(Error::ChecksumMismatch { offset: 17, .. })
+            Err(StreamError::ChecksumMismatch { offset: 17 })
         ));
     }
 
@@ -820,7 +866,7 @@ mod tests {
         bytes.truncate(17);
         assert!(matches!(
             parse_send_stream(&bytes),
-            Err(Error::BadSendStream(_))
+            Err(StreamError::Malformed(_))
         ));
     }
 
@@ -830,7 +876,7 @@ mod tests {
         bytes.push(0);
         assert!(matches!(
             parse_send_stream(&bytes),
-            Err(Error::BadSendStream(_))
+            Err(StreamError::Malformed(_))
         ));
     }
 
@@ -840,13 +886,13 @@ mod tests {
         bytes[0] = b'x';
         assert!(matches!(
             parse_send_stream(&bytes),
-            Err(Error::BadSendStream(_))
+            Err(StreamError::Malformed(_))
         ));
         let mut bytes = StreamWriter::new().finish();
         bytes[13] = 9;
         assert!(matches!(
             parse_send_stream(&bytes),
-            Err(Error::UnsupportedFeature(_))
+            Err(StreamError::UnsupportedVersion(9))
         ));
     }
 
@@ -864,7 +910,7 @@ mod tests {
         bytes[17 + 6..17 + 10].copy_from_slice(&crc.to_le_bytes());
         assert!(matches!(
             parse_send_stream(&bytes),
-            Err(Error::BadSendStream(_))
+            Err(StreamError::Malformed(_))
         ));
     }
 

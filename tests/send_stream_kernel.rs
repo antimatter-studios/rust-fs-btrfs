@@ -428,8 +428,8 @@ fn send_streams_agree_with_btrfs_send_and_btrfs_receive() {
     }
     let kernel_report = read(&out.join("kernel.report"));
     assert!(
-        kernel_report.lines().count() >= 14,
-        "the guest reported too little of the snapshot:\n{kernel_report}"
+        kernel_report.lines().count() == 13,
+        "the snapshot holds 13 paths, and the guest reported:\n{kernel_report}"
     );
     assert_eq!(
         replay.report(),

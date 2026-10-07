@@ -19,8 +19,8 @@ never does.
   `btrfs send` wrote parses into the commands `btrfs receive --dump` lists and
   replays into the snapshot the kernel shows, and `btrfs receive` rebuilds the
   same snapshot from a stream this crate wrote.
-- **`Error::BadSendStream`**, for a send stream that is malformed rather than
-  a volume that is damaged; the C ABI maps it to `EINVAL`.
+- **`send::StreamError`**, its own error type. A malformed stream is bytes
+  handed in, not a damaged volume, so it is kept out of the crate's `Error`.
 
 ### Fixed
 
