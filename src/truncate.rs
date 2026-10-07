@@ -202,7 +202,12 @@ impl Filesystem {
                 if bytenr != 0 {
                     let offset = le64(d, fe::OFFSET);
                     let (refs, extent_len, generation) = self.extent_item(bytenr)?;
-                    if !window_inside_extent(bytenr + offset, num, bytenr, extent_len) {
+                    // A compressed extent's window is in its decoded bytes,
+                    // which its on-disk length does not bound.
+                    let compressed = d[fe::COMPRESSION] != 0;
+                    if !compressed
+                        && !window_inside_extent(bytenr + offset, num, bytenr, extent_len)
+                    {
                         return Err(Error::UnsupportedFeature(format!(
                             "inode {ino}: the item at {start} references [{}, +{num}), outside \
                              the {extent_len}-byte extent the extent tree records at {bytenr}",
