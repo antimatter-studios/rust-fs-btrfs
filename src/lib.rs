@@ -86,6 +86,7 @@ pub mod leaf_edit;
 pub mod log_tree;
 pub mod mkfs;
 pub mod send;
+pub mod raid56;
 pub mod subvol;
 pub mod super_write;
 pub mod superblock;
