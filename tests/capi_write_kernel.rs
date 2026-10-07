@@ -71,13 +71,21 @@ impl Drop for Scratch {
     }
 }
 
-/// Each file's SHA-256 and the physical address of its first extent.
+/// Each file's SHA-256 and the physical address of every one of its
+/// extents, comma-separated, from `filefrag`.
+///
+/// Every extent, not only the first: the second write's commit is free to
+/// reuse the space the first write's commit released, so the first extent
+/// can land back exactly where it began. The extent the second write
+/// copies last cannot, because its old copy is still allocated while the
+/// new one is placed.
 fn kernel_view(image: &str, what: &str) -> Vec<(String, String)> {
     let mut script = String::new();
     for name in ["cow.bin", "summed.bin"] {
         script.push_str(&format!(
             "printf '%s %s\\n' \"$(sha256sum \"$MNT/{name}\" | cut -d' ' -f1)\" \
-             \"$(filefrag -v \"$MNT/{name}\" | awk '$1 == \"0:\" {{print $4; exit}}')\"\n"
+             \"$(filefrag -v \"$MNT/{name}\" | awk '$1 ~ /^[0-9]+:$/ \
+             {{printf \"%s%s\", sep, $4; sep = \",\"}}')\"\n"
         ));
     }
     guest_kernel_read_ok(image, what, &script)
@@ -168,7 +176,7 @@ fn the_c_abi_writes_a_copy_on_write_file_the_checker_and_kernel_accept() {
     );
     assert_ne!(
         after[0].1, before[0].1,
-        "cow.bin's first extent is where it was, so the write was not copy-on-write"
+        "cow.bin's extents are all where they were, so the writes were not copy-on-write"
     );
     assert_eq!(
         after[1], before[1],
