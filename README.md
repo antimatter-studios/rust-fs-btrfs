@@ -125,6 +125,7 @@ as damaged is one `btrfs check --readonly` refuses too; after `fs.btrfs write`,
 and the kernel read back exactly the bytes written.
 
 [i262]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/262
+[i267]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/267
 [i274]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/274
 
 ## Test contract

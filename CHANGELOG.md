@@ -25,6 +25,15 @@ never does.
   same snapshot from a stream this crate wrote.
 - **`send::StreamError`**, its own error type. A malformed stream is bytes
   handed in, not a damaged volume, so it is kept out of the crate's `Error`.
+- **A subvolume can be made read-only or writable again (#267, first
+  slice).** `Filesystem::set_subvolume_read_only` sets or clears bit 0 of the
+  subvolume's `ROOT_ITEM` flags and commits it as one copy-on-write
+  transaction, as `btrfs property set <subvol> ro` does. A received subvolume is
+  refused when made writable, because its received UUID would have to be
+  cleared. `tests/subvol_readonly_kernel.rs` has `btrfs check` find the volume
+  clean, `btrfs property get` report the new flags, and the kernel refuse a
+  write into the newly read-only subvolume and accept one into the newly
+  writable snapshot.
 
 ### Fixed
 
