@@ -339,6 +339,47 @@ int fs_btrfs_link(fs_btrfs_fs_t *fs, const char *src, const char *dst);
 int fs_btrfs_unlink(fs_btrfs_fs_t *fs, const char *path);
 int fs_btrfs_rmdir(fs_btrfs_fs_t *fs, const char *path);
 
+/* ---- attributes ---- */
+
+/*
+ * Each call below is one committed transaction on the top-level
+ * subvolume, and moves the inode's change time as Linux does. `path` is
+ * not followed when it is a symbolic link: the link itself changes. Each
+ * returns 0, or -1 with the errno: ENOENT for no such path, EROFS on a
+ * read-only handle, ENOTSUP for what cannot be written yet (a leaf with
+ * no room for a new attribute item, as nothing yet splits an fs tree
+ * leaf, or a value too large for one leaf item).
+ */
+
+/*
+ * Set the extended attribute `name` (fully qualified: "user.colour") to
+ * the `size` bytes at `value`, replacing any value it had; or remove it
+ * (ENOENT when it is not there). An empty name is EINVAL and one over
+ * 255 bytes ERANGE. ACLs are the attributes "system.posix_acl_access"
+ * and "system.posix_acl_default", in the kernel's xattr encoding.
+ */
+int fs_btrfs_setxattr(fs_btrfs_fs_t *fs, const char *path, const char *name,
+                      const void *value, size_t size);
+int fs_btrfs_removexattr(fs_btrfs_fs_t *fs, const char *path,
+                         const char *name);
+
+/* Set the permission bits to the low 12 bits of `mode`, keeping the type. */
+int fs_btrfs_chmod(fs_btrfs_fs_t *fs, const char *path, uint32_t mode);
+
+/* Set the owner; a uid or gid of UINT32_MAX ((uint32_t)-1) is left as is. */
+int fs_btrfs_chown(fs_btrfs_fs_t *fs, const char *path, uint32_t uid,
+                   uint32_t gid);
+
+/*
+ * Set the access and modification times, as seconds since the epoch and
+ * nanoseconds; a nanoseconds value of FS_BTRFS_UTIME_OMIT leaves that
+ * time as it is, and one of a second or more is EINVAL.
+ */
+#define FS_BTRFS_UTIME_OMIT ((uint32_t)((1u << 30) - 2))
+int fs_btrfs_utimens(fs_btrfs_fs_t *fs, const char *path, int64_t atime_sec,
+                     uint32_t atime_nsec, int64_t mtime_sec,
+                     uint32_t mtime_nsec);
+
 #ifdef __cplusplus
 }
 #endif
