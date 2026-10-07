@@ -387,6 +387,9 @@ pub(crate) struct FileExtent {
     pub extent_start: u64,
     /// Whether the bytes on disk are compressed.
     pub compressed: bool,
+    /// Where this reference starts within the extent's bytes — decoded
+    /// bytes, for a compressed one: the item's `offset`.
+    pub ref_offset: u64,
 }
 
 /// One piece of a write: the device, the physical offset on it, and
@@ -2343,6 +2346,7 @@ impl Filesystem {
                     logical: None,
                     extent_start: 0,
                     compressed: false,
+                    ref_offset: 0,
                 }),
                 Piece::Preallocated { logical, len } => out.push(FileExtent {
                     start,
@@ -2350,6 +2354,7 @@ impl Filesystem {
                     logical: None,
                     extent_start: logical,
                     compressed: false,
+                    ref_offset: 0,
                 }),
                 Piece::Hole => {}
                 Piece::Regular { logical, len } => out.push(FileExtent {
@@ -2360,13 +2365,15 @@ impl Filesystem {
                     // in; the extent item is keyed by the run's start.
                     extent_start: le64(data, file_extent::DISK_BYTENR),
                     compressed: false,
+                    ref_offset: logical - le64(data, file_extent::DISK_BYTENR),
                 }),
-                Piece::Compressed { len, .. } => out.push(FileExtent {
+                Piece::Compressed { len, offset, .. } => out.push(FileExtent {
                     start,
                     len,
                     logical: None,
                     extent_start: le64(data, file_extent::DISK_BYTENR),
                     compressed: true,
+                    ref_offset: offset,
                 }),
             }
         }
