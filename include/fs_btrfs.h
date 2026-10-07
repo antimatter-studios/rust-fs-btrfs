@@ -339,6 +339,17 @@ int fs_btrfs_link(fs_btrfs_fs_t *fs, const char *src, const char *dst);
 int fs_btrfs_unlink(fs_btrfs_fs_t *fs, const char *path);
 int fs_btrfs_rmdir(fs_btrfs_fs_t *fs, const char *path);
 
+/*
+ * Move the name `from` to `to`. A name already at `to` is replaced, as
+ * POSIX rename does; renaming onto another name of the same file does
+ * nothing. Returns 0, or -1: ENOENT when `from` is not there, ENOTDIR
+ * when a directory would replace something else, EISDIR when something
+ * else would replace a directory, ENOTEMPTY when the directory replaced
+ * holds entries, EINVAL for a directory moved into itself or below
+ * itself, and as fs_btrfs_unlink otherwise.
+ */
+int fs_btrfs_rename(fs_btrfs_fs_t *fs, const char *from, const char *to);
+
 /* ---- attributes ---- */
 
 /*

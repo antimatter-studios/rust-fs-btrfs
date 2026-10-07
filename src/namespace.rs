@@ -1,5 +1,5 @@
-//! Names in a directory: create, mkdir, symlink, link, unlink and rmdir
-//! (#262).
+//! Names in a directory: create, mkdir, symlink, link, unlink, rmdir and
+//! rename (#262).
 //!
 //! A name in a Btrfs directory is four items in the fs tree, and a new
 //! file is one or two more:
@@ -39,14 +39,19 @@
 //! - removing the last name of a file that still holds data extents:
 //!   releasing an extent is not implemented outside a copy-on-write
 //!   write, so such a file is refused whole rather than left leaking;
-//! - removing a directory that is not empty.
+//! - removing a directory that is not empty;
+//! - moving a directory into itself or below itself.
 //!
 //! Removing a name is the same items in reverse: the entries and the
 //! reference lose the name (an item holding nothing else is deleted),
 //! the parent's size and times move, and an inode left with no name is
 //! deleted together with its attributes and inline data.
 //!
-//! Renaming and truncating are the rest of #262 and not here yet.
+//! Renaming is a removal and an addition in one transaction: the old
+//! entries and reference go, new ones are filed under a fresh index in
+//! the destination, and a name already there is removed first, exactly
+//! as an unlink or rmdir would. Truncating is the rest of #262 and not
+//! here yet.
 
 use std::sync::Arc;
 
@@ -235,40 +240,172 @@ impl Filesystem {
         if !dir.is_dir() {
             return Err(Error::NotADirectory);
         }
-        let entry = self.lookup_entry(parent, name)?;
-        if !entry.is_inode() {
-            return Err(Error::UnsupportedFeature(format!(
-                "{:?} is subvolume {}, and deleting a subvolume is not this operation",
-                String::from_utf8_lossy(name),
-                entry.ino
-            )));
-        }
-        let child = self.read_inode(entry.ino)?;
+        let child = self.named_inode(parent, name)?;
         match (want_dir, child.is_dir()) {
             (false, true) => return Err(Error::NotAFile),
             (true, false) => return Err(Error::NotADirectory),
             _ => {}
         }
-        let ino = child.ino;
         if want_dir {
-            let has_entries = self
-                .last_key_at_or_before(&key(ino, DIR_INDEX_KEY, u64::MAX))?
-                .is_some_and(|k| k.objectid == ino && k.key_type == DIR_INDEX_KEY);
-            if child.size != 0 || has_entries {
-                return Err(Error::UnsupportedFeature(format!(
-                    "directory {:?} is not empty",
-                    String::from_utf8_lossy(name)
-                )));
-            }
+            self.refuse_non_empty(&child, name)?;
         }
         let generation = self.next_generation()?;
         let now = now();
-        let mut edits = Vec::new();
+        let mut p = Pending::default();
+        self.drop_entry(&mut p, parent, name, child.ino)?;
+        p.touch(parent, &[io::CTIME, io::MTIME]);
+        self.drop_link(&mut p, &child, name)?;
+        let edits = p.into_edits(self, generation, now)?;
+        self.commit_edits(child.ino, edits, generation, now)
+    }
 
+    /// Move the name `old_name` in `old_parent` to `new_name` in
+    /// `new_parent`, as one committed transaction. A name already at the
+    /// destination is replaced, as POSIX `rename` does: a file by a file,
+    /// an empty directory by a directory, and the replaced inode loses
+    /// that name (and goes, with its last one).
+    ///
+    /// Renaming a name onto another name of the same inode does nothing,
+    /// as POSIX says.
+    ///
+    /// # Errors
+    ///
+    /// As [`Filesystem::unlink`]; [`Error::NotFound`] when there is no
+    /// `old_name`, [`Error::NotADirectory`] when a directory would
+    /// replace something else, [`Error::NotAFile`] when something else
+    /// would replace a directory, and [`Error::UnsupportedFeature`] for a
+    /// directory moved into itself or below itself, a replaced directory
+    /// that is not empty, and a replaced file whose last name it is while
+    /// it still holds data extents. Nothing is written unless everything
+    /// is.
+    pub fn rename(
+        &mut self,
+        old_parent: u64,
+        old_name: &[u8],
+        new_parent: u64,
+        new_name: &[u8],
+    ) -> Result<()> {
+        self.require_writable_top_level()?;
+        check_name(old_name)?;
+        check_name(new_name)?;
+        for d in [old_parent, new_parent] {
+            if !self.read_inode(d)?.is_dir() {
+                return Err(Error::NotADirectory);
+            }
+        }
+        let child = self.named_inode(old_parent, old_name)?;
+        if old_parent == new_parent && old_name == new_name {
+            return Ok(());
+        }
+        if child.is_dir() && old_parent != new_parent && self.is_within(new_parent, child.ino)? {
+            return Err(Error::UnsupportedFeature(format!(
+                "directory {:?} cannot be moved into itself or below itself",
+                String::from_utf8_lossy(old_name)
+            )));
+        }
+        let generation = self.next_generation()?;
+        let now = now();
+        let mut p = Pending::default();
+
+        // A name at the destination is replaced.
+        match self.named_inode(new_parent, new_name) {
+            Ok(target) if target.ino == child.ino => return Ok(()),
+            Ok(target) => {
+                match (child.is_dir(), target.is_dir()) {
+                    (true, false) => return Err(Error::NotADirectory),
+                    (false, true) => return Err(Error::NotAFile),
+                    (true, true) => self.refuse_non_empty(&target, new_name)?,
+                    (false, false) => {}
+                }
+                self.drop_entry(&mut p, new_parent, new_name, target.ino)?;
+                self.drop_link(&mut p, &target, new_name)?;
+            }
+            Err(Error::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+
+        self.drop_entry(&mut p, old_parent, old_name, child.ino)?;
+        let index = self.next_dir_index(new_parent)?;
+        self.add_entry(
+            &mut p,
+            new_parent,
+            new_name,
+            child.ino,
+            file_type(&child),
+            index,
+            generation,
+        )?;
+        p.touch(old_parent, &[io::CTIME, io::MTIME]);
+        p.touch(new_parent, &[io::CTIME, io::MTIME]);
+        p.touch(child.ino, &[io::CTIME]);
+        let edits = p.into_edits(self, generation, now)?;
+        self.commit_edits(child.ino, edits, generation, now)
+    }
+
+    /// The inode `name` in `dir` names, refusing a subvolume.
+    fn named_inode(&self, dir: u64, name: &[u8]) -> Result<Inode> {
+        let entry = self.lookup_entry(dir, name)?;
+        if !entry.is_inode() {
+            return Err(Error::UnsupportedFeature(format!(
+                "{:?} is subvolume {}, and a subvolume's name is not changed here",
+                String::from_utf8_lossy(name),
+                entry.ino
+            )));
+        }
+        self.read_inode(entry.ino)
+    }
+
+    /// Refuse a directory that holds any entry.
+    fn refuse_non_empty(&self, dir: &Inode, name: &[u8]) -> Result<()> {
+        let ino = dir.ino;
+        let has_entries = self
+            .last_key_at_or_before(&key(ino, DIR_INDEX_KEY, u64::MAX))?
+            .is_some_and(|k| k.objectid == ino && k.key_type == DIR_INDEX_KEY);
+        if dir.size != 0 || has_entries {
+            return Err(Error::UnsupportedFeature(format!(
+                "directory {:?} is not empty",
+                String::from_utf8_lossy(name)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether directory `dir` is `ancestor` or lies below it, walking
+    /// up through each directory's one `INODE_REF` to the top.
+    pub(crate) fn is_within(&self, dir: u64, ancestor: u64) -> Result<bool> {
+        let mut at = dir;
+        // A tree deeper than this is a loop, not a directory hierarchy.
+        for _ in 0..65_536 {
+            if at == ancestor {
+                return Ok(true);
+            }
+            let parent = self
+                .items_of(at)?
+                .into_iter()
+                .find(|(k, _)| k.key_type == INODE_REF_KEY)
+                .map(|(k, _)| k.offset)
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(format!(
+                        "directory {at} has no reference to its parent"
+                    ))
+                })?;
+            if parent == at {
+                return Ok(false);
+            }
+            at = parent;
+        }
+        Err(Error::UnsupportedFeature(format!(
+            "directory {dir}'s parents do not reach the top"
+        )))
+    }
+
+    /// Remove `name`'s two entries from `parent` and `ino`'s reference
+    /// to it, and shrink `parent`'s size by the name.
+    fn drop_entry(&self, p: &mut Pending, parent: u64, name: &[u8], ino: u64) -> Result<()> {
         // The child's reference to this parent loses the name, and gives
         // up the index the parent filed it under.
         let ref_key = key(ino, INODE_REF_KEY, parent);
-        let refs = self.item_bytes(ref_key)?.ok_or_else(|| {
+        let refs = p.get(self, ref_key)?.ok_or_else(|| {
             Error::UnsupportedFeature(format!(
                 "inode {ino} has no reference item from directory {parent}; a name held in \
                  an extended reference is not removed"
@@ -281,60 +418,102 @@ impl Filesystem {
                 String::from_utf8_lossy(name)
             ))
         })?;
-        edits.push(put_or_delete(ref_key, rest));
+        p.set(ref_key, non_empty(rest));
 
         // The parent's two entries.
         let hash_key = key(parent, DIR_ITEM_KEY, dir::name_hash(name));
-        let by_hash = self.item_bytes(hash_key)?.ok_or(Error::NotFound)?;
+        let by_hash = p.get(self, hash_key)?.ok_or(Error::NotFound)?;
         let rest = without_dir_record(&by_hash, name).ok_or(Error::NotFound)?;
-        edits.push(put_or_delete(hash_key, rest));
+        p.set(hash_key, non_empty(rest));
         let index_key = key(parent, DIR_INDEX_KEY, index);
-        if self.item_bytes(index_key)?.is_none() {
+        if p.get(self, index_key)?.is_none() {
             return Err(Error::UnsupportedFeature(format!(
                 "directory {parent} has no index entry {index} for {:?}, so its two indexes \
                  already disagree",
                 String::from_utf8_lossy(name)
             )));
         }
-        edits.push(ItemEdit::Delete(index_key));
-        let mut raw = self.raw_inode(parent)?;
-        let size = le64(&raw, io::SIZE).saturating_sub(2 * name.len() as u64);
-        raw[io::SIZE..io::SIZE + 8].copy_from_slice(&size.to_le_bytes());
-        touch(&mut raw, generation, now, &[io::CTIME, io::MTIME]);
-        edits.push(put(parent, INODE_ITEM_KEY, 0, raw));
+        p.set(index_key, None);
+        p.grow_dir(self, parent, -(2 * name.len() as i64))
+    }
 
-        // The child: one name fewer, or gone.
-        let nlink = if want_dir { 1 } else { child.nlink };
+    /// Add `name` for `ino` in `parent` under `index`: its reference, the
+    /// parent's two entries, and the parent's size.
+    #[allow(clippy::too_many_arguments)]
+    fn add_entry(
+        &self,
+        p: &mut Pending,
+        parent: u64,
+        name: &[u8],
+        ino: u64,
+        ft: u8,
+        index: u64,
+        generation: u64,
+    ) -> Result<()> {
+        let ref_key = key(ino, INODE_REF_KEY, parent);
+        let mut refs = p.get(self, ref_key)?.unwrap_or_default();
+        refs.extend(inode_ref(index, name));
+        if refs.len() > self.max_item_size() {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}'s references from directory {parent} would outgrow a leaf, and \
+                 extended references are not written"
+            )));
+        }
+        p.set(ref_key, Some(refs));
+
+        let entry = dir_entry(ino, generation, ft, name);
+        let hash_key = key(parent, DIR_ITEM_KEY, dir::name_hash(name));
+        let mut by_hash = p.get(self, hash_key)?.unwrap_or_default();
+        by_hash.extend_from_slice(&entry);
+        if by_hash.len() > self.max_item_size() {
+            return Err(Error::UnsupportedFeature(format!(
+                "directory {parent}'s names sharing the hash of {:?} would outgrow a leaf",
+                String::from_utf8_lossy(name)
+            )));
+        }
+        p.set(hash_key, Some(by_hash));
+        p.set(key(parent, DIR_INDEX_KEY, index), Some(entry));
+        p.grow_dir(self, parent, 2 * name.len() as i64)
+    }
+
+    /// `inode` has lost one name: one link fewer, or — with its last
+    /// name gone — the inode and every item it owns deleted.
+    fn drop_link(&self, p: &mut Pending, inode: &Inode, name: &[u8]) -> Result<()> {
+        let ino = inode.ino;
+        // A directory has one link however many names it has had.
+        let nlink = if inode.is_dir() { 1 } else { inode.nlink };
         if nlink > 1 {
-            let mut raw = self.raw_inode(ino)?;
+            let mut raw = p
+                .get(self, key(ino, INODE_ITEM_KEY, 0))?
+                .ok_or(Error::NotFound)?;
             raw[io::NLINK..io::NLINK + 4].copy_from_slice(&(nlink - 1).to_le_bytes());
-            touch(&mut raw, generation, now, &[io::CTIME]);
-            edits.push(put(ino, INODE_ITEM_KEY, 0, raw));
-        } else {
-            for (k, data) in self.items_of(ino)? {
-                match k.key_type {
-                    // Already edited above.
-                    INODE_REF_KEY if k.offset == parent => {}
-                    INODE_ITEM_KEY | dir::XATTR_ITEM_KEY => edits.push(ItemEdit::Delete(k)),
-                    EXTENT_DATA_KEY if holds_no_extent(&data) => edits.push(ItemEdit::Delete(k)),
-                    EXTENT_DATA_KEY => {
-                        return Err(Error::UnsupportedFeature(format!(
-                            "{:?} is the last name of inode {ino}, which holds data extents, \
-                             and releasing them is not implemented yet",
-                            String::from_utf8_lossy(name)
-                        )))
-                    }
-                    other => {
-                        return Err(Error::UnsupportedFeature(format!(
-                            "inode {ino} owns an item of type {other} at {}, which removing it \
-                             does not handle",
-                            k.offset
-                        )))
-                    }
+            p.set(key(ino, INODE_ITEM_KEY, 0), Some(raw));
+            p.touch(ino, &[io::CTIME]);
+            return Ok(());
+        }
+        for (k, data) in self.items_of(ino)? {
+            match k.key_type {
+                // A reference already emptied by this change.
+                INODE_REF_KEY if p.get(self, k)?.is_none() => {}
+                INODE_ITEM_KEY | dir::XATTR_ITEM_KEY => p.set(k, None),
+                EXTENT_DATA_KEY if holds_no_extent(&data) => p.set(k, None),
+                EXTENT_DATA_KEY => {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "{:?} is the last name of inode {ino}, which holds data extents, \
+                         and releasing them is not implemented yet",
+                        String::from_utf8_lossy(name)
+                    )))
+                }
+                other => {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "inode {ino} owns an item of type {other} at {}, which removing it \
+                         does not handle",
+                        k.offset
+                    )))
                 }
             }
         }
-        self.commit_edits(ino, edits, generation, now)
+        Ok(())
     }
 
     /// Every fs tree item under `ino`, in key order.
@@ -768,6 +947,108 @@ pub(crate) fn put_or_delete(k: DiskKey, rest: Vec<u8>) -> ItemEdit {
         ItemEdit::Delete(k)
     } else {
         ItemEdit::Put(OwnedItem { key: k, data: rest })
+    }
+}
+
+/// What is left of an item, or `None` when nothing is and it goes.
+fn non_empty(rest: Vec<u8>) -> Option<Vec<u8>> {
+    (!rest.is_empty()).then_some(rest)
+}
+
+/// The fs tree items one change reads and rewrites, gathered so that
+/// two edits of one item become one: a rename inside one directory
+/// edits that directory's inode, and possibly one hash bucket, twice.
+///
+/// Each item is read from the tree the first time it is asked for, and
+/// every later read sees what the change has made of it so far.
+#[derive(Default)]
+struct Pending {
+    /// Each item as the tree holds it now: `None` when it is not there.
+    before: std::collections::BTreeMap<(u64, u8, u64), Option<Vec<u8>>>,
+    /// Each item as the change leaves it: `None` when it is deleted.
+    after: std::collections::BTreeMap<(u64, u8, u64), Option<Vec<u8>>>,
+    /// The inodes whose times move, and which times.
+    touched: std::collections::BTreeMap<u64, Vec<usize>>,
+}
+
+impl Pending {
+    fn get(&mut self, fs: &Filesystem, k: DiskKey) -> Result<Option<Vec<u8>>> {
+        let t = (k.objectid, k.key_type, k.offset);
+        if let Some(v) = self.after.get(&t) {
+            return Ok(v.clone());
+        }
+        let v = fs.item_bytes(k)?;
+        self.before.insert(t, v.clone());
+        self.after.insert(t, v.clone());
+        Ok(v)
+    }
+
+    fn set(&mut self, k: DiskKey, v: Option<Vec<u8>>) {
+        self.after.insert((k.objectid, k.key_type, k.offset), v);
+    }
+
+    /// Move directory `dir`'s size by `delta` bytes.
+    fn grow_dir(&mut self, fs: &Filesystem, dir: u64, delta: i64) -> Result<()> {
+        let k = key(dir, INODE_ITEM_KEY, 0);
+        let mut raw = self.get(fs, k)?.ok_or(Error::NotFound)?;
+        if raw.len() < INODE_ITEM_SIZE {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {dir}'s item is {} bytes, shorter than an inode",
+                raw.len()
+            )));
+        }
+        let size = le64(&raw, io::SIZE).saturating_add_signed(delta);
+        raw[io::SIZE..io::SIZE + 8].copy_from_slice(&size.to_le_bytes());
+        self.set(k, Some(raw));
+        Ok(())
+    }
+
+    /// Mark `ino`'s `times` to move to the change's time.
+    fn touch(&mut self, ino: u64, times: &[usize]) {
+        let entry = self.touched.entry(ino).or_default();
+        for &t in times {
+            if !entry.contains(&t) {
+                entry.push(t);
+            }
+        }
+    }
+
+    /// The edits that turn the tree into what the change made of it,
+    /// with every touched inode that survives stamped once.
+    fn into_edits(
+        mut self,
+        fs: &Filesystem,
+        generation: u64,
+        now: (u64, u32),
+    ) -> Result<Vec<ItemEdit>> {
+        for (ino, times) in std::mem::take(&mut self.touched) {
+            let k = key(ino, INODE_ITEM_KEY, 0);
+            if let Some(mut raw) = self.get(fs, k)? {
+                if raw.len() < INODE_ITEM_SIZE {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "inode {ino}'s item is {} bytes, shorter than an inode",
+                        raw.len()
+                    )));
+                }
+                touch(&mut raw, generation, now, &times);
+                self.set(k, Some(raw));
+            }
+        }
+        let mut edits = Vec::new();
+        for (t, after) in self.after {
+            let before = self.before.get(&t).cloned().flatten();
+            if before == after {
+                continue;
+            }
+            let k = key(t.0, t.1, t.2);
+            match after {
+                Some(data) => edits.push(ItemEdit::Put(OwnedItem { key: k, data })),
+                // Made and removed by the same change: nothing to do.
+                None if before.is_none() => {}
+                None => edits.push(ItemEdit::Delete(k)),
+            }
+        }
+        Ok(edits)
     }
 }
 

@@ -92,6 +92,7 @@ read_file_huge_size       1
 read_path_cost            1
 readlink_kernel_oracle    1
 release_attestation       2
+rename_kernel             1
 render_plan               4
 send_stream_kernel        1
 shared_tree_block_release 1

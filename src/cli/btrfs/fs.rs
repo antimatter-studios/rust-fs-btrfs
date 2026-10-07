@@ -200,6 +200,32 @@ fn command() -> Cmd {
                      new items is refused with exit 3.",
                 ),
         )
+        .subcommand(
+            Cmd::new("mv")
+                .about("Move a name, replacing whatever is at the destination")
+                .arg(
+                    Arg::new("source")
+                        .value_name("SOURCE")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .after_help(
+                    "Examples:\n  fs.btrfs disk.img mv /notes.txt /archive/notes.txt\n  \
+                     fs.btrfs disk.img mv /draft /final\n\n\
+                     PATH is the new name itself, not a directory to move into. A name \
+                     already there is replaced, as rename(2) does: a file by a file, an empty \
+                     directory by a directory. Committed as one transaction; only the \
+                     top-level subvolume is written, and a replaced file whose last name it \
+                     is while it still holds data is refused with exit 3 \
+                     (rust-fs-btrfs#262).",
+                ),
+        )
         .subcommand(key_command(
             "get",
             "Report the filesystem's properties, or one of them",
@@ -307,7 +333,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
             sub.get_one("output"),
         ),
         "write" => write(target, offset, path_arg(sub)),
-        "mkdir" | "create" | "rm" | "rmdir" | "ln" => names(target, offset, verb, sub),
+        "mkdir" | "create" | "rm" | "rmdir" | "ln" | "mv" => names(target, offset, verb, sub),
         "get" | "info" => get(
             target,
             offset,
@@ -401,6 +427,13 @@ fn names(
                 fs.link(file.ino, parent.ino, name).map_err(fail)?;
                 ("linked", Some(file.ino))
             }
+        }
+        "mv" => {
+            let source = os_bytes(sub.get_one::<OsString>("source").expect("clap requires it"));
+            let (from, from_name) = split_parent(&fs, source)?;
+            fs.rename(from.ino, from_name, parent.ino, name)
+                .map_err(|e| btrfs_error(source, e))?;
+            ("moved", None)
         }
         other => unreachable!("not a namespace verb: {other}"),
     };
