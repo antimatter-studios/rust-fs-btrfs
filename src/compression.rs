@@ -394,7 +394,7 @@ mod tests {
     /// what the read path decodes (#265).
     #[test]
     fn a_padded_zlib_extent_the_write_path_makes_decodes() {
-        let plain: Vec<u8> = b"compressible text, ".repeat(6000);
+        let plain: Vec<u8> = b"compressible text, ".repeat(7000);
         let plain = &plain[..MAX_UNCOMPRESSED];
         let mut packed = compress_zlib(plain);
         assert!(packed.len() < plain.len() / 4, "{} bytes", packed.len());
