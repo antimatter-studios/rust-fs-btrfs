@@ -57,6 +57,12 @@ never does.
   write match the kernel's own stream byte for byte, and `btrfs receive`
   rebuild the snapshot with its extents still compressed and its preallocated
   range still allocated.
+- **A reflink copy is sent as a clone (#273).** A run of a data extent that a
+  file the receiver already has holds -- one sent earlier in the stream, or,
+  in an incremental stream, one of the parent's files -- is sent as a `CLONE`
+  of it instead of its bytes, when the receiver's clone can take the range.
+  `tests/send_stream_kernel.rs` has `btrfs receive` turn both kinds into
+  shared extents.
 - **`send::StreamError`**, its own error type. A malformed stream is bytes
   handed in, not a damaged volume, so it is kept out of the crate's `Error`.
 - **An unreplayed log tree can be read.** `Filesystem::log` returns every item

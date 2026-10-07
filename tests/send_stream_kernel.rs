@@ -26,7 +26,10 @@
 //! incremental stream names the same parent as the kernel's, never
 //! mentions the file that did not change, and `btrfs receive` applies it
 //! on top of the parent (received from this crate's full stream) to give
-//! exactly the child the kernel shows.
+//! exactly the child the kernel shows. A reflink copy is a clone in both of
+//! this crate's streams -- from the file sent before it in the full one,
+//! from the parent's file in the incremental one -- and on the receiver
+//! every extent of the copy is shared.
 //!
 //! **Version 2.** The kernel sends a snapshot holding zlib, LZO and zstd
 //! extents and a preallocated range as a version-2 stream with its
@@ -159,6 +162,8 @@ printf 'becomes a directory\n' > keep/becomes-dir
 setfattr -n user.keep -v same keep/same.txt
 setfattr -n user.change -v before keep/edited.bin
 setfattr -n user.drop -v soon keep/grows.txt
+head -c 200000 /dev/urandom > big.bin
+cp --reflink=always big.bin big-copy.bin
 cd /
 sync
 btrfs subvolume snapshot -r "$MNT/src" "$MNT/snap1" >/dev/null
@@ -195,6 +200,7 @@ setfattr -n user.added -v 0x01 keep/inner/travels.txt
 chown 1000:1001 keep/inner/travels.txt
 chmod 0600 keep/one-link.txt
 touch -d '2001-02-03 04:05:06.5' keep/same.txt
+cp --reflink=always keep/untouched.bin keep/reflinked.bin
 cd /
 sync
 btrfs subvolume snapshot -r "$MNT/src" "$MNT/snap2" >/dev/null
@@ -213,8 +219,13 @@ mkfs.btrfs -q "$work/img"
 mkdir "$work/mnt"
 mount -o loop "$work/img" "$work/mnt"
 trap 'umount "$work/mnt" 2>/dev/null || true; rm -rf "$work"' EXIT
+shared() {
+    filefrag -v "$1" | awk '/^ *[0-9]+:/ { n++; if (/shared/) s++ } END { printf "extents=%d shared=%d\n", n, s }'
+}
 btrfs receive -f "$OUT/ours.full.stream" "$work/mnt"
+shared "$work/mnt/snap1/big-copy.bin" > "$OUT/received.full.shared"
 btrfs receive -f "$OUT/ours.inc.stream" "$work/mnt"
+shared "$work/mnt/snap2/keep/reflinked.bin" > "$OUT/received.inc.shared"
 report "$MNT/snap2" > "$OUT/source.report"
 report "$work/mnt/snap2" > "$OUT/received.report"
 btrfs subvolume show "$MNT/snap2" > "$OUT/source.show"
@@ -703,6 +714,34 @@ fn incremental_streams_agree_with_btrfs_send_and_btrfs_receive() {
             "the SNAPSHOT command's attribute {a} is not the kernel's"
         );
     }
+    // A reflink copy is cloned, not sent again: in the full stream from
+    // the file sent before it, in the incremental one from the parent's.
+    let clone_of = |stream: &SendStream, dest: &[u8]| -> (Vec<u8>, Vec<u8>) {
+        let c = stream
+            .commands
+            .iter()
+            .find(|c| c.cmd == cmd::CLONE && c.path().ok() == Some(dest))
+            .unwrap_or_else(|| panic!("no clone into {:?}", String::from_utf8_lossy(dest)));
+        (
+            c.attr(attr::CLONE_PATH).unwrap().to_vec(),
+            c.attr(attr::CLONE_UUID).unwrap().to_vec(),
+        )
+    };
+    let full_parsed = parse_send_stream(&full).expect("our full stream parses");
+    assert_eq!(
+        clone_of(&full_parsed, b"big-copy.bin"),
+        (
+            b"big.bin".to_vec(),
+            full_parsed.commands[0].attr(attr::UUID).unwrap().to_vec()
+        )
+    );
+    assert_eq!(
+        clone_of(&parsed, b"keep/reflinked.bin"),
+        (
+            b"keep/untouched.bin".to_vec(),
+            kernel.commands[0].attr(attr::CLONE_UUID).unwrap().to_vec()
+        )
+    );
     let untouched: &[u8] = b"keep/untouched.bin";
     assert!(
         !parsed
@@ -733,6 +772,19 @@ fn incremental_streams_agree_with_btrfs_send_and_btrfs_receive() {
         received, source,
         "btrfs receive, applying this crate's incremental stream to the parent, rebuilt something other than the child"
     );
+    // The clones made shared extents on the receiver, not copies.
+    for file in ["received.full.shared", "received.inc.shared"] {
+        let seen = read(&out.join(file));
+        let counts: Vec<u32> = seen
+            .trim()
+            .split(' ')
+            .map(|f| f.split('=').nth(1).unwrap().parse().unwrap())
+            .collect();
+        assert!(
+            counts[0] > 0 && counts[0] == counts[1],
+            "{file}: every extent of the clone should be shared: {seen}"
+        );
+    }
     assert_eq!(
         show_field(&read(&out.join("received.show")), "Received UUID:"),
         show_field(&read(&out.join("source.show")), "UUID:"),

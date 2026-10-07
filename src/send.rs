@@ -693,7 +693,7 @@ const ROOT_ITEM_UUID: usize = root_item::GENERATION_V2 + 8;
 const ROOT_ITEM_CTRANSID: usize = ROOT_ITEM_UUID + 3 * 16;
 
 /// What a send of one subvolume needs from its `ROOT_ITEM`.
-struct SubvolIdentity {
+pub(crate) struct SubvolIdentity {
     name: Vec<u8>,
     uuid: [u8; 16],
     ctransid: u64,
@@ -750,6 +750,7 @@ impl Filesystem {
         w.attr(attr::PATH, &subvol.name)?;
         w.attr(attr::UUID, &subvol.uuid)?;
         w.attr_u64(attr::CTRANSID, subvol.ctransid)?;
+        let mut ctx = SendCtx::new(opts, &subvol);
 
         let root = tree.root_inode()?;
         let mut order = vec![Pending {
@@ -779,7 +780,7 @@ impl Filesystem {
                     continue;
                 }
                 let inode = tree.read_inode(entry.ino)?;
-                self.send_create(&tree, &mut w, &path, &inode, opts)?;
+                self.send_create(&tree, &mut w, &path, &inode, &mut ctx)?;
                 if inode.is_dir() {
                     queue.push_back((inode.ino, path.clone(), depth + 1));
                 }
@@ -826,7 +827,7 @@ impl Filesystem {
         w: &mut StreamWriter,
         path: &[u8],
         inode: &Inode,
-        opts: SendOptions,
+        ctx: &mut SendCtx,
     ) -> Result<()> {
         let kind = inode.file_type().ok_or_else(|| {
             Error::UnsupportedFeature(format!(
@@ -855,7 +856,7 @@ impl Filesystem {
         }
 
         if kind == FileType::Regular {
-            self.send_data(tree, w, path, inode, opts)?;
+            self.send_data(tree, w, path, inode, ctx)?;
         }
         for x in tree.list_xattrs(inode.ino)? {
             w.begin(cmd::SET_XATTR);
@@ -877,17 +878,22 @@ impl Filesystem {
     /// Holes are left out: they read as zeros, and the closing `TRUNCATE`
     /// gives the file its size. A preallocated range is left out of a
     /// version-1 stream for the same reason, and kept as a `FALLOCATE` in a
-    /// version-2 one. A compressed extent goes as an `ENCODED_WRITE` when
-    /// [`SendOptions::compressed_data`] asks and the stream can name its
-    /// compression; otherwise its bytes are decoded and written.
+    /// version-2 one. A run of a data extent that a file the receiver
+    /// already has holds -- shared by a reflink copy -- is cloned from it
+    /// rather than sent again. A compressed extent goes as an
+    /// `ENCODED_WRITE` when [`SendOptions::compressed_data`] asks and the
+    /// stream can name its compression; otherwise its bytes are decoded and
+    /// written.
     fn send_data(
         &self,
         tree: &Filesystem,
         w: &mut StreamWriter,
         path: &[u8],
         inode: &Inode,
-        opts: SendOptions,
+        ctx: &mut SendCtx,
     ) -> Result<()> {
+        let opts = ctx.opts;
+        let sector = u64::from(tree.sb.sectorsize);
         for ((objectid, key_type, start), item) in tree.item_run(inode.ino, EXTENT_DATA_KEY)? {
             if objectid != inode.ino || key_type != EXTENT_DATA_KEY {
                 break;
@@ -913,9 +919,23 @@ impl Filesystem {
                 _ if x.disk_bytenr == 0 => {} // a hole
                 _ => {
                     let end = start.saturating_add(x.num_bytes);
-                    if !(opts.compressed_data && send_encoded(tree, w, path, inode, start, &x)?) {
+                    let len = x.num_bytes.min(inode.size.saturating_sub(start));
+                    if let Some((src, from)) = ctx.clones.find(&x, start, len, sector) {
+                        w.begin(cmd::CLONE);
+                        w.attr(attr::PATH, path)?;
+                        w.attr_u64(attr::FILE_OFFSET, start)?;
+                        w.attr_u64(attr::CLONE_LEN, len)?;
+                        w.attr(attr::CLONE_UUID, &src.uuid)?;
+                        w.attr_u64(attr::CLONE_CTRANSID, src.ctransid)?;
+                        w.attr(attr::CLONE_PATH, &src.path)?;
+                        w.attr_u64(attr::CLONE_OFFSET, from)?;
+                    } else if !(opts.compressed_data
+                        && send_encoded(tree, w, path, inode, start, &x)?)
+                    {
                         send_writes(tree, w, path, inode, start, end)?;
                     }
+                    let (uuid, ctransid) = (ctx.uuid, ctx.ctransid);
+                    ctx.clones.add(&x, start, uuid, ctransid, path, inode.size);
                 }
             }
         }
@@ -972,6 +992,109 @@ impl Filesystem {
     }
 }
 
+/// What writing one stream carries from file to file.
+pub(crate) struct SendCtx {
+    pub(crate) opts: SendOptions,
+    /// The subvolume the receiver is building: what a clone from a file
+    /// already sent in this stream names.
+    uuid: [u8; 16],
+    ctransid: u64,
+    pub(crate) clones: Clones,
+}
+
+impl SendCtx {
+    fn new(opts: SendOptions, building: &SubvolIdentity) -> Self {
+        Self {
+            opts,
+            uuid: building.uuid,
+            ctransid: building.ctransid,
+            clones: Clones::default(),
+        }
+    }
+}
+
+/// A run of a data extent that a file the receiver already has holds.
+pub(crate) struct CloneSource {
+    /// The subvolume the file is in, as the stream names it.
+    uuid: [u8; 16],
+    ctransid: u64,
+    path: Vec<u8>,
+    /// Where in the file the run starts, and where in the extent.
+    file_start: u64,
+    extent_offset: u64,
+    len: u64,
+    file_size: u64,
+}
+
+/// Where each data extent can be cloned from, by its address and
+/// compression.
+#[derive(Default)]
+pub(crate) struct Clones {
+    by_extent: BTreeMap<(u64, u8), Vec<CloneSource>>,
+}
+
+impl Clones {
+    /// Record that the file at `path`, `file_size` long, holds extent item
+    /// `x` from file offset `start`.
+    pub(crate) fn add(
+        &mut self,
+        x: &RawExtent,
+        start: u64,
+        uuid: [u8; 16],
+        ctransid: u64,
+        path: &[u8],
+        file_size: u64,
+    ) {
+        if x.kind == EXTENT_INLINE || x.kind == EXTENT_PREALLOC || x.disk_bytenr == 0 {
+            return;
+        }
+        self.by_extent
+            .entry((x.disk_bytenr, x.compression))
+            .or_default()
+            .push(CloneSource {
+                uuid,
+                ctransid,
+                path: path.to_vec(),
+                file_start: start,
+                extent_offset: x.offset,
+                len: x.num_bytes,
+                file_size,
+            });
+    }
+
+    /// A source for `len` bytes of extent item `x` placed at file offset
+    /// `start`, and the offset in the source file to clone from.
+    ///
+    /// Only a clone the receiver can make: both offsets on a sector
+    /// boundary, and the length a whole number of sectors unless it runs
+    /// to the source's end, as the kernel's clone requires.
+    fn find(
+        &self,
+        x: &RawExtent,
+        start: u64,
+        len: u64,
+        sector: u64,
+    ) -> Option<(&CloneSource, u64)> {
+        if len == 0 || sector == 0 || !start.is_multiple_of(sector) {
+            return None;
+        }
+        let want_end = x.offset.checked_add(len)?;
+        self.by_extent
+            .get(&(x.disk_bytenr, x.compression))?
+            .iter()
+            .find_map(|s| {
+                if x.offset < s.extent_offset || want_end > s.extent_offset.checked_add(s.len)? {
+                    return None;
+                }
+                let from = s.file_start.checked_add(x.offset - s.extent_offset)?;
+                let end = from.checked_add(len)?;
+                let aligned = from.is_multiple_of(sector)
+                    && (len.is_multiple_of(sector) || end == s.file_size);
+                (aligned && end <= s.file_size).then_some((s, from))
+            })
+    }
+}
+
 /// A file extent item's type byte: inline, regular, preallocated.
 const EXTENT_INLINE: u8 = 0;
 const EXTENT_PREALLOC: u8 = 2;
@@ -981,7 +1104,7 @@ const EXTENT_PREALLOC: u8 = 2;
 const MAX_COMPRESSED: u64 = 128 * 1024;
 
 /// One file extent item, its fields as stored.
-struct RawExtent {
+pub(crate) struct RawExtent {
     kind: u8,
     compression: u8,
     encryption: u8,
@@ -994,7 +1117,7 @@ struct RawExtent {
 }
 
 impl RawExtent {
-    fn parse(item: &[u8], ino: u64, start: u64) -> Result<Self> {
+    pub(crate) fn parse(item: &[u8], ino: u64, start: u64) -> Result<Self> {
         let need = if item.get(file_extent::TYPE) == Some(&EXTENT_INLINE) {
             file_extent::INLINE_DATA
         } else {
@@ -1313,6 +1436,70 @@ mod tests {
         let mut three = SendOptions::v2();
         three.version = 3;
         assert!(three.check().is_err());
+    }
+
+    fn regular(bytenr: u64, offset: u64, num_bytes: u64) -> RawExtent {
+        RawExtent {
+            kind: 1,
+            compression: 0,
+            encryption: 0,
+            other_encoding: 0,
+            ram_bytes: 1 << 20,
+            disk_bytenr: bytenr,
+            disk_num_bytes: 1 << 20,
+            offset,
+            num_bytes,
+        }
+    }
+
+    /// A clone is found where a file already sent holds the same run of
+    /// the same extent, at the offset that run sits in that file.
+    #[test]
+    fn a_clone_comes_from_the_file_that_holds_the_run() {
+        let mut clones = Clones::default();
+        // `a` holds the extent's first 64 KiB from its own offset 8 KiB.
+        clones.add(&regular(1 << 30, 0, 65_536), 8192, [1; 16], 7, b"a", 73_728);
+        let (src, from) = clones
+            .find(&regular(1 << 30, 4096, 16_384), 0, 16_384, 4096)
+            .expect("a run inside a's");
+        assert_eq!((src.path.as_slice(), from), (&b"a"[..], 12_288));
+        assert_eq!((src.uuid, src.ctransid), ([1; 16], 7));
+        // Another extent, or past what `a` holds: nothing.
+        assert!(clones
+            .find(&regular(2 << 30, 0, 4096), 0, 4096, 4096)
+            .is_none());
+        assert!(clones
+            .find(&regular(1 << 30, 61_440, 8192), 0, 8192, 4096)
+            .is_none());
+    }
+
+    /// The receiver's clone wants sector-aligned offsets, and a length in
+    /// whole sectors unless it runs to the source's end.
+    #[test]
+    fn a_clone_the_receiver_would_refuse_is_not_offered() {
+        let mut clones = Clones::default();
+        clones.add(&regular(1 << 30, 0, 12_288), 0, [1; 16], 7, b"a", 10_000);
+        // The whole of a 10,000-byte file: to the source's end, so fine.
+        assert!(clones
+            .find(&regular(1 << 30, 0, 12_288), 0, 10_000, 4096)
+            .is_some());
+        // Short of the end and not whole sectors: refused.
+        assert!(clones
+            .find(&regular(1 << 30, 0, 12_288), 0, 5000, 4096)
+            .is_none());
+        // Into an offset off a sector boundary: refused.
+        assert!(clones
+            .find(&regular(1 << 30, 0, 4096), 100, 4096, 4096)
+            .is_none());
+        // Holes, inline and preallocated extents are never sources.
+        let mut none = Clones::default();
+        none.add(&regular(0, 0, 4096), 0, [1; 16], 7, b"hole", 4096);
+        let mut prealloc = regular(1 << 30, 0, 4096);
+        prealloc.kind = EXTENT_PREALLOC;
+        none.add(&prealloc, 0, [1; 16], 7, b"prealloc", 4096);
+        assert!(none
+            .find(&regular(1 << 30, 0, 4096), 0, 4096, 4096)
+            .is_none());
     }
 
     #[test]
