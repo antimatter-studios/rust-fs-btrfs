@@ -920,7 +920,10 @@ struct WritableCopy(PathBuf);
 
 impl WritableCopy {
     fn new(name: &str) -> Self {
-        let src = fixture("btrfs-nodatacow.img");
+        Self::of("btrfs-nodatacow.img", name)
+    }
+    fn of(image: &str, name: &str) -> Self {
+        let src = fixture(image);
         let dst = PathBuf::from(temp_path!("{name}"));
         std::fs::copy(&src, &dst)
             .unwrap_or_else(|e| panic!("copy {} to {}: {e}", src.display(), dst.display()));
@@ -1400,5 +1403,130 @@ fn dir_open_takes_a_non_utf8_path_as_bytes() {
         !msg.contains("not valid UTF-8"),
         "the path was refused for its encoding rather than looked up: {msg}"
     );
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+// ---------------------------------------------------------------------
+// Subvolumes
+//
+// The kernel-made subvolume fixture: a directory `top`, a subvolume `sub`
+// with `inner` nested in it, a writable snapshot `snap` -- whose copy of
+// `inner` is the empty directory a snapshot shows -- and a read-only one,
+// `rosnap`. What the flags mean on disk is held to the kernel by
+// subvol_readonly_kernel and subvol_default_kernel; this holds the C ABI
+// to the library behind it.
+// ---------------------------------------------------------------------
+
+const SUBVOL_IMAGE: &str = "btrfs-subvol.img";
+
+fn subvol_is_readonly(fs: *mut fs_btrfs_fs, path: &str) -> i32 {
+    unsafe { fs_btrfs_subvol_is_readonly(fs, cstr(path).as_ptr()) }
+}
+
+fn subvol_set_readonly(fs: *mut fs_btrfs_fs, path: &str, read_only: i32) -> i32 {
+    unsafe { fs_btrfs_subvol_set_readonly(fs, cstr(path).as_ptr(), read_only) }
+}
+
+fn subvol_is_default(fs: *mut fs_btrfs_fs, path: &str) -> i32 {
+    unsafe { fs_btrfs_subvol_is_default(fs, cstr(path).as_ptr()) }
+}
+
+fn subvol_set_default(fs: *mut fs_btrfs_fs, path: &str) -> i32 {
+    unsafe { fs_btrfs_subvol_set_default(fs, cstr(path).as_ptr()) }
+}
+
+/// A subvolume is named by its top directory, nested or not; any other
+/// path -- a directory, a file, a snapshot's stand-in for a nested
+/// subvolume, nothing at all -- is ENOENT, and NULL is refused.
+#[test]
+fn a_subvolume_is_named_by_its_top_directory() {
+    let copy = WritableCopy::of(SUBVOL_IMAGE, "btrfscapi-subvol-names.img");
+    let fs = copy.open_ro();
+    for (path, read_only) in [
+        ("/", 0),
+        ("/sub", 0),
+        ("sub/", 0),
+        ("/sub/inner", 0),
+        ("/snap", 0),
+        ("/rosnap", 1),
+    ] {
+        assert_eq!(
+            subvol_is_readonly(fs, path),
+            read_only,
+            "{path}: {}",
+            last_error()
+        );
+        assert_eq!(fs_btrfs_last_errno(), 0, "{path}");
+    }
+    for path in ["/top", "/top/a.txt", "/snap/inner", "/nowhere"] {
+        assert_eq!(subvol_is_readonly(fs, path), -1, "{path}");
+        assert_eq!(fs_btrfs_last_errno(), ENOENT, "{path}: {}", last_error());
+        assert_eq!(subvol_is_default(fs, path), -1, "{path}");
+        assert_eq!(fs_btrfs_last_errno(), ENOENT, "{path}: {}", last_error());
+    }
+    let null_fs = std::ptr::null_mut();
+    assert_eq!(subvol_is_readonly(null_fs, "/sub"), -1);
+    assert_eq!(subvol_set_readonly(null_fs, "/sub", 1), -1);
+    assert_eq!(subvol_is_default(null_fs, "/sub"), -1);
+    assert_eq!(subvol_set_default(null_fs, "/sub"), -1);
+    assert_eq!(
+        unsafe { fs_btrfs_subvol_is_readonly(fs, std::ptr::null()) },
+        -1
+    );
+    assert_eq!(
+        unsafe { fs_btrfs_subvol_set_default(fs, std::ptr::null()) },
+        -1
+    );
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+/// The read-only flag set and cleared through the C ABI is on disk for
+/// the next handle, and a read-only handle refuses to change it.
+#[test]
+fn the_read_only_flag_changes_through_the_c_abi() {
+    let copy = WritableCopy::of(SUBVOL_IMAGE, "btrfscapi-subvol-ro.img");
+    let fs = copy.open_rw();
+    assert_eq!(subvol_set_readonly(fs, "/sub", 1), 0, "{}", last_error());
+    assert_eq!(subvol_set_readonly(fs, "/rosnap", 0), 0, "{}", last_error());
+    // Already so: still a success.
+    assert_eq!(subvol_set_readonly(fs, "/sub", 1), 0, "{}", last_error());
+    assert_eq!(subvol_is_readonly(fs, "/sub"), 1);
+    assert_eq!(subvol_is_readonly(fs, "/rosnap"), 0);
+    assert_eq!(subvol_set_readonly(fs, "/top", 1), -1);
+    assert_eq!(fs_btrfs_last_errno(), ENOENT, "{}", last_error());
+    unsafe { fs_btrfs_umount(fs) };
+
+    let fs = copy.open_ro();
+    assert_eq!(subvol_is_readonly(fs, "/sub"), 1, "{}", last_error());
+    assert_eq!(subvol_is_readonly(fs, "/rosnap"), 0, "{}", last_error());
+    assert_eq!(subvol_set_readonly(fs, "/sub", 0), -1);
+    assert_eq!(fs_btrfs_last_errno(), EROFS, "{}", last_error());
+    unsafe { fs_btrfs_umount(fs) };
+}
+
+/// The default subvolume chosen through the C ABI is on disk for the next
+/// handle, a nested one included; "/" makes the top level the default
+/// again; a read-only handle refuses.
+#[test]
+fn the_default_subvolume_changes_through_the_c_abi() {
+    let copy = WritableCopy::of(SUBVOL_IMAGE, "btrfscapi-subvol-default.img");
+    let fs = copy.open_rw();
+    assert_eq!(subvol_is_default(fs, "/"), 1, "{}", last_error());
+    assert_eq!(subvol_is_default(fs, "/sub"), 0, "{}", last_error());
+    assert_eq!(subvol_set_default(fs, "/sub/inner"), 0, "{}", last_error());
+    assert_eq!(subvol_is_default(fs, "/sub/inner"), 1);
+    assert_eq!(subvol_is_default(fs, "/"), 0);
+    unsafe { fs_btrfs_umount(fs) };
+
+    let fs = copy.open_ro();
+    assert_eq!(subvol_is_default(fs, "/sub/inner"), 1, "{}", last_error());
+    assert_eq!(subvol_set_default(fs, "/"), -1);
+    assert_eq!(fs_btrfs_last_errno(), EROFS, "{}", last_error());
+    unsafe { fs_btrfs_umount(fs) };
+
+    let fs = copy.open_rw();
+    assert_eq!(subvol_set_default(fs, "/"), 0, "{}", last_error());
+    assert_eq!(subvol_is_default(fs, "/"), 1);
+    assert_eq!(subvol_is_default(fs, "/sub/inner"), 0);
     unsafe { fs_btrfs_umount(fs) };
 }

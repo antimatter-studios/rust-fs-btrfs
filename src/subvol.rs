@@ -652,6 +652,71 @@ impl Filesystem {
         )
     }
 
+    /// The subvolume a mount without `subvol=` shows: what `btrfs subvolume
+    /// get-default` prints.
+    ///
+    /// Read from the `default` entry in the root tree's directory (objectid
+    /// 6), the one [`Filesystem::set_default_subvolume`] rewrites. A root
+    /// tree with no such entry has the top level as its default, as the
+    /// kernel reads it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadSuperblock`] for an entry too short to name a subvolume,
+    /// and whatever reading the root tree returns.
+    pub fn default_subvolume(&self) -> Result<u64> {
+        use crate::dir::{name_hash, DIR_ITEM_KEY};
+        use crate::transaction::ROOT_TREE_DIR_OBJECTID;
+        let key = (ROOT_TREE_DIR_OBJECTID, DIR_ITEM_KEY, name_hash(b"default"));
+        let Some(entry) = self
+            .root_tree_items()?
+            .into_iter()
+            .find(|(o, t, off, _)| (*o, *t, *off) == key)
+            .map(|(_, _, _, data)| data)
+        else {
+            return Ok(FS_TREE_OBJECTID);
+        };
+        entry
+            .get(..8)
+            .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")))
+            .ok_or_else(|| {
+                Error::BadSuperblock(format!(
+                    "the root tree's default entry is {} bytes, too short to name a subvolume",
+                    entry.len()
+                ))
+            })
+    }
+
+    /// The id of the subvolume whose top directory `path` names, from this
+    /// handle's own top: `/` for the tree this handle reads, `/sub` for a
+    /// subvolume called `sub` there, `/sub/inner` for one nested in it.
+    ///
+    /// The path is resolved as [`Filesystem::resolve_path_bytes`] resolves
+    /// it, crossing into subvolumes on the way, so it names the subvolume
+    /// the way a mounted filesystem's path would.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for a path that does not exist, or that ends
+    /// anywhere but at a subvolume's top directory -- an ordinary
+    /// directory, a file, or the empty directory a snapshot shows where its
+    /// source had a nested subvolume -- and whatever the tree walks return.
+    pub fn subvolume_at(&self, path: &[u8]) -> Result<u64> {
+        let target = self.resolve_path_bytes(path)?;
+        if target.inode.ino != FIRST_FREE_OBJECTID || !target.inode.is_dir() {
+            return Err(Error::NotFound);
+        }
+        let root = target
+            .tree
+            .as_ref()
+            .map_or(self.fs_tree_root, |t| t.fs_tree_root);
+        self.subvolumes()?
+            .into_iter()
+            .find(|s| s.bytenr == root)
+            .map(|s| s.id)
+            .ok_or(Error::NotFound)
+    }
+
     /// Commit a change to one root tree leaf as a transaction, then reopen
     /// the mount on the new generation.
     fn commit_root_tree_change(

@@ -25,6 +25,15 @@ never does.
   same snapshot from a stream this crate wrote.
 - **`send::StreamError`**, its own error type. A malformed stream is bytes
   handed in, not a damaged volume, so it is kept out of the crate's `Error`.
+- **The C ABI reads and changes a subvolume's read-only flag and the default
+  subvolume (#267).** `fs_btrfs_subvol_is_readonly`,
+  `fs_btrfs_subvol_set_readonly`, `fs_btrfs_subvol_is_default` and
+  `fs_btrfs_subvol_set_default` name a subvolume by the path of its top
+  directory, as a mount shows it, and fail with ENOENT for any other path and
+  EROFS on a handle not opened for writing. Behind them,
+  `Filesystem::subvolume_at` finds a subvolume by that path and
+  `Filesystem::default_subvolume` reads the default back;
+  `tests/subvol_default_kernel.rs` holds both to what the kernel says.
 - **The default subvolume can be chosen (#267).**
   `Filesystem::set_default_subvolume` repoints the root tree's `default`
   entry and, for any subvolume but the top level, sets the `DEFAULT_SUBVOL`

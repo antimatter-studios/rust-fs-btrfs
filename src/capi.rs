@@ -1176,3 +1176,160 @@ pub unsafe extern "C" fn fs_btrfs_write_file(
         }
     })
 }
+
+// ---------------------------------------------------------------------
+// Subvolumes
+//
+// A subvolume is named by the path of its top directory, as a mounted
+// filesystem would show it: "/sub", "/sub/inner", "/" for the top level.
+// A path that ends anywhere else -- an ordinary directory, a file, the
+// empty directory a snapshot shows where its source had a nested
+// subvolume -- is ENOENT: no subvolume is there.
+// ---------------------------------------------------------------------
+
+/// The subvolume `path` names, or `None` with the error recorded.
+///
+/// # Safety
+///
+/// `fs` must be a live handle or NULL; `path` NUL-terminated or NULL.
+unsafe fn subvolume_named(fs: *mut fs_btrfs_fs, path: *const c_char) -> Option<u64> {
+    if fs.is_null() {
+        set_error("fs is NULL".into(), EIO);
+        return None;
+    }
+    let path = unsafe { borrow_bytes(path, "path") }?;
+    match unsafe { &*fs }.fs.subvolume_at(path) {
+        Ok(id) => Some(id),
+        Err(Error::NotFound) => {
+            set_error(format!("no subvolume is at {}", shown(path)), ENOENT);
+            None
+        }
+        Err(e) => {
+            record(&e);
+            None
+        }
+    }
+}
+
+/// Whether the subvolume at `path` is read-only.
+///
+/// Returns 1 for read-only, 0 for writable, -1 with the error recorded.
+///
+/// # Safety
+///
+/// `fs` must be a live handle and `path` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_subvol_is_readonly(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+) -> c_int {
+    guard(-1, || {
+        let Some(id) = (unsafe { subvolume_named(fs, path) }) else {
+            return -1;
+        };
+        match unsafe { &*fs }.fs.subvolumes() {
+            Ok(list) => match list.into_iter().find(|s| s.id == id) {
+                Some(s) => c_int::from(s.read_only),
+                None => {
+                    set_error(format!("subvolume {id} is not listed"), EIO);
+                    -1
+                }
+            },
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
+}
+
+/// Make the subvolume at `path` read-only (`read_only` non-zero) or
+/// writable (zero), as one committed transaction: what `btrfs property
+/// set <subvol> ro true|false` does. Asking for the state it is already
+/// in commits nothing.
+///
+/// Returns 0, or -1 with the error recorded: EROFS for a handle not
+/// opened with [`fs_btrfs_mount_rw`], ENOENT for no subvolume at `path`,
+/// ENOTSUP for a received subvolume made writable.
+///
+/// # Safety
+///
+/// `fs` must be a live handle and `path` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_subvol_set_readonly(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+    read_only: c_int,
+) -> c_int {
+    guard(-1, || {
+        let Some(id) = (unsafe { subvolume_named(fs, path) }) else {
+            return -1;
+        };
+        match unsafe { &mut *fs }
+            .fs
+            .set_subvolume_read_only(id, read_only != 0)
+        {
+            Ok(()) => 0,
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
+}
+
+/// Whether the subvolume at `path` is the default one, the subvolume a
+/// mount without `subvol=` shows.
+///
+/// Returns 1 for yes, 0 for no, -1 with the error recorded.
+///
+/// # Safety
+///
+/// `fs` must be a live handle and `path` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_subvol_is_default(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+) -> c_int {
+    guard(-1, || {
+        let Some(id) = (unsafe { subvolume_named(fs, path) }) else {
+            return -1;
+        };
+        match unsafe { &*fs }.fs.default_subvolume() {
+            Ok(default) => c_int::from(default == id),
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
+}
+
+/// Make the subvolume at `path` the default one, as one committed
+/// transaction: what `btrfs subvolume set-default` does. "/" makes the top
+/// level the default again.
+///
+/// Returns 0, or -1 with the error recorded: EROFS for a handle not
+/// opened with [`fs_btrfs_mount_rw`], ENOENT for no subvolume at `path`.
+///
+/// # Safety
+///
+/// `fs` must be a live handle and `path` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_subvol_set_default(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+) -> c_int {
+    guard(-1, || {
+        let Some(id) = (unsafe { subvolume_named(fs, path) }) else {
+            return -1;
+        };
+        match unsafe { &mut *fs }.fs.set_default_subvolume(id) {
+            Ok(()) => 0,
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
+}
