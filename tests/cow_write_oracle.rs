@@ -241,10 +241,13 @@ fn a_checksummed_file_is_written_with_digests_the_checker_and_kernel_verify() {
         let image = scratch.image();
         let before = kernel_view(&image, "before the write", &["a.bin", "b.bin"]);
 
-        // (file, offset, bytes)
+        // (file, offset, bytes). Across a.bin's two extents first, then
+        // inside its second only: a.bin's first extent then moves once,
+        // and a second move could land back in the space the first one
+        // released, which would leave nothing for `filefrag` to see.
         let writes: Vec<(&str, u64, Vec<u8>)> = vec![
-            ("a.bin", 5000, b"checksummed, inside one extent ".repeat(3)),
             ("a.bin", 61440, vec![0xa5; 8192]),
+            ("a.bin", 70000, b"checksummed, inside one extent ".repeat(3)),
             ("b.bin", 30000, vec![0x5a; 3000]),
         ];
 
