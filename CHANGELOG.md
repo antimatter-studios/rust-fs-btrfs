@@ -44,6 +44,12 @@ never does.
 - **A transient HTTP 5xx from the chore release download no longer fails a CI
   job.** `scripts/ci-install-chore.sh` retries both downloads up to five times
   on any error; the checksum check still guards what was fetched.
+- **Moving a tree block that a balance flagged `FULL_BACKREF` keeps its
+  references true.** The data extents under such a leaf, and the children of
+  such a node, are recorded as referred to by the block's address; a move now
+  re-points each of those references at the new address and keeps the flag on
+  the new record, where it used to leave them naming the old block and
+  `btrfs check` reported a referencer count mismatch for every extent (#287).
 
 ## [0.10.2] — 2026-10-07
 

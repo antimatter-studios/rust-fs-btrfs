@@ -478,6 +478,9 @@ impl Filesystem {
         }
 
         let moved: BTreeMap<u64, u64> = plan.rewrites.iter().map(|r| (r.old, r.new)).collect();
+        // What each moved block's record says about its references, and
+        // which of its children's records name it by address (#287).
+        let backrefs = self.backrefs(plan)?;
 
         // How far each block group's `used` moves, and which of them
         // have had it written so far (#223).
@@ -539,8 +542,12 @@ impl Filesystem {
                         owned = self.apply_records(
                             rewrite.old,
                             owned,
-                            plan,
                             data,
+                            Moves {
+                                plan,
+                                to: &moved,
+                                backrefs: &backrefs,
+                            },
                             generation,
                             &mut applied,
                         )?;
@@ -704,6 +711,9 @@ impl Filesystem {
             let mut touched: Vec<u64> = plan.released();
             touched.extend(plan.allocated());
             touched.extend(data.addresses());
+            // A moved block flagged FULL_BACKREF is named by address in
+            // its children's records, which therefore change too (#287).
+            touched.extend(self.backrefs(&plan)?.repoints.iter().map(|r| r.bytenr));
 
             let before = seed.len();
             seed.extend(self.extent_leaves_for(&touched)?);
@@ -805,12 +815,12 @@ impl Filesystem {
         &self,
         leaf: u64,
         items: Vec<crate::leaf_edit::OwnedItem>,
-        plan: &Plan,
         data: &DataWrite,
+        moves: Moves<'_>,
         generation: u64,
         applied: &mut DataApplied,
     ) -> Result<Vec<crate::leaf_edit::OwnedItem>> {
-        use crate::extent_write::{record_tree_block, TreeBlockAllocation};
+        use crate::extent_write::{offsets, record_tree_block, TreeBlockAllocation};
         use crate::leaf_edit::{delete, insert, OwnedItem};
 
         // Which leaf each address belongs to, by the rule a descent
@@ -826,7 +836,7 @@ impl Filesystem {
 
         // Releases first, so the leaf is at its smallest before
         // anything is added to it.
-        for rewrite in &plan.rewrites {
+        for rewrite in &moves.plan.rewrites {
             if !mine(rewrite.old)? {
                 continue;
             }
@@ -902,7 +912,19 @@ impl Filesystem {
             applied.released += 1;
         }
 
-        for rewrite in &plan.rewrites {
+        // Each reference that names a moved full-backref block by its
+        // old address now names its new one (#287). Without this the
+        // data under a moved leaf is recorded as referred to by a block
+        // that no longer exists, and `btrfs check` reports a referencer
+        // count mismatch for every extent of it.
+        for repoint in &moves.backrefs.repoints {
+            if !mine(repoint.bytenr)? {
+                continue;
+            }
+            out = apply_repoint(self.sb.nodesize, out, repoint)?;
+        }
+
+        for rewrite in &moves.plan.rewrites {
             if !mine(rewrite.new)? {
                 continue;
             }
@@ -912,7 +934,25 @@ impl Filesystem {
                 generation,
                 owner: rewrite.owner,
             };
-            let (key, body) = record_tree_block(&self.sb, alloc)?;
+            let (key, mut body) = record_tree_block(&self.sb, alloc)?;
+            // The new record says what the old one did about references:
+            // a block flagged FULL_BACKREF keeps the flag, because its
+            // children's records were re-pointed rather than converted,
+            // and a block its parent names by address is named by the
+            // parent's new address (#287).
+            if let Some(old) = moves.backrefs.records.get(&rewrite.old) {
+                if old.full_backref {
+                    let flags = crate::backref::flags(&body).unwrap_or(0)
+                        | crate::backref::BLOCK_FLAG_FULL_BACKREF;
+                    body[offsets::FLAGS..offsets::FLAGS + 8].copy_from_slice(&flags.to_le_bytes());
+                }
+                if let Some(parent) = old.shared_parent {
+                    let parent = moves.to.get(&parent).copied().unwrap_or(parent);
+                    body[offsets::REF_TYPE] = crate::backref::SHARED_BLOCK_REF;
+                    body[offsets::REF_OFFSET..offsets::REF_OFFSET + 8]
+                        .copy_from_slice(&parent.to_le_bytes());
+                }
+            }
             // Nor here: a record already under the new address means the
             // free-space picture that chose it was wrong, and `insert`
             // refuses a duplicate key.
@@ -949,6 +989,213 @@ impl Filesystem {
         }
         Ok(out)
     }
+}
+
+/// Where a plan moves each block, and what that does to references, as
+/// [`Filesystem::apply_records`] needs them.
+#[derive(Clone, Copy)]
+struct Moves<'a> {
+    /// The plan: every block moving.
+    plan: &'a Plan,
+    /// Each moved block's new address, by its old one.
+    to: &'a BTreeMap<u64, u64>,
+    /// The references the moves change.
+    backrefs: &'a Backrefs,
+}
+
+/// What a moved block's own extent record said about references, which
+/// its new record repeats.
+#[derive(Debug, Clone, Copy, Default)]
+struct OldRecord {
+    /// It was flagged `FULL_BACKREF`: its children's records name it by
+    /// address.
+    full_backref: bool,
+    /// Its one reference was a shared one, naming this parent.
+    shared_parent: Option<u64>,
+}
+
+/// A reference that names a moved block as its parent, and must name the
+/// block's new address instead.
+#[derive(Debug, Clone, Copy)]
+struct Repoint {
+    /// The extent whose record holds the reference: a child tree block,
+    /// or a data extent a leaf's file item points at.
+    bytenr: u64,
+    /// The parent's old address.
+    from: u64,
+    /// The parent's new address.
+    to: u64,
+}
+
+/// The reference bookkeeping a plan's moves carry (#287).
+#[derive(Debug, Default)]
+struct Backrefs {
+    /// Each moved block's old record, by its old address.
+    records: BTreeMap<u64, OldRecord>,
+    /// Every reference naming a moved full-backref block by address,
+    /// except those of children that move too: their records are
+    /// replaced whole, and the new one is written naming the new parent.
+    repoints: Vec<Repoint>,
+}
+
+impl Filesystem {
+    /// What `plan`'s moves do to back references.
+    ///
+    /// Balance leaves tree blocks flagged `FULL_BACKREF`: their children
+    /// are recorded as referred to by the block's ADDRESS, by a shared
+    /// reference, rather than by the tree that owns it. Moving such a
+    /// block leaves every one of those references naming a block that is
+    /// gone. They are re-pointed at the new address, and the block's new
+    /// record keeps the flag, so the volume says the same thing about
+    /// who refers to what as it did before; see [`crate::backref`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates a read failure, and a record whose inline references
+    /// cannot be read.
+    fn backrefs(&self, plan: &Plan) -> Result<Backrefs> {
+        use crate::backref::{self, BLOCK_FLAG_FULL_BACKREF, SHARED_BLOCK_REF};
+        use crate::fs::{file_extent as fe, EXTENT_PREALLOC};
+
+        let extent_root = self.tree_root(objectid::EXTENT_TREE)?;
+        let reader = self.pool_reader();
+        let tree = reader.tree();
+        let moving: BTreeSet<u64> = plan.rewrites.iter().map(|r| r.old).collect();
+
+        let mut out = Backrefs::default();
+        for rewrite in &plan.rewrites {
+            let key = DiskKey {
+                objectid: rewrite.old,
+                key_type: key_type::METADATA_ITEM,
+                offset: u64::from(rewrite.level),
+            };
+            // A missing record is `apply_records`' to report, when it
+            // comes to delete it.
+            let Some(record) = tree.search(extent_root, &key)? else {
+                continue;
+            };
+            let refs = backref::inline_refs(key_type::METADATA_ITEM, &record.data)?;
+            let full_backref =
+                backref::flags(&record.data).is_some_and(|f| f & BLOCK_FLAG_FULL_BACKREF != 0);
+            let shared_parent = match refs.as_slice() {
+                [only] if only.kind == SHARED_BLOCK_REF => Some(only.offset()),
+                _ => None,
+            };
+            out.records.insert(
+                rewrite.old,
+                OldRecord {
+                    full_backref,
+                    shared_parent,
+                },
+            );
+            if !full_backref {
+                continue;
+            }
+
+            let block = self.read_tree_block(rewrite.old)?;
+            let mut children = BTreeSet::new();
+            if let Some(ptrs) = block.body.key_ptrs() {
+                children.extend(
+                    ptrs.iter()
+                        .map(|p| p.blockptr)
+                        .filter(|child| !moving.contains(child)),
+                );
+            } else if let Some(items) = block.body.items() {
+                for item in items {
+                    if item.key.key_type != EXTENT_DATA_KEY {
+                        continue;
+                    }
+                    let Some(d) = block.item_data(item) else {
+                        continue;
+                    };
+                    if d.len() < fe::REGULAR_SIZE
+                        || !matches!(d[fe::TYPE], EXTENT_REGULAR | EXTENT_PREALLOC)
+                    {
+                        continue;
+                    }
+                    let at = u64::from_le_bytes(
+                        d[fe::DISK_BYTENR..fe::DISK_BYTENR + 8]
+                            .try_into()
+                            .expect("8 bytes"),
+                    );
+                    // Zero is a hole: no extent, so no reference.
+                    if at != 0 {
+                        children.insert(at);
+                    }
+                }
+            }
+            out.repoints
+                .extend(children.into_iter().map(|bytenr| Repoint {
+                    bytenr,
+                    from: rewrite.old,
+                    to: rewrite.new,
+                }));
+        }
+        Ok(out)
+    }
+}
+
+/// Re-point the shared reference `repoint` describes, in the extent-tree
+/// leaf holding its record.
+///
+/// Inline in the extent item when the reference is there, and otherwise
+/// the reference's own item, keyed by the parent it names, which is
+/// re-filed under the new parent.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] when this leaf holds neither: the extent
+/// tree does not say what the moved block's contents do, and carrying on
+/// would leave a reference naming a block that is gone.
+fn apply_repoint(
+    nodesize: u32,
+    mut items: Vec<crate::leaf_edit::OwnedItem>,
+    repoint: &Repoint,
+) -> Result<Vec<crate::leaf_edit::OwnedItem>> {
+    use crate::backref::{repoint_inline, SHARED_BLOCK_REF, SHARED_DATA_REF};
+    use crate::leaf_edit::{delete, insert, OwnedItem};
+
+    if let Some(item) = items.iter_mut().find(|i| {
+        i.key.objectid == repoint.bytenr
+            && matches!(
+                i.key.key_type,
+                key_type::EXTENT_ITEM | key_type::METADATA_ITEM
+            )
+    }) {
+        let (body, moved) =
+            repoint_inline(item.key.key_type, &item.data, repoint.from, repoint.to)?;
+        if moved > 0 {
+            item.data = body;
+            return Ok(items);
+        }
+    }
+    for kind in [SHARED_BLOCK_REF, SHARED_DATA_REF] {
+        let key = DiskKey {
+            objectid: repoint.bytenr,
+            key_type: kind,
+            offset: repoint.from,
+        };
+        let Some(data) = items.iter().find(|i| i.key == key).map(|i| i.data.clone()) else {
+            continue;
+        };
+        let items = delete(&items, &key)?;
+        return insert(
+            nodesize,
+            &items,
+            OwnedItem {
+                key: DiskKey {
+                    offset: repoint.to,
+                    ..key
+                },
+                data,
+            },
+        );
+    }
+    Err(Error::UnsupportedFeature(format!(
+        "the block at {} moves to {}, and the extent at {} is referred to by it, but the \
+         extent tree leaf holding that extent's record names no reference from it",
+        repoint.from, repoint.to, repoint.bytenr
+    )))
 }
 
 /// How much of a [`DataWrite`] the rendered leaves carried.
