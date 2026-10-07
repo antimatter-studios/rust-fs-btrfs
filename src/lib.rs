@@ -62,6 +62,7 @@
 //! - [`transaction`], [`extent_write`], [`block_group`] and [`commit`] — tree
 //!   rewrites and the commit of a new generation, separate from file writes
 //! - [`send`] — send streams: parsed, and written from a read-only subvolume
+//! - [`log_tree`] — reading an unreplayed log tree, and a mount that ignores it
 //! - [`capi`] — the C ABI
 
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -82,6 +83,7 @@ pub mod extent_write;
 pub mod fs;
 pub mod inode;
 pub mod leaf_edit;
+pub mod log_tree;
 pub mod mkfs;
 pub mod send;
 pub mod subvol;

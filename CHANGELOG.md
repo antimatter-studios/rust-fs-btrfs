@@ -34,6 +34,11 @@ never does.
   the kernel's own incremental stream against `btrfs receive --dump`.
 - **`send::StreamError`**, its own error type. A malformed stream is bytes
   handed in, not a damaged volume, so it is kept out of the crate's `Error`.
+- **An unreplayed log tree can be read.** `Filesystem::log` returns every item
+  of every subvolume's log tree, with the logged inodes, names and file
+  contents, and `Filesystem::mount_ignoring_log` opens such a volume read-only
+  on its committed trees, like the kernel's `ro,nologreplay`. Every other mount
+  still refuses a non-empty log; replaying it is the rest of #266.
 
 ### Changed
 
