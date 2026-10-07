@@ -1685,47 +1685,51 @@ build_seed() {
 }
 
 # ---------------------------------------------------------------------
-# squota — simple quotas (`mkfs.btrfs -O squota`), with content written
-# while they were on, so its data extents carry the owner references
-# simple quotas add (#270). The manifest is every file's size and
-# SHA-256, then `btrfs qgroup show` as the kernel reported it.
+# squota — simple quotas (`-O squota`), with content, so its data
+# extents carry the owner references simple quotas add (#270). The
+# manifest is every file's size and SHA-256.
+#
+# MADE BY MKFS, NOT FILLED BY THE KERNEL. Simple quotas arrived in Linux
+# and btrfs-progs 6.7; the guest runs Debian 12's 6.1 kernel, which
+# refuses to mount such a volume, and Debian's btrfs-progs 6.2, which
+# does not know the feature (CI run 37610992432). So the static
+# btrfs-progs scripts/vm-setup.sh installs formats it with `--rootdir`,
+# copying a directory tree in as it builds the filesystem, and its own
+# `btrfs check` and `dump-tree` are the oracles that it is sound and
+# carries the owner references.
 #
 # In its own directory: it is refused for writing on purpose, and the
 # suites that walk every image in test-disks/ try to write each one.
 # ---------------------------------------------------------------------
 build_squota() {
-    local img="$WORK/btrfs-squota.img" manifest="$WORK/btrfs-squota.manifest" i
-    rm -f "$img" "$manifest"
-    truncate -s 512M "$img"
-    mkfs.btrfs -f -O squota "$img" >/dev/null
-    mount -o loop "$img" "$MNT"
-    mkdir -p "$MNT/dir"
+    local img="$WORK/btrfs-squota.img" manifest="$WORK/btrfs-squota.manifest"
+    local src="$WORK/squota-root" i
+    rm -rf "$img" "$manifest" "$src"
+    mkdir -p "$src/dir"
     for i in 1 2 3; do
-        echo "squota file $i" > "$MNT/dir/file-$i.txt"
+        echo "squota file $i" > "$src/dir/file-$i.txt"
     done
-    dd if=/dev/urandom of="$MNT/big.bin" bs=1M count=4 status=none
-    btrfs subvolume create "$MNT/sub" >/dev/null
-    dd if=/dev/urandom of="$MNT/sub/in-sub.bin" bs=64K count=3 status=none
-    sync
-    {
-        ( cd "$MNT" && find . -mindepth 1 -type f | sort | while read -r p; do
-            printf '%s\t%s\t%s\n' "${p#.}" "$(stat -c%s "$p")" \
-                "$(sha256sum "$p" | cut -d' ' -f1)"
-          done )
-        echo "# btrfs qgroup show --raw"
-        btrfs qgroup show --raw "$MNT"
-    } > "$manifest"
-    umount "$MNT"
-    btrfs inspect-internal dump-super "$img" | grep -q 'SIMPLE_QUOTA' || {
+    dd if=/dev/urandom of="$src/big.bin" bs=1M count=4 status=none
+    dd if=/dev/urandom of="$src/dir/middle.bin" bs=64K count=3 status=none
+    ( cd "$src" && find . -mindepth 1 -type f | sort | while read -r p; do
+        printf '%s\t%s\t%s\n' "${p#.}" "$(stat -c%s "$p")" \
+            "$(sha256sum "$p" | cut -d' ' -f1)"
+      done ) > "$manifest"
+    truncate -s 512M "$img"
+    "$STATIC_PROGS/mkfs.btrfs" -f -O squota --rootdir "$src" "$img" >/dev/null
+    rm -rf "$src"
+    "$STATIC_PROGS/btrfs" inspect-internal dump-super "$img" | grep -q 'SIMPLE_QUOTA' || {
         echo "guest-build-images: btrfs-squota does not carry SIMPLE_QUOTA" >&2
         exit 1
     }
-    btrfs inspect-internal dump-tree -t extent "$img" | grep -q 'EXTENT_OWNER_REF' || {
+    "$STATIC_PROGS/btrfs" inspect-internal dump-tree -t extent "$img" \
+        | grep -q 'EXTENT_OWNER_REF' || {
         echo "guest-build-images: btrfs-squota has no owner reference in its extent tree" >&2
         exit 1
     }
-    btrfs check --readonly "$img" >/dev/null 2>&1 || {
+    "$STATIC_PROGS/btrfs" check --readonly "$img" >/dev/null 2>&1 || {
         echo "guest-build-images: btrfs check does not find btrfs-squota clean" >&2
+        "$STATIC_PROGS/btrfs" check --readonly "$img" >&2 || true
         exit 1
     }
     mkdir -p "$OUT/squota"

@@ -7,11 +7,13 @@
 //! the usage that goes with it would leave the accounting wrong, so a
 //! read-write mount is refused by name.
 //!
-//! The fixture is `squota/btrfs-squota.img`, made and populated by the
-//! kernel with simple quotas on; the builder refuses to publish it unless
-//! the superblock carries the bit, the extent tree holds an owner
-//! reference, and `btrfs check` finds it clean. Its manifest is every
-//! file's size and SHA-256 as the kernel read it.
+//! The fixture is `squota/btrfs-squota.img`, formatted with simple quotas
+//! on by btrfs-progs' own `mkfs.btrfs --rootdir` from a directory tree in
+//! the harness VM (the guest's kernel predates simple quotas, so it
+//! cannot fill one); the builder refuses to publish it unless the
+//! superblock carries the bit, the extent tree holds an owner reference,
+//! and that btrfs-progs' `btrfs check` finds it clean. Its manifest is
+//! every file's size and SHA-256 as they were in the directory.
 
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs_test_support::{fixture, sha256_hex, temp_path};
@@ -28,7 +30,7 @@ fn mount() -> Filesystem {
 }
 
 #[test]
-fn every_file_reads_what_the_kernel_wrote() {
+fn every_file_reads_what_mkfs_copied_in() {
     let fs = mount();
     let manifest =
         std::fs::read_to_string(fixture("squota/btrfs-squota.manifest")).expect("manifest");
