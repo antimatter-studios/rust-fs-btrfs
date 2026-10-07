@@ -146,9 +146,46 @@ fn command() -> Cmd {
                      reason.",
                 ),
         )
+        .subcommand(name_command(
+            "mkdir",
+            "Create an empty directory, mode 0755 unless --mode says otherwise",
+            "fs.btrfs disk.img mkdir /backup\n  fs.btrfs disk.img mkdir --mode 700 /private",
+            Some("755"),
+        ))
+        .subcommand(name_command(
+            "create",
+            "Create an empty regular file, mode 0644 unless --mode says otherwise",
+            "fs.btrfs disk.img create /notes.txt",
+            Some("644"),
+        ))
+        .subcommand(name_command(
+            "rm",
+            "Remove a name; the file goes with its last name",
+            "fs.btrfs disk.img rm /notes.txt",
+            None,
+        ))
+        .subcommand(name_command(
+            "rmdir",
+            "Remove an empty directory",
+            "fs.btrfs disk.img rmdir /backup",
+            None,
+        ))
         .subcommand(
-            Cmd::new("mkdir")
-                .about("Create a directory (not implemented: needs directory edits)")
+            Cmd::new("ln")
+                .about("Add a name for a file (a hard link), or with -s make a symbolic link")
+                .arg(
+                    Arg::new("symbolic")
+                        .short('s')
+                        .long("symbolic")
+                        .action(ArgAction::SetTrue)
+                        .help("Make a symbolic link whose target is TARGET, as given"),
+                )
+                .arg(
+                    Arg::new("target")
+                        .value_name("TARGET")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
                 .arg(
                     Arg::new("path")
                         .value_name("PATH")
@@ -156,9 +193,11 @@ fn command() -> Cmd {
                         .value_parser(value_parser!(OsString)),
                 )
                 .after_help(
-                    "Examples:\n  fs.btrfs disk.img mkdir /backup\n\n\
-                     Answers `not implemented` (exit 3) until this library can add a \
-                     directory entry (rust-fs-btrfs#262).",
+                    "Examples:\n  fs.btrfs disk.img ln /data/a /data/also-a\n  \
+                     fs.btrfs disk.img ln -s ../etc/hosts /hosts\n\n\
+                     A new name is committed as one transaction. Only the top-level \
+                     subvolume is written, and a directory whose leaf has no room for the \
+                     new items is refused with exit 3.",
                 ),
         )
         .subcommand(key_command(
@@ -202,6 +241,39 @@ fn command() -> Cmd {
         )
 }
 
+/// A verb taking one PATH, and for one that creates, a --mode.
+fn name_command(
+    name: &'static str,
+    about: &'static str,
+    examples: &'static str,
+    mode: Option<&'static str>,
+) -> Cmd {
+    let mut cmd = Cmd::new(name)
+        .about(about)
+        .arg(
+            Arg::new("path")
+                .value_name("PATH")
+                .required(true)
+                .value_parser(value_parser!(OsString)),
+        )
+        .after_help(format!(
+            "Examples:\n  {examples}\n\n\
+             Committed as one transaction. Only the top-level subvolume is written; a \
+             directory whose leaf has no room for the new items, and the last name of a \
+             file still holding data, are refused with exit 3 (rust-fs-btrfs#262)."
+        ));
+    if let Some(default) = mode {
+        cmd = cmd.arg(
+            Arg::new("mode")
+                .long("mode")
+                .value_name("OCTAL")
+                .default_value(default)
+                .help("Permission bits, in octal"),
+        );
+    }
+    cmd
+}
+
 fn key_command(name: &'static str, about: &'static str) -> Cmd {
     Cmd::new(name)
         .about(about)
@@ -235,7 +307,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
             sub.get_one("output"),
         ),
         "write" => write(target, offset, path_arg(sub)),
-        "mkdir" => Err(CliError::not_implemented(format!("mkdir: {COW_BLOCKED}"))),
+        "mkdir" | "create" | "rm" | "rmdir" | "ln" => names(target, offset, verb, sub),
         "get" | "info" => get(
             target,
             offset,
@@ -265,6 +337,96 @@ fn os_bytes(s: &OsString) -> &[u8] {
 #[cfg(not(unix))]
 fn os_bytes(s: &OsString) -> &[u8] {
     s.to_str().map(str::as_bytes).unwrap_or_default()
+}
+
+/// The namespace verbs: each opens the image read-write, makes one change
+/// and commits it.
+fn names(
+    target: &OsString,
+    offset: u64,
+    verb: &str,
+    sub: &ArgMatches,
+) -> Result<Outcome, CliError> {
+    let path = path_arg(sub);
+    let dev = device::open_rw(target, offset)?;
+    let mut fs = Filesystem::mount_rw(dev).map_err(|e| {
+        btrfs_error(
+            format!("{} (read-write)", target.to_string_lossy()).as_bytes(),
+            e,
+        )
+    })?;
+    let (parent, name) = split_parent(&fs, path)?;
+    let mode = match sub.try_get_one::<String>("mode") {
+        Ok(Some(m)) => u32::from_str_radix(m, 8)
+            .ok()
+            .filter(|m| *m <= 0o7777)
+            .ok_or_else(|| CliError::usage(format!("--mode {m}: not octal permission bits")))?,
+        _ => 0,
+    };
+    let fail = |e| btrfs_error(path, e);
+    let (what, ino) = match verb {
+        "mkdir" => (
+            "created",
+            Some(
+                fs.mkdir(parent.ino, name, mode, parent.uid, parent.gid)
+                    .map_err(fail)?,
+            ),
+        ),
+        "create" => (
+            "created",
+            Some(
+                fs.create(parent.ino, name, mode, parent.uid, parent.gid)
+                    .map_err(fail)?,
+            ),
+        ),
+        "rm" => {
+            fs.unlink(parent.ino, name).map_err(fail)?;
+            ("removed", None)
+        }
+        "rmdir" => {
+            fs.rmdir(parent.ino, name).map_err(fail)?;
+            ("removed", None)
+        }
+        "ln" => {
+            let source = os_bytes(sub.get_one::<OsString>("target").expect("clap requires it"));
+            if sub.get_flag("symbolic") {
+                let ino = fs
+                    .symlink(parent.ino, name, source, parent.uid, parent.gid)
+                    .map_err(fail)?;
+                ("linked", Some(ino))
+            } else {
+                let file = fs
+                    .lookup_path_bytes(source)
+                    .map_err(|e| btrfs_error(source, e))?;
+                fs.link(file.ino, parent.ino, name).map_err(fail)?;
+                ("linked", Some(file.ino))
+            }
+        }
+        other => unreachable!("not a namespace verb: {other}"),
+    };
+    let mut fields = vec![("path", Json::from(show(path))), (what, Json::from(true))];
+    if let Some(ino) = ino {
+        fields.push(("inode", Json::from(ino)));
+    }
+    Ok(Outcome::report(Json::object(fields)).with_text(format!("{what} {}", show(path))))
+}
+
+/// `path` as its directory, resolved, and its last component.
+fn split_parent<'a>(fs: &Filesystem, path: &'a [u8]) -> Result<(Inode, &'a [u8]), CliError> {
+    let end = path
+        .iter()
+        .rposition(|&b| b != b'/')
+        .ok_or_else(|| CliError::usage(format!("{}: names no entry", show(path))))?;
+    let trimmed = &path[..=end];
+    let (dir, name) = match trimmed.iter().rposition(|&b| b == b'/') {
+        Some(at) => (&trimmed[..at], &trimmed[at + 1..]),
+        None => (&b""[..], trimmed),
+    };
+    let parent = fs.lookup_path_bytes(dir).map_err(|e| btrfs_error(dir, e))?;
+    if !parent.is_dir() {
+        return Err(CliError::failed(format!("{}: not a directory", show(dir))));
+    }
+    Ok((parent, name))
 }
 
 /// A byte string for a person to read. Never fed back into a lookup:

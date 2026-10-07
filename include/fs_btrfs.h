@@ -293,6 +293,52 @@ int fs_btrfs_can_write_in_place(fs_btrfs_fs_t *fs, const char *path);
 int64_t fs_btrfs_write_file(fs_btrfs_fs_t *fs, const char *path,
                             const void *buf, uint64_t offset, uint64_t length);
 
+/* ---- names ---- */
+
+/*
+ * Each call below is one committed transaction on the top-level
+ * subvolume: the directory and inode items it adds or removes are
+ * written copy-on-write, so a crash leaves the old namespace or the new.
+ * A new inode is owned like its directory. A directory whose leaf has no
+ * room for the new items is refused with ENOTSUP, as nothing yet splits
+ * an fs tree leaf.
+ */
+
+/*
+ * Create an empty regular file (fs_btrfs_create) or directory
+ * (fs_btrfs_mkdir) at `path` with permission bits `mode`. Returns the
+ * new inode number, or 0: EEXIST when the name is taken, ENOENT or
+ * ENOTDIR for the directory, EINVAL for a name no directory can hold,
+ * EROFS on a read-only handle, ENOTSUP for what cannot be written yet.
+ */
+uint64_t fs_btrfs_create(fs_btrfs_fs_t *fs, const char *path, uint32_t mode);
+uint64_t fs_btrfs_mkdir(fs_btrfs_fs_t *fs, const char *path, uint32_t mode);
+
+/*
+ * Create a symbolic link at `linkpath` whose target is `target`, stored
+ * inline (at most one sector less a byte). Returns the new inode number,
+ * or 0 as fs_btrfs_create.
+ */
+uint64_t fs_btrfs_symlink(fs_btrfs_fs_t *fs, const char *target,
+                          const char *linkpath);
+
+/*
+ * Add the name `dst` for the file at `src`. Returns 0, or -1: EISDIR for
+ * a directory, EEXIST when `dst` is taken, otherwise as fs_btrfs_create.
+ */
+int fs_btrfs_link(fs_btrfs_fs_t *fs, const char *src, const char *dst);
+
+/*
+ * Remove a name (fs_btrfs_unlink) or an empty directory (fs_btrfs_rmdir).
+ * An inode losing its last name is deleted with it. Returns 0, or -1:
+ * ENOENT for no such name, EISDIR from unlink on a directory, ENOTDIR
+ * from rmdir on anything else, ENOTEMPTY for a directory holding
+ * entries, and ENOTSUP for the last name of a file still holding data
+ * extents, which cannot be released yet.
+ */
+int fs_btrfs_unlink(fs_btrfs_fs_t *fs, const char *path);
+int fs_btrfs_rmdir(fs_btrfs_fs_t *fs, const char *path);
+
 #ifdef __cplusplus
 }
 #endif
