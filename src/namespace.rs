@@ -481,6 +481,7 @@ impl Filesystem {
             time: now,
             root_flags: None,
             edits,
+            csum_edits: Vec::new(),
         };
         let dirty: Vec<u64> = {
             let reader = self.pool_reader();

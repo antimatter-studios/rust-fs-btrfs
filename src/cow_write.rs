@@ -24,7 +24,12 @@
 //! 4. **The free-space tree** and the **block groups' `used`** follow, and
 //!    the superblock's `bytes_used` moves by whatever the copy is shorter
 //!    than the extent it replaced.
-//! 5. **The inode** is stamped with the transaction, a new change count
+//! 5. **The checksum tree** loses the old extent's digests — an
+//!    `EXTENT_CSUM` item covering it is deleted, or cut down to the
+//!    sectors of its neighbours it also covers — and, unless the file is
+//!    `nodatasum`, gains one digest per sector of the copy, in the
+//!    volume's checksum algorithm (#261).
+//! 6. **The inode** is stamped with the transaction, a new change count
 //!    and new change and modification times.
 //!
 //! The data goes to every mirror first; then the tree blocks, a flush,
@@ -36,8 +41,9 @@
 //! Each refusal is a case not yet written, named so a caller can tell
 //! which it met:
 //!
-//! - a **checksummed** file: its new extent needs `EXTENT_CSUM` items and
-//!   its old one's removed, and the checksum tree is not written yet;
+//! - a checksum tree leaf with no room for the copy's digests, or one the
+//!   change would empty: splitting and removing a leaf for an item edit
+//!   are not written yet;
 //! - a write that **grows** the file, or lands in a **hole**: both
 //!   allocate where the file has no extent item to repoint;
 //! - an **inline**, **preallocated** or **compressed** extent: each
@@ -49,14 +55,16 @@
 //! A write in a `nodatacow` file goes to [`Filesystem::write_at`], which
 //! writes in place and commits nothing.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use crate::chunk::{objectid, DiskKey};
 use crate::error::{Error, Result};
 use crate::fs::{Filesystem, EXTENT_DATA_KEY};
 use crate::inode::{Inode, INODE_ITEM_KEY, INODE_NODATACOW, INODE_NODATASUM};
+use crate::leaf_edit::OwnedItem;
 use crate::super_write::Commit;
-use crate::transaction::{DataMove, DataWrite};
+use crate::transaction::{DataMove, DataWrite, ItemEdit};
 use crate::write::window_inside_extent;
 
 /// How many rounds a write's plan has to close over its own bookkeeping.
@@ -120,12 +128,7 @@ impl Filesystem {
 
     fn write_cow(&mut self, inode: &Inode, offset: u64, data: &[u8]) -> Result<usize> {
         let ino = inode.ino;
-        if inode.flags & INODE_NODATASUM == 0 {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino} is copy-on-write and checksummed, and writing it means writing \
-                 checksum items for its new extents, which is not implemented"
-            )));
-        }
+        let summed = inode.flags & INODE_NODATASUM == 0;
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or_else(|| Error::UnsupportedFeature("write range overflows".into()))?;
@@ -139,7 +142,6 @@ impl Filesystem {
 
         // Every refusal before anything is allocated.
         let targets = self.plan_cow_targets(ino, offset, end)?;
-        self.refuse_checksummed_extents(ino, &targets)?;
 
         let lens: Vec<u64> = targets.iter().map(|t| t.len).collect();
         let news = self.find_data_extents(&lens)?;
@@ -181,6 +183,7 @@ impl Filesystem {
             time: (now.as_secs(), now.subsec_nanos()),
             root_flags: None,
             edits: Vec::new(),
+            csum_edits: self.csum_edits(&targets, &contents, summed)?,
         };
 
         // The fs tree leaves the write edits: the inode item's, and each
@@ -199,6 +202,14 @@ impl Filesystem {
                     offset: key_offset,
                 };
                 leaves.insert(tree.descend(self.fs_tree_root, &key)?.header.bytenr);
+            }
+            // And the checksum tree's, for each digest item the write
+            // cuts, removes or adds.
+            if !write.csum_edits.is_empty() {
+                let root = self.tree_root(crate::csum::CSUM_TREE_OBJECTID)?;
+                for edit in &write.csum_edits {
+                    leaves.insert(tree.descend(root, &edit.key())?.header.bytenr);
+                }
             }
             leaves.into_iter().collect()
         };
@@ -327,36 +338,218 @@ impl Filesystem {
         Ok(out)
     }
 
-    /// Refuse an extent the checksum tree has items for.
+    /// The checksum tree edits a write makes (#261).
     ///
-    /// A `nodatasum` file's extents carry none, and releasing one leaves
-    /// nothing behind in that tree. One that does have them would leave
-    /// checksums for a range nothing allocates — which `btrfs check`
-    /// reports — so it is refused rather than released.
-    fn refuse_checksummed_extents(&self, ino: u64, targets: &[Target]) -> Result<()> {
-        let Ok(root) = self.tree_root(crate::csum::CSUM_TREE_OBJECTID) else {
-            return Ok(());
+    /// Every `EXTENT_CSUM` item covering a sector of an extent the write
+    /// releases is deleted, and what it also covered outside those
+    /// extents — a neighbour's digests, which the kernel packs into the
+    /// same item when extents are contiguous — is put back as items of
+    /// its own. Then, for a checksummed file, each copy gains a digest per
+    /// sector of exactly the bytes written to it, in items no larger than
+    /// the kernel's.
+    ///
+    /// The copy's space must have no digests already: one there would be
+    /// a leftover the new digests would overlap, and that is refused.
+    /// Deletes come before puts, so a leaf is at its smallest before
+    /// anything is added to it.
+    fn csum_edits(
+        &self,
+        targets: &[Target],
+        contents: &[(u64, Vec<u8>)],
+        summed: bool,
+    ) -> Result<Vec<ItemEdit>> {
+        use crate::csum::{CSUM_TREE_OBJECTID, EXTENT_CSUM_KEY, EXTENT_CSUM_OBJECTID};
+        let csum = self.sb.csum_type;
+        let size = csum.digest_len();
+        let sector = u64::from(self.sb.sectorsize);
+        let root = match self.tree_root(CSUM_TREE_OBJECTID) {
+            Ok(root) => root,
+            Err(_) if !summed => return Ok(Vec::new()),
+            Err(e) => return Err(e),
         };
-        let reader = self.pool_reader();
-        let tree = reader.tree();
-        for t in targets {
-            let found = crate::csum::digests_for_range(
-                &tree,
-                root,
-                self.sb.csum_type.digest_len(),
-                u64::from(self.sb.sectorsize),
-                t.extent_start,
-                t.extent_len,
-            )?;
-            if !found.is_empty() {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino} is nodatasum, yet the checksum tree holds {} checksums for its \
-                     extent at {}; releasing the extent would leave them describing nothing",
-                    found.len(),
-                    t.extent_start
-                )));
+        let key = |offset: u64| DiskKey {
+            objectid: EXTENT_CSUM_OBJECTID,
+            key_type: EXTENT_CSUM_KEY,
+            offset,
+        };
+        let released: Vec<(u64, u64)> = targets
+            .iter()
+            .map(|t| (t.extent_start, t.extent_start + t.extent_len))
+            .collect();
+
+        // Each item covering a released sector, whole.
+        let mut items: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        {
+            let reader = self.pool_reader();
+            let tree = reader.tree();
+            for &(start, end) in &released {
+                let found =
+                    crate::csum::digests_for_range(&tree, root, size, sector, start, end - start)?;
+                let Some(&first) = found.keys().next() else {
+                    continue;
+                };
+                // The item holding the first sector begins at or before
+                // it; walk from there over every item the range reaches.
+                let leaf = tree.descend(root, &key(first))?;
+                let from = leaf
+                    .body
+                    .items()
+                    .unwrap_or(&[])
+                    .iter()
+                    .rev()
+                    .find(|i| {
+                        i.key.objectid == EXTENT_CSUM_OBJECTID
+                            && i.key.key_type == EXTENT_CSUM_KEY
+                            && i.key.offset <= first
+                    })
+                    .map_or(key(first), |i| i.key);
+                tree.for_each_from(root, &from, &mut |k: &DiskKey, data: &[u8]| {
+                    if k.objectid != EXTENT_CSUM_OBJECTID
+                        || k.key_type != EXTENT_CSUM_KEY
+                        || k.offset >= end
+                    {
+                        return Ok(false);
+                    }
+                    let covers_end = k.offset + (data.len() / size) as u64 * sector;
+                    if covers_end > start {
+                        items.insert(k.offset, data.to_vec());
+                    }
+                    Ok(true)
+                })?;
             }
         }
-        Ok(())
+
+        let mut deletes = Vec::new();
+        let mut puts = Vec::new();
+        for (offset, data) in &items {
+            let runs = kept_runs(*offset, data, size, sector, &released);
+            if !runs.iter().any(|(at, _)| at == offset) {
+                deletes.push(ItemEdit::Delete(key(*offset)));
+            }
+            for (at, bytes) in runs {
+                puts.push(ItemEdit::Put(OwnedItem {
+                    key: key(at),
+                    data: bytes,
+                }));
+            }
+        }
+
+        if summed {
+            // The kernel's own cap on one item, MAX_CSUM_ITEMS: what fits
+            // in a leaf beside two item headers, less one.
+            let per_item = ((self.sb.nodesize as usize - LEAF_HEADER - 2 * ITEM_HEADER) / size)
+                .saturating_sub(1)
+                .max(1);
+            let reader = self.pool_reader();
+            let tree = reader.tree();
+            for (at, bytes) in contents {
+                let len = bytes.len() as u64;
+                let stale = crate::csum::digests_for_range(&tree, root, size, sector, *at, len)?;
+                if !stale.is_empty() {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "the checksum tree already holds {} digests for the space at {at} the \
+                         copy was given, which nothing allocates",
+                        stale.len()
+                    )));
+                }
+                let sectors: Vec<&[u8]> = bytes.chunks(sector as usize).collect();
+                for (n, group) in sectors.chunks(per_item).enumerate() {
+                    let mut packed = Vec::with_capacity(group.len() * size);
+                    for s in group {
+                        packed.extend_from_slice(&csum.digest(s)[..size]);
+                    }
+                    puts.push(ItemEdit::Put(OwnedItem {
+                        key: key(at + (n * per_item) as u64 * sector),
+                        data: packed,
+                    }));
+                }
+            }
+        }
+        deletes.extend(puts);
+        Ok(deletes)
+    }
+}
+
+/// A leaf's header, and the header of each item in it.
+const LEAF_HEADER: usize = 101;
+const ITEM_HEADER: usize = 25;
+
+/// The runs of an `EXTENT_CSUM` item's sectors that no released extent
+/// holds, each with its digests: what is kept of the item when the
+/// extents in `released` (each `[start, end)`) give theirs up. The item
+/// begins at `offset` and holds `size`-byte digests, one per `sector`.
+fn kept_runs(
+    offset: u64,
+    data: &[u8],
+    size: usize,
+    sector: u64,
+    released: &[(u64, u64)],
+) -> Vec<(u64, Vec<u8>)> {
+    let mut runs: Vec<(u64, Vec<u8>)> = Vec::new();
+    for (i, digest) in data.chunks_exact(size).enumerate() {
+        let at = offset + i as u64 * sector;
+        if released.iter().any(|&(a, b)| at >= a && at < b) {
+            continue;
+        }
+        match runs.last_mut() {
+            Some((run, bytes)) if *run + (bytes.len() / size) as u64 * sector == at => {
+                bytes.extend_from_slice(digest)
+            }
+            _ => runs.push((at, digest.to_vec())),
+        }
+    }
+    runs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kept_runs;
+
+    /// Eight 4-byte digests from 0x10000, one per 4 KiB sector, each
+    /// holding its own index.
+    fn item() -> Vec<u8> {
+        (0u32..8).flat_map(|i| i.to_le_bytes()).collect()
+    }
+
+    fn digests(range: std::ops::Range<u32>) -> Vec<u8> {
+        range.flat_map(|i| i.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn an_item_keeps_the_sectors_on_either_side_of_a_released_extent() {
+        let runs = kept_runs(0x10000, &item(), 4, 4096, &[(0x11000, 0x13000)]);
+        assert_eq!(
+            runs,
+            vec![(0x10000, digests(0..1)), (0x13000, digests(3..8))],
+            "the head stays under its key and the tail moves to the extent's end"
+        );
+    }
+
+    #[test]
+    fn an_item_wholly_inside_released_extents_keeps_nothing() {
+        assert!(kept_runs(0x10000, &item(), 4, 4096, &[(0x10000, 0x18000)]).is_empty());
+        assert!(
+            kept_runs(
+                0x10000,
+                &item(),
+                4,
+                4096,
+                &[(0x10000, 0x14000), (0x14000, 0x18000)]
+            )
+            .is_empty(),
+            "two adjacent released extents release the whole item between them"
+        );
+    }
+
+    #[test]
+    fn an_item_losing_only_its_head_keeps_its_tail_under_a_new_key() {
+        let runs = kept_runs(0x10000, &item(), 4, 4096, &[(0xf000, 0x12000)]);
+        assert_eq!(runs, vec![(0x12000, digests(2..8))]);
+    }
+
+    #[test]
+    fn an_item_no_released_extent_reaches_is_kept_whole() {
+        let runs = kept_runs(0x10000, &item(), 4, 4096, &[(0x20000, 0x30000)]);
+        assert_eq!(runs, vec![(0x10000, item())]);
     }
 }
