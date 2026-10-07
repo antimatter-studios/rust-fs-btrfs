@@ -87,6 +87,7 @@ log_tree_kernel           1
 lookup_by_name_key        1
 node_write_oracle         4
 oracle_vm_fixtures        3
+pool_degraded             7
 pool_oracle               4
 prealloc_extent_write     1
 raid56_oracle             6

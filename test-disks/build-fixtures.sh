@@ -114,6 +114,7 @@ artefacts_for() {
             echo btrfs-raid5.manifest
             echo btrfs-raid6-1.img; echo btrfs-raid6-2.img; echo btrfs-raid6-3.img
             echo btrfs-raid6-4.img; echo btrfs-raid6.manifest
+            echo btrfs-raid0-1.img; echo btrfs-raid0-2.img; echo btrfs-raid0.manifest
             ;;
         dirtylog)
             echo dirtylog/btrfs-dirty-log.img
