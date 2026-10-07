@@ -42,7 +42,7 @@ not.
 | B-tree node + leaf traversal | done — walk and keyed search, on multi-level trees |
 | Root tree, fs tree, extent tree | done |
 | Inodes, directory items, extent data | done |
-| Directory listing, lookup, path resolution | done |
+| Directory listing, lookup, path resolution | done — `..` included, out of a subvolume into its parent as on a mount, checked against what the kernel reads at the same paths |
 | Symlinks | done |
 | Extended attributes: read | done — `list_xattrs` / `get_xattr`, checked name by name against `getfattr` |
 | Extended attributes: write | not yet — setting one means inserting into a tree a transaction has to commit |
@@ -55,7 +55,7 @@ not.
 | Compression (zlib / lzo / zstd extents) | done — all three, verified against files the kernel wrote |
 | Write path: overwrite in place | done — `nodatacow` files only, no journal needed |
 | Write path: anything copy-on-write | partial — `Filesystem::write` overwrites bytes inside a file's existing extents and commits the transaction (#61). It refuses a write that grows a file or lands in a hole, a checksummed file (most files: the checksum tree is not written yet), and inline, preallocated, compressed and shared extents (#261). The CLI and the C ABI do not use it yet (#274) |
-| C ABI (`fs_btrfs_*`) | done, including the write entry points |
+| C ABI (`fs_btrfs_*`) | done, including the write entry points. Read paths cross into subvolumes; `fs_btrfs_mount_pool` opens a filesystem of several devices and `fs_btrfs_open_subvolume` one subvolume as its own root |
 
 ## Command-line tools
 

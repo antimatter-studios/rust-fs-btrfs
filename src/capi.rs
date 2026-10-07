@@ -438,6 +438,80 @@ pub unsafe extern "C" fn fs_btrfs_mount_with_fs_core_device(
     })
 }
 
+/// Mount a filesystem spanning several devices, given every one of them.
+///
+/// The devices are told apart by the device id in each one's own
+/// superblock, so the order of `device_paths` does not matter. A set
+/// missing a member, holding a device of another filesystem, or naming
+/// one device twice is refused rather than half read (#271).
+///
+/// # Safety
+///
+/// `device_paths` must be NULL or point to `count` pointers, each NULL or
+/// a NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_mount_pool(
+    device_paths: *const *const c_char,
+    count: usize,
+) -> *mut fs_btrfs_fs {
+    guard(std::ptr::null_mut(), || {
+        if device_paths.is_null() || count == 0 {
+            set_error("device_paths is NULL or count is zero".into(), EINVAL);
+            return std::ptr::null_mut();
+        }
+        let paths = unsafe { std::slice::from_raw_parts(device_paths, count) };
+        let mut devices: Vec<Arc<dyn BlockRead>> = Vec::with_capacity(count);
+        for (i, &p) in paths.iter().enumerate() {
+            let Some(path) = (unsafe { borrow_str(p, &format!("device_paths[{i}]")) }) else {
+                return std::ptr::null_mut();
+            };
+            match FileDevice::open(path) {
+                Ok(dev) => devices.push(Arc::new(dev)),
+                Err(e) => {
+                    set_error(format!("opening {path} failed: {e}"), ENOENT);
+                    return std::ptr::null_mut();
+                }
+            }
+        }
+        match Filesystem::mount_pool(devices) {
+            Ok(fs) => Box::into_raw(Box::new(fs_btrfs_fs { fs })),
+            Err(e) => {
+                record(&e);
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// A new handle reading subvolume or snapshot `id` as a filesystem of its
+/// own: paths through it are absolute within the subvolume.
+///
+/// Read-only whatever `fs` is, and released with [`fs_btrfs_umount`]
+/// independently of `fs`. ENOENT when no subvolume has that id.
+///
+/// # Safety
+///
+/// `fs` must be NULL or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_open_subvolume(
+    fs: *mut fs_btrfs_fs,
+    id: u64,
+) -> *mut fs_btrfs_fs {
+    guard(std::ptr::null_mut(), || {
+        if fs.is_null() {
+            set_error("fs is NULL".into(), EINVAL);
+            return std::ptr::null_mut();
+        }
+        match unsafe { &*fs }.fs.open_subvolume(id) {
+            Ok(sub) => Box::into_raw(Box::new(fs_btrfs_fs { fs: sub })),
+            Err(e) => {
+                record(&e);
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
 /// Release a mounted-filesystem handle. Safe to call with NULL.
 ///
 /// # Safety
@@ -530,9 +604,9 @@ pub unsafe extern "C" fn fs_btrfs_stat(
         let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
-        match unsafe { &*fs }.fs.lookup_path_bytes(path) {
-            Ok(inode) => {
-                fill_attr(&inode, out);
+        match unsafe { &*fs }.fs.resolve_path_bytes(path) {
+            Ok(target) => {
+                fill_attr(&target.inode, out);
                 0
             }
             Err(e) => {
@@ -689,14 +763,17 @@ pub unsafe extern "C" fn fs_btrfs_read_file(
         let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
-        let fs = &unsafe { &*fs }.fs;
-        let found = match fs.lookup_path_bytes(path) {
-            Ok(i) => i,
+        // Across subvolumes, as `fs_btrfs_dir_open` lists them (#271): the
+        // inode is read in the tree the path ended in.
+        let target = match unsafe { &*fs }.fs.resolve_path_bytes(path) {
+            Ok(t) => t,
             Err(e) => {
                 record(&e);
                 return -1;
             }
         };
+        let fs = target.fs(&unsafe { &*fs }.fs);
+        let found = &target.inode;
         let out = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), length as usize) };
         match fs.read_at(found.ino, offset, out) {
             Ok(n) => n as i64,
@@ -740,14 +817,17 @@ pub unsafe extern "C" fn fs_btrfs_readlink(
         let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
-        let fs = &unsafe { &*fs }.fs;
-        let found = match fs.lookup_path_bytes(path) {
-            Ok(i) => i,
+        // Across subvolumes, as `fs_btrfs_dir_open` lists them (#271): the
+        // inode is read in the tree the path ended in.
+        let target = match unsafe { &*fs }.fs.resolve_path_bytes(path) {
+            Ok(t) => t,
             Err(e) => {
                 record(&e);
                 return -1;
             }
         };
+        let fs = target.fs(&unsafe { &*fs }.fs);
+        let found = &target.inode;
         if !found.is_symlink() {
             set_error(
                 format!("readlink: {} is not a symbolic link", shown(path)),
@@ -834,14 +914,17 @@ pub unsafe extern "C" fn fs_btrfs_listxattr(
         let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
-        let fs = &unsafe { &*fs }.fs;
-        let found = match fs.lookup_path_bytes(path) {
-            Ok(i) => i,
+        // Across subvolumes, as `fs_btrfs_dir_open` lists them (#271): the
+        // inode is read in the tree the path ended in.
+        let target = match unsafe { &*fs }.fs.resolve_path_bytes(path) {
+            Ok(t) => t,
             Err(e) => {
                 record(&e);
                 return -1;
             }
         };
+        let fs = target.fs(&unsafe { &*fs }.fs);
+        let found = &target.inode;
         let entries = match fs.list_xattrs(found.ino) {
             Ok(v) => v,
             Err(e) => {
@@ -902,14 +985,17 @@ pub unsafe extern "C" fn fs_btrfs_getxattr(
             return -1;
         }
         let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-        let fs = &unsafe { &*fs }.fs;
-        let found = match fs.lookup_path_bytes(path) {
-            Ok(i) => i,
+        // Across subvolumes, as `fs_btrfs_dir_open` lists them (#271): the
+        // inode is read in the tree the path ended in.
+        let target = match unsafe { &*fs }.fs.resolve_path_bytes(path) {
+            Ok(t) => t,
             Err(e) => {
                 record(&e);
                 return -1;
             }
         };
+        let fs = target.fs(&unsafe { &*fs }.fs);
+        let found = &target.inode;
         let value = match fs.get_xattr(found.ino, name) {
             Ok(Some(v)) => v,
             Ok(None) => {

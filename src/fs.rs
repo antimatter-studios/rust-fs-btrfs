@@ -1393,23 +1393,31 @@ impl Filesystem {
     /// and this crate never decides. Components are compared byte for
     /// byte against the on-disk entry, so a name handed out by a listing
     /// always resolves when handed back (#214).
+    ///
+    /// `..` is the directory the walk came from, and `..` at the top is
+    /// the top (#271). Symbolic links are never followed, so the walk is
+    /// only ever in a directory it entered by name, and that directory's
+    /// parent is the one it entered from: no `INODE_REF` needs reading.
     pub fn lookup_path_bytes(&self, path: &[u8]) -> Result<Inode> {
-        let mut inode = self.root_inode()?;
+        let mut walked = vec![self.root_inode()?];
         for component in path
             .split(|&b| b == b'/')
             .filter(|c| !c.is_empty() && *c != b".")
         {
-            if component == b".." {
-                return Err(Error::UnsupportedFeature(
-                    "`..` in a path is not resolved by lookup_path".into(),
-                ));
-            }
-            if !inode.is_dir() {
+            let here = walked.last().expect("the top is never popped");
+            if !here.is_dir() {
                 return Err(Error::NotADirectory);
             }
-            inode = self.lookup(inode.ino, component)?;
+            if component == b".." {
+                if walked.len() > 1 {
+                    walked.pop();
+                }
+                continue;
+            }
+            let next = self.lookup(here.ino, component)?;
+            walked.push(next);
         }
-        Ok(inode)
+        Ok(walked.pop().expect("the top is never popped"))
     }
 
     /// Refuse a reference whose window leaves the extent the extent tree

@@ -6,6 +6,13 @@ never does.
 
 ## [Unreleased]
 
+### Added
+
+- **The C ABI mounts a pool and opens a subvolume.** `fs_btrfs_mount_pool`
+  takes every device of a multi-device filesystem, in any order, and
+  `fs_btrfs_open_subvolume` gives a read-only handle rooted at one subvolume
+  or snapshot by its id (#271).
+
 ### Fixed
 
 - **The block-group used-count test picks a block whose move really crosses
@@ -13,6 +20,16 @@ never does.
   tree block outside that group, of every tree a plan can move, instead of the
   first 300 fs and csum leaves; when the kernel's layout offers none, the
   failure names that layout (#279, #280).
+
+- **A path with `..` in it resolves.** `lookup_path` and `resolve_path`
+  refused it; `..` is now the directory the walk came from, the top's parent
+  is the top, and climbing out of a subvolume lands in its parent tree, as the
+  kernel reads the same paths (#271).
+- **The C ABI reads inside subvolumes.** `fs_btrfs_stat`, `fs_btrfs_read_file`,
+  `fs_btrfs_readlink`, `fs_btrfs_listxattr` and `fs_btrfs_getxattr` stopped at
+  a subvolume's boundary while `fs_btrfs_dir_open` listed what was beyond it;
+  every reading call now crosses (#271).
+
 
 ## [0.10.2] — 2026-10-07
 

@@ -124,12 +124,31 @@ fs_btrfs_fs_t *fs_btrfs_mount_with_callbacks(const fs_btrfs_blockdev_cfg_t *cfg)
  */
 fs_btrfs_fs_t *fs_btrfs_mount_with_fs_core_device(struct FsCoreDevice *handle);
 
+/*
+ * Mount a filesystem spanning several devices, given every one of them,
+ * in any order. A set missing a member, holding a device of another
+ * filesystem, or naming one device twice is refused (NULL).
+ */
+fs_btrfs_fs_t *fs_btrfs_mount_pool(const char *const *device_paths, size_t count);
+/*
+ * A new, read-only handle over subvolume or snapshot `id` (as `btrfs
+ * subvolume list` numbers them); paths through it are absolute within the
+ * subvolume. Release it with fs_btrfs_umount, independently of `fs`.
+ * Paths given to `fs` itself already cross into subvolumes, as a mount
+ * shows them; this is for a caller that wants one subvolume as its root.
+ */
+fs_btrfs_fs_t *fs_btrfs_open_subvolume(fs_btrfs_fs_t *fs, uint64_t id);
+
 void fs_btrfs_umount(fs_btrfs_fs_t *fs);
 int fs_btrfs_get_volume_info(fs_btrfs_fs_t *fs, fs_btrfs_volume_info_t *out);
 
 /* ---- lookup and metadata ---- */
 
-/* Symbolic links are NOT followed; describes the link itself. */
+/*
+ * Symbolic links are NOT followed; describes the link itself. Every path
+ * a reading call takes is absolute, resolves `..`, and crosses into
+ * subvolumes and snapshots as a mount shows them.
+ */
 int fs_btrfs_stat(fs_btrfs_fs_t *fs, const char *path, fs_btrfs_attr_t *out);
 int fs_btrfs_stat_ino(fs_btrfs_fs_t *fs, uint64_t inode, fs_btrfs_attr_t *out);
 
