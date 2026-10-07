@@ -1049,6 +1049,77 @@ build_pool() {
     done
     publish "$a" "$b" "$manifest"
     note "built btrfs-pool-a and btrfs-pool-b (two-device RAID1 with content)"
+
+    build_parity_pool raid5 3
+    build_parity_pool raid6 4
+}
+
+# ---------------------------------------------------------------------
+# parity pools — RAID5 on three devices and RAID6 on four, data AND
+# metadata, with a manifest of what the kernel wrote (#268).
+#
+# Parity rotates from one full stripe to the next, so a reader that
+# placed the data elements by any other rule reads parity as data and
+# returns the right length of the wrong bytes. The 8 MiB file crosses
+# dozens of full stripes, which is every rotation many times over, and
+# the manifest's digests are what make that a check on the bytes.
+#
+# Members are named btrfs-<profile>-<n>.img for n = 1.., in device-id
+# order as mkfs.btrfs assigns them (the order the devices are given).
+# ---------------------------------------------------------------------
+build_parity_pool() {
+    local profile="$1" count="$2" i f loops=() imgs=()
+    local manifest="$WORK/btrfs-$profile.manifest"
+    for i in $(seq 1 "$count"); do
+        f="$WORK/btrfs-$profile-$i.img"
+        rm -f "$f"
+        truncate -s 256M "$f"
+        imgs+=("$f")
+        loops+=("$(losetup --find --show "$f")")
+    done
+    parity_cleanup() {
+        mountpoint -q "$MNT" && umount "$MNT" || true
+        for f in "${loops[@]}"; do losetup -d "$f" 2>/dev/null || true; done
+    }
+    trap 'parity_cleanup; cleanup' EXIT
+
+    mkfs.btrfs -f -d "$profile" -m "$profile" "${loops[@]}" >/dev/null 2>&1
+
+    mount "${loops[0]}" "$MNT"
+    mkdir -p "$MNT/dir"
+    for i in 1 2 3; do
+        echo "$profile file $i" > "$MNT/dir/file-$i.txt"
+    done
+    dd if=/dev/urandom of="$MNT/big.bin" bs=1M count=8 status=none
+    # Odd-sized, so a file ends partway through a stripe element.
+    dd if=/dev/urandom of="$MNT/odd.bin" bs=1 count=200003 status=none
+    sync
+    btrfs filesystem df "$MNT" | grep -qi "data, $profile" || {
+        echo "guest-build-images: the $profile pool holds no $profile data chunk" >&2
+        exit 1
+    }
+
+    ( cd "$MNT" && find . -mindepth 1 | sort | while read -r p; do
+        if [ -f "$p" ]; then
+            printf '%s\t%s\t%s\n' "${p#.}" "$(stat -c%s "$p")" \
+                "$(sha256sum "$p" | cut -d' ' -f1)"
+        else
+            printf '%s\tdir\t-\n' "${p#.}"
+        fi
+      done ) > "$manifest"
+
+    umount "$MNT"
+    # btrfs check reads every tree through the parity profile; a pool it
+    # does not find clean is not a reference worth holding a reader to.
+    btrfs check --readonly "${loops[0]}" >/dev/null 2>&1 || {
+        echo "guest-build-images: btrfs check does not find the $profile pool clean" >&2
+        exit 1
+    }
+    for f in "${loops[@]}"; do losetup -d "$f"; done
+    trap cleanup EXIT
+
+    publish "${imgs[@]}" "$manifest"
+    note "built btrfs-$profile-1..$count ($count-device ${profile^^} with content)"
 }
 
 # ---------------------------------------------------------------------

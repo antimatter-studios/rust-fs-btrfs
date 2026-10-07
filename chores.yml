@@ -415,6 +415,14 @@ tasks:
       - test-disks/btrfs-split-vary-after.img
       - test-disks/btrfs-pool-a.img
       - test-disks/btrfs-pool-b.img
+      # RAID5 on three devices and RAID6 on four, data and metadata
+      - test-disks/btrfs-raid5-1.img
+      - test-disks/btrfs-raid5-2.img
+      - test-disks/btrfs-raid5-3.img
+      - test-disks/btrfs-raid6-1.img
+      - test-disks/btrfs-raid6-2.img
+      - test-disks/btrfs-raid6-3.img
+      - test-disks/btrfs-raid6-4.img
       # a log tree the kernel has not replayed; its own directory, like
       # the snapshot, because every other reader refuses it on purpose
       - test-disks/dirtylog/btrfs-dirty-log.img
