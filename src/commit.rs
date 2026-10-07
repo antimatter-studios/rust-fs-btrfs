@@ -99,6 +99,19 @@ impl Filesystem {
     /// copy exists to resolve, and a reader picks the newest copy that
     /// verifies.
     pub fn commit(&self, blocks: &[PlacedBlock], commit: &Commit) -> Result<()> {
+        self.commit_sized(blocks, commit, None)
+    }
+
+    /// [`Filesystem::commit`], and when `total_bytes` is given, the
+    /// superblock's size and its device item's size set to it — a resize
+    /// (#264). Both are in the image before its backup slot is filled,
+    /// which records the size too.
+    pub(crate) fn commit_sized(
+        &self,
+        blocks: &[PlacedBlock],
+        commit: &Commit,
+        total_bytes: Option<u64>,
+    ) -> Result<()> {
         if self.writable.is_none() {
             return Err(Error::ReadOnly);
         }
@@ -108,7 +121,7 @@ impl Filesystem {
         //    a root tree that does not parse is refused while refusing is
         //    still free. One per device: each device's superblock carries
         //    its own `dev_item`, which the commit does not change (#298).
-        let images = self.superblock_images(blocks, commit)?;
+        let images = self.superblock_images(blocks, commit, total_bytes)?;
 
         // 1. Every tree block, to every mirror. Nothing points at these
         //    yet, so their order among themselves does not matter --
@@ -182,13 +195,33 @@ impl Filesystem {
         &self,
         blocks: &[PlacedBlock],
         commit: &Commit,
+        total_bytes: Option<u64>,
     ) -> Result<Vec<SuperblockImage>> {
+        use crate::superblock::{dev_item_offsets, offsets as so};
+        let devices = self.write_devices();
+        // A RESIZE IS ONE DEVICE'S (#264). The superblock's total and its
+        // device item's are the same number only when there is one
+        // device; a pool member's is its own share, which this does not
+        // compute, so a pool is refused before anything is written.
+        if total_bytes.is_some() && devices.len() != 1 {
+            return Err(Error::UnsupportedFeature(
+                "resizing a pool of several devices is not supported".into(),
+            ));
+        }
         let mut roots = None;
         let mut images = Vec::new();
-        for device in self.write_devices() {
+        for device in devices {
             let mut raw = vec![0u8; SUPERBLOCK_SIZE];
             device.read_at(SUPER_OFFSETS[0], &mut raw)?;
             super_write::apply(&mut raw, self.sb.csum_type, commit)?;
+            if let Some(size) = total_bytes {
+                for at in [
+                    so::TOTAL_BYTES,
+                    so::DEV_ITEM + dev_item_offsets::TOTAL_BYTES,
+                ] {
+                    raw[at..at + 8].copy_from_slice(&size.to_le_bytes());
+                }
+            }
             if roots.is_none() {
                 roots = Some(self.backup_roots(&raw, blocks, commit)?);
             }

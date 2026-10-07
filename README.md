@@ -66,7 +66,7 @@ Metadata is JSON on stdout by default, `--text` for people. A failure is
 | `write PATH` | an existing file, overwritten with exactly as many bytes from stdin as it holds: a NODATACOW file (`chattr +C`) in place, any other one copy-on-write into new extents, committed as one transaction. A new file, a different length, a path inside a subvolume, a checksummed file, or a snapshotted, inline, preallocated or compressed extent is refused with exit 3 and the library's reason; the copy-on-write cases wait on [#261][i261], creating, removing and resizing on [#262][i262] |
 | `mkdir` | not implemented (exit 3): needs directory edits, [#262][i262] |
 | `set label VALUE` | writes the label (at most 255 bytes) into every superblock copy, each with a fresh checksum; a pool of several devices is refused |
-| `resize` | not implemented (exit 3): no resize |
+| `resize` | not implemented (exit 3) in the tool yet; the library and the C ABI resize ([#264][i264]) |
 
 `mkfs.btrfs` makes a single-device filesystem with the standard formatter's
 defaults (metadata and system DUP, data single, the free-space tree, skinny

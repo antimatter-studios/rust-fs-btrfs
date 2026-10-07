@@ -1449,3 +1449,31 @@ unsafe fn remove(fs: *mut fs_btrfs_fs, path: *const c_char, dir: bool) -> c_int 
         }
     }
 }
+
+/// Make the filesystem `size` bytes (rounded down to a sector), as one
+/// committed transaction: the device item, the superblock's size and its
+/// copy of the device item. The device must already hold that many bytes;
+/// after a shrink the caller may cut it to the new size.
+///
+/// Returns 0, or -1 with the error recorded: EROFS on a read-only handle,
+/// ENOTSUP for a size past the device, a shrink past a chunk (moving it is
+/// a balance), or a filesystem of several devices.
+///
+/// # Safety
+///
+/// `fs` must be a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_resize(fs: *mut fs_btrfs_fs, size: u64) -> c_int {
+    guard(-1, || {
+        let Some(fs) = (unsafe { handle_mut(fs) }) else {
+            return -1;
+        };
+        match fs.resize(size) {
+            Ok(()) => 0,
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
+}

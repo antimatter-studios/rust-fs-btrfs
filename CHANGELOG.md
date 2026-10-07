@@ -51,6 +51,14 @@ never does.
   directory whose leaf has no room, and the last name of a file still holding
   data extents, are refused with nothing written; `rename` and `truncate` are
   still to come (#262).
+- **A filesystem can be resized.** `Filesystem::resize` grows a single-device
+  filesystem into a device the caller has already made larger, or shrinks it
+  when no chunk lies past the new end, as one transaction: the chunk tree's
+  device item, the superblock's size and its copy of the device item. The
+  planner now moves chunk tree blocks, within SYSTEM block groups, and the
+  commit moves the superblock's chunk root. The C ABI gains
+  `fs_btrfs_resize`; `fs.btrfs resize` still answers not implemented. Moving
+  chunks (a balance) and pools of several devices are refused (#264).
 - **A transaction can put and delete fs tree items.** The planner renders item
   edits into the leaves they land in, and a leaf whose first key changes has
   its parent's key follow it.
