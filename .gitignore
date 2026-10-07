@@ -33,6 +33,7 @@ test-disks/seed/
 test-disks/cli/
 test-disks/features/
 test-disks/scrub/
+test-disks/squota/
 test-disks/[0-9]*/
 test-disks/test-run/
 !test-disks/.gitkeep

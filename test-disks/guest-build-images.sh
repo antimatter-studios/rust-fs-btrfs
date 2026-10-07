@@ -39,7 +39,7 @@ set -euo pipefail
 OUT="$1"
 shift
 
-TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog cli features scrub seed"
+TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog cli features scrub seed squota"
 
 # ARGUMENTS FIRST, ENVIRONMENT SECOND. A misspelt target is the caller's
 # mistake and should be named as one wherever it is made; the root and
@@ -1682,6 +1682,60 @@ build_seed() {
         rm -f "$f"
     done
     note "built seed/btrfs-seed and seed/btrfs-sprout (a seed and the filesystem sprouted from it)"
+}
+
+# ---------------------------------------------------------------------
+# squota — simple quotas (`mkfs.btrfs -O squota`), with content written
+# while they were on, so its data extents carry the owner references
+# simple quotas add (#270). The manifest is every file's size and
+# SHA-256, then `btrfs qgroup show` as the kernel reported it.
+#
+# In its own directory: it is refused for writing on purpose, and the
+# suites that walk every image in test-disks/ try to write each one.
+# ---------------------------------------------------------------------
+build_squota() {
+    local img="$WORK/btrfs-squota.img" manifest="$WORK/btrfs-squota.manifest" i
+    rm -f "$img" "$manifest"
+    truncate -s 512M "$img"
+    mkfs.btrfs -f -O squota "$img" >/dev/null
+    mount -o loop "$img" "$MNT"
+    mkdir -p "$MNT/dir"
+    for i in 1 2 3; do
+        echo "squota file $i" > "$MNT/dir/file-$i.txt"
+    done
+    dd if=/dev/urandom of="$MNT/big.bin" bs=1M count=4 status=none
+    btrfs subvolume create "$MNT/sub" >/dev/null
+    dd if=/dev/urandom of="$MNT/sub/in-sub.bin" bs=64K count=3 status=none
+    sync
+    {
+        ( cd "$MNT" && find . -mindepth 1 -type f | sort | while read -r p; do
+            printf '%s\t%s\t%s\n' "${p#.}" "$(stat -c%s "$p")" \
+                "$(sha256sum "$p" | cut -d' ' -f1)"
+          done )
+        echo "# btrfs qgroup show --raw"
+        btrfs qgroup show --raw "$MNT"
+    } > "$manifest"
+    umount "$MNT"
+    btrfs inspect-internal dump-super "$img" | grep -q 'SIMPLE_QUOTA' || {
+        echo "guest-build-images: btrfs-squota does not carry SIMPLE_QUOTA" >&2
+        exit 1
+    }
+    btrfs inspect-internal dump-tree -t extent "$img" | grep -q 'EXTENT_OWNER_REF' || {
+        echo "guest-build-images: btrfs-squota has no owner reference in its extent tree" >&2
+        exit 1
+    }
+    btrfs check --readonly "$img" >/dev/null 2>&1 || {
+        echo "guest-build-images: btrfs check does not find btrfs-squota clean" >&2
+        exit 1
+    }
+    mkdir -p "$OUT/squota"
+    local f
+    for f in "$img" "$manifest"; do
+        cp --sparse=always "$f" "$OUT/squota/$(basename "$f").partial"
+        mv -f "$OUT/squota/$(basename "$f").partial" "$OUT/squota/$(basename "$f")"
+        rm -f "$f"
+    done
+    note "built squota/btrfs-squota"
 }
 
 # ---------------------------------------------------------------------
