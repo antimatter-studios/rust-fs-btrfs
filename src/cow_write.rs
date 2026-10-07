@@ -180,6 +180,7 @@ impl Filesystem {
                 })
                 .collect(),
             time: (now.as_secs(), now.subsec_nanos()),
+            edits: Vec::new(),
         };
 
         // The fs tree leaves the write edits: the inode item's, and each
