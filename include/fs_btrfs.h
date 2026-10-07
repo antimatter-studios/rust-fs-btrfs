@@ -357,6 +357,16 @@ int fs_btrfs_rmdir(fs_btrfs_fs_t *fs, const char *path);
  */
 int fs_btrfs_rename(fs_btrfs_fs_t *fs, const char *from, const char *to);
 
+/*
+ * Set the length of the regular file at `path` to `size`, as one committed
+ * transaction. Shrinking releases the extents wholly past the new end;
+ * growing needs the volume's no-holes feature. Returns 0, or -1: ENOENT
+ * for no such path, EISDIR for anything but a regular file, EROFS on a
+ * read-only handle, ENOTSUP for an extent a snapshot or reflink shares or
+ * for growing a file whose last sector is partly past its end.
+ */
+int fs_btrfs_truncate(fs_btrfs_fs_t *fs, const char *path, uint64_t size);
+
 /* ---- attributes ---- */
 
 /*

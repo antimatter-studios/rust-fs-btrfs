@@ -515,7 +515,7 @@ impl Filesystem {
     }
 
     /// Every fs tree item under `ino`, in key order.
-    fn items_of(&self, ino: u64) -> Result<Vec<(DiskKey, Vec<u8>)>> {
+    pub(crate) fn items_of(&self, ino: u64) -> Result<Vec<(DiskKey, Vec<u8>)>> {
         let reader = self.pool_reader();
         let tree = reader.tree();
         let mut out = Vec::new();
@@ -660,13 +660,28 @@ impl Filesystem {
             default_subvol: None,
             edits,
             csum_edits: Vec::new(),
+            releases: Vec::new(),
         };
+        self.commit_write(write, generation)
+    }
+
+    /// [`Filesystem::commit_edits`] for a change that also edits the
+    /// checksum tree or releases data extents of `write.ino`: every leaf
+    /// an edit lands in is dirty, and `bytes_used` gives back what each
+    /// released extent held.
+    pub(crate) fn commit_write(&mut self, write: DataWrite, generation: u64) -> Result<()> {
         let dirty: Vec<u64> = {
             let reader = self.pool_reader();
             let tree = reader.tree();
             let mut leaves = std::collections::BTreeSet::new();
             for edit in &write.edits {
                 leaves.insert(tree.descend(self.fs_tree_root, &edit.key())?.header.bytenr);
+            }
+            if !write.csum_edits.is_empty() {
+                let root = self.tree_root(crate::csum::CSUM_TREE_OBJECTID)?;
+                for edit in &write.csum_edits {
+                    leaves.insert(tree.descend(root, &edit.key())?.header.bytenr);
+                }
             }
             leaves.into_iter().collect()
         };
@@ -675,7 +690,8 @@ impl Filesystem {
         let root = self.planned_root(&plan).ok_or_else(|| {
             Error::UnsupportedFeature("the change's plan does not move the root tree".into())
         })?;
-        let bytes_used = match plan.usage_delta(u64::from(self.sb.nodesize)) {
+        let released: i128 = write.releases.iter().map(|r| i128::from(r.old_len)).sum();
+        let bytes_used = match plan.usage_delta(u64::from(self.sb.nodesize)) - released {
             0 => None,
             d => Some(
                 u64::try_from(i128::from(self.sb.bytes_used) + d).map_err(|_| {
