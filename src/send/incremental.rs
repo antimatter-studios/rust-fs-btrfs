@@ -266,6 +266,126 @@ fn changed_ranges(
     out
 }
 
+/// One change to the receiver's namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NameOp {
+    Rename { from: Vec<u8>, to: Vec<u8> },
+    Unlink(Vec<u8>),
+    Link { path: Vec<u8>, existing: Vec<u8> },
+    Create { path: Vec<u8>, id: Id },
+    Rmdir(Vec<u8>),
+}
+
+/// The namespace changes that turn the parent's names into the child's.
+struct NamePlan {
+    ops: Vec<NameOp>,
+    /// The receiver's names once they are done: the child's.
+    ns: Namespace,
+    /// Every inode a change named, and every directory one went into or
+    /// out of.
+    touched: BTreeSet<Id>,
+    /// The inodes made new.
+    created: BTreeSet<Id>,
+}
+
+/// The three passes of the [module documentation](self), over the two
+/// snapshots' names (`(directory, name, inode)`, breadth-first). `was_dir`
+/// says whether a parent's inode is a directory; `kept` whether the child
+/// has it.
+fn plan_names(
+    parent: &[(Id, Vec<u8>, Id)],
+    child: &[(Id, Vec<u8>, Id)],
+    was_dir: impl Fn(Id) -> bool,
+    kept: impl Fn(Id) -> bool,
+) -> Result<NamePlan> {
+    let mut ns = Namespace::default();
+    for (dir, name, id) in parent {
+        ns.add(*dir, name, *id);
+    }
+    let wanted: BTreeSet<(Id, &[u8], Id)> = child
+        .iter()
+        .map(|(d, n, i)| (*d, n.as_slice(), *i))
+        .collect();
+    let top_names: BTreeSet<&[u8]> = child
+        .iter()
+        .filter(|(d, _, _)| *d == TOP)
+        .map(|(_, n, _)| n.as_slice())
+        .collect();
+    let mut ops = Vec::new();
+    let mut touched: BTreeSet<Id> = BTreeSet::new();
+    let mut orphans: BTreeMap<Id, Vec<u8>> = BTreeMap::new();
+
+    // 1. Take away every name the child does not have.
+    for (dir, name, id) in parent {
+        if wanted.contains(&(*dir, name.as_slice(), *id)) {
+            continue;
+        }
+        let path = ns.entry_path(*dir, name)?;
+        let last_name = ns.refs.get(id).map_or(0, BTreeSet::len) <= 1;
+        ns.remove(*dir, name);
+        if was_dir(*id) || (kept(*id) && last_name) {
+            let orphan = orphan_name(&ns, &top_names, *id);
+            ops.push(NameOp::Rename {
+                from: path,
+                to: orphan.clone(),
+            });
+            ns.add(TOP, &orphan, *id);
+            orphans.insert(*id, orphan);
+            touched.insert(TOP);
+        } else {
+            ops.push(NameOp::Unlink(path));
+        }
+        touched.insert(*dir);
+        touched.insert(*id);
+    }
+
+    // 2. Make the child's names, top-down.
+    let mut created: BTreeSet<Id> = BTreeSet::new();
+    for (dir, name, id) in child {
+        if ns.names.get(&(*dir, name.clone())) == Some(id) {
+            continue;
+        }
+        let path = ns.entry_path(*dir, name)?;
+        if let Some(orphan) = orphans.remove(id) {
+            ops.push(NameOp::Rename {
+                from: orphan.clone(),
+                to: path,
+            });
+            ns.remove(TOP, &orphan);
+        } else if ns.has_name(*id) {
+            ops.push(NameOp::Link {
+                path,
+                existing: ns.path(*id)?,
+            });
+        } else {
+            ops.push(NameOp::Create { path, id: *id });
+            created.insert(*id);
+        }
+        ns.add(*dir, name, *id);
+        touched.insert(*dir);
+        touched.insert(*id);
+    }
+
+    // 3. Remove the directories the child does not have: orphans, and
+    //    empty, since every name inside them was taken away in pass 1.
+    for (id, orphan) in &orphans {
+        if kept(*id) {
+            return Err(Error::BadSuperblock(format!(
+                "inode {} is in both snapshots and was given no name in the child",
+                id.0
+            )));
+        }
+        ops.push(NameOp::Rmdir(orphan.clone()));
+        ns.remove(TOP, orphan);
+    }
+    Ok(NamePlan {
+        ops,
+        ns,
+        touched,
+        created,
+    })
+}
+
 impl Filesystem {
     /// An incremental version-1 send stream of subvolume `id` against
     /// `parent`, as `btrfs send -p` writes one: what a receiver holding
@@ -296,88 +416,43 @@ impl Filesystem {
         w.attr(attr::CLONE_UUID, &parent_id.uuid)?;
         w.attr_u64(attr::CLONE_CTRANSID, parent_id.ctransid)?;
 
-        let mut ns = Namespace::default();
-        for (dir, name, id) in &p.entries {
-            ns.add(*dir, name, *id);
+        let plan = plan_names(
+            &p.entries,
+            &c.entries,
+            |id| p.inodes[&id].is_dir(),
+            |id| c.inodes.contains_key(&id),
+        )?;
+        for op in &plan.ops {
+            match op {
+                NameOp::Rename { from, to } => {
+                    w.begin(cmd::RENAME);
+                    w.attr(attr::PATH, from)?;
+                    w.attr(attr::PATH_TO, to)?;
+                }
+                NameOp::Unlink(path) => {
+                    w.begin(cmd::UNLINK);
+                    w.attr(attr::PATH, path)?;
+                }
+                NameOp::Link { path, existing } => {
+                    w.begin(cmd::LINK);
+                    w.attr(attr::PATH, path)?;
+                    w.attr(attr::PATH_LINK, existing)?;
+                }
+                NameOp::Create { path, id } => {
+                    self.send_create(&ctree, &mut w, path, &c.inodes[id])?;
+                }
+                NameOp::Rmdir(path) => {
+                    w.begin(cmd::RMDIR);
+                    w.attr(attr::PATH, path)?;
+                }
+            }
         }
-        let wanted: BTreeSet<(Id, &[u8], Id)> = c
-            .entries
-            .iter()
-            .map(|(d, n, i)| (*d, n.as_slice(), *i))
-            .collect();
-        let top_names: BTreeSet<&[u8]> = c
-            .entries
-            .iter()
-            .filter(|(d, _, _)| *d == TOP)
-            .map(|(_, n, _)| n.as_slice())
-            .collect();
-        let mut touched: BTreeSet<Id> = BTreeSet::new();
-        let mut orphans: BTreeMap<Id, Vec<u8>> = BTreeMap::new();
-
-        // 1. Take away every name the child does not have.
-        for (dir, name, id) in &p.entries {
-            if wanted.contains(&(*dir, name.as_slice(), *id)) {
-                continue;
-            }
-            let path = ns.entry_path(*dir, name)?;
-            let kept = c.inodes.contains_key(id);
-            let last_name = ns.refs.get(id).map_or(0, BTreeSet::len) <= 1;
-            ns.remove(*dir, name);
-            if p.inodes[id].is_dir() || (kept && last_name) {
-                let orphan = orphan_name(&ns, &top_names, *id);
-                w.begin(cmd::RENAME);
-                w.attr(attr::PATH, &path)?;
-                w.attr(attr::PATH_TO, &orphan)?;
-                ns.add(TOP, &orphan, *id);
-                orphans.insert(*id, orphan);
-                touched.insert(TOP);
-            } else {
-                w.begin(cmd::UNLINK);
-                w.attr(attr::PATH, &path)?;
-            }
-            touched.insert(*dir);
-            touched.insert(*id);
-        }
-
-        // 2. Make the child's names, top-down.
-        let mut created: BTreeSet<Id> = BTreeSet::new();
-        for (dir, name, id) in &c.entries {
-            if ns.names.get(&(*dir, name.clone())) == Some(id) {
-                continue;
-            }
-            let path = ns.entry_path(*dir, name)?;
-            if let Some(orphan) = orphans.remove(id) {
-                w.begin(cmd::RENAME);
-                w.attr(attr::PATH, &orphan)?;
-                w.attr(attr::PATH_TO, &path)?;
-                ns.remove(TOP, &orphan);
-            } else if ns.has_name(*id) {
-                let existing = ns.path(*id)?;
-                w.begin(cmd::LINK);
-                w.attr(attr::PATH, &path)?;
-                w.attr(attr::PATH_LINK, &existing)?;
-            } else {
-                self.send_create(&ctree, &mut w, &path, &c.inodes[id])?;
-                created.insert(*id);
-            }
-            ns.add(*dir, name, *id);
-            touched.insert(*dir);
-            touched.insert(*id);
-        }
-
-        // 3. Remove the directories the child does not have: orphans, and
-        //    empty, since every name inside them was taken away in pass 1.
-        for (id, orphan) in &orphans {
-            if c.inodes.contains_key(id) {
-                return Err(Error::BadSuperblock(format!(
-                    "inode {} is in both snapshots and was given no name in the child",
-                    id.0
-                )));
-            }
-            w.begin(cmd::RMDIR);
-            w.attr(attr::PATH, orphan)?;
-            ns.remove(TOP, orphan);
-        }
+        let NamePlan {
+            ns,
+            mut touched,
+            created,
+            ..
+        } = plan;
 
         // 4. What changed inside each inode both snapshots have.
         for (id, new) in &c.inodes {
@@ -582,6 +657,331 @@ mod tests {
         let b = vec![(0, 6, Backing::Inline(b"bbbbbb".to_vec()))];
         assert_eq!(changed_ranges(&a, 5, &a, 5), vec![]);
         assert_eq!(changed_ranges(&a, 5, &b, 6), vec![(0, 6)]);
+    }
+
+    /// The receiver, as far as names go: what each path names, and
+    /// whether it is a directory. Applies each change as `btrfs receive`
+    /// would, refusing one the kernel would refuse.
+    #[derive(Default)]
+    struct Receiver {
+        paths: BTreeMap<Vec<u8>, (Id, bool)>,
+    }
+
+    fn parent_of(path: &[u8]) -> &[u8] {
+        path.iter()
+            .rposition(|&b| b == b'/')
+            .map_or(&b""[..], |i| &path[..i])
+    }
+
+    fn under(path: &[u8], dir: &[u8]) -> bool {
+        path.len() > dir.len() && path.starts_with(dir) && path[dir.len()] == b'/'
+    }
+
+    impl Receiver {
+        fn is_dir(&self, path: &[u8]) -> bool {
+            path.is_empty() || self.paths.get(path).is_some_and(|(_, d)| *d)
+        }
+
+        fn apply(&mut self, op: &NameOp, dirs: &BTreeSet<Id>) {
+            let shown = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
+            match op {
+                NameOp::Rename { from, to } => {
+                    assert!(
+                        self.paths.contains_key(from),
+                        "rename of {}, which is not there",
+                        shown(from)
+                    );
+                    assert!(
+                        !self.paths.contains_key(to),
+                        "rename onto {}, which is taken",
+                        shown(to)
+                    );
+                    assert!(
+                        self.is_dir(parent_of(to)),
+                        "rename into {}, no directory",
+                        shown(to)
+                    );
+                    assert!(!under(to, from), "rename of {} into itself", shown(from));
+                    let moved: Vec<Vec<u8>> = self
+                        .paths
+                        .keys()
+                        .filter(|p| *p == from || under(p, from))
+                        .cloned()
+                        .collect();
+                    for p in moved {
+                        let v = self.paths.remove(&p).unwrap();
+                        let mut q = to.clone();
+                        q.extend_from_slice(&p[from.len()..]);
+                        self.paths.insert(q, v);
+                    }
+                }
+                NameOp::Unlink(p) => {
+                    let (_, dir) = self.paths.remove(p).expect("unlink of a missing name");
+                    assert!(!dir, "unlink of directory {}", shown(p));
+                }
+                NameOp::Link { path, existing } => {
+                    let (id, dir) = self.paths[existing];
+                    assert!(!dir, "a hard link to directory {}", shown(existing));
+                    assert!(!self.paths.contains_key(path), "link onto {}", shown(path));
+                    assert!(self.is_dir(parent_of(path)), "link into {}", shown(path));
+                    self.paths.insert(path.clone(), (id, false));
+                }
+                NameOp::Create { path, id } => {
+                    assert!(
+                        !self.paths.contains_key(path),
+                        "create onto {}",
+                        shown(path)
+                    );
+                    assert!(self.is_dir(parent_of(path)), "create in {}", shown(path));
+                    self.paths.insert(path.clone(), (*id, dirs.contains(id)));
+                }
+                NameOp::Rmdir(p) => {
+                    let (_, dir) = self.paths.remove(p).expect("rmdir of a missing name");
+                    assert!(dir, "rmdir of file {}", shown(p));
+                    assert!(
+                        !self.paths.keys().any(|q| under(q, p)),
+                        "rmdir of {}, which is not empty",
+                        shown(p)
+                    );
+                }
+            }
+        }
+    }
+
+    /// A tree given as path -> inode, as `(directory, name, inode)`
+    /// breadth-first.
+    fn entries(tree: &BTreeMap<Vec<u8>, Id>) -> Vec<(Id, Vec<u8>, Id)> {
+        let mut paths: Vec<&Vec<u8>> = tree.keys().collect();
+        paths.sort_by_key(|p| (p.iter().filter(|&&b| b == b'/').count(), (*p).clone()));
+        paths
+            .into_iter()
+            .map(|p| {
+                let parent = parent_of(p);
+                let dir = if parent.is_empty() { TOP } else { tree[parent] };
+                let name = p[p.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1)..].to_vec();
+                (dir, name, tree[p])
+            })
+            .collect()
+    }
+
+    /// Plan the parent into the child, replay the plan, and land on the
+    /// child.
+    fn check(parent: &BTreeMap<Vec<u8>, Id>, child: &BTreeMap<Vec<u8>, Id>, dirs: &BTreeSet<Id>) {
+        let kept: BTreeSet<Id> = child.values().copied().collect();
+        let plan = plan_names(
+            &entries(parent),
+            &entries(child),
+            |id| dirs.contains(&id),
+            |id| kept.contains(&id),
+        )
+        .unwrap();
+        let mut rx = Receiver::default();
+        for (p, id) in parent {
+            rx.paths.insert(p.clone(), (*id, dirs.contains(id)));
+        }
+        for op in &plan.ops {
+            rx.apply(op, dirs);
+        }
+        let landed: BTreeMap<Vec<u8>, Id> =
+            rx.paths.into_iter().map(|(p, (id, _))| (p, id)).collect();
+        assert_eq!(&landed, child, "after {:?}", plan.ops);
+    }
+
+    fn tree(paths: &[(&str, u64)]) -> BTreeMap<Vec<u8>, Id> {
+        paths
+            .iter()
+            .map(|(p, ino)| (p.as_bytes().to_vec(), (*ino, 1)))
+            .collect()
+    }
+
+    /// Swapped names, nesting turned inside out, a file rescued from a
+    /// directory that goes, a name given to a new inode, links added and
+    /// dropped.
+    #[test]
+    fn the_hard_shapes_land_on_the_child() {
+        let dirs: BTreeSet<Id> = [257, 258, 259, 260, 270].map(|i| (i, 1)).into();
+        let parent = tree(&[
+            ("a", 257),
+            ("a/b", 258),
+            ("a/b/x", 300),
+            ("gone", 259),
+            ("gone/deeper", 260),
+            ("gone/deeper/rescued", 301),
+            ("s1", 302),
+            ("s2", 303),
+            ("two", 304),
+            ("two-again", 304),
+            ("replaced", 305),
+        ]);
+        let child = tree(&[
+            ("b", 258),
+            ("b/a", 257),
+            ("b/x", 300),
+            ("a", 306),
+            ("rescued", 301),
+            ("s1", 303),
+            ("s2", 302),
+            ("two", 304),
+            ("elsewhere", 270),
+            ("elsewhere/two", 304),
+            ("replaced", 307),
+        ]);
+        check(&parent, &child, &dirs);
+    }
+
+    /// A small pseudo-random generator, so the shapes below are the same on
+    /// every run.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n.max(1) as u64) as usize
+        }
+    }
+
+    /// A tree being edited at random, as path -> inode.
+    struct Edits {
+        rng: Rng,
+        tree: BTreeMap<Vec<u8>, Id>,
+        dirs: BTreeSet<Id>,
+        next_ino: u64,
+        names: u32,
+        /// Numbers of inodes gone since the parent was taken, for reuse
+        /// under a new generation.
+        reusable: Vec<u64>,
+    }
+
+    impl Edits {
+        fn fresh_name(&mut self, dir: &[u8]) -> Vec<u8> {
+            self.names += 1;
+            let mut p = dir.to_vec();
+            if !p.is_empty() {
+                p.push(b'/');
+            }
+            p.extend_from_slice(format!("n{}", self.names).as_bytes());
+            p
+        }
+
+        fn some_dir(&mut self, not_under: Option<&[u8]>) -> Vec<u8> {
+            let dirs: Vec<Vec<u8>> = std::iter::once(Vec::new())
+                .chain(
+                    self.tree
+                        .iter()
+                        .filter(|(_, id)| self.dirs.contains(id))
+                        .map(|(p, _)| p.clone()),
+                )
+                .filter(|d| not_under.is_none_or(|n| d != n && !under(d, n)))
+                .collect();
+            dirs[self.rng.below(dirs.len())].clone()
+        }
+
+        fn some_path(&mut self, files_only: bool) -> Option<Vec<u8>> {
+            let paths: Vec<Vec<u8>> = self
+                .tree
+                .iter()
+                .filter(|(_, id)| !files_only || !self.dirs.contains(id))
+                .map(|(p, _)| p.clone())
+                .collect();
+            (!paths.is_empty()).then(|| paths[self.rng.below(paths.len())].clone())
+        }
+
+        fn create(&mut self, reuse: bool) {
+            let dir = self.some_dir(None);
+            let path = self.fresh_name(&dir);
+            let id = if reuse && !self.reusable.is_empty() && self.rng.below(2) == 0 {
+                let i = self.rng.below(self.reusable.len());
+                (self.reusable.swap_remove(i), 2)
+            } else {
+                self.next_ino += 1;
+                (self.next_ino, 1)
+            };
+            if self.rng.below(3) == 0 {
+                self.dirs.insert(id);
+            }
+            self.tree.insert(path, id);
+        }
+
+        /// Everything at or under `path`.
+        fn subtree(&self, path: &[u8]) -> Vec<Vec<u8>> {
+            self.tree
+                .keys()
+                .filter(|q| q.as_slice() == path || under(q, path))
+                .cloned()
+                .collect()
+        }
+
+        fn edit(&mut self) {
+            let Some(path) = self.some_path(false) else {
+                return self.create(true);
+            };
+            match self.rng.below(5) {
+                0 => self.create(true),
+                // Move anything somewhere it can go.
+                1 => {
+                    let dir = self.some_dir(Some(&path));
+                    let to = self.fresh_name(&dir);
+                    for q in self.subtree(&path) {
+                        let id = self.tree.remove(&q).expect("listed");
+                        let mut r = to.clone();
+                        r.extend_from_slice(&q[path.len()..]);
+                        self.tree.insert(r, id);
+                    }
+                }
+                // Remove a name and everything under it.
+                2 => {
+                    let before: BTreeSet<u64> = self.tree.values().map(|id| id.0).collect();
+                    for q in self.subtree(&path) {
+                        self.tree.remove(&q);
+                    }
+                    let after: BTreeSet<u64> = self.tree.values().map(|id| id.0).collect();
+                    self.reusable.extend(before.difference(&after));
+                }
+                // Another name for a file.
+                3 => {
+                    if let Some(file) = self.some_path(true) {
+                        let dir = self.some_dir(None);
+                        let to = self.fresh_name(&dir);
+                        let id = self.tree[&file];
+                        self.tree.insert(to, id);
+                    }
+                }
+                // A file's name given to a new inode.
+                _ => {
+                    if let Some(file) = self.some_path(true) {
+                        self.next_ino += 1;
+                        self.tree.insert(file, (self.next_ino, 1));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Random trees changed at random -- moves, removals, creations, hard
+    /// links, names given to new inodes, inode numbers reused under a new
+    /// generation -- all land on the child.
+    #[test]
+    fn random_changes_land_on_the_child() {
+        for seed in 1..=500u64 {
+            let mut e = Edits {
+                rng: Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1),
+                tree: BTreeMap::new(),
+                dirs: BTreeSet::new(),
+                next_ino: 256,
+                names: 0,
+                reusable: Vec::new(),
+            };
+            for _ in 0..15 {
+                e.create(false);
+            }
+            let parent = e.tree.clone();
+            for _ in 0..12 {
+                e.edit();
+            }
+            check(&parent, &e.tree, &e.dirs);
+        }
     }
 
     /// A path is rebuilt from the names the stream has left so far.
