@@ -78,6 +78,8 @@ fn errno_for(e: &Error) -> c_int {
         Error::ReadOnly => EROFS_ERRNO,
         // A format the caller asked for that cannot be made.
         Error::InvalidGeometry(_) => EINVAL,
+        // A send stream handed in, rather than a volume read.
+        Error::BadSendStream(_) => EINVAL,
         // A compressed extent, an unsupported profile, or a feature this
         // driver declines are all "the request is valid, this driver
         // cannot serve it" — which is what ENOTSUP means.

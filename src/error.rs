@@ -103,6 +103,11 @@ pub enum Error {
     /// A format was asked for that cannot be made: a device too small, a
     /// node size out of range, a label too long. Nothing was written.
     InvalidGeometry(String),
+
+    /// A send stream is malformed: a wrong magic, a command or an
+    /// attribute that runs past its end, a missing attribute, or no end
+    /// command. Carries the byte offset of what is wrong.
+    BadSendStream(String),
 }
 
 impl fmt::Display for Error {
@@ -136,6 +141,7 @@ impl fmt::Display for Error {
             Error::NotAFile => f.write_str("not a regular file"),
             Error::ReadOnly => f.write_str("filesystem is read-only"),
             Error::InvalidGeometry(m) => write!(f, "cannot format: {m}"),
+            Error::BadSendStream(m) => write!(f, "malformed send stream: {m}"),
         }
     }
 }

@@ -12,6 +12,15 @@ never does.
   takes every device of a multi-device filesystem, in any order, and
   `fs_btrfs_open_subvolume` gives a read-only handle rooted at one subvolume
   or snapshot by its id (#271).
+- **Send streams are read and written (#273).** `send::parse_send_stream`
+  reads a version 1 or 2 stream and verifies every command's checksum, and
+  `Filesystem::send_subvolume` writes a full version-1 stream of a read-only
+  subvolume. `tests/send_stream_kernel.rs` has the kernel judge both: a stream
+  `btrfs send` wrote parses into the commands `btrfs receive --dump` lists and
+  replays into the snapshot the kernel shows, and `btrfs receive` rebuilds the
+  same snapshot from a stream this crate wrote.
+- **`Error::BadSendStream`**, for a send stream that is malformed rather than
+  a volume that is damaged; the C ABI maps it to `EINVAL`.
 
 ### Fixed
 

@@ -61,6 +61,7 @@
 //! - [`cow_write`] — the copy-on-write file write, which commits a transaction
 //! - [`transaction`], [`extent_write`], [`block_group`] and [`commit`] — tree
 //!   rewrites and the commit of a new generation, separate from file writes
+//! - [`send`] — send streams: parsed, and written from a read-only subvolume
 //! - [`capi`] — the C ABI
 
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -81,6 +82,7 @@ pub mod fs;
 pub mod inode;
 pub mod leaf_edit;
 pub mod mkfs;
+pub mod send;
 pub mod subvol;
 pub mod super_write;
 pub mod superblock;
