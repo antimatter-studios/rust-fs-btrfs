@@ -194,16 +194,16 @@ fn refuses_what_it_cannot_answer() {
         ),
         "descending through a file must be NotADirectory"
     );
-    assert!(
-        matches!(
-            fs.lookup_path("/many/../many"),
-            Err(fs_btrfs::Error::UnsupportedFeature(_))
-        ),
-        "`..` must be declined rather than silently resolved"
-    );
-
     // Reading a directory's bytes as file contents is not meaningful.
     let many = fs.lookup_path("/many").expect("/many");
+    // `..` is resolved now, as the kernel resolves it (#271;
+    // tests/subvol_oracle.rs holds it to the kernel's reads), so it is no
+    // longer a refusal: it lands where the path without the detour does.
+    assert_eq!(
+        fs.lookup_path("/many/../many").expect("/many/../many").ino,
+        many.ino,
+        "`..` returns to the directory the walk came from"
+    );
     assert!(
         matches!(fs.read_file(many.ino), Err(fs_btrfs::Error::NotAFile)),
         "reading a directory as a file must be refused"
