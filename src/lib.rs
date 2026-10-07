@@ -93,6 +93,7 @@ pub mod super_write;
 pub mod superblock;
 pub mod transaction;
 pub mod tree_write;
+pub mod trim;
 pub mod write;
 pub mod xattr;
 

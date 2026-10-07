@@ -82,6 +82,13 @@ never does.
   DUP chunk; two of RAID5; three of RAID6) is refused at mount, naming the
   chunk. Checked against the kernel-written RAID5 pool without each member,
   RAID6 without every pair and RAID1 without either (#300).
+- **A trim.** `Filesystem::trim_ranges` lists every free run of every block
+  group, from the free-space tree (or the extent tree's gaps without one),
+  mapped to the device range of each copy, and `Filesystem::trim` hands each to
+  a discard the caller supplies, on a read-write mount, changing nothing on the
+  filesystem. Checked against the free runs `btrfs inspect-internal dump-tree`
+  lists and the copies its chunk tree places (#305). RAID5/6 groups are
+  refused.
 
 ### Changed
 
