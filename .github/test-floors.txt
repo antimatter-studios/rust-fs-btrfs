@@ -107,6 +107,7 @@ scrub_parity_oracle       4
 shared_tree_block_release 1
 snapshot_shared_write     1
 split_oracle              4
+subvol_default_kernel     1
 subvol_oracle             8
 subvol_readonly_kernel    1
 superblock_mirrors        4
