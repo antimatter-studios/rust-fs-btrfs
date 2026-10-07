@@ -136,6 +136,70 @@ pub(crate) struct DataWrite {
     /// The modification time stamped on the inode, as seconds and
     /// nanoseconds since the epoch.
     pub time: (u64, u32),
+    /// Items of tree `root` put or removed outright: a namespace change
+    /// (#262) is the inode, reference and directory items it adds,
+    /// replaces or deletes, and nothing else. Each lands in the leaf a
+    /// descent for its key reaches, which the caller marks dirty.
+    pub edits: Vec<ItemEdit>,
+}
+
+/// One change to an item of the tree a [`DataWrite`] names (#262).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ItemEdit {
+    /// Insert the item, or replace the one already under its key.
+    Put(crate::leaf_edit::OwnedItem),
+    /// Remove the item under this key, which must be there.
+    Delete(crate::chunk::DiskKey),
+}
+
+impl ItemEdit {
+    /// The key the edit is filed under.
+    pub(crate) fn key(&self) -> crate::chunk::DiskKey {
+        match self {
+            ItemEdit::Put(item) => item.key,
+            ItemEdit::Delete(key) => *key,
+        }
+    }
+}
+
+/// Apply the edits aimed at one leaf to its items.
+///
+/// A put replaces an item under the same key or inserts a new one in key
+/// order; a delete removes one that must be there. The result must still
+/// fit in one block: splitting an fs tree leaf would add a block and a
+/// key to its parent, which a plan of one-for-one rewrites cannot hold,
+/// so a leaf that would overflow is refused before anything is written.
+fn apply_item_edits(
+    nodesize: u32,
+    leaf: u64,
+    mut items: Vec<crate::leaf_edit::OwnedItem>,
+    edits: &[&ItemEdit],
+) -> Result<Vec<crate::leaf_edit::OwnedItem>> {
+    use crate::leaf_edit::{delete, insert};
+    for edit in edits {
+        match edit {
+            ItemEdit::Put(item) => {
+                if items.iter().any(|i| i.key == item.key) {
+                    items = delete(&items, &item.key)?;
+                }
+                items = insert(nodesize, &items, item.clone()).map_err(|_| {
+                    Error::UnsupportedFeature(format!(
+                        "the fs tree leaf at {leaf} has no room for another {}-byte item, and \
+                         splitting an fs tree leaf is not implemented",
+                        item.data.len()
+                    ))
+                })?;
+            }
+            ItemEdit::Delete(key) => items = delete(&items, key)?,
+        }
+    }
+    if items.is_empty() {
+        return Err(Error::UnsupportedFeature(format!(
+            "the change empties the fs tree leaf at {leaf}, and removing a leaf from its \
+             tree is not implemented"
+        )));
+    }
+    Ok(items)
 }
 
 impl DataWrite {
@@ -479,6 +543,27 @@ impl Filesystem {
 
         let moved: BTreeMap<u64, u64> = plan.rewrites.iter().map(|r| (r.old, r.new)).collect();
 
+        // The leaf each item edit lands in: the one a descent for its key
+        // reaches, as the caller found when it marked them dirty.
+        let edit_leaves: Vec<u64> = if data.edits.is_empty() {
+            Vec::new()
+        } else {
+            let root = self.tree_root(data.root)?;
+            let reader = self.pool_reader();
+            let tree = reader.tree();
+            data.edits
+                .iter()
+                .map(|e| Ok(tree.descend(root, &e.key())?.header.bytenr))
+                .collect::<Result<_>>()?
+        };
+        let mut edits_applied = 0usize;
+        // Each rendered block's first key, by its old address. An edit can
+        // change a leaf's first key, and the node above must then carry
+        // the new one, so blocks are rendered from the leaves up.
+        let mut first_keys: BTreeMap<u64, crate::chunk::DiskKey> = BTreeMap::new();
+        let mut rewrites: Vec<&Rewrite> = plan.rewrites.iter().collect();
+        rewrites.sort_by_key(|r| r.level);
+
         // How far each block group's `used` moves, and which of them
         // have had it written so far (#223).
         let deltas = self.block_group_deltas(plan, data)?;
@@ -488,7 +573,7 @@ impl Filesystem {
         let mut applied = DataApplied::default();
 
         let mut out = Vec::with_capacity(plan.rewrites.len());
-        for rewrite in &plan.rewrites {
+        for rewrite in rewrites {
             let block = self.read_tree_block(rewrite.old)?;
             let raw = block.bytes().to_vec();
             let id = BlockIdentity {
@@ -507,6 +592,9 @@ impl Filesystem {
                         .iter()
                         .map(|p| {
                             let mut p = *p;
+                            if let Some(&key) = first_keys.get(&p.blockptr) {
+                                p.key = key;
+                            }
                             if let Some(&to) = moved.get(&p.blockptr) {
                                 p.blockptr = to;
                                 p.generation = generation;
@@ -514,6 +602,9 @@ impl Filesystem {
                             p
                         })
                         .collect();
+                    if let Some(first) = updated.first() {
+                        first_keys.insert(rewrite.old, first.key);
+                    }
                     build_node(&self.sb, id, &updated)?
                 }
                 None => {
@@ -560,6 +651,21 @@ impl Filesystem {
                         apply_file_write(&mut owned, data, generation, &mut applied)?;
                     }
 
+                    // Items put or removed outright, in the leaf each lands in.
+                    if rewrite.owner == data.root {
+                        let here: Vec<&ItemEdit> = data
+                            .edits
+                            .iter()
+                            .zip(&edit_leaves)
+                            .filter(|(_, &leaf)| leaf == rewrite.old)
+                            .map(|(e, _)| e)
+                            .collect();
+                        if !here.is_empty() {
+                            owned = apply_item_edits(self.sb.nodesize, rewrite.old, owned, &here)?;
+                            edits_applied += here.len();
+                        }
+                    }
+
                     // A root tree leaf names other trees' roots.
                     if rewrite.owner == objectid::ROOT_TREE {
                         for item in &mut owned {
@@ -591,6 +697,9 @@ impl Filesystem {
                         }
                     }
 
+                    if let Some(first) = owned.first() {
+                        first_keys.insert(rewrite.old, first.key);
+                    }
                     let borrowed: Vec<_> = owned.iter().map(|i| i.as_leaf_item()).collect();
                     build_leaf(&self.sb, id, &borrowed)?
                 }
@@ -611,6 +720,14 @@ impl Filesystem {
             return Err(Error::UnsupportedFeature(format!(
                 "the plan moves the used count of the block group at {start} by {delta} bytes, \
                  but the leaf holding its block group item is not one the plan rewrites"
+            )));
+        }
+        // NOR IS AN ITEM EDIT: one whose leaf the plan does not rewrite
+        // would be committed as a change that never happened.
+        if edits_applied != data.edits.len() {
+            return Err(Error::UnsupportedFeature(format!(
+                "the change edits {} items, and the plan rewrote the leaves of {edits_applied}",
+                data.edits.len()
             )));
         }
         // NOR IS A FILE WRITE. Every part of it is in a leaf the plan was
