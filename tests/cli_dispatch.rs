@@ -126,16 +126,15 @@ fn a_wrong_command_line_is_a_structured_error_on_stderr_with_status_2() {
 #[test]
 fn the_verbs_this_library_cannot_do_answer_not_implemented_with_status_3() {
     // None of these opens the image: the answer does not depend on it.
-    for (args, why) in [
-        (vec!["mkdir", "/d"], "rust-fs-btrfs#262"),
-        (vec!["resize", "1G"], "resize"),
-    ] {
-        let message = refused(tool("fs.btrfs").arg("never-opened.img").args(&args), 3);
-        assert!(
-            message.starts_with("not implemented: ") && message.contains(why),
-            "{args:?}: {message}"
-        );
-    }
+    // `mkdir` was one too until it could make a directory (#262).
+    let message = refused(
+        tool("fs.btrfs").args(["never-opened.img", "resize", "1G"]),
+        3,
+    );
+    assert!(
+        message.starts_with("not implemented: ") && message.contains("resize"),
+        "resize: {message}"
+    );
     // A key that is not settable is refused as read-only, still status 3;
     // one that does not exist is a wrong command line.
     let message = refused(
