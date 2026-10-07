@@ -95,6 +95,7 @@ shared_tree_block_release 1
 snapshot_shared_write     1
 split_oracle              4
 subvol_oracle             8
+subvol_readonly_kernel    1
 superblock_mirrors        4
 super_flags_refusals      3
 super_write_oracle        3
