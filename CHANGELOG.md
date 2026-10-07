@@ -110,6 +110,20 @@ never does.
   DUP chunk; two of RAID5; three of RAID6) is refused at mount, naming the
   chunk. Checked against the kernel-written RAID5 pool without each member,
   RAID6 without every pair and RAID1 without either (#300).
+- **Names can be created and removed.** `Filesystem::create`, `mkdir`,
+  `symlink`, `link`, `unlink` and `rmdir` each commit one transaction on the
+  top-level subvolume: the inode, its reference, both directory entries and
+  the parent's size and times, through the same planner and commit as a
+  copy-on-write write. The C ABI gains `fs_btrfs_create`, `fs_btrfs_mkdir`,
+  `fs_btrfs_symlink`, `fs_btrfs_link`, `fs_btrfs_unlink` and `fs_btrfs_rmdir`
+  (EEXIST, ENOTEMPTY, EISDIR and ENOTDIR where POSIX says), and `fs.btrfs`
+  gains `create`, `rm`, `rmdir` and `ln [-s]`, and its `mkdir` works. A
+  directory whose leaf has no room, and the last name of a file still holding
+  data extents, are refused with nothing written; `rename` and `truncate` are
+  still to come (#262).
+- **A transaction can put and delete fs tree items.** The planner renders item
+  edits into the leaves they land in, and a leaf whose first key changes has
+  its parent's key follow it.
 
 ### Changed
 

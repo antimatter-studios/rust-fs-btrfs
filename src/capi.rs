@@ -54,6 +54,16 @@ const EISDIR: c_int = 21;
 /// `EINVAL` — a NULL argument, or readlink on something that is not a link.
 const EINVAL: c_int = 22;
 const EROFS_ERRNO: c_int = 30;
+/// `EEXIST` — a name to be created is already there.
+const EEXIST: c_int = 17;
+/// `ENOTEMPTY` — 66 on Darwin and 39 on Linux.
+const fn enotempty() -> c_int {
+    if cfg!(target_os = "macos") {
+        66
+    } else {
+        39
+    }
+}
 /// `ERANGE` — a result did not fit the caller's buffer.
 const ERANGE: c_int = 34;
 /// `ENOTSUP` is 45 on Darwin and 95 on Linux.
@@ -1180,4 +1190,262 @@ pub unsafe extern "C" fn fs_btrfs_write_file(
             }
         }
     })
+}
+
+// ---------------------------------------------------------------------
+// Names (#262): create, mkdir, symlink, link, unlink, rmdir
+// ---------------------------------------------------------------------
+
+/// `path` split into its directory and its last component, with the
+/// directory resolved. Records the error and returns `None` on failure.
+fn parent_of<'a>(fs: &Filesystem, path: &'a [u8]) -> Option<(Inode, &'a [u8])> {
+    let trimmed = match path.iter().rposition(|&b| b != b'/') {
+        Some(end) => &path[..=end],
+        None => {
+            set_error(format!("{}: names no entry", shown(path)), EINVAL);
+            return None;
+        }
+    };
+    let (dir, name) = match trimmed.iter().rposition(|&b| b == b'/') {
+        Some(at) => (&trimmed[..at], &trimmed[at + 1..]),
+        None => (&b""[..], trimmed),
+    };
+    if !crate::namespace::is_valid_name(name) {
+        set_error(
+            format!("{}: not a name a directory can hold", shown(path)),
+            EINVAL,
+        );
+        return None;
+    }
+    match fs.lookup_path_bytes(dir) {
+        Ok(inode) if inode.is_dir() => Some((inode, name)),
+        Ok(_) => {
+            set_error(format!("{}: not a directory", shown(dir)), ENOTDIR);
+            None
+        }
+        Err(e) => {
+            record(&e);
+            None
+        }
+    }
+}
+
+/// `parent_of`, refusing with EEXIST when the name is already there.
+fn new_name<'a>(fs: &Filesystem, path: &'a [u8]) -> Option<(Inode, &'a [u8])> {
+    let (dir, name) = parent_of(fs, path)?;
+    match fs.lookup(dir.ino, name) {
+        Err(Error::NotFound) => Some((dir, name)),
+        Err(Error::UnsupportedFeature(_)) | Ok(_) => {
+            set_error(format!("{}: already exists", shown(path)), EEXIST);
+            None
+        }
+        Err(e) => {
+            record(&e);
+            None
+        }
+    }
+}
+
+/// The handle as a mutable filesystem, or `None` with EIO recorded.
+unsafe fn handle_mut<'a>(fs: *mut fs_btrfs_fs) -> Option<&'a mut Filesystem> {
+    if fs.is_null() {
+        set_error("fs is NULL".into(), EIO);
+        return None;
+    }
+    Some(&mut unsafe { &mut *fs }.fs)
+}
+
+/// Create an empty regular file at `path` with permission bits `mode`
+/// (the low 12 bits), owned like its directory, committed as one
+/// transaction.
+///
+/// Returns the new inode number, or 0 with the error recorded: EEXIST
+/// when the name is taken, ENOENT/ENOTDIR for the directory, EINVAL for
+/// a name no directory can hold, EROFS on a read-only handle, ENOTSUP
+/// for what this driver cannot write yet.
+///
+/// # Safety
+///
+/// `fs` must be a live handle and `path` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_create(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+    mode: u32,
+) -> u64 {
+    guard(0, || unsafe { make(fs, path, mode, false) })
+}
+
+/// Create an empty directory at `path`. As [`fs_btrfs_create`].
+///
+/// # Safety
+///
+/// As [`fs_btrfs_create`].
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_mkdir(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+    mode: u32,
+) -> u64 {
+    guard(0, || unsafe { make(fs, path, mode, true) })
+}
+
+unsafe fn make(fs: *mut fs_btrfs_fs, path: *const c_char, mode: u32, dir: bool) -> u64 {
+    let Some(fs) = (unsafe { handle_mut(fs) }) else {
+        return 0;
+    };
+    let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
+        return 0;
+    };
+    let Some((parent, name)) = new_name(fs, path) else {
+        return 0;
+    };
+    let made = if dir {
+        fs.mkdir(parent.ino, name, mode, parent.uid, parent.gid)
+    } else {
+        fs.create(parent.ino, name, mode, parent.uid, parent.gid)
+    };
+    made.unwrap_or_else(|e| {
+        record(&e);
+        0
+    })
+}
+
+/// Create a symbolic link at `linkpath` pointing at `target`, stored
+/// inline. Returns the new inode number, or 0 with the error recorded,
+/// as [`fs_btrfs_create`]; a target too long to store inline is ENOTSUP.
+///
+/// # Safety
+///
+/// `fs` must be a live handle; `target` and `linkpath` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_symlink(
+    fs: *mut fs_btrfs_fs,
+    target: *const c_char,
+    linkpath: *const c_char,
+) -> u64 {
+    guard(0, || {
+        let Some(fs) = (unsafe { handle_mut(fs) }) else {
+            return 0;
+        };
+        let Some(target) = (unsafe { borrow_bytes(target, "target") }) else {
+            return 0;
+        };
+        let Some(path) = (unsafe { borrow_bytes(linkpath, "linkpath") }) else {
+            return 0;
+        };
+        let Some((parent, name)) = new_name(fs, path) else {
+            return 0;
+        };
+        fs.symlink(parent.ino, name, target, parent.uid, parent.gid)
+            .unwrap_or_else(|e| {
+                record(&e);
+                0
+            })
+    })
+}
+
+/// Add the name `dst` for the file at `src`: a hard link. Returns 0, or
+/// -1 with the error recorded: EISDIR when `src` is a directory, EEXIST
+/// when `dst` is taken, and as [`fs_btrfs_create`] otherwise.
+///
+/// # Safety
+///
+/// `fs` must be a live handle; `src` and `dst` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_link(
+    fs: *mut fs_btrfs_fs,
+    src: *const c_char,
+    dst: *const c_char,
+) -> c_int {
+    guard(-1, || {
+        let Some(fs) = (unsafe { handle_mut(fs) }) else {
+            return -1;
+        };
+        let Some(src) = (unsafe { borrow_bytes(src, "src") }) else {
+            return -1;
+        };
+        let Some(dst) = (unsafe { borrow_bytes(dst, "dst") }) else {
+            return -1;
+        };
+        let target = match fs.lookup_path_bytes(src) {
+            Ok(i) => i,
+            Err(e) => {
+                record(&e);
+                return -1;
+            }
+        };
+        let Some((parent, name)) = new_name(fs, dst) else {
+            return -1;
+        };
+        match fs.link(target.ino, parent.ino, name) {
+            Ok(()) => 0,
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
+}
+
+/// Remove the name `path`, and the file with it when that was its last
+/// name. Returns 0, or -1 with the error recorded: ENOENT when there is
+/// no such name, EISDIR for a directory, ENOTSUP for the last name of a
+/// file still holding data extents, which this driver cannot release yet.
+///
+/// # Safety
+///
+/// `fs` must be a live handle and `path` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_unlink(fs: *mut fs_btrfs_fs, path: *const c_char) -> c_int {
+    guard(-1, || unsafe { remove(fs, path, false) })
+}
+
+/// Remove the empty directory `path`. Returns 0, or -1 with the error
+/// recorded: ENOTEMPTY when it holds anything, ENOTDIR when it is not a
+/// directory, and as [`fs_btrfs_unlink`] otherwise.
+///
+/// # Safety
+///
+/// `fs` must be a live handle and `path` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_rmdir(fs: *mut fs_btrfs_fs, path: *const c_char) -> c_int {
+    guard(-1, || unsafe { remove(fs, path, true) })
+}
+
+unsafe fn remove(fs: *mut fs_btrfs_fs, path: *const c_char, dir: bool) -> c_int {
+    let Some(fs) = (unsafe { handle_mut(fs) }) else {
+        return -1;
+    };
+    let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
+        return -1;
+    };
+    let Some((parent, name)) = parent_of(fs, path) else {
+        return -1;
+    };
+    if dir {
+        match fs.lookup(parent.ino, name).and_then(|i| fs.read_dir(i.ino)) {
+            Ok(entries) if !entries.is_empty() => {
+                set_error(format!("{}: directory not empty", shown(path)), enotempty());
+                return -1;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                record(&e);
+                return -1;
+            }
+        }
+    }
+    let removed = if dir {
+        fs.rmdir(parent.ino, name)
+    } else {
+        fs.unlink(parent.ino, name)
+    };
+    match removed {
+        Ok(()) => 0,
+        Err(e) => {
+            record(&e);
+            -1
+        }
+    }
 }
