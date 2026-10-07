@@ -23,10 +23,21 @@
 //! every one of the 22 plans that crossed groups then needed an insert
 //! into a full extent-tree leaf, the leaf an insert at the bottom of the
 //! hole lands in having no room. Alternate files leave items, and room,
-//! in every leaf over the holes. Every tree leaf outside that group then
-//! moves across groups. A plan touching a group whose records straddle a
-//! leaf (#177, read from btrfs-progs' own dump), or one needing an insert
-//! into a full extent-tree leaf, is still passed over rather than used.
+//! in every leaf over the holes. A plan touching a group whose records
+//! straddle a leaf (#177, read from btrfs-progs' own dump), or one needing
+//! an insert into a full extent-tree leaf, is still passed over rather
+//! than used.
+//!
+//! WHICH BLOCK IS MOVED is worked out from the volume, not assumed. The
+//! kernel decides where every tree block ends up, and on some runs it
+//! packed every fs and csum leaf into the very group the allocator draws
+//! from, so that no move of one could cross anything (#279, #280). The
+//! test asks the allocator which group its next block is in, and tries
+//! every tree block outside that group first, of every tree a plan can
+//! move, leaves and nodes, with no cap. When none will do, the failure
+//! names the layout — the target group, how the tree blocks are spread
+//! over the groups, and why each crossing plan was passed over — so a
+//! layout miss reads as one rather than as a fault in the driver.
 
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::super_write::Commit;
@@ -34,7 +45,7 @@ use fs_btrfs_test_support::{
     assert_btrfs_check_clean, dump_tree, guest_kernel_write_ok, oracle, temp_path,
 };
 use fs_core::{BlockDevice, FileDevice};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -87,14 +98,21 @@ fn straddling_groups(image: &Path) -> BTreeSet<u64> {
         .collect()
 }
 
-/// The leaves of the fs and csum trees, from btrfs-progs.
-fn tree_leaves(image: &Path) -> Vec<u64> {
-    ["5", "7"]
+/// Every block of every tree a plan can move, leaves and nodes alike,
+/// from btrfs-progs: the fs, csum, extent, root, dev and free-space trees.
+///
+/// Not only the fs and csum leaves, and not only the first few hundred.
+/// Whether a move crosses groups depends on where the block sits relative
+/// to where the allocator will put its copy, and a search confined to one
+/// kind of block found none on volumes where the kernel had packed those
+/// into the very group the allocator draws from (#279, #280).
+fn tree_blocks(image: &Path) -> Vec<u64> {
+    ["5", "7", "2", "1", "4", "10"]
         .iter()
         .flat_map(|tree| {
             dump_tree(image, tree)
                 .lines()
-                .filter_map(|l| l.strip_prefix("leaf "))
+                .filter_map(|l| l.strip_prefix("leaf ").or_else(|| l.strip_prefix("node ")))
                 .filter_map(|l| l.split_whitespace().next()?.parse::<u64>().ok())
                 .collect::<Vec<_>>()
         })
@@ -148,46 +166,76 @@ fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
     let fs = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>).expect("mount rw");
     let generation = fs.superblock().generation + 1;
 
-    // Any tree leaf whose move crosses groups. The allocator takes the
-    // lowest free address, so which leaves do depends on where the
-    // kernel left free space; they are tried in turn.
-    let leaves = tree_leaves(&image);
-    let tried = leaves.len().min(300);
+    // The allocator takes the lowest free address, so every copy a plan
+    // makes lands in one group, and a move crosses groups exactly when
+    // some block it rewrites lies outside that group. Which group that
+    // is comes from the allocator itself, and the blocks outside it are
+    // tried first, every one of them if need be.
+    let blocks = tree_blocks(&image);
+    assert!(!blocks.is_empty(), "btrfs-progs listed no tree blocks");
+    let target = {
+        let plan = fs
+            .plan_transaction_closed(&[blocks[0]], 64)
+            .expect("planning the transaction");
+        plan.allocated().into_iter().min().and_then(group_of)
+    };
+    let mut by_group: BTreeMap<Option<u64>, usize> = BTreeMap::new();
+    for &b in &blocks {
+        *by_group.entry(group_of(b)).or_default() += 1;
+    }
+    let mut candidates = blocks.clone();
+    candidates.sort_by_key(|&b| group_of(b) == target);
+
     let mut chosen = None;
+    let mut crossed = 0usize;
+    let mut on_a_straddle = 0usize;
     let mut full_leaf = 0usize;
     let mut first_full = None;
-    for dirty in leaves.into_iter().take(tried) {
+    for &dirty in &candidates {
         let plan = fs
             .plan_transaction_closed(&[dirty], 64)
             .expect("planning the transaction");
         let released: BTreeSet<_> = plan.released().into_iter().map(group_of).collect();
         let allocated: BTreeSet<_> = plan.allocated().into_iter().map(group_of).collect();
+        if released == allocated {
+            continue;
+        }
+        crossed += 1;
         let touches_a_straddle = released
             .iter()
             .chain(allocated.iter())
             .any(|g| g.is_some_and(|g| straddling.contains(&g)));
-        if released == allocated || touches_a_straddle {
+        if touches_a_straddle {
+            on_a_straddle += 1;
             continue;
         }
         // Inserting into a full extent-tree leaf is not implemented, and
         // is refused by name; a plan that needs it is not this test's.
         match fs.render_plan(&plan, generation) {
-            Ok(blocks) => {
-                chosen = Some((plan, blocks, released, allocated));
+            Ok(rendered) => {
+                chosen = Some((plan, rendered, released, allocated));
                 break;
             }
             Err(e) if e.to_string().contains("does not fit") => {
                 full_leaf += 1;
-                first_full.get_or_insert(format!("moving the leaf at {dirty}: {e}"));
+                first_full.get_or_insert(format!("moving the block at {dirty}: {e}"));
             }
-            Err(e) => panic!("rendering a plan moving the leaf at {dirty}: {e}"),
+            Err(e) => panic!("rendering a plan moving the block at {dirty}: {e}"),
         }
     }
-    let (plan, blocks, released, allocated) = chosen.unwrap_or_else(|| {
+    // NOT A SKIP, and not the driver's fault either: when nothing is
+    // chosen, the message says what the kernel's layout was, so a layout
+    // miss reads as one rather than as a regression.
+    let (plan, rendered, released, allocated) = chosen.unwrap_or_else(|| {
         panic!(
-            "none of {tried} tree leaves moves across groups without touching a group whose \
-             free-space records straddle a leaf ({straddling:?} do); {full_leaf} crossed \
-             groups but needed an insert into a full extent-tree leaf (first: {})",
+            "the volume the kernel made holds no tree block whose move crosses block groups \
+             cleanly, so the layout, not the driver, is what failed. The allocator's next \
+             block is in the group at {target:?}; the {} tree blocks are spread over groups \
+             {by_group:?}. Of them, {crossed} crossed groups: {on_a_straddle} touched one of \
+             the {} groups whose free-space records straddle a leaf ({straddling:?}), and \
+             {full_leaf} needed an insert into a full extent-tree leaf (first: {})",
+            blocks.len(),
+            straddling.len(),
             first_full.as_deref().unwrap_or("none")
         )
     });
@@ -195,7 +243,7 @@ fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
         .planned_root(&plan)
         .expect("the plan moves the root tree");
     fs.commit(
-        &blocks,
+        &rendered,
         &Commit {
             generation,
             root,

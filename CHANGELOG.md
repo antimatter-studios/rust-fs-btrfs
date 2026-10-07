@@ -6,6 +6,14 @@ never does.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The block-group used-count test picks a block whose move really crosses
+  groups.** It asks the allocator where its next block goes and tries every
+  tree block outside that group, of every tree a plan can move, instead of the
+  first 300 fs and csum leaves; when the kernel's layout offers none, the
+  failure names that layout (#279, #280).
+
 ## [0.10.2] — 2026-10-07
 
 A tooling release: the library and its C ABI are unchanged.
