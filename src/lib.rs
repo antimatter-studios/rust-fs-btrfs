@@ -59,6 +59,7 @@
 //!   [`csum`] each decode one kind of item
 //! - [`write`](mod@write) — the in-place file write, which commits nothing
 //! - [`cow_write`] — the copy-on-write file write, which commits a transaction
+//! - [`namespace`] — names in a directory: create, mkdir, symlink, link, unlink, rmdir
 //! - [`transaction`], [`extent_write`], [`block_group`] and [`commit`] — tree
 //!   rewrites and the commit of a new generation, separate from file writes
 //! - [`send`] — send streams: parsed, and written from a read-only subvolume
@@ -83,6 +84,7 @@ pub mod inode;
 pub mod leaf_edit;
 pub mod mkfs;
 pub mod send;
+pub mod namespace;
 pub mod subvol;
 pub mod super_write;
 pub mod superblock;
