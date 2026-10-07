@@ -29,6 +29,7 @@ test-disks/*.super
 test-disks/btrfs-split*.txt
 test-disks/snapshot/
 test-disks/dirtylog/
+test-disks/seed/
 test-disks/cli/
 test-disks/features/
 test-disks/scrub/

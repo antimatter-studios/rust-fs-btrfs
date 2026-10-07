@@ -784,10 +784,23 @@ impl Filesystem {
 
         // Each device's own superblock says which device it is and which
         // filesystem it belongs to.
+        //
+        // A SEED IS ANOTHER FILESYSTEM, AND STILL A MEMBER (#270). A
+        // filesystem sprouted from a seed (`btrfstune -S 1`, then `btrfs
+        // device add`) keeps the seed's chunks on the seed device, whose
+        // own superblock names the seed's fsid, not the sprout's. Such a
+        // device is set aside here, and accepted once the sprout's chunk
+        // tree is read and holds a DEV_ITEM for it with that fsid and
+        // device uuid; see `verify_seed_members`.
         let mut by_id: BTreeMap<u64, Arc<dyn BlockRead>> = BTreeMap::new();
+        let mut seeds: Vec<(u64, crate::superblock::DevItem, Arc<dyn BlockRead>)> = Vec::new();
         let mut fsid: Option<[u8; 16]> = None;
         for dev in devices {
             let (sb, _) = crate::superblock::read_superblock(&*dev)?;
+            if sb.is_seeding() {
+                seeds.push((sb.dev_item.devid, sb.dev_item.clone(), dev));
+                continue;
+            }
 
             match fsid {
                 None => fsid = Some(sb.fsid),
@@ -808,13 +821,100 @@ impl Filesystem {
         }
 
         // Read the filesystem through whichever device holds the
-        // superblock's own copy; the rest are reached by devid.
-        let first = by_id
-            .values()
-            .next()
-            .expect("at least one device, checked above")
-            .clone();
-        Self::open_pool_with(first, by_id, None, None, degraded)
+        // superblock's own copy; the rest are reached by devid. With a
+        // sprout that is a sprout device: the seed's superblock describes
+        // the seed as it was, not the filesystem grown from it.
+        let first = match by_id.values().next() {
+            Some(first) => first.clone(),
+            // Seeds alone: a seed filesystem by itself, which is one
+            // filesystem like any other.
+            None => {
+                for (id, _, dev) in seeds {
+                    let (sb, _) = crate::superblock::read_superblock(&*dev)?;
+                    match fsid {
+                        None => fsid = Some(sb.fsid),
+                        Some(seen) if seen != sb.fsid => {
+                            return Err(Error::UnsupportedFeature(
+                                "these devices belong to different filesystems".to_string(),
+                            ))
+                        }
+                        Some(_) => {}
+                    }
+                    if by_id.insert(id, dev).is_some() {
+                        return Err(Error::UnsupportedFeature(format!(
+                            "two devices both claim to be device {id}"
+                        )));
+                    }
+                }
+                let first = by_id
+                    .values()
+                    .next()
+                    .expect("at least one device, checked above")
+                    .clone();
+                return Self::open_pool_with(first, by_id, None, None, degraded);
+            }
+        };
+        let mut seed_items = Vec::new();
+        for (id, item, dev) in seeds {
+            if by_id.insert(id, dev).is_some() {
+                return Err(Error::UnsupportedFeature(format!(
+                    "two devices both claim to be device {id}"
+                )));
+            }
+            seed_items.push(item);
+        }
+        let fs = Self::open_pool_with(first, by_id, None, None, degraded)?;
+        fs.verify_seed_members(&seed_items)?;
+        Ok(fs)
+    }
+
+    /// Refuse a seed device the filesystem was not sprouted from.
+    ///
+    /// The sprout's chunk tree holds a `DEV_ITEM` for every device it
+    /// spans, its seeds' included, and a seed's records the seed's fsid
+    /// and device uuid. A seed device given with a sprout must match its
+    /// devid's item in both, or it is some other seed that happens to
+    /// carry the same devid, and its chunks would be read from the wrong
+    /// disk.
+    fn verify_seed_members(&self, seeds: &[crate::superblock::DevItem]) -> Result<()> {
+        if seeds.is_empty() {
+            return Ok(());
+        }
+        let mut items: BTreeMap<u64, crate::superblock::DevItem> = BTreeMap::new();
+        let mut bad = None;
+        self.for_each_item_in(self.sb.chunk_root, &mut |key: &DiskKey, data: &[u8]| {
+            if key.objectid == crate::chunk::objectid::DEV_ITEMS
+                && key.key_type == crate::chunk::key_type::DEV_ITEM
+            {
+                match crate::superblock::DevItem::parse(data) {
+                    Ok(item) => {
+                        items.insert(key.offset, item);
+                    }
+                    Err(e) => bad = Some(e),
+                }
+            }
+        })?;
+        if let Some(e) = bad {
+            return Err(e);
+        }
+        for seed in seeds {
+            let Some(item) = items.get(&seed.devid) else {
+                return Err(Error::UnsupportedFeature(format!(
+                    "a seed device claims to be device {}, which this filesystem does not \
+                     have",
+                    seed.devid
+                )));
+            };
+            if item.fsid != seed.fsid || item.uuid != seed.uuid {
+                return Err(Error::UnsupportedFeature(format!(
+                    "the seed device given as device {} is not the one this filesystem was \
+                     sprouted from: its fsid or device uuid differs from the filesystem's \
+                     record of it",
+                    seed.devid
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// `known` is a superblock selection already read from `device`'s
