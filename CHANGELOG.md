@@ -143,6 +143,12 @@ never does.
   still overwritten in place, and any other unchecksummed file is written into
   new extents and committed as one transaction. What that path cannot write yet
   is refused with the case named and #261 cited (#274).
+- **A scrub repairs a bad copy from a good one.** `Filesystem::scrub_repair`,
+  on a read-write mount, scrubs and then writes a copy that verifies over every
+  copy that does not, with no transaction, since the logical contents do not
+  change; a bad copy with no good twin is listed as unrepairable. After it, the
+  kernel's scrub counts no error and `btrfs check` finds the volume clean
+  (#302). A pool of several devices is not repaired yet.
 
 ### Fixed
 

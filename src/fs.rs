@@ -1588,6 +1588,51 @@ impl Filesystem {
         Self::read_logical_pool_mirror(&self.device, &self.devices, &self.map, mirror, logical, buf)
     }
 
+    /// Write `buf` over copy `mirror` of the logical range and no other
+    /// copy, as it lies: no checksum stamped, no transaction. For scrub
+    /// repair, which writes a copy that already verified over one that
+    /// did not, so the logical contents do not change (#302).
+    ///
+    /// Every span is resolved and checked against the device before the
+    /// first byte is written. A pool is refused: its copies live on
+    /// several devices, and this mount writes one.
+    pub(crate) fn write_mirror_in_place(
+        &self,
+        logical: u64,
+        mirror: usize,
+        buf: &[u8],
+    ) -> Result<()> {
+        let device = self.writable.as_ref().ok_or(Error::ReadOnly)?;
+        if !self.devices.is_empty() {
+            return Err(Error::UnsupportedFeature(
+                "repairing a copy in place on a pool of several devices is not supported yet"
+                    .into(),
+            ));
+        }
+        let mut spans = Vec::new();
+        let mut done = 0usize;
+        while done < buf.len() {
+            let m = self.map.map_mirror(logical + done as u64, mirror)?;
+            let n = (m.len as usize).min(buf.len() - done);
+            if n == 0 {
+                return Err(Error::UnmappedLogical(logical + done as u64));
+            }
+            Self::writable_span(device, m.physical, n)?;
+            spans.push((m.physical, done, n));
+            done += n;
+        }
+        for (physical, from, n) in spans {
+            device.write_at(physical, &buf[from..from + n])?;
+        }
+        Ok(())
+    }
+
+    /// Flush the device this mount writes.
+    pub(crate) fn flush_written(&self) -> Result<()> {
+        self.writable.as_ref().ok_or(Error::ReadOnly)?.flush()?;
+        Ok(())
+    }
+
     /// Every data checksum the csum tree holds for `[start, start + len)`,
     /// by sector address; empty on a volume with no csum tree.
     pub(crate) fn data_digests(&self, start: u64, len: u64) -> Result<crate::csum::SectorDigests> {

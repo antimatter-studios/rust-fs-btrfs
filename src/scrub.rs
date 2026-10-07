@@ -1,5 +1,6 @@
-//! Scrub, read-only: every copy of every allocated block read and checked
-//! against its checksum, nothing repaired (#268).
+//! Scrub: every copy of every allocated block read and checked against
+//! its checksum (#268), and on a read-write mount every bad copy that has
+//! a good twin overwritten with it (#302).
 //!
 //! A read uses the first copy that verifies and never looks at the rest,
 //! so a second copy can be bad for years without anything noticing —
@@ -28,7 +29,7 @@
 
 use crate::btree::{TreeBlock, TreeGeometry};
 use crate::chunk::{key_type, objectid, Chunk, DiskKey};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::fs::Filesystem;
 use std::collections::BTreeSet;
 
@@ -359,6 +360,101 @@ impl Filesystem {
     fn read_copy(&self, at: u64, mirror: usize, buf: &mut [u8]) -> Result<()> {
         self.read_mirror_unverified(at, mirror, buf)
     }
+
+    /// Scrub, then write a copy that verifies over every copy that does
+    /// not (#302).
+    ///
+    /// No transaction: the bytes written are ones another copy of the
+    /// same address already holds, so the logical contents of the
+    /// filesystem do not change and no tree points anywhere new. That is
+    /// what the kernel's repairing scrub does too. A bad copy with no
+    /// good twin is left as it is and listed as unrepairable.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] unless opened with [`Filesystem::mount_rw`],
+    /// and [`Error::UnsupportedFeature`] on a pool of several devices,
+    /// which a single-device read-write mount cannot write. A write
+    /// failure part way leaves the copies already repaired repaired and
+    /// the rest as they were: each copy is written whole before the next.
+    pub fn scrub_repair(&self) -> Result<RepairReport> {
+        if !self.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        let scrub = self.scrub()?;
+        let geom = TreeGeometry::from_superblock(self.superblock());
+        let mut repaired = Vec::new();
+        let mut unrepairable = Vec::new();
+        for error in &scrub.errors {
+            if !error.repairable {
+                unrepairable.push(error.clone());
+                continue;
+            }
+            let good = self.verified_copy(error, &geom)?;
+            self.write_mirror_in_place(error.logical, error.mirror, &good)?;
+            repaired.push((error.what, error.logical, error.mirror));
+        }
+        if !repaired.is_empty() {
+            self.flush_written()?;
+            // A tree block cached from the copy just rewritten is the
+            // same bytes, but nothing here relies on that.
+            self.forget_tree_blocks();
+        }
+        Ok(RepairReport {
+            scrub,
+            repaired,
+            unrepairable,
+        })
+    }
+
+    /// The bytes of a copy of `error`'s block or sector that verifies, from
+    /// a copy other than the bad one.
+    fn verified_copy(&self, error: &ScrubError, geom: &TreeGeometry) -> Result<Vec<u8>> {
+        let len = match error.what {
+            ScrubTarget::TreeBlock => u64::from(self.superblock().nodesize),
+            ScrubTarget::Data => u64::from(self.superblock().sectorsize),
+        };
+        let digests = match error.what {
+            ScrubTarget::Data => self.data_digests(error.logical, len)?,
+            ScrubTarget::TreeBlock => Default::default(),
+        };
+        for mirror in 0..self.chunk_map().mirrors_at(error.logical)? {
+            if mirror == error.mirror {
+                continue;
+            }
+            let mut buf = vec![0u8; len as usize];
+            if self.read_copy(error.logical, mirror, &mut buf).is_err() {
+                continue;
+            }
+            let good = match error.what {
+                ScrubTarget::TreeBlock => {
+                    TreeBlock::parse(buf.clone(), error.logical, geom).is_ok()
+                }
+                ScrubTarget::Data => digests
+                    .get(&error.logical)
+                    .is_some_and(|want| self.superblock().csum_type.verify(&buf, want)),
+            };
+            if good {
+                return Ok(buf);
+            }
+        }
+        Err(Error::UnsupportedFeature(format!(
+            "no copy of {} verifies any more; the scrub found one that did",
+            error.logical
+        )))
+    }
+}
+
+/// What [`Filesystem::scrub_repair`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RepairReport {
+    /// The scrub that found what to repair, before anything was written.
+    pub scrub: ScrubReport,
+    /// Every bad copy overwritten with a good one: what it is, its
+    /// logical address, and which copy.
+    pub repaired: Vec<(ScrubTarget, u64, usize)>,
+    /// Every bad copy left as it was, because no copy of it verifies.
+    pub unrepairable: Vec<ScrubError>,
 }
 
 /// The logical bytes one full stripe of a parity chunk holds: its data
