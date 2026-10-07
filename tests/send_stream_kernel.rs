@@ -15,6 +15,19 @@
 //! subvolume exactly as it shows the source, with the source's UUID
 //! recorded as the one it was received from.
 //!
+//! **Incremental.** The kernel snapshots a subvolume twice, changing it in
+//! between in every way a difference can take -- names added, removed,
+//! moved, swapped and nested the other way round, a file rescued from a
+//! directory that goes, a name given to a new inode or a different type,
+//! data rewritten in the middle, appended, cut short and punched out, hard
+//! links added and dropped, extended attributes changed, added and
+//! removed, a new owner, mode and time. The kernel's `btrfs send -p`
+//! stream parses into what `btrfs receive --dump` lists. This crate's own
+//! incremental stream names the same parent as the kernel's, never
+//! mentions the file that did not change, and `btrfs receive` applies it
+//! on top of the parent (received from this crate's full stream) to give
+//! exactly the child the kernel shows.
+//!
 //! The snapshot holds what a stream has to carry: inline and multi-chunk
 //! data, a hole, a preallocated range, an empty file, nested directories,
 //! a hard link, symbolic links (one dangling), a FIFO, a character
@@ -26,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fs_btrfs::fs::Filesystem;
-use fs_btrfs::send::{attr, cmd, command_name, parse_send_stream, Command};
+use fs_btrfs::send::{attr, cmd, command_name, parse_send_stream, Command, SendStream};
 use fs_btrfs_test_support::{
     fixture, guest_kernel_read_ok, guest_kernel_write_ok, guest_quote, sha256_hex,
 };
@@ -105,9 +118,101 @@ btrfs subvolume show "$MNT/snap" > "$OUT/source.show"
 btrfs subvolume show "$work/mnt/snap" > "$OUT/received.show"
 "#;
 
-fn scratch() -> PathBuf {
+/// The guest builds a parent and a child snapshot of one subvolume, the
+/// child differing in every way an incremental stream carries, sends the
+/// difference, and reports the child.
+const POPULATE_INCREMENTAL: &str = r#"
+btrfs subvolume create "$MNT/src" >/dev/null
+cd "$MNT/src"
+mkdir -p keep/inner gone/deeper moved swap outer/inner2
+printf 'stays the same\n' > keep/same.txt
+head -c 300000 /dev/urandom > keep/untouched.bin
+head -c 200000 /dev/urandom > keep/edited.bin
+head -c 100000 /dev/urandom > keep/shrinks.bin
+printf 'short' > keep/grows.txt
+head -c 70000 /dev/urandom > keep/holed.bin
+printf 'old name\n' > keep/renamed-from.txt
+printf 'travels\n' > keep/inner/travels.txt
+printf 'going\n' > gone/a.txt
+printf 'rescued\n' > gone/deeper/b.txt
+printf 'in moved\n' > moved/m.txt
+printf 'A' > swap/a
+printf 'B' > swap/b
+printf 'x' > outer/inner2/x
+printf 'one link\n' > keep/one-link.txt
+printf 'two links\n' > keep/two-links.txt
+ln keep/two-links.txt keep/two-links-2.txt
+printf 'replaced\n' > keep/replaced.txt
+ln -s same.txt keep/becomes-file
+printf 'becomes a directory\n' > keep/becomes-dir
+setfattr -n user.keep -v same keep/same.txt
+setfattr -n user.change -v before keep/edited.bin
+setfattr -n user.drop -v soon keep/grows.txt
+cd /
+sync
+btrfs subvolume snapshot -r "$MNT/src" "$MNT/snap1" >/dev/null
+cd "$MNT/src"
+printf 'new\n' > new.txt
+mkdir -p fresh/dir
+printf 'fresh\n' > fresh/dir/f.txt
+ln fresh/dir/f.txt fresh/f-again.txt
+mv gone/deeper/b.txt keep/rescued.txt
+rm -r gone
+mv keep/renamed-from.txt keep/renamed-to.txt
+mv moved keep/moved-here
+mv swap/a swap/tmp
+mv swap/b swap/a
+mv swap/tmp swap/b
+mv outer/inner2 inner2
+mv outer inner2/outer
+dd if=/dev/urandom of=keep/edited.bin bs=4096 seek=10 count=3 conv=notrunc status=none
+truncate -s 5000 keep/shrinks.bin
+printf ' and longer now' >> keep/grows.txt
+fallocate -p -o 8192 -l 16384 keep/holed.bin
+ln keep/one-link.txt one-link-elsewhere.txt
+rm keep/two-links-2.txt
+rm keep/replaced.txt
+printf 'a new inode\n' > keep/replaced.txt
+rm keep/becomes-file
+printf 'a file now\n' > keep/becomes-file
+rm keep/becomes-dir
+mkdir keep/becomes-dir
+printf 'inside\n' > keep/becomes-dir/inside.txt
+setfattr -n user.change -v after keep/edited.bin
+setfattr -x user.drop keep/grows.txt
+setfattr -n user.added -v 0x01 keep/inner/travels.txt
+chown 1000:1001 keep/inner/travels.txt
+chmod 0600 keep/one-link.txt
+touch -d '2001-02-03 04:05:06.5' keep/same.txt
+cd /
+sync
+btrfs subvolume snapshot -r "$MNT/src" "$MNT/snap2" >/dev/null
+btrfs send -q -p "$MNT/snap1" -f "$OUT/kernel.inc.stream" "$MNT/snap2"
+btrfs receive --dump -f "$OUT/kernel.inc.stream" > "$OUT/kernel.inc.dump"
+report "$MNT/snap2" > "$OUT/kernel.report"
+"#;
+
+/// The guest receives this crate's full stream of the parent, then its
+/// incremental stream of the child, into a fresh filesystem, and reports
+/// both children.
+const RECEIVE_INCREMENTAL: &str = r#"
+work="$(mktemp -d /var/tmp/fs-btrfs-receive.XXXXXX)"
+truncate -s 512M "$work/img"
+mkfs.btrfs -q "$work/img"
+mkdir "$work/mnt"
+mount -o loop "$work/img" "$work/mnt"
+trap 'umount "$work/mnt" 2>/dev/null || true; rm -rf "$work"' EXIT
+btrfs receive -f "$OUT/ours.full.stream" "$work/mnt"
+btrfs receive -f "$OUT/ours.inc.stream" "$work/mnt"
+report "$MNT/snap2" > "$OUT/source.report"
+report "$work/mnt/snap2" > "$OUT/received.report"
+btrfs subvolume show "$MNT/snap2" > "$OUT/source.show"
+btrfs subvolume show "$work/mnt/snap2" > "$OUT/received.show"
+"#;
+
+fn scratch(tag: &str) -> PathBuf {
     let dir = PathBuf::from(fs_btrfs_test_support::temp_path!(
-        "send-{}",
+        "send-{tag}-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
@@ -337,24 +442,63 @@ impl Replay {
 }
 
 /// `btrfs receive --dump`'s path, as the stream carries it: the dump
-/// joins every path but the subvolume's own onto `./snap/`.
-fn dump_path(field: &str, subvol: bool) -> &str {
+/// joins every path but the subvolume's own onto `./<name>/`.
+fn dump_path<'a>(field: &'a str, name: &str, subvol: bool) -> &'a str {
     let p = field.strip_prefix("./").unwrap_or(field);
     if subvol {
         return p;
     }
-    let p = p.strip_prefix("snap").unwrap_or(p);
+    let p = p.strip_prefix(name).unwrap_or(p);
     p.strip_prefix('/').unwrap_or(p)
 }
 
-/// The snapshot named `snap` on `image`, through this crate's reader.
-fn snapshot_id(fs: &Filesystem) -> u64 {
+/// The subvolume called `name`, through this crate's reader.
+fn subvolume_id(fs: &Filesystem, name: &[u8]) -> u64 {
     fs.subvolumes()
         .expect("list the subvolumes")
         .into_iter()
-        .find(|s| s.name == b"snap")
-        .expect("the guest made a subvolume named snap")
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("the guest made no subvolume named {name:?}"))
         .id
+}
+
+/// The parser finds the commands `btrfs receive --dump` lists, in the
+/// same order and on the same paths, in a stream of subvolume `name`.
+fn assert_matches_dump(stream: &SendStream, dump: &str, name: &str) {
+    let dumped: Vec<(&str, &str)> = dump
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let mut f = l.split_whitespace();
+            (f.next().unwrap(), f.next().unwrap_or(""))
+        })
+        .collect();
+    let ours: Vec<(&str, String)> = stream
+        .commands
+        .iter()
+        .filter(|c| c.cmd != cmd::END)
+        .map(|c| {
+            (
+                command_name(c.cmd).unwrap_or("?"),
+                String::from_utf8_lossy(c.path().unwrap_or_default()).into_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ours.len(),
+        dumped.len(),
+        "btrfs receive --dump lists {} commands, the parser found {}:\n{dump}",
+        dumped.len(),
+        ours.len()
+    );
+    for (i, ((cmd_name, path), (dname, dpath))) in ours.iter().zip(&dumped).enumerate() {
+        assert_eq!(cmd_name, dname, "command {i}:\n{dump}");
+        assert_eq!(
+            path,
+            dump_path(dpath, name, i == 0),
+            "command {i}'s path:\n{dump}"
+        );
+    }
 }
 
 fn show_field(show: &str, name: &str) -> String {
@@ -366,7 +510,7 @@ fn show_field(show: &str, name: &str) -> String {
 
 #[test]
 fn send_streams_agree_with_btrfs_send_and_btrfs_receive() {
-    let out = scratch();
+    let out = scratch("full");
     let image = out.join("btrfs-send.img");
     std::fs::copy(fixture("btrfs-default.img"), &image).expect("copy the fixture");
     let image_str = image.to_str().expect("a UTF-8 scratch path").to_string();
@@ -386,41 +530,7 @@ fn send_streams_agree_with_btrfs_send_and_btrfs_receive() {
     assert_eq!(kernel.commands.last().map(|c| c.cmd), Some(cmd::END));
     assert_eq!(kernel.commands[0].path().unwrap(), b"snap");
 
-    let dump = read(&out.join("kernel.dump"));
-    let dumped: Vec<(&str, &str)> = dump
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| {
-            let mut f = l.split_whitespace();
-            (f.next().unwrap(), f.next().unwrap_or(""))
-        })
-        .collect();
-    let ours: Vec<(&str, String)> = kernel
-        .commands
-        .iter()
-        .filter(|c| c.cmd != cmd::END)
-        .map(|c| {
-            (
-                command_name(c.cmd).unwrap_or("?"),
-                String::from_utf8_lossy(c.path().unwrap_or_default()).into_owned(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        ours.len(),
-        dumped.len(),
-        "btrfs receive --dump lists {} commands, the parser found {}:\n{dump}",
-        dumped.len(),
-        ours.len()
-    );
-    for (i, ((name, path), (dname, dpath))) in ours.iter().zip(&dumped).enumerate() {
-        assert_eq!(name, dname, "command {i}:\n{dump}");
-        assert_eq!(
-            path,
-            dump_path(dpath, i == 0),
-            "command {i}'s path:\n{dump}"
-        );
-    }
+    assert_matches_dump(&kernel, &read(&out.join("kernel.dump")), "snap");
 
     let mut replay = Replay::default();
     for c in &kernel.commands {
@@ -441,7 +551,7 @@ fn send_streams_agree_with_btrfs_send_and_btrfs_receive() {
     let dev = FileDevice::open(&image).expect("open the image");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount the image");
     let ours_bytes = fs
-        .send_subvolume(snapshot_id(&fs))
+        .send_subvolume(subvolume_id(&fs, b"snap"))
         .expect("send the snapshot");
     std::fs::write(out.join("ours.stream"), &ours_bytes).expect("write our stream");
 
@@ -476,5 +586,101 @@ fn send_streams_agree_with_btrfs_send_and_btrfs_receive() {
         show_field(&read(&out.join("received.show")), "Received UUID:"),
         show_field(&read(&out.join("source.show")), "UUID:"),
         "the received subvolume does not name the source as where it came from"
+    );
+}
+
+#[test]
+fn incremental_streams_agree_with_btrfs_send_and_btrfs_receive() {
+    let out = scratch("incremental");
+    let image = out.join("btrfs-send-incremental.img");
+    std::fs::copy(fixture("btrfs-default.img"), &image).expect("copy the fixture");
+    let image_str = image.to_str().expect("a UTF-8 scratch path").to_string();
+
+    // The kernel makes both snapshots and sends the difference.
+    guest_kernel_write_ok(
+        &image_str,
+        "populate two snapshots and send the difference",
+        &guest_script(&out, POPULATE_INCREMENTAL),
+    );
+    let kernel_report = read(&out.join("kernel.report"));
+    for path in [
+        "keep/rescued.txt\t",
+        "inner2/outer\t",
+        "keep/becomes-dir/inside.txt\t",
+    ] {
+        assert!(
+            kernel_report.contains(path),
+            "the guest did not make {path:?}:\n{kernel_report}"
+        );
+    }
+
+    // --- Reading what the kernel wrote ---
+    let kernel_bytes = std::fs::read(out.join("kernel.inc.stream")).expect("the kernel's stream");
+    let kernel = parse_send_stream(&kernel_bytes).expect("parse the kernel's incremental stream");
+    assert_eq!(kernel.commands.first().map(|c| c.cmd), Some(cmd::SNAPSHOT));
+    assert_eq!(kernel.commands[0].path().unwrap(), b"snap2");
+    assert_matches_dump(&kernel, &read(&out.join("kernel.inc.dump")), "snap2");
+
+    // --- Writing one the kernel applies ---
+    let dev = FileDevice::open(&image).expect("open the image");
+    let fs = Filesystem::mount(Arc::new(dev)).expect("mount the image");
+    let parent = subvolume_id(&fs, b"snap1");
+    let child = subvolume_id(&fs, b"snap2");
+    let full = fs.send_subvolume(parent).expect("send the parent");
+    let inc = fs
+        .send_subvolume_incremental(child, parent)
+        .expect("send the child against the parent");
+    std::fs::write(out.join("ours.full.stream"), &full).expect("write our full stream");
+    std::fs::write(out.join("ours.inc.stream"), &inc).expect("write our incremental stream");
+
+    let parsed = parse_send_stream(&inc).expect("our incremental stream parses");
+    assert_eq!(parsed.commands[0].cmd, cmd::SNAPSHOT);
+    for a in [
+        attr::PATH,
+        attr::UUID,
+        attr::CTRANSID,
+        attr::CLONE_UUID,
+        attr::CLONE_CTRANSID,
+    ] {
+        assert_eq!(
+            parsed.commands[0].attr(a),
+            kernel.commands[0].attr(a),
+            "the SNAPSHOT command's attribute {a} is not the kernel's"
+        );
+    }
+    let untouched: &[u8] = b"keep/untouched.bin";
+    assert!(
+        !parsed
+            .commands
+            .iter()
+            .any(|c| c.path().ok() == Some(untouched)),
+        "the stream names a file that did not change"
+    );
+    assert!(
+        inc.len() < full.len() / 4,
+        "the incremental stream is {} bytes against the full stream's {}: it is not carrying only the difference",
+        inc.len(),
+        full.len()
+    );
+
+    guest_kernel_read_ok(
+        &image_str,
+        "receive our full and incremental streams",
+        &guest_script(&out, RECEIVE_INCREMENTAL),
+    );
+    let source = read(&out.join("source.report"));
+    let received = read(&out.join("received.report"));
+    assert_eq!(
+        source, kernel_report,
+        "the source snapshot changed between mounts"
+    );
+    assert_eq!(
+        received, source,
+        "btrfs receive, applying this crate's incremental stream to the parent, rebuilt something other than the child"
+    );
+    assert_eq!(
+        show_field(&read(&out.join("received.show")), "Received UUID:"),
+        show_field(&read(&out.join("source.show")), "UUID:"),
+        "the received child does not name the source as where it came from"
     );
 }

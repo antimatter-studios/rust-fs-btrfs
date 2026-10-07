@@ -33,21 +33,27 @@
 //!
 //! # What a written stream holds
 //!
-//! A full stream: no parent snapshot, so every inode is created. The
-//! kernel creates each inode under a temporary name and renames it into
-//! place; a receiver only needs each command to make sense when it is
-//! applied, so here every inode is created at its final path, parents
-//! before children. Then, per inode, its data (holes and preallocated
+//! A full stream ([`Filesystem::send_subvolume`]): no parent snapshot,
+//! so every inode is created. The kernel creates each inode under a
+//! temporary name and renames it into place; a receiver only needs each
+//! command to make sense when it is applied, so here every inode is
+//! created at its final path, parents before children. Then, per inode, its data (holes and preallocated
 //! ranges are left unwritten, as the kernel leaves them), its extended
 //! attributes and its size; owners and modes once everything exists; and
 //! the times last and deepest first, because creating an entry moves its
 //! directory's modification time.
+//!
+//! An incremental stream ([`Filesystem::send_subvolume_incremental`])
+//! carries only what changed since a parent snapshot the receiver already
+//! holds; [`incremental`] says how.
 //!
 //! The oracle is the other implementation: `tests/send_stream_kernel.rs`
 //! parses streams the kernel's `btrfs send` wrote and has the guest's
 //! `btrfs receive` replay streams this module wrote.
 
 use std::collections::{BTreeMap, VecDeque};
+
+pub mod incremental;
 
 use crate::error::{Error, Result};
 use crate::fs::{root_item, Filesystem, ROOT_ITEM_KEY};

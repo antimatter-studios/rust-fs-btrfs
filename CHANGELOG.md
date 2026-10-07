@@ -23,6 +23,15 @@ never does.
   `btrfs send` wrote parses into the commands `btrfs receive --dump` lists and
   replays into the snapshot the kernel shows, and `btrfs receive` rebuilds the
   same snapshot from a stream this crate wrote.
+- **Incremental send streams are written (#273).**
+  `Filesystem::send_subvolume_incremental` writes what changed between two
+  read-only snapshots, as `btrfs send -p` does: names taken away, moved and
+  made through orphan names in the top directory so no rename lands on a name
+  in use or inside itself, only the ranges of a kept file whose extent items
+  read from somewhere new, and changed extended attributes, owners, modes and
+  times. `tests/send_stream_kernel.rs` has the guest's `btrfs receive` apply
+  it on top of the parent and the kernel show the child exactly, and parses
+  the kernel's own incremental stream against `btrfs receive --dump`.
 - **`send::StreamError`**, its own error type. A malformed stream is bytes
   handed in, not a damaged volume, so it is kept out of the crate's `Error`.
 
