@@ -25,6 +25,13 @@ never does.
   same snapshot from a stream this crate wrote.
 - **`send::StreamError`**, its own error type. A malformed stream is bytes
   handed in, not a damaged volume, so it is kept out of the crate's `Error`.
+- **The default subvolume can be chosen (#267).**
+  `Filesystem::set_default_subvolume` repoints the root tree's `default`
+  entry and, for any subvolume but the top level, sets the `DEFAULT_SUBVOL`
+  incompatible feature in the same commit, as `btrfs subvolume set-default`
+  does. `tests/subvol_default_kernel.rs` has `btrfs check` find the volume
+  clean, `btrfs subvolume get-default` name the new default, and a plain kernel
+  mount show its contents.
 - **A subvolume can be made read-only or writable again (#267, first
   slice).** `Filesystem::set_subvolume_read_only` sets or clears bit 0 of the
   subvolume's `ROOT_ITEM` flags and commits it as one copy-on-write

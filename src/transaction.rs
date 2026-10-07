@@ -140,6 +140,9 @@ pub(crate) struct DataWrite {
     /// `(objectid, flags)`. The item keeps its size, so the root tree leaf
     /// holding it is rewritten in place.
     pub root_flags: Option<(u64, u64)>,
+    /// The subvolume the root tree's `default` entry is pointed at. The
+    /// entry keeps its size, so its leaf is rewritten in place.
+    pub default_subvol: Option<u64>,
 }
 
 impl DataWrite {
@@ -566,6 +569,9 @@ impl Filesystem {
 
                     // A root tree leaf names other trees' roots.
                     if rewrite.owner == objectid::ROOT_TREE {
+                        if let Some(id) = data.default_subvol {
+                            applied.default_subvol += point_default_at(&mut owned, id)?;
+                        }
                         if let Some((id, flags)) = data.root_flags {
                             for item in &mut owned {
                                 if item.key.objectid == id
@@ -639,6 +645,12 @@ impl Filesystem {
                     applied.root_flags
                 )));
             }
+        }
+        if data.default_subvol.is_some() && applied.default_subvol != 1 {
+            return Err(Error::UnsupportedFeature(format!(
+                "the plan repointed {} `default` entries in the root tree, not one",
+                applied.default_subvol
+            )));
         }
         // NOR IS A FILE WRITE. Every part of it is in a leaf the plan was
         // closed over, so a part not applied means the leaf it is in was
@@ -991,6 +1003,8 @@ struct DataApplied {
     recorded: usize,
     /// `ROOT_ITEM`s whose flags were set.
     root_flags: usize,
+    /// `default` entries repointed.
+    default_subvol: usize,
 }
 
 /// Offsets within a data extent's `EXTENT_ITEM` body carrying one inline
@@ -1120,6 +1134,46 @@ fn apply_file_write(
         }
     }
     Ok(())
+}
+
+/// `BTRFS_ROOT_TREE_DIR_OBJECTID`: the root tree's directory, which
+/// holds the one entry `default`.
+pub(crate) const ROOT_TREE_DIR_OBJECTID: u64 = 6;
+
+/// Point the root tree's `default` entry at subvolume `id`, in `items`.
+///
+/// The entry's location key is `(id, ROOT_ITEM, u64::MAX)`; only the
+/// objectid changes, so the item keeps its size. Returns how many entries
+/// it changed. An item under the `default` key holding any other name, or
+/// more than one name, is refused rather than guessed at.
+fn point_default_at(items: &mut [crate::leaf_edit::OwnedItem], id: u64) -> Result<usize> {
+    use crate::dir::{name_hash, offsets as d, DIR_ITEM_HEADER_SIZE, DIR_ITEM_KEY};
+    let hash = name_hash(b"default");
+    let mut changed = 0;
+    for item in items.iter_mut() {
+        if item.key.objectid != ROOT_TREE_DIR_OBJECTID
+            || item.key.key_type != DIR_ITEM_KEY
+            || item.key.offset != hash
+        {
+            continue;
+        }
+        let data = &mut item.data;
+        let well_formed = data.len() == DIR_ITEM_HEADER_SIZE + 7
+            && u16::from_le_bytes([data[d::NAME_LEN], data[d::NAME_LEN + 1]]) == 7
+            && u16::from_le_bytes([data[d::DATA_LEN], data[d::DATA_LEN + 1]]) == 0
+            && &data[d::NAME..d::NAME + 7] == b"default"
+            && data[d::LOCATION + 8] == ROOT_ITEM_KEY;
+        if !well_formed {
+            return Err(Error::UnsupportedFeature(
+                "the root tree's `default` entry is not the single entry naming a root item \
+                 that it should be"
+                    .into(),
+            ));
+        }
+        data[d::LOCATION..d::LOCATION + 8].copy_from_slice(&id.to_le_bytes());
+        changed += 1;
+    }
+    Ok(changed)
 }
 
 use crate::chunk::{key_type, DiskKey};
