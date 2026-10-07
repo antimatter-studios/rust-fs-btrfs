@@ -143,6 +143,22 @@ never does.
   still overwritten in place, and any other unchecksummed file is written into
   new extents and committed as one transaction. What that path cannot write yet
   is refused with the case named and #261 cited (#274).
+- **The default subvolume can be chosen (#267).**
+  `Filesystem::set_default_subvolume` repoints the root tree's `default`
+  entry and, for any subvolume but the top level, sets the `DEFAULT_SUBVOL`
+  incompatible feature in the same commit, as `btrfs subvolume set-default`
+  does. `tests/subvol_default_kernel.rs` has `btrfs check` find the volume
+  clean, `btrfs subvolume get-default` name the new default, and a plain kernel
+  mount show its contents.
+- **A subvolume can be made read-only or writable again (#267, first
+  slice).** `Filesystem::set_subvolume_read_only` sets or clears bit 0 of the
+  subvolume's `ROOT_ITEM` flags and commits it as one copy-on-write
+  transaction, as `btrfs property set <subvol> ro` does. A received subvolume is
+  refused when made writable, because its received UUID would have to be
+  cleared. `tests/subvol_readonly_kernel.rs` has `btrfs check` find the volume
+  clean, `btrfs property get` report the new flags, and the kernel refuse a
+  write into the newly read-only subvolume and accept one into the newly
+  writable snapshot.
 
 ### Fixed
 
