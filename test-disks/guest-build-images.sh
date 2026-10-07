@@ -159,6 +159,11 @@ dump_super() {
 
 note() { echo "[guest] $*"; }
 
+# The features Debian's btrfs-progs cannot format (#270) are formatted by
+# the static release build scripts/vm-setup.sh installs beside it, called
+# by path. Everything else keeps the distribution's tools.
+STATIC_PROGS=/opt/btrfs-progs-static
+
 # fs_tree_level <image> — the level of the fs tree's root, 0 for a leaf.
 #
 # THROUGH A FILE, NOT A PIPE. `awk ... exit` closes its input on the
@@ -1209,6 +1214,9 @@ build_cli() {
 #               items live in a tree of their own instead of the extent
 #               tree, so a reader that looks for them in the extent tree
 #               finds none. The manifest is every file's size and SHA-256.
+#               Formatted by the static btrfs-progs, whose mkfs knows the
+#               feature; filled by the kernel, and checked by Debian's
+#               `btrfs check`.
 #
 # In its own directory: the suites that walk every image in test-disks/
 # also try to write each one, and a block group tree volume is refused
@@ -1218,7 +1226,7 @@ build_features() {
     local img="$WORK/btrfs-bgt.img" manifest="$WORK/btrfs-bgt.manifest" i
     rm -f "$img" "$manifest"
     truncate -s 512M "$img"
-    mkfs.btrfs -f -O block-group-tree "$img" >/dev/null
+    "$STATIC_PROGS/mkfs.btrfs" -f -O block-group-tree "$img" >/dev/null
     mount -o loop "$img" "$MNT"
     mkdir -p "$MNT/dir"
     for i in 1 2 3; do
@@ -1252,6 +1260,7 @@ build_features() {
 # ---------------------------------------------------------------------
 
 echo "[guest] $(btrfs --version 2>&1 | head -1) on $(uname -srm)"
+echo "[guest] static: $("$STATIC_PROGS/mkfs.btrfs" --version 2>&1 | sed -n 1p)"
 for target in "$@"; do
     started=$(date +%s)
     "build_$target"
