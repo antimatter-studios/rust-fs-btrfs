@@ -700,7 +700,7 @@ impl Filesystem {
             FileType::Symlink => w.attr(attr::PATH_LINK, &tree.read_link(inode.ino)?)?,
             FileType::CharDevice | FileType::BlockDevice | FileType::Fifo | FileType::Socket => {
                 w.attr_u64(attr::MODE, u64::from(inode.mode))?;
-                w.attr_u64(attr::RDEV, inode.rdev)?;
+                w.attr_u64(attr::RDEV, stream_rdev(inode.rdev))?;
             }
             _ => {}
         }
@@ -807,9 +807,32 @@ impl Filesystem {
     }
 }
 
+/// An inode item's device number as a send stream carries it.
+///
+/// The inode item packs the major number above bit 20 and the minor below
+/// it; the stream carries the number `mknod(2)` takes, whose low byte is the
+/// minor's low byte, bits 8..20 the major and bits 20 up the rest of the
+/// minor. Observed against the kernel: a `c 1 3` node is `0x100003` on disk
+/// and `0x103` in the stream `btrfs send` writes for it.
+fn stream_rdev(on_disk: u64) -> u64 {
+    let major = on_disk >> 20;
+    let minor = on_disk & 0xf_ffff;
+    (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The device number is re-packed, not copied: `/dev/null` (1:3) is
+    /// `0x100003` in the inode item and `0x103` in the stream.
+    #[test]
+    fn a_device_number_is_repacked_for_the_stream() {
+        assert_eq!(stream_rdev(0x0010_0003), 0x103);
+        assert_eq!(stream_rdev(0), 0);
+        // 8:300 -- a minor above 255 moves its high bits above the major.
+        assert_eq!(stream_rdev((8 << 20) | 300), 0x0010_082c);
+    }
 
     /// A stream built by the writer reads back command for command.
     #[test]
