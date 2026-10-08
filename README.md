@@ -55,6 +55,7 @@ not.
 | Compression (zlib / lzo / zstd extents) | done — all three, verified against files the kernel wrote |
 | Write path: overwrite in place | done — `nodatacow` files only, no journal needed |
 | Write path: anything copy-on-write | partial — `Filesystem::write` overwrites bytes inside a file's existing extents and commits the transaction (#61). It refuses a write that grows a file or lands in a hole, a checksummed file (most files: the checksum tree is not written yet), and inline, preallocated, compressed and shared extents (#261). The CLI and the C ABI do not use it yet (#274) |
+| Send streams | read: version 1 and 2, every checksum verified, matched against `btrfs receive --dump` (`send::parse_send_stream`). Written: a full version-1 stream of a read-only subvolume that `btrfs receive` rebuilds exactly (`Filesystem::send_subvolume`). Incremental streams (`-p`), clone sources and applying a stream to an image (receive) are not done ([#273][i273]) |
 | C ABI (`fs_btrfs_*`) | done, including the write entry points. Read paths cross into subvolumes; `fs_btrfs_mount_pool` opens a filesystem of several devices and `fs_btrfs_open_subvolume` one subvolume as its own root |
 
 ## Command-line tools
@@ -146,6 +147,7 @@ as damaged is one `btrfs check --readonly` refuses too; after `fs.btrfs write`,
 and the kernel read back exactly the bytes written.
 
 [i262]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/262
+[i273]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/273
 [i274]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/274
 
 ## Test contract
