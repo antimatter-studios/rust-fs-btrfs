@@ -8,6 +8,10 @@ never does.
 
 ### Added
 
+- **`docs/features.md`, a features page kept current by every pull request.**
+  Each feature's state, the release it shipped in, its tracking issue and the
+  test that checks it. The README's status table is a short summary pointing
+  to it, and `tests/docs_describe_the_code.rs` reads its rows from the page.
 - **The C ABI mounts a pool and opens a subvolume.** `fs_btrfs_mount_pool`
   takes every device of a multi-device filesystem, in any order, and
   `fs_btrfs_open_subvolume` gives a read-only handle rooted at one subvolume
