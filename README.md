@@ -22,41 +22,19 @@ address anything else at all.
 
 ## Status
 
-Under active development. The table is the honest state of what is implemented,
-not a roadmap.
-
-It was last wrong in the other direction: it described a reader with the write
-path "out of scope" and B-tree traversal, inodes and compression "planned", all
-of which had been in for some time. A status table that understates is not
-harmless — someone deciding whether this is usable reads it and concludes it is
-not.
-
-| Area | Support |
-|------|---------|
-| Superblock (primary at 64 KiB) | done — 216 field comparisons against dump-super |
-| Superblock mirrors (64 MiB, 256 GiB) | done — every copy is read and the valid one with the highest generation is used; a read-write mount refuses unless that is the primary (#90) |
-| Checksum: **crc32c** | done |
-| Checksum: **xxhash64**, **sha256**, **blake2b** | done — all four verified against real media |
-| System chunk array → chunk tree bootstrap | done |
-| Chunk tree / logical→physical mapping | done — bootstrap array, then the full tree folded in |
-| B-tree node + leaf traversal | done — walk and keyed search, on multi-level trees |
-| Root tree, fs tree, extent tree | done |
-| Inodes, directory items, extent data | done |
-| Directory listing, lookup, path resolution | done — `..` included, out of a subvolume into its parent as on a mount, checked against what the kernel reads at the same paths |
-| Symlinks | done |
-| Extended attributes: read | done — `list_xattrs` / `get_xattr`, checked name by name against `getfattr` |
-| Extended attributes: write | not yet — setting one means inserting into a tree a transaction has to commit |
-| Profiles: single, dup, raid0, raid1, raid10 | done |
-| Profiles: raid5/6 | refused explicitly, not guessed |
-| Mixed block groups (`mkfs.btrfs -M`) | reads; covered by the fixture matrix |
-| Subvolumes and snapshots: listing | done — id, path, parent, snapshot and read-only flags, checked against `btrfs subvolume list` |
-| Subvolumes and snapshots: reading inside one | done — `open_subvolume` gives a handle over that tree; read-only |
-| A path that crosses into a subvolume | done in `resolve_path`, which hands back the subvolume and the inode in it; `lookup_path` stops at the boundary and says which subvolume to open, because an inode number means nothing without its tree |
-| Compression (zlib / lzo / zstd extents) | done — all three, verified against files the kernel wrote |
-| Write path: overwrite in place | done — `nodatacow` files only, no journal needed |
-| Write path: anything copy-on-write | partial — `Filesystem::write` overwrites bytes inside a file's existing extents and commits the transaction (#61). It refuses a write that grows a file or lands in a hole, a checksummed file (most files: the checksum tree is not written yet), and inline, preallocated, compressed and shared extents (#261). The CLI and the C ABI do not use it yet (#274) |
-| Send streams | read: version 1 and 2, every checksum verified, matched against `btrfs receive --dump` (`send::parse_send_stream`). Written: a full version-1 stream of a read-only subvolume that `btrfs receive` rebuilds exactly (`Filesystem::send_subvolume`). Incremental streams (`-p`), clone sources and applying a stream to an image (receive) are not done ([#273][i273]) |
-| C ABI (`fs_btrfs_*`) | done, including the write entry points. Read paths cross into subvolumes; `fs_btrfs_mount_pool` opens a filesystem of several devices and `fs_btrfs_open_subvolume` one subvolume as its own root |
+Under active development. Reading is supported for single- and multi-device
+volumes in the single, dup, raid0, raid1 and raid10 profiles, with every
+checksum type and compression the kernel writes, extended attributes, ACLs,
+and paths into subvolumes and snapshots; raid5/6 is refused. Writing commits
+real transactions the kernel accepts, but covers only overwrites: in place
+for `nodatacow` files, and copy-on-write inside a file's existing extents.
+`fsck.btrfs` checks without repairing, `mkfs.btrfs` formats one device, and
+send streams are read and written. **[docs/features.md](docs/features.md) is
+the full list**: every feature, its state (supported, experimental, partial,
+refused, not supported or upcoming), the release it shipped in, its tracking
+issue and the test that checks it. Every pull request that changes behaviour
+updates it, and `tests/docs_describe_the_code.rs` fails a row that falls
+behind the code.
 
 ## Command-line tools
 
@@ -147,7 +125,6 @@ as damaged is one `btrfs check --readonly` refuses too; after `fs.btrfs write`,
 and the kernel read back exactly the bytes written.
 
 [i262]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/262
-[i273]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/273
 [i274]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/274
 
 ## Test contract
