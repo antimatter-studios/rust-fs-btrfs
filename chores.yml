@@ -496,9 +496,15 @@ tasks:
     # and subvolume pull requests add, each section measured at 17 to 21
     # lines and 0.7 to 1.4 KB (runs 37604852088, 37609289817): about 476
     # lines and 37900 bytes with all of them, so 500 lines and 40000 bytes.
+    #
+    # Re-measured for the merge queue (#330), which runs a group of pull
+    # requests' tests in one tier: 510 lines and 41482 bytes on #325's
+    # branch, the largest of the open stack (run of 2026-10-09), so 660
+    # lines and 54000 bytes, ~30% over it. A per-pull-request raise edits
+    # this one line in every pull request, which conflicts inside a queue.
     cmds:
       - test-disks/build-fixtures.sh --check
-      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 500 40000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 660 54000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
@@ -584,7 +590,11 @@ tasks:
       - task: test:kernel
       # Budget measured on #297's run of 2026-10-08: 1068 lines, 57622
       # bytes, the suite having grown by the full-backref leaf-move tests.
-      - '../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 1070 57700 -- scripts/test.sh --locked --release'
+      # Re-measured for the merge queue (#330), which runs a group of pull
+      # requests in one tier: 1082 lines and 58108 bytes on #319's branch,
+      # the largest of the open stack (run of 2026-10-09), so 1410 lines and
+      # 75600 bytes, ~30% over it, as the table above sizes every tier.
+      - '../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 1410 75600 -- scripts/test.sh --locked --release'
       - task: test:scripts
       # The command-line tools, built and staged from this checkout, then
       # tested as installed. A separate invocation because test:cli reads
