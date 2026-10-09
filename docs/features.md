@@ -125,9 +125,9 @@ Linux kernel in the guest.
 | C ABI readlink contract shared with the family | Supported | 0.7.0 | | `readlink_kernel_oracle.rs` |
 | C ABI: every read crosses into subvolumes | Supported | Unreleased (#271) | | `capi_subvol.rs` |
 | C ABI: `fs_btrfs_mount_pool`, `fs_btrfs_open_subvolume` | Supported | Unreleased (#271) | | `capi_pool.rs` |
-| C ABI and `fs.btrfs write` through the copy-on-write path | Upcoming | | #274 (PR #293) | |
+| C ABI and `fs.btrfs write` through the copy-on-write path | Supported | Unreleased (#274) | | `capi_write_kernel.rs`, `cli_write_kernel.rs` |
 | `fs.btrfs` `ls`, `read`, `get`/`info` (`--features cli`) | Supported | 0.8.0 | | `cli_oracle.rs`, `tests/cli/test-read.sh` |
-| `fs.btrfs write`: an existing `nodatacow` file, same length | Partial | 0.8.0 | #274 (PR #293) | `cli_write_kernel.rs` |
+| `fs.btrfs write`: an existing `nodatacow` file, same length | Partial | 0.8.0 | #274 | `cli_write_kernel.rs` |
 | `fs.btrfs mkdir` | Not supported (`not implemented`, exit 3) | 0.8.0 | #262 | `tests/cli/test-blocked.sh` |
 | `fs.btrfs set label` | Supported | 0.9.0 (#264) | | `cli_label_kernel.rs` |
 | `rust-fs-btrfs doctor`, man pages, shell completions | Supported | 0.8.0; pages 0.8.1 | | `cli_dispatch.rs`, `cli_docs.rs` |

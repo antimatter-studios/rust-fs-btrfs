@@ -1,8 +1,8 @@
 # fs.btrfs write, as installed, on a copy of the kernel-made CLI volume:
-# the one write this library can make -- an existing NODATACOW file
-# overwritten in place at the same length -- round-trips byte for byte,
-# and every other write is refused with the library's reason and status 3
-# (or 1 for a path that is no file at all), leaving the image untouched.
+# an existing NODATACOW file overwritten in place at the same length
+# round-trips byte for byte, and every write the library cannot make yet
+# is refused with its reason and status 3 (or 1 for a path that is no
+# file at all), leaving the image untouched.
 #
 # What btrfs-progs and the kernel make of the written volume is checked in
 # tests/cli_write_kernel.rs, in the harness VM.
@@ -68,6 +68,7 @@ head -c "$random_size" /dev/urandom >"$SANDBOX/random-sized.bin"
 refused 3 "grow the file" /nocow/data.bin "$SANDBOX/longer.bin"
 refused 3 "shorter is not something this library does yet" /nocow/data.bin "$SANDBOX/shorter.bin"
 refused 3 "copy-on-write" /dir/random.bin "$SANDBOX/random-sized.bin"
+refused 3 "checksum.*rust-fs-btrfs#261" /dir/random.bin "$SANDBOX/random-sized.bin"
 refused 3 "copy-on-write|inline" /hello.txt "$SANDBOX/hello-sized.bin"
 refused 3 "^not implemented: .*creating a file is not something this library does yet" /new.txt "$SANDBOX/shorter.bin"
 refused 3 "^not implemented: .*creating a file" /dir/new.txt "$SANDBOX/shorter.bin"
