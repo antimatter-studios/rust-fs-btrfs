@@ -30,6 +30,7 @@ test-disks/btrfs-split*.txt
 test-disks/snapshot/
 test-disks/dirtylog/
 test-disks/cli/
+test-disks/features/
 test-disks/[0-9]*/
 test-disks/test-run/
 !test-disks/.gitkeep

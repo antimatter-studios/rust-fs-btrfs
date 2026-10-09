@@ -39,7 +39,7 @@ set -euo pipefail
 OUT="$1"
 shift
 
-TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog cli"
+TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog cli features"
 
 # ARGUMENTS FIRST, ENVIRONMENT SECOND. A misspelt target is the caller's
 # mistake and should be named as one wherever it is made; the root and
@@ -158,6 +158,11 @@ dump_super() {
 }
 
 note() { echo "[guest] $*"; }
+
+# The features Debian's btrfs-progs cannot format (#270) are formatted by
+# the static release build scripts/vm-setup.sh installs beside it, called
+# by path. Everything else keeps the distribution's tools.
+STATIC_PROGS=/opt/btrfs-progs-static
 
 # fs_tree_level <image> — the level of the fs tree's root, 0 for a leaf.
 #
@@ -1202,8 +1207,60 @@ build_cli() {
 }
 
 # ---------------------------------------------------------------------
+# features — one filesystem per optional on-disk feature, each made by
+# the kernel with content and a manifest of it (#270).
+#
+#   btrfs-bgt   the block group tree (`-O block-group-tree`): block group
+#               items live in a tree of their own instead of the extent
+#               tree, so a reader that looks for them in the extent tree
+#               finds none. The manifest is every file's size and SHA-256.
+#               Formatted by the static btrfs-progs, whose mkfs knows the
+#               feature; filled by the kernel, and checked by Debian's
+#               `btrfs check`.
+#
+# In its own directory: the suites that walk every image in test-disks/
+# also try to write each one, and a block group tree volume is refused
+# for writing on purpose.
+# ---------------------------------------------------------------------
+build_features() {
+    local img="$WORK/btrfs-bgt.img" manifest="$WORK/btrfs-bgt.manifest" i
+    rm -f "$img" "$manifest"
+    truncate -s 512M "$img"
+    "$STATIC_PROGS/mkfs.btrfs" -f -O block-group-tree "$img" >/dev/null
+    mount -o loop "$img" "$MNT"
+    mkdir -p "$MNT/dir"
+    for i in 1 2 3; do
+        echo "bgt file $i" > "$MNT/dir/file-$i.txt"
+    done
+    dd if=/dev/urandom of="$MNT/big.bin" bs=1M count=4 status=none
+    sync
+    ( cd "$MNT" && find . -mindepth 1 -type f | sort | while read -r p; do
+        printf '%s\t%s\t%s\n' "${p#.}" "$(stat -c%s "$p")" \
+            "$(sha256sum "$p" | cut -d' ' -f1)"
+      done ) > "$manifest"
+    umount "$MNT"
+    btrfs inspect-internal dump-super "$img" | grep -q 'BLOCK_GROUP_TREE' || {
+        echo "guest-build-images: btrfs-bgt has no block group tree" >&2
+        exit 1
+    }
+    btrfs check --readonly "$img" >/dev/null 2>&1 || {
+        echo "guest-build-images: btrfs check does not find btrfs-bgt clean" >&2
+        exit 1
+    }
+    mkdir -p "$OUT/features"
+    local f
+    for f in "$img" "$manifest"; do
+        cp --sparse=always "$f" "$OUT/features/$(basename "$f").partial"
+        mv -f "$OUT/features/$(basename "$f").partial" "$OUT/features/$(basename "$f")"
+        rm -f "$f"
+    done
+    note "built features/btrfs-bgt"
+}
+
+# ---------------------------------------------------------------------
 
 echo "[guest] $(btrfs --version 2>&1 | head -1) on $(uname -srm)"
+echo "[guest] static: $("$STATIC_PROGS/mkfs.btrfs" --version 2>&1 | sed -n 1p)"
 for target in "$@"; do
     started=$(date +%s)
     "build_$target"

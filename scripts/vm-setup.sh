@@ -73,4 +73,45 @@ if [ -z "$version" ] ||
     exit 1
 fi
 
+# A SECOND, NEWER BTRFS-PROGS, FOR THE FEATURES DEBIAN'S CANNOT MAKE.
+# Debian 12's mkfs.btrfs 6.2 answers `-O block-group-tree` and `-O squota`
+# with "unrecognized filesystem feature" (CI runs 37609259686 and
+# 37610992432), so the fixtures for those features (#270) are formatted by
+# btrfs-progs' own static release build instead. It goes in a directory
+# of its own and is called by path, never put on PATH: every other
+# fixture and every oracle keeps the distribution's version, so no
+# existing answer moves. The checksum pins the exact binary.
+static_progs_version=7.1
+static_progs_dir=/opt/btrfs-progs-static
+case "$(uname -m)" in
+    x86_64)
+        static_progs_asset=btrfs.box.static
+        static_progs_sha256=ed9a8815d12e40d2bf413d1259133a6727106715a2e5d8095179439b5d3f1467
+        ;;
+    aarch64)
+        static_progs_asset=btrfs.box.static-arm
+        static_progs_sha256=42c59468de77ad5fac2b9eb378ee9201ad501d8fcbc588807ce6ff123dfbdac6
+        ;;
+    *)
+        echo "vm-setup: btrfs-progs publishes no static build for $(uname -m)" >&2
+        exit 1
+        ;;
+esac
+if ! echo "$static_progs_sha256  $static_progs_dir/btrfs.box" | sha256sum -c --status 2>/dev/null; then
+    mkdir -p "$static_progs_dir"
+    curl -fsSL --retry 5 --retry-all-errors -o "$static_progs_dir/btrfs.box.partial" \
+        "https://github.com/kdave/btrfs-progs/releases/download/v$static_progs_version/$static_progs_asset"
+    echo "$static_progs_sha256  $static_progs_dir/btrfs.box.partial" | sha256sum -c --status || {
+        echo "vm-setup: btrfs-progs v$static_progs_version $static_progs_asset does not match its pinned checksum" >&2
+        exit 1
+    }
+    chmod 755 "$static_progs_dir/btrfs.box.partial"
+    mv -f "$static_progs_dir/btrfs.box.partial" "$static_progs_dir/btrfs.box"
+fi
+# The box is one binary that acts as whichever tool it is invoked as.
+for tool in btrfs mkfs.btrfs btrfstune; do
+    ln -sfn btrfs.box "$static_progs_dir/$tool"
+done
+"$static_progs_dir/mkfs.btrfs" --version 2>&1 | sed -n 1p
+
 echo "vm-setup: btrfs-progs and the oracle tools are installed in the guest"

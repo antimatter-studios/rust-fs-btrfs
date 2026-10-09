@@ -74,6 +74,12 @@ never does.
   are refused by name: a data extent the leaf names at several inodes or
   offsets, one with other keyed data references, and one whose references
   would no longer fit inline (#287).
+- **A block group tree volume's block groups are found.** With the
+  `block_group_tree` feature the block group items live in tree 11, not the
+  extent tree, and `block_groups` looked only in the extent tree: the list was
+  empty and `fsck.btrfs` reported a volume `btrfs check` finds clean. Checked
+  against `btrfs inspect-internal dump-tree` on a volume the kernel populated
+  (#270).
 
 ## [0.10.2] — 2026-10-07
 

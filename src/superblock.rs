@@ -1076,8 +1076,9 @@ impl Superblock {
     ///
     /// Gates, through the compat_ro bit: `mount_rw` refuses such a volume
     /// (`refuse_unmaintained_compat_ro`, #72), because the write path
-    /// looks for block group items in the extent tree. Reading does not
-    /// use block groups.
+    /// updates block group items in the extent tree. Reading the block
+    /// groups (`Filesystem::block_groups`, and `fsck.btrfs` through it)
+    /// follows the bit to the block group tree (#270).
     pub fn has_block_group_tree(&self) -> bool {
         self.compat_ro_flags & compat_ro::BLOCK_GROUP_TREE != 0
     }
