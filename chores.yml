@@ -582,7 +582,9 @@ tasks:
       - test-disks/build-fixtures.sh --check
       - task: test:oracle
       - task: test:kernel
-      - '../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 1060 57500 -- scripts/test.sh --locked --release'
+      # Budget measured on #297's run of 2026-10-08: 1068 lines, 57622
+      # bytes, the suite having grown by the full-backref leaf-move tests.
+      - '../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 1070 57700 -- scripts/test.sh --locked --release'
       - task: test:scripts
       # The command-line tools, built and staged from this checkout, then
       # tested as installed. A separate invocation because test:cli reads
