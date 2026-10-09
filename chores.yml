@@ -127,9 +127,11 @@ chore_min_version: 0.10.0
 #                                                    36610919288, logs-test).
 #                                                    Was 84 / 6,906 before
 #                                                    hard_link_extref's sweeps
-#     suite       810 /  44,217    1,060 /  57,500   ~30%: every target
+#     suite     1,082 /  58,108    1,410 /  75,600   ~30%: every target
 #                                                    once, so it grows
-#                                                    with the suite
+#                                                    with the suite; sized
+#                                                    for a merge queue
+#                                                    group (#330)
 #     scripts     134 /   6,672      175 /   8,700   ~30%: one line per
 #                                                    assertion, so it grows
 #                                                    with the guards. 134 /
@@ -153,9 +155,16 @@ chore_min_version: 0.10.0
 #                                                    both measured locally.
 #                                                    Was 72 / 3,400 -> 95 /
 #                                                    4,450 on 2026-09-26
-#     vm          957 /  50,636    1,250 /  66,000   ~30%: the same suite,
+#     vm        1,262 /  66,689    1,640 /  86,700   ~30%: the same suite,
 #                                                    plus the guest's own
-#                                                    build, from cold
+#                                                    build, from cold. Was
+#                                                    957 / 50,636 -> 1,250 /
+#                                                    66,000 until a merge
+#                                                    queue group (main, #293,
+#                                                    #296, #315) printed
+#                                                    1,262 / 66,689 and
+#                                                    failed it (run
+#                                                    37992298587)
 #     cli          20 /     693       26 /     900   ~30%: 20 / 671 on macOS
 #                                                    with test-docs.sh, plus
 #                                                    the 22 bytes CI's longer
@@ -548,7 +557,10 @@ tasks:
           guest_args="$guest_args $arg"
         done
         # shellcheck disable=SC2086  # the words are the point
-        bash ../rust-fs-core/scripts/tier.sh test:vm vm 1250 66000 -- \
+        # Budget: the queue group that outgrew 1250 / 66000 (main with
+        # #293, #296 and #315, run 37992298587) printed 1262 lines and
+        # 66689 bytes; ~30% over that, as the table above sizes every tier.
+        bash ../rust-fs-core/scripts/tier.sh test:vm vm 1640 86700 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
 
   test:
