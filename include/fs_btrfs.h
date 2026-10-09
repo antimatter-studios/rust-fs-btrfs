@@ -14,11 +14,13 @@
  * recent call, not its most recent failure.
  *
  * The driver reads, and writes within narrow limits: fs_btrfs_mount_rw
- * opens a volume for writing and fs_btrfs_write_file overwrites a
- * nodatacow file in place; everything else is refused. It refuses rather
- * than guesses, when reading as well: a compressed
- * extent fails with ENOTSUP rather than returning its undecoded bytes,
- * because a caller cannot distinguish those from a corrupt file.
+ * opens a volume for writing, fs_btrfs_write_file overwrites a nodatacow
+ * file in place, and fs_btrfs_subvol_set_readonly and
+ * fs_btrfs_subvol_set_default change a subvolume's read-only flag and
+ * which subvolume a plain mount shows; everything else is refused. It
+ * refuses rather than guesses, when reading as well: a compressed extent
+ * fails with ENOTSUP rather than returning its undecoded bytes, because a
+ * caller cannot distinguish those from a corrupt file.
  */
 
 #ifndef FS_BTRFS_H
@@ -292,6 +294,41 @@ int fs_btrfs_can_write_in_place(fs_btrfs_fs_t *fs, const char *path);
  */
 int64_t fs_btrfs_write_file(fs_btrfs_fs_t *fs, const char *path,
                             const void *buf, uint64_t offset, uint64_t length);
+
+/* ---- Subvolumes ----------------------------------------------------
+ *
+ * A subvolume is named by the path of its top directory, as a mounted
+ * filesystem shows it: "/sub", "/sub/inner", "/" for the top level. A
+ * path that ends anywhere else -- an ordinary directory, a file, the
+ * empty directory a snapshot shows where its source had a nested
+ * subvolume -- fails with ENOENT.
+ */
+
+/* 1 if the subvolume at `path` is read-only, 0 if writable, -1 on error. */
+int fs_btrfs_subvol_is_readonly(fs_btrfs_fs_t *fs, const char *path);
+
+/*
+ * Make the subvolume at `path` read-only (`read_only` non-zero) or
+ * writable (zero), committed as one transaction, as `btrfs property set
+ * <subvol> ro` does. Returns 0, or -1: EROFS for a handle not opened with
+ * fs_btrfs_mount_rw, ENOTSUP for a received subvolume made writable.
+ */
+int fs_btrfs_subvol_set_readonly(fs_btrfs_fs_t *fs, const char *path,
+                                 int read_only);
+
+/*
+ * 1 if the subvolume at `path` is the one a mount without subvol= shows,
+ * 0 if not, -1 on error.
+ */
+int fs_btrfs_subvol_is_default(fs_btrfs_fs_t *fs, const char *path);
+
+/*
+ * Make the subvolume at `path` the one a mount without subvol= shows,
+ * committed as one transaction, as `btrfs subvolume set-default` does.
+ * "/" makes the top level the default again. Returns 0, or -1: EROFS for
+ * a handle not opened with fs_btrfs_mount_rw.
+ */
+int fs_btrfs_subvol_set_default(fs_btrfs_fs_t *fs, const char *path);
 
 #ifdef __cplusplus
 }
