@@ -1188,7 +1188,7 @@ pub unsafe extern "C" fn fs_btrfs_write_file(
 }
 
 // ---------------------------------------------------------------------
-// Names (#262): create, mkdir, symlink, link, unlink, rmdir
+// Names (#262): create, mkdir, symlink, link, unlink, rmdir, rename
 // ---------------------------------------------------------------------
 
 /// `path` split into its directory and its last component, with the
@@ -1443,6 +1443,91 @@ unsafe fn remove(fs: *mut fs_btrfs_fs, path: *const c_char, dir: bool) -> c_int 
             -1
         }
     }
+}
+
+/// Move the name `from` to `to`, as one committed transaction. A name
+/// already at `to` is replaced, as POSIX `rename` does; renaming onto
+/// another name of the same file does nothing.
+///
+/// Returns 0, or -1 with the error recorded: ENOENT when `from` is not
+/// there, ENOTDIR when a directory would replace something else, EISDIR
+/// when something else would replace a directory, ENOTEMPTY when the
+/// directory replaced holds entries, EINVAL for a directory moved into
+/// itself or below itself, and as [`fs_btrfs_unlink`] otherwise.
+///
+/// # Safety
+///
+/// `fs` must be a live handle; `from` and `to` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_rename(
+    fs: *mut fs_btrfs_fs,
+    from: *const c_char,
+    to: *const c_char,
+) -> c_int {
+    guard(-1, || {
+        let Some(fs) = (unsafe { handle_mut(fs) }) else {
+            return -1;
+        };
+        let Some(from) = (unsafe { borrow_bytes(from, "from") }) else {
+            return -1;
+        };
+        let Some(to) = (unsafe { borrow_bytes(to, "to") }) else {
+            return -1;
+        };
+        let Some((old_dir, old_name)) = parent_of(fs, from) else {
+            return -1;
+        };
+        let Some((new_dir, new_name)) = parent_of(fs, to) else {
+            return -1;
+        };
+        // The cases POSIX gives their own errno, told apart here so the
+        // caller is not handed a bare ENOTSUP for them.
+        let moved = match fs.lookup(old_dir.ino, old_name) {
+            Ok(i) => i,
+            Err(e) => {
+                record(&e);
+                return -1;
+            }
+        };
+        if moved.is_dir() {
+            match fs.is_within(new_dir.ino, moved.ino) {
+                Ok(true) => {
+                    set_error(
+                        format!("{}: cannot move a directory into itself", shown(to)),
+                        EINVAL,
+                    );
+                    return -1;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    record(&e);
+                    return -1;
+                }
+            }
+            if let Ok(replaced) = fs.lookup(new_dir.ino, new_name) {
+                if replaced.is_dir() && replaced.ino != moved.ino {
+                    match fs.read_dir(replaced.ino) {
+                        Ok(entries) if !entries.is_empty() => {
+                            set_error(format!("{}: directory not empty", shown(to)), enotempty());
+                            return -1;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            record(&e);
+                            return -1;
+                        }
+                    }
+                }
+            }
+        }
+        match fs.rename(old_dir.ino, old_name, new_dir.ino, new_name) {
+            Ok(()) => 0,
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------

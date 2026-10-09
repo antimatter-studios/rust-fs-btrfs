@@ -36,6 +36,11 @@ never does.
   directory whose leaf has no room, and the last name of a file still holding
   data extents, are refused with nothing written; `rename` and `truncate` are
   still to come (#262).
+- **A name can be moved.** `Filesystem::rename` commits one transaction that
+  removes the old entries and reference and files new ones under a fresh
+  index in the destination, replacing a name already there as POSIX `rename`
+  does. The C ABI gains `fs_btrfs_rename` (ENOTDIR, EISDIR, ENOTEMPTY and
+  EINVAL where POSIX says), and `fs.btrfs` gains `mv` (#262).
 - **Extended attributes, ACLs, mode, owner and times can be written.**
   `Filesystem::set_xattr`, `remove_xattr`, `set_mode`, `set_owner` and
   `set_times` each commit one transaction on the top-level subvolume and move

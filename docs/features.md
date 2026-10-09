@@ -91,7 +91,8 @@ Linux kernel in the guest.
 | A volume whose log tree holds entries | Refused for writing | | #266 (PR #328) | |
 | A pool of several devices, written | Not supported | | #298 (PR #316) | |
 | Create, mkdir, symlink, link, unlink, rmdir | Supported | Unreleased (#262) | | `namespace_kernel.rs` |
-| Rename, truncate | Not supported | | #262 (PR #314, #323) | |
+| Rename, replacing a name already there as POSIX does (`rename`, `fs_btrfs_rename`, `fs.btrfs mv`) | Supported | Unreleased (#262) | | `rename_kernel.rs` |
+| Truncate | Not supported | | #262 (PR #323) | |
 | Extended attributes, ACLs, mode, owner and times, written | Supported on the top-level subvolume; a leaf with no room is refused | Unreleased (#263) | | `attrs_kernel.rs` |
 | Compression on write | Not supported | | #265 (PR #325) | |
 | Reflink, clone-range, fallocate, dedupe | Not supported | | #269 | |
