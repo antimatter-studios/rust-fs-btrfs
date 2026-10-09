@@ -47,7 +47,7 @@ suite.
 | Profiles: single, dup, raid0, raid1, raid10 | Supported | 0.3.0; pools 0.6.0 | | `oracle_vm_fixtures.rs`, `pool_oracle.rs` |
 | One bad copy of a DUP tree block | Supported: the other copy is read | 0.7.0 | | `dup_mirror_fallback.rs` |
 | One device of a multi-device pool, opened alone | Refused | 0.6.0 | | `pool_oracle.rs` |
-| Profiles: raid5, raid6 | Refused | 0.3.0 | #268, #300 (PR #296, #319) | |
+| Profiles: raid5, raid6 | Supported for reading, with any one element (RAID6: any two) rebuilt from parity; refused for writing | Unreleased (#268) | #299, #300 (PR #319) | `raid56_oracle.rs` |
 | Mixed block groups (`mkfs.btrfs -M`) | Supported | 0.3.0 | | `oracle_vm_fixtures.rs` |
 | Subvolumes and snapshots: listing, with id, path, parent, snapshot and read-only flags | Supported | 0.6.0 | | `subvol_oracle.rs` |
 | Subvolumes and snapshots: reading inside one (`open_subvolume`) | Supported, read-only | 0.7.0 | | `subvol_oracle.rs`, `kernel_readback.rs` |
