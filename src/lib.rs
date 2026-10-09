@@ -66,6 +66,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod backref;
 pub mod block_group;
 pub mod btree;
 pub mod capi;

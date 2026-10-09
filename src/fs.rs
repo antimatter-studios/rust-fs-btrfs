@@ -330,7 +330,7 @@ pub(crate) mod file_extent {
 /// Extent storage kinds.
 const EXTENT_INLINE: u8 = 0;
 pub(crate) const EXTENT_REGULAR: u8 = 1;
-const EXTENT_PREALLOC: u8 = 2;
+pub(crate) const EXTENT_PREALLOC: u8 = 2;
 
 /// One resolved piece of a file's contents.
 enum Piece<'a> {

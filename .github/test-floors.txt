@@ -74,6 +74,7 @@ free_space_oracle         4
 free_space_straddle       2
 fs_oracle                 13
 fstree_oracle             2
+full_backref_move         1
 fuzz_decoders             5
 getxattr_byte_names       1
 hard_link_extref          5

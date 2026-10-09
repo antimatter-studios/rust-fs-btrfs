@@ -44,6 +44,17 @@ never does.
 - **A transient HTTP 5xx from the chore release download no longer fails a CI
   job.** `scripts/ci-install-chore.sh` retries both downloads up to five times
   on any error; the checksum check still guards what was fetched.
+- **Moving a tree block that a balance flagged `FULL_BACKREF` keeps its
+  references true.** The data extents under such a leaf, and the children of
+  such a node, are recorded as referred to by the block's address. The move
+  used to leave them naming the old block, and `btrfs check` reported a
+  referencer count mismatch for every extent. The copy is now an ordinary
+  block of its tree, as the kernel's copy-on-write makes it: its record drops
+  the flag, and each of those references becomes the keyed one, by tree or by
+  inode and offset, with the same count. The shapes this does not write yet
+  are refused by name: a data extent the leaf names at several inodes or
+  offsets, one with other keyed data references, and one whose references
+  would no longer fit inline (#287).
 
 ## [0.10.2] — 2026-10-07
 
