@@ -47,13 +47,47 @@ fn merged(mut runs: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     out
 }
 
+/// `(start, length)` of every block group btrfs-progs lists in the extent
+/// tree, which it prints as
+///
+/// ```text
+/// item 3 key (13631488 BLOCK_GROUP_ITEM 8388608) itemoff 16141 itemsize 24
+/// ```
+fn progs_block_groups(image: &Path) -> Vec<(u64, u64)> {
+    let groups: Vec<(u64, u64)> = dump_tree(image, "extent")
+        .lines()
+        .filter_map(|line| {
+            let rest = line.split("key (").nth(1)?;
+            let f: Vec<&str> = rest.split([' ', ')']).collect();
+            (f.get(1) == Some(&"BLOCK_GROUP_ITEM"))
+                .then(|| (f[0].parse().expect("start"), f[2].parse().expect("length")))
+        })
+        .collect();
+    assert!(
+        !groups.is_empty(),
+        "{}: btrfs-progs lists no block group at all",
+        image.display()
+    );
+    groups
+}
+
 /// `(start, length)` of every `FREE_SPACE_EXTENT` btrfs-progs lists in
-/// the free-space tree, which it prints as
+/// the free-space tree inside a block group the volume has, which it
+/// prints as
 ///
 /// ```text
 /// item 1 key (13631488 FREE_SPACE_EXTENT 8388608) itemoff 16242 itemsize 0
 /// ```
+///
+/// Only inside a block group, because the tree can describe one that is
+/// gone. On the default fixture it holds a `FREE_SPACE_INFO` and a free run
+/// at 1 MiB, 12 MiB long, where there is no chunk and no
+/// `BLOCK_GROUP_ITEM`: what mkfs's temporary first chunk left behind when
+/// it was removed (measured on the fixtures of 2026-10-09). There is
+/// nothing there to trim as a block group's free space, and a trim that
+/// mapped it would find no chunk to put it on.
 fn progs_free(image: &Path) -> Vec<(u64, u64)> {
+    let groups = progs_block_groups(image);
     let dump = dump_tree(image, "10");
     assert!(
         !dump.contains("FREE_SPACE_BITMAP"),
@@ -68,6 +102,9 @@ fn progs_free(image: &Path) -> Vec<(u64, u64)> {
             let f: Vec<&str> = rest.split([' ', ')']).collect();
             (f.get(1) == Some(&"FREE_SPACE_EXTENT"))
                 .then(|| (f[0].parse().expect("start"), f[2].parse().expect("length")))
+        })
+        .filter(|&(start, _): &(u64, u64)| {
+            groups.iter().any(|&(g, len)| start >= g && start < g + len)
         })
         .collect();
     assert!(
