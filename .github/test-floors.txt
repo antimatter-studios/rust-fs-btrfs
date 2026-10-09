@@ -56,6 +56,7 @@ cli_write_kernel          1
 commit_order              3
 compat_ro_write_refusal   2
 compressed_extent_window  3
+compress_write_kernel     1
 compressed_short_decode   2
 compression_oracle        3
 cow_write_oracle          3

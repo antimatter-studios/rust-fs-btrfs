@@ -114,8 +114,17 @@ pub(crate) struct DataMove {
     pub old_ref_offset: u64,
     /// Where the copy goes.
     pub new: u64,
-    /// The copy's length: the item's `num_bytes`.
+    /// The copy's length as the file sees it: the item's `num_bytes` and
+    /// `ram_bytes`.
     pub len: u64,
+    /// The copy's length on disk: `len` for a copy stored as it is, the
+    /// compressed length rounded up to a sector for one compressed
+    /// (#265). The extent's record, its free space and its block group's
+    /// `used` count this.
+    pub disk_len: u64,
+    /// The copy's compression type, as the item's `compression` byte
+    /// records it: 0 for none, 1 for zlib.
+    pub compression: u8,
     /// The key offset of the file's `EXTENT_DATA` item.
     pub file_offset: u64,
 }
@@ -1127,7 +1136,7 @@ impl Filesystem {
                     key: DiskKey {
                         objectid: m.new,
                         key_type: key_type::EXTENT_ITEM,
-                        offset: m.len,
+                        offset: m.disk_len,
                     },
                     data: data_extent_body(1, Some(generation), data.root, data.ino, m.file_offset)
                         .to_vec(),
@@ -1252,9 +1261,11 @@ fn apply_file_write(
                 let Some(m) = data.moves.iter().find(|m| m.file_offset == item.key.offset) else {
                     continue;
                 };
+                // Compressed or not: a copy replaces either, and is
+                // stored as `m.compression` says.
                 let regular = d.len() == fe::REGULAR_SIZE
                     && d[fe::TYPE] == EXTENT_REGULAR
-                    && d[fe::COMPRESSION] == 0
+                    && d[fe::COMPRESSION] <= 3
                     && d[fe::ENCRYPTION] == 0
                     && d[fe::OTHER_ENCODING..fe::OTHER_ENCODING + 2] == [0, 0];
                 if !regular
@@ -1271,8 +1282,9 @@ fn apply_file_write(
                 put64(d, fe::GENERATION, generation);
                 put64(d, fe::RAM_BYTES, m.len);
                 put64(d, fe::DISK_BYTENR, m.new);
-                put64(d, fe::DISK_NUM_BYTES, m.len);
+                put64(d, fe::DISK_NUM_BYTES, m.disk_len);
                 put64(d, fe::OFFSET, 0);
+                d[fe::COMPRESSION] = m.compression;
                 applied.items += 1;
             }
             _ => {}
@@ -1316,7 +1328,7 @@ impl Filesystem {
         }
         // A data extent counts its own length, not a node's.
         for m in &data.moves {
-            *out.entry(group_of(m.new)?).or_default() += i128::from(m.len);
+            *out.entry(group_of(m.new)?).or_default() += i128::from(m.disk_len);
         }
         for (old, old_len, _) in data.released_extents() {
             *out.entry(group_of(old)?).or_default() -= i128::from(old_len);
@@ -1563,7 +1575,7 @@ impl Filesystem {
             .allocated()
             .into_iter()
             .map(|at| (at, nodesize))
-            .chain(data.moves.iter().map(|m| (m.new, m.len)))
+            .chain(data.moves.iter().map(|m| (m.new, m.disk_len)))
             .collect();
 
         let mut out: Vec<OwnedItem> = Vec::with_capacity(items.len());

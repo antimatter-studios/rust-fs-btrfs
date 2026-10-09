@@ -84,7 +84,7 @@ Linux kernel in the guest.
 | Copy-on-write writes: overwrites inside a file's existing, unshared, unchecksummed, uncompressed extents | Partial | 0.8.1 (#61) | #261 | `cow_write_oracle.rs` |
 | A write that grows a file or lands in a hole | Refused | 0.8.1 (#61) | #261 | `cow_write_oracle.rs` |
 | Copy-on-write into a checksummed file, with the replaced extents' digests removed | Supported | Unreleased (#261) | | `cow_write_oracle.rs` |
-| A write into an inline, preallocated, compressed or shared extent | Refused | 0.7.0 (#74); copy-on-write 0.8.1 | #261 | `prealloc_extent_write.rs`, `snapshot_shared_write.rs`, `shared_tree_block_release.rs` |
+| A write into an inline, preallocated or shared extent | Refused | 0.7.0 (#74); copy-on-write 0.8.1 | #261 | `prealloc_extent_write.rs`, `snapshot_shared_write.rs`, `shared_tree_block_release.rs` |
 | An extent item whose window falls outside its extent | Refused | 0.7.0 | | `extent_window_write.rs` |
 | Moving a full-backref tree leaf | Partial: data back references are left inconsistent | | #287 (PR #297) | |
 | A volume with a `compat_ro` feature the writer does not maintain | Refused for writing | 0.7.0 | | `compat_ro_write_refusal.rs` |
@@ -95,7 +95,7 @@ Linux kernel in the guest.
 | Truncate (`truncate`, `fs_btrfs_truncate`, `fs.btrfs truncate`): shrinking releases what it cuts; growing on a no-holes volume | Supported; an extent a snapshot or reflink shares is refused | Unreleased (#262) | | `truncate_kernel.rs` |
 | Rename | Not supported | | #262 (PR #314) | |
 | Extended attributes, ACLs, mode, owner and times, written | Not supported | | #263 (PR #312) | |
-| Compression on write | Not supported | | #265 (PR #325) | |
+| Compression on write: zlib, for a file marked `chattr +c` or whose compression property names zlib | Supported; zstd and LZO are stored uncompressed | Unreleased (#265) | #265 | `compress_write_kernel.rs` |
 | Reflink, clone-range, fallocate, dedupe | Not supported | | #269 | |
 | Subvolumes and snapshots: create, delete, read-only flag, default subvolume | Not supported | | #267 (PR #306, #309, #317) | |
 | Device add, remove, replace; balance; defragment; trim | Not supported | | #268, #303, #304, #305 (PR #322) | |
