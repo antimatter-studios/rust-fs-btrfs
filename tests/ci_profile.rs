@@ -3004,3 +3004,23 @@ fn the_chore_download_retries_a_transient_server_error() {
          add `--retry 5 --retry-all-errors --retry-delay 2`: {bare:#?}"
     );
 }
+
+/// ci.yml runs in main's merge queue.
+///
+/// The queue tests each group of queued pull requests on a temporary
+/// branch, and reports a required check only from a workflow that triggers
+/// on `merge_group`. Without the trigger `ci-ok` never reports there, and
+/// every queued pull request waits until the queue times it out. It is the
+/// queue, not "branches must be up to date", that keeps a merge from
+/// landing a tree CI did not test, so dropping the trigger would also stop
+/// every merge.
+#[test]
+fn ci_yml_runs_in_the_merge_queue() {
+    let wf = parse_workflow(&read_or_panic(&ci_yml()));
+    assert!(
+        wf.triggers.iter().any(|t| t == "merge_group"),
+        "ci.yml does not trigger on `merge_group` (its triggers: {:?}), so the merge \
+         queue never sees `ci-ok` and no pull request can merge",
+        wf.triggers
+    );
+}
