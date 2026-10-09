@@ -85,7 +85,7 @@ Linux kernel in the guest.
 | Free-space tree and block-group `used` kept in step | Supported | 0.6.0; `used` 0.8.0 | | `free_space_oracle.rs`, `block_group_used.rs`, `free_space_straddle.rs` |
 | A commit cut at any write | Supported: the volume is the old or the new generation | 0.8.0 | | `crash_consistency.rs` |
 | Copy-on-write writes: overwrites inside a file's existing, unshared, unchecksummed, uncompressed extents | Partial | 0.8.1 (#61) | #261 | `cow_write_oracle.rs` |
-| A write that grows a file or lands in a hole | Refused | 0.8.1 (#61) | #261, #262 (PR #323) | `cow_write_oracle.rs` |
+| A write that grows a file or lands in a hole | Refused | 0.8.1 (#61) | #261 | `cow_write_oracle.rs` |
 | Copy-on-write into a checksummed file, with the replaced extents' digests removed | Supported | Unreleased (#261) | | `cow_write_oracle.rs` |
 | A write into an inline, preallocated, compressed or shared extent | Refused | 0.7.0 (#74); copy-on-write 0.8.1 | #261 | `prealloc_extent_write.rs`, `snapshot_shared_write.rs`, `shared_tree_block_release.rs` |
 | An extent item whose window falls outside its extent | Refused | 0.7.0 | | `extent_window_write.rs` |
@@ -97,7 +97,7 @@ Linux kernel in the guest.
 | A pool of several devices, written (`mount_pool_rw`) | Supported, RAID5/6 included; a stale, read-only or missing member is refused | Unreleased (#298, #299) | | `pool_write_kernel.rs`, `raid56_write_kernel.rs` |
 | Create, mkdir, symlink, link, unlink, rmdir | Supported | Unreleased (#262) | | `namespace_kernel.rs` |
 | Rename, replacing a name already there as POSIX does (`rename`, `fs_btrfs_rename`, `fs.btrfs mv`) | Supported | Unreleased (#262) | | `rename_kernel.rs` |
-| Truncate | Not supported | | #262 (PR #323) | |
+| Truncate (`truncate`, `fs_btrfs_truncate`, `fs.btrfs truncate`): shrinking releases what it cuts; growing on a no-holes volume | Supported; an extent a snapshot or reflink shares is refused | Unreleased (#262) | | `truncate_kernel.rs` |
 | Extended attributes, ACLs, mode, owner and times, written | Supported on the top-level subvolume; a leaf with no room is refused | Unreleased (#263) | | `attrs_kernel.rs` |
 | Compression on write | Not supported | | #265 (PR #325) | |
 | Reflink, clone-range, fallocate, dedupe | Not supported | | #269 | |
