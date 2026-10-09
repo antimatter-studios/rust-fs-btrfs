@@ -102,7 +102,8 @@ Linux kernel in the guest.
 | Reflink, clone-range, fallocate, dedupe | Not supported | | #269 | |
 | Subvolumes and snapshots: making one read-only or writable again | Supported | Unreleased (#267) | | `subvol_readonly_kernel.rs` |
 | Subvolumes and snapshots: choosing the default subvolume | Supported | Unreleased (#267) | | `subvol_default_kernel.rs` |
-| Subvolumes and snapshots: create, delete | Not supported | | #267 (PR #317) | |
+| Subvolumes and snapshots: the read-only flag and the default subvolume through the C ABI (`fs_btrfs_subvol_*`) | Supported | Unreleased (#267) | | `capi.rs`, `subvol_default_kernel.rs` |
+| Subvolumes and snapshots: create, delete | Not supported | | #267 | |
 | Device add, remove, replace; balance; defragment | Not supported | | #268, #303, #304, #305 | |
 | Trim: every free run of every block group handed to a caller's discard, on every copy | Supported; RAID5/6 groups refused | Unreleased (#305) | | `trim_oracle.rs` |
 | RAID5/6 writes | Not supported | | #299 | |
