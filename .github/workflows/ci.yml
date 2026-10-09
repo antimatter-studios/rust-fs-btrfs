@@ -81,6 +81,11 @@ on:
   # bottom no run at all -- which a merge queue then reads as nothing
   # failing.
   pull_request:
+  # Main merges through a merge queue: each group of queued pull requests is
+  # tested on a temporary branch, main plus the group in order, and the
+  # queue reads `ci-ok` only from a workflow that triggers here. That run,
+  # not "branches must be up to date", is what keeps main to trees CI ran.
+  merge_group:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
