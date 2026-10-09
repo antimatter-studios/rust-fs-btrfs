@@ -1148,7 +1148,11 @@ impl Filesystem {
 
     /// Every fs tree item under `objectid` and `key_type`, in key order.
     #[allow(clippy::type_complexity)]
-    fn item_run(&self, objectid: u64, key_type: u8) -> Result<Vec<((u64, u8, u64), Vec<u8>)>> {
+    pub(crate) fn item_run(
+        &self,
+        objectid: u64,
+        key_type: u8,
+    ) -> Result<Vec<((u64, u8, u64), Vec<u8>)>> {
         self.with_fs_tree(|tree, root| {
             Ok(tree
                 .find_all(root, objectid, key_type)?
