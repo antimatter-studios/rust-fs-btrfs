@@ -19,7 +19,6 @@ blocked() {
         "$SANDBOX/b.err"
 }
 
-blocked mkdir /d -- "rust-fs-btrfs#262"
 blocked resize 20G -- "resize"
 blocked resize 20G --force -- "resize"
 
@@ -33,8 +32,8 @@ check "set of an unknown key exits 2" test $? -eq 2
 jq_check "set of an unknown key is a structured usage error" '.code == 2' "$SANDBOX/uk.err"
 
 # --text: `fs.btrfs: <message>`, for a person.
-fs.btrfs --text "$img" mkdir /d >/dev/null 2>"$SANDBOX/t.err"
-check "mkdir --text exits 3" test $? -eq 3
-check "mkdir --text says so for a person" grep -q '^fs.btrfs: not implemented: ' "$SANDBOX/t.err"
+fs.btrfs --text "$img" resize 20G >/dev/null 2>"$SANDBOX/t.err"
+check "resize --text exits 3" test $? -eq 3
+check "resize --text says so for a person" grep -q '^fs.btrfs: not implemented: ' "$SANDBOX/t.err"
 
 finish
