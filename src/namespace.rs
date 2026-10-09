@@ -495,8 +495,8 @@ impl Filesystem {
             match k.key_type {
                 // A reference already emptied by this change.
                 INODE_REF_KEY if p.get(self, k)?.is_none() => {}
-                INODE_ITEM_KEY | dir::XATTR_ITEM_KEY => p.set(k, None),
-                EXTENT_DATA_KEY if holds_no_extent(&data) => p.set(k, None),
+                INODE_ITEM_KEY | dir::XATTR_ITEM_KEY => p.remove(self, k)?,
+                EXTENT_DATA_KEY if holds_no_extent(&data) => p.remove(self, k)?,
                 EXTENT_DATA_KEY => {
                     return Err(Error::UnsupportedFeature(format!(
                         "{:?} is the last name of inode {ino}, which holds data extents, \
@@ -985,6 +985,20 @@ impl Pending {
 
     fn set(&mut self, k: DiskKey, v: Option<Vec<u8>>) {
         self.after.insert((k.objectid, k.key_type, k.offset), v);
+    }
+
+    /// Delete `k`, reading it first so the change knows it was there.
+    ///
+    /// A bare `set(k, None)` on a key never read has no "before", and
+    /// [`Pending::into_edits`] then takes it for an item made and removed
+    /// by the same change, and drops the delete. That left the inode item
+    /// of every file and directory whose last name was removed behind,
+    /// with no reference to it, which `btrfs check` reports as a wrong
+    /// link count.
+    fn remove(&mut self, fs: &Filesystem, k: DiskKey) -> Result<()> {
+        self.get(fs, k)?;
+        self.set(k, None);
+        Ok(())
     }
 
     /// Move directory `dir`'s size by `delta` bytes.
