@@ -165,6 +165,10 @@ impl Filesystem {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
+        let released: Vec<(u64, u64)> = targets
+            .iter()
+            .map(|t| (t.extent_start, t.extent_start + t.extent_len))
+            .collect();
         let write = DataWrite {
             root: objectid::FS_TREE,
             ino,
@@ -182,7 +186,8 @@ impl Filesystem {
                 .collect(),
             time: (now.as_secs(), now.subsec_nanos()),
             edits: Vec::new(),
-            csum_edits: self.csum_edits(&targets, &contents, summed)?,
+            csum_edits: self.csum_edits(&released, &contents, summed)?,
+            releases: Vec::new(),
         };
 
         // The fs tree leaves the write edits: the inode item's, and each
@@ -338,10 +343,11 @@ impl Filesystem {
         Ok(out)
     }
 
-    /// The checksum tree edits a write makes (#261).
+    /// The checksum tree edits a write makes (#261), or a truncate
+    /// (#262): `released` holds each extent given up, as `[start, end)`.
     ///
-    /// Every `EXTENT_CSUM` item covering a sector of an extent the write
-    /// releases is deleted, and what it also covered outside those
+    /// Every `EXTENT_CSUM` item covering a sector of a released extent is
+    /// deleted, and what it also covered outside those
     /// extents — a neighbour's digests, which the kernel packs into the
     /// same item when extents are contiguous — is put back as items of
     /// its own. Then, for a checksummed file, each copy gains a digest per
@@ -352,9 +358,9 @@ impl Filesystem {
     /// a leftover the new digests would overlap, and that is refused.
     /// Deletes come before puts, so a leaf is at its smallest before
     /// anything is added to it.
-    fn csum_edits(
+    pub(crate) fn csum_edits(
         &self,
-        targets: &[Target],
+        released: &[(u64, u64)],
         contents: &[(u64, Vec<u8>)],
         summed: bool,
     ) -> Result<Vec<ItemEdit>> {
@@ -372,17 +378,12 @@ impl Filesystem {
             key_type: EXTENT_CSUM_KEY,
             offset,
         };
-        let released: Vec<(u64, u64)> = targets
-            .iter()
-            .map(|t| (t.extent_start, t.extent_start + t.extent_len))
-            .collect();
-
         // Each item covering a released sector, whole.
         let mut items: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
         {
             let reader = self.pool_reader();
             let tree = reader.tree();
-            for &(start, end) in &released {
+            for &(start, end) in released {
                 let found =
                     crate::csum::digests_for_range(&tree, root, size, sector, start, end - start)?;
                 let Some(&first) = found.keys().next() else {
@@ -422,7 +423,7 @@ impl Filesystem {
         let mut deletes = Vec::new();
         let mut puts = Vec::new();
         for (offset, data) in &items {
-            let runs = kept_runs(*offset, data, size, sector, &released);
+            let runs = kept_runs(*offset, data, size, sector, released);
             if !runs.iter().any(|(at, _)| at == offset) {
                 deletes.push(ItemEdit::Delete(key(*offset)));
             }

@@ -120,6 +120,21 @@ pub(crate) struct DataMove {
     pub file_offset: u64,
 }
 
+/// A data extent a transaction releases without a copy taking its place
+/// (#262): a truncate's extents past the new end. Like a [`DataMove`]'s
+/// old extent, it is released whole, which is right only because its one
+/// reference is the file item the change deletes; the caller refuses
+/// anything else first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DataRelease {
+    /// The extent being released.
+    pub old: u64,
+    /// Its length, as the extent tree's `EXTENT_ITEM` key records it.
+    pub old_len: u64,
+    /// The offset in its `EXTENT_DATA_REF`, as [`DataMove::old_ref_offset`].
+    pub old_ref_offset: u64,
+}
+
 /// The file-data half of a transaction: one file whose extents move.
 ///
 /// Empty for a transaction that only relocates tree blocks, which is
@@ -146,6 +161,9 @@ pub(crate) struct DataWrite {
     /// replace lose theirs. Each lands in the leaf a descent for its key
     /// reaches in the checksum tree, which the caller marks dirty.
     pub csum_edits: Vec<ItemEdit>,
+    /// Extents of the file released outright, their file items deleted
+    /// by `edits`.
+    pub releases: Vec<DataRelease>,
 }
 
 /// One change to an item of the tree a [`DataWrite`] names (#262).
@@ -210,7 +228,24 @@ fn apply_item_edits(
 impl DataWrite {
     /// Every address whose extent-tree record changes.
     fn addresses(&self) -> Vec<u64> {
-        self.moves.iter().flat_map(|m| [m.old, m.new]).collect()
+        self.moves
+            .iter()
+            .flat_map(|m| [m.old, m.new])
+            .chain(self.releases.iter().map(|r| r.old))
+            .collect()
+    }
+
+    /// Every data extent released, by address, length and reference
+    /// offset: each move's old extent and each outright release.
+    fn released_extents(&self) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
+        self.moves
+            .iter()
+            .map(|m| (m.old, m.old_len, m.old_ref_offset))
+            .chain(
+                self.releases
+                    .iter()
+                    .map(|r| (r.old, r.old_len, r.old_ref_offset)),
+            )
     }
 }
 
@@ -776,11 +811,14 @@ impl Filesystem {
                 data.ino, applied.items, applied.inodes
             )));
         }
-        if applied.released != n || applied.recorded != n {
+        let released = n + data.releases.len();
+        if applied.released != released || applied.recorded != n {
             return Err(Error::UnsupportedFeature(format!(
-                "the write moves {n} data extents, and the plan released the records of {} and \
-                 recorded {}",
-                applied.released, applied.recorded
+                "the write moves {n} data extents and releases {}, and the plan released the \
+                 records of {} and recorded {}",
+                data.releases.len(),
+                applied.released,
+                applied.recorded
             )));
         }
         Ok(out)
@@ -1024,17 +1062,17 @@ impl Filesystem {
         // everything else for -- one reference, held inline by this very
         // file item. Anything else would free bytes another file or a
         // snapshot still reads.
-        for m in &data.moves {
-            if !mine(m.old)? {
+        for (old, old_len, old_ref_offset) in data.released_extents() {
+            if !mine(old)? {
                 continue;
             }
             let key = DiskKey {
-                objectid: m.old,
+                objectid: old,
                 key_type: key_type::EXTENT_ITEM,
-                offset: m.old_len,
+                offset: old_len,
             };
             let body = out.iter().find(|i| i.key == key).map(|i| i.data.as_slice());
-            let expected = data_extent_body(1, None, data.root, data.ino, m.old_ref_offset);
+            let expected = data_extent_body(1, None, data.root, data.ino, old_ref_offset);
             let held = body.is_some_and(|b| {
                 b.len() == expected.len()
                     && b[..8] == expected[..8]
@@ -1045,7 +1083,7 @@ impl Filesystem {
                     "the data extent at {} is not recorded as one reference held inline by \
                      inode {} at {} in tree {}, so releasing it could free bytes something \
                      else reads",
-                    m.old, data.ino, m.old_ref_offset, data.root
+                    old, data.ino, old_ref_offset, data.root
                 )));
             }
             out = delete(&out, &key)?;
@@ -1279,7 +1317,9 @@ impl Filesystem {
         // A data extent counts its own length, not a node's.
         for m in &data.moves {
             *out.entry(group_of(m.new)?).or_default() += i128::from(m.len);
-            *out.entry(group_of(m.old)?).or_default() -= i128::from(m.old_len);
+        }
+        for (old, old_len, _) in data.released_extents() {
+            *out.entry(group_of(old)?).or_default() -= i128::from(old_len);
         }
         out.retain(|_, delta| *delta != 0);
         Ok(out)
@@ -1517,7 +1557,7 @@ impl Filesystem {
             .released()
             .into_iter()
             .map(|at| (at, nodesize))
-            .chain(data.moves.iter().map(|m| (m.old, m.old_len)))
+            .chain(data.released_extents().map(|(old, len, _)| (old, len)))
             .collect();
         let allocated: Vec<(u64, u64)> = plan
             .allocated()

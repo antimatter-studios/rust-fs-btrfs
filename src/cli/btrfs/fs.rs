@@ -200,6 +200,30 @@ fn command() -> Cmd {
                      new items is refused with exit 3.",
                 ),
         )
+        .subcommand(
+            Cmd::new("truncate")
+                .about("Set a file's length, releasing what lies past a shorter one")
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .arg(
+                    Arg::new("size")
+                        .value_name("BYTES")
+                        .required(true)
+                        .value_parser(value_parser!(u64)),
+                )
+                .after_help(
+                    "Examples:\n  fs.btrfs disk.img truncate /log.txt 0\n  \
+                     fs.btrfs disk.img truncate /sparse.img 1073741824\n\n\
+                     Committed as one transaction. Shrinking releases the extents wholly past \
+                     the new end; growing needs the volume's no-holes feature. An extent a \
+                     snapshot or reflink shares, and growing a file whose last sector is \
+                     partly past its end, are refused with exit 3 (rust-fs-btrfs#262).",
+                ),
+        )
         .subcommand(key_command(
             "get",
             "Report the filesystem's properties, or one of them",
@@ -308,6 +332,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         ),
         "write" => write(target, offset, path_arg(sub)),
         "mkdir" | "create" | "rm" | "rmdir" | "ln" => names(target, offset, verb, sub),
+        "truncate" => truncate(target, offset, sub),
         "get" | "info" => get(
             target,
             offset,
@@ -409,6 +434,26 @@ fn names(
         fields.push(("inode", Json::from(ino)));
     }
     Ok(Outcome::report(Json::object(fields)).with_text(format!("{what} {}", show(path))))
+}
+
+/// Set a file's length, as one committed transaction.
+fn truncate(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Outcome, CliError> {
+    let path = path_arg(sub);
+    let size = *sub.get_one::<u64>("size").expect("clap requires it");
+    let dev = device::open_rw(target, offset)?;
+    let mut fs = Filesystem::mount_rw(dev).map_err(|e| {
+        btrfs_error(
+            format!("{} (read-write)", target.to_string_lossy()).as_bytes(),
+            e,
+        )
+    })?;
+    let inode = fs
+        .lookup_path_bytes(path)
+        .map_err(|e| btrfs_error(path, e))?;
+    fs.truncate(inode.ino, size)
+        .map_err(|e| btrfs_error(path, e))?;
+    let report = Json::object([("path", Json::from(show(path))), ("size", Json::from(size))]);
+    Ok(Outcome::report(report).with_text(format!("{} is {size} bytes", show(path))))
 }
 
 /// `path` as its directory, resolved, and its last component.
