@@ -81,9 +81,10 @@ Linux kernel in the guest.
 | Whole transactions: tree edits, splits, relocation, commit order, backup roots | Supported | 0.6.0; backup roots 0.7.0 (#78) | | `transaction_oracle.rs`, `split_oracle.rs`, `commit_order.rs`, `backup_ring.rs` |
 | Free-space tree and block-group `used` kept in step | Supported | 0.6.0; `used` 0.8.0 | | `free_space_oracle.rs`, `block_group_used.rs`, `free_space_straddle.rs` |
 | A commit cut at any write | Supported: the volume is the old or the new generation | 0.8.0 | | `crash_consistency.rs` |
-| Copy-on-write writes: overwrites inside a file's existing, unshared, unchecksummed, uncompressed extents | Partial | 0.8.1 (#61) | #261 (PR #318) | `cow_write_oracle.rs` |
+| Copy-on-write writes: overwrites inside a file's existing, unshared, unchecksummed, uncompressed extents | Partial | 0.8.1 (#61) | #261 | `cow_write_oracle.rs` |
 | A write that grows a file or lands in a hole | Refused | 0.8.1 (#61) | #261, #262 (PR #323) | `cow_write_oracle.rs` |
-| A write into a checksummed, inline, preallocated, compressed or shared extent | Refused | 0.7.0 (#74); copy-on-write 0.8.1 | #261 (PR #318) | `prealloc_extent_write.rs`, `snapshot_shared_write.rs`, `shared_tree_block_release.rs` |
+| Copy-on-write into a checksummed file, with the replaced extents' digests removed | Supported | Unreleased (#261) | | `cow_write_oracle.rs` |
+| A write into an inline, preallocated, compressed or shared extent | Refused | 0.7.0 (#74); copy-on-write 0.8.1 | #261 | `prealloc_extent_write.rs`, `snapshot_shared_write.rs`, `shared_tree_block_release.rs` |
 | An extent item whose window falls outside its extent | Refused | 0.7.0 | | `extent_window_write.rs` |
 | Moving a full-backref tree leaf | Partial: data back references are left inconsistent | | #287 (PR #297) | |
 | A volume with a `compat_ro` feature the writer does not maintain | Refused for writing | 0.7.0 | | `compat_ro_write_refusal.rs` |
