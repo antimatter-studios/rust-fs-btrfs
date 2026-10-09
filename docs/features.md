@@ -90,7 +90,8 @@ Linux kernel in the guest.
 | A read-write mount whose newest superblock is not the primary | Refused | 0.7.0 (#90) | | `superblock_mirrors.rs` |
 | A volume whose log tree holds entries | Refused for writing | | #266 (PR #328) | |
 | A pool of several devices, written | Not supported | | #298 (PR #316) | |
-| Create, mkdir, unlink, rmdir, rename, link, symlink, truncate | Not supported | | #262 (PR #311, #314, #323) | |
+| Create, mkdir, symlink, link, unlink, rmdir | Supported | Unreleased (#262) | | `namespace_kernel.rs` |
+| Rename, truncate | Not supported | | #262 (PR #314, #323) | |
 | Extended attributes, ACLs, mode, owner and times, written | Not supported | | #263 (PR #312) | |
 | Compression on write | Not supported | | #265 (PR #325) | |
 | Reflink, clone-range, fallocate, dedupe | Not supported | | #269 | |
