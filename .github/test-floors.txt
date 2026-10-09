@@ -81,6 +81,7 @@ kernel_readback           2
 leaf_edit_oracle          3
 lib                       232
 lookup_by_name_key        1
+namespace_kernel          2
 node_write_oracle         4
 oracle_vm_fixtures        3
 pool_oracle               4
