@@ -95,7 +95,8 @@ Linux kernel in the guest.
 | Compression on write | Not supported | | #265 (PR #325) | |
 | Reflink, clone-range, fallocate, dedupe | Not supported | | #269 | |
 | Subvolumes and snapshots: making one read-only or writable again | Supported | Unreleased (#267) | | `subvol_readonly_kernel.rs` |
-| Subvolumes and snapshots: create, delete, default subvolume | Not supported | | #267 (PR #309, #317) | |
+| Subvolumes and snapshots: choosing the default subvolume | Supported | Unreleased (#267) | | `subvol_default_kernel.rs` |
+| Subvolumes and snapshots: create, delete | Not supported | | #267 (PR #317) | |
 | Device add, remove, replace; balance; defragment; trim | Not supported | | #268, #303, #304, #305 (PR #322) | |
 | RAID5/6 writes | Not supported | | #299 | |
 | Label, written to every superblock copy | Supported | 0.9.0 (#264) | | `cli_label_kernel.rs` |
