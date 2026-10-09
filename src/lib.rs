@@ -90,6 +90,7 @@ pub mod raid56;
 pub mod scrub;
 pub mod send;
 pub mod namespace;
+pub mod send;
 pub mod subvol;
 pub mod super_write;
 pub mod superblock;
