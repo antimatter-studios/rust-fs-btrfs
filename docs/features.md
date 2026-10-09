@@ -113,7 +113,8 @@ Linux kernel in the guest.
 |---|---|---|---|---|
 | Reading a version 1 or 2 stream, every checksum verified | Supported | Unreleased (#273) | | `send_stream_kernel.rs` |
 | Writing a full version-1 stream of a read-only subvolume | Supported | Unreleased (#273) | | `send_stream_kernel.rs` |
-| Incremental streams, version-2 writes, clone sources | Upcoming | | #273 (PR #315, #320, #324) | |
+| Incremental send streams, written against a parent snapshot | Supported | Unreleased (#273) | | `send_stream_kernel.rs` |
+| Version-2 writes, clone sources | Upcoming | | #273 (PR #320, #324) | |
 | Applying a stream to an image (receive) | Not supported | | #273 | |
 
 ## Interfaces
