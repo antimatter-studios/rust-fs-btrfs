@@ -56,11 +56,9 @@ suite.
 | An extent item whose window falls outside its extent | Refused | 0.7.0 | | `extent_window_read.rs`, `compressed_extent_window.rs` |
 | An inode claiming an impossible size | Refused | 0.7.0 | | `read_file_huge_size.rs` |
 | A metadata-only dump | Refused at every mount | 0.7.0 (#76) | | `super_flags_refusals.rs` |
-| A seed device | Supported, read-only; refused read-write | 0.7.0 (#76) | PR #327 (reading a sprout) | `super_flags_refusals.rs` |
-| A block group tree volume (`-O block-group-tree`) | Supported, read-only; refused read-write, since block group usage is updated in the extent tree | Unreleased (#270) | | `block_group_tree_oracle.rs` |
 | A seed device | Supported, read-only; refused read-write | 0.7.0 (#76) | | `super_flags_refusals.rs` |
 | A filesystem sprouted from a seed, read across the seed and the sprout | Supported, read-only | Unreleased (#270) | | `seed_oracle.rs` |
-| A block group tree volume | Upcoming | | PR #308 | |
+| A block group tree volume (`-O block-group-tree`) | Supported, read-only; refused read-write, since block group usage is updated in the extent tree | Unreleased (#270) | | `block_group_tree_oracle.rs` |
 | A volume with simple quotas | Upcoming | | #270 (PR #310) | |
 | Fuzzed decoders | Supported | 0.7.0 | | `fuzz_decoders.rs` |
 
