@@ -598,6 +598,16 @@ impl Filesystem {
         }
         let fs = Self::open(device.clone(), Some(device))?;
         crate::superblock::refuse_unmaintained_compat_ro(fs.sb.compat_ro_flags)?;
+        // Parity is read and rebuilt from, never updated: a write into a
+        // RAID5/6 chunk would leave its full stripe's parity describing
+        // bytes that are no longer there (#268).
+        if fs.sb.incompat_flags & crate::superblock::incompat::RAID56 != 0 {
+            return Err(Error::UnsupportedFeature(
+                "this volume uses RAID5/6, which can be read but not written: a write \
+                 would have to update parity"
+                    .into(),
+            ));
+        }
         // A SEED DEVICE IS READ-ONLY BY CONSTRUCTION (#76). Another
         // filesystem is layered on it, and writes belong to that sprout;
         // writing the seed changes blocks the sprout depends on being
@@ -858,7 +868,7 @@ impl Filesystem {
             let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
                 Self::read_logical_pool(&device, &devices, &boot, logical, buf)
             };
-            let mirrors = |logical: u64| -> Result<usize> { boot.mirrors_at(logical) };
+            let mirrors = |logical: u64| -> Result<usize> { boot.read_attempts_at(logical) };
             // POOL-AWARE, BECAUSE A RAID1 COPY IS ON ANOTHER DISK. The
             // single-device form reads every mirror from `device` at the
             // mapping's physical offset, ignoring the devid the mapping
@@ -902,7 +912,7 @@ impl Filesystem {
             let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
                 Self::read_logical_pool(&device, &devices, &map, logical, buf)
             };
-            let mirrors = |logical: u64| -> Result<usize> { map.mirrors_at(logical) };
+            let mirrors = |logical: u64| -> Result<usize> { map.read_attempts_at(logical) };
             let read_mirror = |logical: u64, mirror: usize, buf: &mut [u8]| -> Result<()> {
                 Self::read_logical_pool_mirror(&device, &devices, &map, mirror, logical, buf)
             };
@@ -965,7 +975,7 @@ impl Filesystem {
             read: Box::new(move |logical, buf| {
                 Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
             }),
-            mirrors: Box::new(move |logical| self.map.mirrors_at(logical)),
+            mirrors: Box::new(move |logical| self.map.read_attempts_at(logical)),
             read_mirror: Box::new(move |logical, mirror, buf| {
                 Self::read_logical_pool_mirror(
                     &self.device,
@@ -1005,8 +1015,26 @@ impl Filesystem {
         if devices.is_empty() {
             return Self::read_logical_on_mirror(device, map, u64::MAX, mirror, logical, buf);
         }
+        let device_for = |devid: u64, at: u64| {
+            devices.get(&devid).ok_or_else(|| {
+                Error::UnsupportedFeature(format!(
+                    "the range at {at} lives on device {devid}, which was not given"
+                ))
+            })
+        };
         let mut done = 0usize;
         while done < buf.len() {
+            let at = logical + done as u64;
+            if let Some(chunk) = Self::rebuilt_from_parity(map, mirror, at) {
+                done += Self::read_rebuilt(
+                    chunk,
+                    mirror,
+                    at,
+                    &mut buf[done..],
+                    &|devid, physical, out| Ok(device_for(devid, at)?.read_at(physical, out)?),
+                )?;
+                continue;
+            }
             let m = map.map_mirror(logical + done as u64, mirror)?;
             let n = (m.len as usize).min(buf.len() - done);
             if n == 0 {
@@ -1067,6 +1095,25 @@ impl Filesystem {
     ) -> Result<()> {
         let mut done = 0usize;
         while done < buf.len() {
+            let at = logical + done as u64;
+            if let Some(chunk) = Self::rebuilt_from_parity(map, mirror, at) {
+                done += Self::read_rebuilt(
+                    chunk,
+                    mirror,
+                    at,
+                    &mut buf[done..],
+                    &|on, physical, out| {
+                        if devid != u64::MAX && on != devid {
+                            return Err(Error::UnsupportedFeature(format!(
+                                "rebuilding the range at {at} needs device {on}, and this \
+                             filesystem was opened with device {devid} alone"
+                            )));
+                        }
+                        Ok(device.read_at(physical, out)?)
+                    },
+                )?;
+                continue;
+            }
             let m = map.map_mirror(logical + done as u64, mirror)?;
             if devid != u64::MAX && m.devid != devid {
                 return Err(Error::UnsupportedFeature(format!(
@@ -1087,6 +1134,78 @@ impl Filesystem {
             done += n;
         }
         Ok(())
+    }
+
+    /// The chunk holding `at`, when read attempt `attempt` of it is a
+    /// rebuild from RAID5/6 parity rather than a mapping.
+    fn rebuilt_from_parity(
+        map: &ChunkMap,
+        attempt: usize,
+        at: u64,
+    ) -> Option<&crate::chunk::Chunk> {
+        if attempt == 0 {
+            return None;
+        }
+        map.chunk_for(at).filter(|c| c.parity_count().is_some())
+    }
+
+    /// Fill the start of `buf` with the bytes at `logical`, rebuilt from
+    /// the rest of their RAID5/6 full stripe by read attempt `attempt`
+    /// (#268), and say how many bytes that was: up to the end of the
+    /// data element, which is as far as one set of parity reaches.
+    ///
+    /// `read(devid, physical, out)` reads one element's bytes. Every one
+    /// the method needs is read in full; none is trusted to be the
+    /// damaged one, which is the caller's checksum's job on the result.
+    fn read_rebuilt(
+        chunk: &crate::chunk::Chunk,
+        attempt: usize,
+        logical: u64,
+        buf: &mut [u8],
+        read: ElementRead<'_>,
+    ) -> Result<usize> {
+        use crate::raid56::{rebuild, Rebuild};
+        let plan = chunk.parity_read(logical)?;
+        let n = (plan.len as usize).min(buf.len());
+        if n == 0 {
+            return Err(Error::UnmappedLogical(logical));
+        }
+        let method = Rebuild::for_attempt(attempt, plan.want, plan.data.len(), plan.q.is_some())
+            .ok_or_else(|| {
+                Error::BadChunkItem(format!(
+                    "read attempt {attempt} of a chunk offering {}",
+                    chunk.read_attempts()
+                ))
+            })?;
+        let fetch = |(devid, physical): (u64, u64)| -> Result<Vec<u8>> {
+            let mut out = vec![0u8; n];
+            read(devid, physical, &mut out)?;
+            Ok(out)
+        };
+        let unread = |i: usize| i == plan.want || method == Rebuild::PQ { other: i };
+        let data = plan
+            .data
+            .iter()
+            .enumerate()
+            .map(|(i, &at)| {
+                if unread(i) {
+                    Ok(None)
+                } else {
+                    fetch(at).map(Some)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let p = match method {
+            Rebuild::P | Rebuild::PQ { .. } => Some(fetch(plan.p)?),
+            Rebuild::Q => None,
+        };
+        let q = match (method, plan.q) {
+            (Rebuild::Q | Rebuild::PQ { .. }, Some(q)) => Some(fetch(q)?),
+            _ => None,
+        };
+        let out = rebuild(method, plan.want, &data, p.as_deref(), q.as_deref())?;
+        buf[..n].copy_from_slice(&out);
+        Ok(n)
     }
 
     /// A handle over the same device, reading a different tree.
@@ -1121,7 +1240,7 @@ impl Filesystem {
         let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
             Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
         };
-        let mirrors = |logical: u64| -> Result<usize> { self.map.mirrors_at(logical) };
+        let mirrors = |logical: u64| -> Result<usize> { self.map.read_attempts_at(logical) };
         let read_mirror = |logical: u64, mirror: usize, buf: &mut [u8]| -> Result<()> {
             Self::read_logical_pool_mirror(
                 &self.device,
@@ -1820,12 +1939,36 @@ impl Filesystem {
             )?
         };
 
-        for (i, chunk) in whole.chunks_exact(sector as usize).enumerate() {
+        for (i, chunk) in whole.chunks_exact_mut(sector as usize).enumerate() {
             let at = first + i as u64 * sector;
             let Some(expected) = digests.get(&at) else {
                 continue;
             };
-            if !self.sb.csum_type.verify(chunk, expected) {
+            if self.sb.csum_type.verify(chunk, expected) {
+                continue;
+            }
+            // The first copy is bad: every other way of reading this
+            // sector, in turn, until one verifies -- the second copy of a
+            // DUP or RAID1 chunk, a rebuild from RAID5/6 parity (#268).
+            // A sector none of them can produce is refused, never returned.
+            let mut repaired = false;
+            for attempt in 1..self.map.read_attempts_at(at)? {
+                let mut other = vec![0u8; sector as usize];
+                let read = Self::read_logical_pool_mirror(
+                    &self.device,
+                    &self.devices,
+                    &self.map,
+                    attempt,
+                    at,
+                    &mut other,
+                );
+                if read.is_ok() && self.sb.csum_type.verify(&other, expected) {
+                    chunk.copy_from_slice(&other);
+                    repaired = true;
+                    break;
+                }
+            }
+            if !repaired {
                 return Err(Error::ChecksumMismatch {
                     what: "a data extent",
                     offset: at,
@@ -2005,6 +2148,9 @@ impl Filesystem {
         target.fs(self).read_file(target.inode.ino)
     }
 }
+
+/// Reads one RAID5/6 element: `(devid, physical, out)`.
+type ElementRead<'a> = &'a dyn Fn(u64, u64, &mut [u8]) -> Result<()>;
 
 /// A tree walker bound to one filesystem's pool.
 ///

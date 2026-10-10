@@ -284,8 +284,6 @@ pub mod incompat {
     ///
     /// The exclusions are deliberate, not accidental:
     ///
-    /// - [`RAID56`] — parity reconstruction is not implemented, and
-    ///   guessing at a RAID5 stripe layout is worse than refusing.
     /// - [`ZONED`], [`EXTENT_TREE_V2`], [`RAID_STRIPE_TREE`],
     ///   [`SIMPLE_QUOTA`], [`REMAP_TREE`] — each restructures something
     ///   the read path depends on.
@@ -312,7 +310,12 @@ pub mod incompat {
         | SKINNY_METADATA
         | NO_HOLES
         | METADATA_UUID
-        | RAID1C34;
+        | RAID1C34
+        // Read: the data elements are placed round the rotating parity
+        // and a damaged one is rebuilt from it (#268), against pools the
+        // kernel wrote. Never written: `mount_rw` takes one device, and a
+        // parity chunk spans several.
+        | RAID56;
 }
 
 /// `compat_ro_flags` bits: features an implementation may ignore while
@@ -1435,12 +1438,11 @@ pub(crate) mod tests {
         ));
     }
 
-    /// Compression and RAID5/6 are known features that this driver
-    /// deliberately does not claim. They must be refused, not ignored.
+    /// Known features this driver deliberately does not claim. They must
+    /// be refused, not ignored.
     #[test]
     fn rejects_known_but_unimplemented_incompat_features() {
         for bit in [
-            incompat::RAID56,
             incompat::ZONED,
             incompat::EXTENT_TREE_V2,
             incompat::RAID_STRIPE_TREE,

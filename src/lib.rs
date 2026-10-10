@@ -85,6 +85,7 @@ pub mod inode;
 pub mod leaf_edit;
 pub mod log_tree;
 pub mod mkfs;
+pub mod raid56;
 pub mod send;
 pub mod subvol;
 pub mod super_write;

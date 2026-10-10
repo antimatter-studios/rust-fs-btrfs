@@ -36,10 +36,12 @@
 //! - RAID10 — RAID0 across `num_stripes / sub_stripes` groups, with each
 //!   group mirrored `sub_stripes` ways.
 //!
-//! RAID5 and RAID6 are deliberately **not** implemented. Their layout
-//! involves a rotating parity stripe, and a plausible-looking guess would
-//! silently return the wrong bytes rather than fail; [`Error::UnsupportedProfile`]
-//! is the honest answer.
+//! - RAID5 and RAID6 — `num_stripes - 1` or `- 2` data elements per full
+//!   stripe, with parity rotating one stripe per full stripe; see
+//!   [`crate::raid56`]. The direct read maps like RAID0 over the data
+//!   elements. There is one copy, so [`Chunk::num_mirrors`] is 1, and the
+//!   further READ ATTEMPTS ([`Chunk::read_attempts`]) rebuild the element
+//!   from parity through [`Chunk::parity_read`] rather than map anywhere.
 
 use crate::error::{Error, Result};
 use crate::superblock::{le16, le32, le64, uuid_at, Superblock, UUID_SIZE};
@@ -171,9 +173,9 @@ pub enum ChunkProfile {
     Raid1c4,
     /// Striped mirrors.
     Raid10,
-    /// Single-parity — recognised, not translatable.
+    /// Single parity, rotating.
     Raid5,
-    /// Double-parity — recognised, not translatable.
+    /// Double parity (P and Q), rotating.
     Raid6,
 }
 
@@ -454,6 +456,79 @@ impl Chunk {
         }
     }
 
+    /// How many ways there are to read any given byte of this chunk: its
+    /// copies, and for RAID5/6 the parity rebuilds after the one copy.
+    ///
+    /// Attempt indices run `0 .. read_attempts()`. Writes use
+    /// [`Chunk::num_mirrors`], which counts copies only.
+    pub fn read_attempts(&self) -> usize {
+        match self.parity_count() {
+            Some(parity) => crate::raid56::Rebuild::attempts(
+                usize::from(self.num_stripes).saturating_sub(parity),
+                parity == 2,
+            ),
+            None => self.num_mirrors(),
+        }
+    }
+
+    /// The number of parity elements per full stripe, for RAID5 and
+    /// RAID6, and `None` for every other profile.
+    pub fn parity_count(&self) -> Option<usize> {
+        match self.profile() {
+            Ok(ChunkProfile::Raid5) => Some(1),
+            Ok(ChunkProfile::Raid6) => Some(2),
+            _ => None,
+        }
+    }
+
+    /// Everything a parity rebuild of `logical` reads: where each element
+    /// of its full stripe is, which data element `logical` is in, and how
+    /// many bytes from `logical` stay inside that element.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnmappedLogical`] outside the chunk and
+    /// [`Error::UnsupportedProfile`] for a chunk without parity.
+    pub fn parity_read(&self, logical: u64) -> Result<ParityRead> {
+        if logical < self.logical || logical >= self.logical_end() {
+            return Err(Error::UnmappedLogical(logical));
+        }
+        let parity = self.parity_count().ok_or_else(|| {
+            Error::UnsupportedProfile("a parity rebuild of a chunk without parity".into())
+        })?;
+        let n = usize::from(self.num_stripes);
+        let k = (n - parity) as u64;
+        let offset = logical - self.logical;
+        let element = offset / self.stripe_len;
+        let within = offset % self.stripe_len;
+        let full = element / k;
+        let place = crate::raid56::placement(n, parity, full)?;
+        let overflow =
+            || Error::BadChunkItem("stripe address arithmetic overflowed 64 bits".into());
+        let row = full
+            .checked_mul(self.stripe_len)
+            .and_then(|r| r.checked_add(within))
+            .ok_or_else(overflow)?;
+        let at = |index: usize| -> Result<(u64, u64)> {
+            let stripe = &self.stripes[index];
+            Ok((
+                stripe.devid,
+                stripe.offset.checked_add(row).ok_or_else(overflow)?,
+            ))
+        };
+        Ok(ParityRead {
+            want: (element % k) as usize,
+            data: place
+                .data_stripes
+                .iter()
+                .map(|&i| at(i))
+                .collect::<Result<_>>()?,
+            p: at(place.p)?,
+            q: place.q.map(at).transpose()?,
+            len: (self.stripe_len - within).min(self.logical_end() - logical),
+        })
+    }
+
     /// Structural checks that do not need any outside context.
     fn validate(&self) -> Result<()> {
         let bad = |m: String| Err(Error::BadChunkItem(m));
@@ -589,9 +664,10 @@ impl Chunk {
             return Err(Error::UnmappedLogical(logical));
         }
         let profile = self.profile()?;
-        if matches!(profile, ChunkProfile::Raid5 | ChunkProfile::Raid6) {
+        if matches!(profile, ChunkProfile::Raid5 | ChunkProfile::Raid6) && mirror > 0 {
             return Err(Error::UnsupportedProfile(format!(
-                "{} needs parity-aware placement, which this driver does not implement",
+                "a {} chunk has one copy; read attempt {mirror} is a rebuild from parity, \
+                 which `parity_read` describes and no single mapping can",
                 profile.name()
             )));
         }
@@ -623,7 +699,13 @@ impl Chunk {
                 let groups = n / sub;
                 ((stripe_nr % groups) * sub + m, stripe_nr / groups)
             }
-            ChunkProfile::Raid5 | ChunkProfile::Raid6 => unreachable!("rejected above"),
+            ChunkProfile::Raid5 | ChunkProfile::Raid6 => {
+                let parity = self.parity_count().expect("a parity profile");
+                let k = n - parity as u64;
+                let full = stripe_nr / k;
+                let place = crate::raid56::placement(usize::from(self.num_stripes), parity, full)?;
+                (place.data_stripes[(stripe_nr % k) as usize] as u64, full)
+            }
         };
 
         let stripe = self
@@ -640,7 +722,9 @@ impl Chunk {
             .ok_or_else(overflow)?;
 
         let to_chunk_end = self.logical_end() - logical;
-        let len = if profile.is_striped() {
+        let len = if profile.is_striped()
+            || matches!(profile, ChunkProfile::Raid5 | ChunkProfile::Raid6)
+        {
             (self.stripe_len - stripe_offset).min(to_chunk_end)
         } else {
             to_chunk_end
@@ -652,6 +736,23 @@ impl Chunk {
             len,
         })
     }
+}
+
+/// Where the elements of one RAID5/6 full stripe are, from
+/// [`Chunk::parity_read`]. Each is `(devid, physical)` at the same offset
+/// into its element as the address asked about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParityRead {
+    /// The data element the address is in.
+    pub want: usize,
+    /// Every data element, by data index.
+    pub data: Vec<(u64, u64)>,
+    /// P.
+    pub p: (u64, u64),
+    /// Q, for RAID6.
+    pub q: Option<(u64, u64)>,
+    /// Bytes from the address to the end of its element or of the chunk.
+    pub len: u64,
 }
 
 /// The logical-to-physical address map: an ordered, non-overlapping set
@@ -835,6 +936,15 @@ impl ChunkMap {
             .chunk_for(logical)
             .ok_or(Error::UnmappedLogical(logical))?
             .num_mirrors())
+    }
+
+    /// How many ways there are to read `logical`; see
+    /// [`Chunk::read_attempts`].
+    pub fn read_attempts_at(&self, logical: u64) -> Result<usize> {
+        Ok(self
+            .chunk_for(logical)
+            .ok_or(Error::UnmappedLogical(logical))?
+            .read_attempts())
     }
 
     /// Translate `logical` using the first copy.
@@ -1217,25 +1327,67 @@ mod tests {
         assert!(matches!(c.map_mirror(0, 2), Err(Error::BadChunkItem(_))));
     }
 
-    /// RAID5 and RAID6 must be refused outright rather than mapped as if
-    /// they were RAID0. Guessing here returns parity blocks as data.
+    /// RAID5 places data elements round the stripes with parity rotating
+    /// one stripe per full stripe, worked out by hand from the layout in
+    /// `crate::raid56`. A second read attempt is a rebuild, which no
+    /// single mapping can describe, so `map_mirror` refuses it.
     #[test]
-    fn refuses_to_map_raid5_and_raid6() {
-        for (bits, stripes) in [(block_group::RAID5, 3usize), (block_group::RAID6, 4)] {
-            let s: Vec<(u64, u64)> = (0..stripes as u64)
-                .map(|i| (i + 1, 0x10_0000 * (i + 1)))
-                .collect();
-            let c = Chunk::parse(
-                0,
-                &chunk_bytes(4 * K64, K64, block_group::DATA | bits, 0, &s),
-            )
-            .unwrap();
-            assert!(
-                matches!(c.map(0), Err(Error::UnsupportedProfile(_))),
-                "profile {:?} should be refused",
-                c.profile()
-            );
+    fn maps_raid5_data_elements_round_the_rotating_parity() {
+        let s: Vec<(u64, u64)> = (0..3u64).map(|i| (i + 1, 0x10_0000 * (i + 1))).collect();
+        let c = Chunk::parse(
+            0,
+            &chunk_bytes(4 * K64, K64, block_group::DATA | block_group::RAID5, 0, &s),
+        )
+        .unwrap();
+        for (logical, devid, physical) in [
+            (0, 1, 0x10_0000),
+            (K64 + 5, 2, 0x20_0005),
+            (2 * K64, 2, 0x20_0000 + K64),
+            (3 * K64, 3, 0x30_0000 + K64),
+        ] {
+            let m = c.map(logical).unwrap();
+            assert_eq!((m.devid, m.physical), (devid, physical), "{logical:#x}");
         }
+        assert_eq!(c.num_mirrors(), 1);
+        assert_eq!(c.read_attempts(), 2);
+        assert!(matches!(
+            c.map_mirror(0, 1),
+            Err(Error::UnsupportedProfile(_))
+        ));
+
+        // Full stripe 1: data on stripes 1 and 2, P on stripe 0.
+        let r = c.parity_read(3 * K64 + 9).unwrap();
+        assert_eq!(r.want, 1);
+        assert_eq!(
+            r.data,
+            vec![(2, 0x20_0000 + K64 + 9), (3, 0x30_0000 + K64 + 9)]
+        );
+        assert_eq!(r.p, (1, 0x10_0000 + K64 + 9));
+        assert_eq!(r.q, None);
+        assert_eq!(r.len, K64 - 9);
+    }
+
+    /// RAID6 over four stripes: two data elements, P and Q, all rotating.
+    #[test]
+    fn maps_raid6_with_p_and_q() {
+        let s: Vec<(u64, u64)> = (0..4u64).map(|i| (i + 1, 0x10_0000 * (i + 1))).collect();
+        let c = Chunk::parse(
+            0,
+            &chunk_bytes(4 * K64, K64, block_group::DATA | block_group::RAID6, 0, &s),
+        )
+        .unwrap();
+        assert_eq!(c.read_attempts(), 4);
+        let r = c.parity_read(2 * K64).unwrap();
+        assert_eq!(r.want, 0);
+        assert_eq!(r.data, vec![(2, 0x20_0000 + K64), (3, 0x30_0000 + K64)]);
+        assert_eq!(r.p, (4, 0x40_0000 + K64));
+        assert_eq!(r.q, Some((1, 0x10_0000 + K64)));
+        assert!(matches!(
+            Chunk::parse(0, &chunk_bytes(4 * K64, K64, block_group::DATA, 0, &s[..1]))
+                .unwrap()
+                .parity_read(0),
+            Err(Error::UnsupportedProfile(_))
+        ));
     }
 
     #[test]

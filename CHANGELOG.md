@@ -39,6 +39,16 @@ never does.
   contents, and `Filesystem::mount_ignoring_log` opens such a volume read-only
   on its committed trees, like the kernel's `ro,nologreplay`. Every other mount
   still refuses a non-empty log; replaying it is the rest of #266.
+- **RAID5 and RAID6 pools are read.** The `raid56` feature no longer refuses
+  the mount: data elements are found round the rotating parity, and an element
+  whose checksum fails is rebuilt from the rest of its full stripe — from P,
+  from Q, or for RAID6 together with a second lost element from both. Checked
+  against three- and four-device pools the kernel wrote, whole, with any one
+  device returning garbage, and for RAID6 with any two (#268). Writing a
+  parity pool is refused.
+- **A data sector that fails its checksum is read from the next copy.** The
+  second copy of a DUP or RAID1 chunk was used for tree blocks only; a file's
+  data now falls back the same way before it is refused (#268).
 
 ### Changed
 
