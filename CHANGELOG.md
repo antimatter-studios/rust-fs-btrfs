@@ -42,6 +42,14 @@ never does.
   write match the kernel's own stream byte for byte, and `btrfs receive`
   rebuild the snapshot with its extents still compressed and its preallocated
   range still allocated.
+- **A pool of several devices can be written.** `Filesystem::mount_pool_rw`
+  opens every member read-write: each copy of a mirrored chunk is written on
+  the device its stripe names, and a commit flushes every member and writes
+  each one's superblocks, keeping its own `dev_item`. A member that missed a
+  commit, or whose primary superblock is not its newest, is refused, as is a
+  read-only member and an incomplete set. RAID5/6 stays refused for writing.
+  Checked by writing a two-device RAID1 pool and having `btrfs check` and the
+  kernel read it back (#298).
 - **`send::StreamError`**, its own error type. A malformed stream is bytes
   handed in, not a damaged volume, so it is kept out of the crate's `Error`.
 - **An unreplayed log tree can be read.** `Filesystem::log` returns every item
@@ -59,14 +67,6 @@ never does.
 - **A data sector that fails its checksum is read from the next copy.** The
   second copy of a DUP or RAID1 chunk was used for tree blocks only; a file's
   data now falls back the same way before it is refused (#268).
-- **A pool of several devices can be written.** `Filesystem::mount_pool_rw`
-  opens every member read-write: each copy of a mirrored chunk is written on
-  the device its stripe names, and a commit flushes every member and writes
-  each one's superblocks, keeping its own `dev_item`. A member that missed a
-  commit, or whose primary superblock is not its newest, is refused, as is a
-  read-only member and an incomplete set. RAID5/6 stays refused for writing.
-  Checked by writing a two-device RAID1 pool and having `btrfs check` and the
-  kernel read it back (#298).
 
 ### Changed
 
