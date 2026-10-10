@@ -92,6 +92,8 @@ Linux kernel in the guest.
 | A read-write mount whose newest superblock is not the primary | Refused | 0.7.0 (#90) | | `superblock_mirrors.rs` |
 | A volume whose log tree holds entries | Partial: the log is read (`Filesystem::log`) and the volume opens read-only on its committed trees (`mount_ignoring_log`, like `ro,nologreplay`); every other mount refuses it, since the log is not replayed | Unreleased (#266) | #266 | `log_tree_kernel.rs` |
 | A pool of several devices, written | Not supported | | #298 (PR #316) | |
+| A volume whose log tree holds entries | Refused for writing | | #266 (PR #328) | |
+| A pool of several devices, written (`mount_pool_rw`) | Supported, except RAID5/6; a stale, read-only or missing member is refused | Unreleased (#298) | #299 | `pool_write_kernel.rs` |
 | Create, mkdir, unlink, rmdir, rename, link, symlink, truncate | Not supported | | #262 (PR #311, #314, #323) | |
 | Extended attributes, ACLs, mode, owner and times, written | Not supported | | #263 (PR #312) | |
 | Compression on write | Not supported | | #265 (PR #325) | |

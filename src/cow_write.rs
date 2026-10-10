@@ -50,7 +50,6 @@
 //! writes in place and commits nothing.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use crate::chunk::{objectid, DiskKey};
 use crate::error::{Error, Result};
@@ -235,12 +234,11 @@ impl Filesystem {
         // The data, to every mirror, before any tree block: nothing
         // names these addresses until the superblocks are written, and
         // the commit's first flush puts them on the device before that.
-        let device = Arc::clone(self.writable.as_ref().expect("checked by write"));
         for (at, buf) in &contents {
-            Self::mirror_spans(&device, &self.map, *at, buf.len())?;
+            self.mirror_spans(*at, buf.len())?;
         }
         for (at, buf) in &contents {
-            Self::write_logical_all_mirrors(&device, &self.map, *at, buf)?;
+            self.write_logical_all_mirrors(*at, buf)?;
         }
         self.commit(
             &blocks,
@@ -255,7 +253,7 @@ impl Filesystem {
         )?;
 
         // The trees this mount holds are the previous generation's.
-        *self = Filesystem::mount_rw(device)?;
+        *self = self.remount_rw()?;
         Ok(data.len())
     }
 
