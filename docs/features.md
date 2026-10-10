@@ -101,7 +101,8 @@ Linux kernel in the guest.
 | Reflink, clone-range, fallocate, dedupe | Not supported | | #269 | |
 | Subvolumes and snapshots: making one read-only or writable again | Supported | Unreleased (#267) | | `subvol_readonly_kernel.rs` |
 | Subvolumes and snapshots: create, delete, default subvolume | Not supported | | #267 (PR #309, #317) | |
-| Device add, remove, replace; balance; defragment; trim | Not supported | | #268, #303, #304, #305 (PR #322) | |
+| Device add, remove, replace; balance; defragment | Not supported | | #268, #303, #304, #305 | |
+| Trim: every free run of every block group handed to a caller's discard, on every copy | Supported; RAID5/6 groups refused | Unreleased (#305) | | `trim_oracle.rs` |
 | RAID5/6 writes | Not supported | | #299 | |
 | Label, written to every superblock copy | Supported | 0.9.0 (#264) | | `cli_label_kernel.rs` |
 | Resize | Not supported (`not implemented`, exit 3) | 0.8.0 | #264 (PR #326) | `tests/cli/test-blocked.sh` |

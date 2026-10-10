@@ -47,6 +47,13 @@ never does.
   times. `tests/send_stream_kernel.rs` has the guest's `btrfs receive` apply
   it on top of the parent and the kernel show the child exactly, and parses
   the kernel's own incremental stream against `btrfs receive --dump`.
+- **A trim.** `Filesystem::trim_ranges` lists every free run of every block
+  group, from the free-space tree (or the extent tree's gaps without one),
+  mapped to the device range of each copy, and `Filesystem::trim` hands each to
+  a discard the caller supplies, on a read-write mount, changing nothing on the
+  filesystem. Checked against the free runs `btrfs inspect-internal dump-tree`
+  lists and the copies its chunk tree places (#305). RAID5/6 groups are
+  refused.
 - **A read-only scrub.** `Filesystem::scrub` reads every copy of every tree
   block and data sector the extent tree says is allocated, checks each against
   its checksum (and a tree block against its own address and filesystem), and

@@ -114,5 +114,6 @@ test_contract             7
 transaction_oracle        5
 transaction_plan          7
 tree_write_oracle         6
+trim_oracle               3
 write_oracle              3
 xattr_oracle              9
