@@ -64,6 +64,13 @@ never does.
   contents, and `Filesystem::mount_ignoring_log` opens such a volume read-only
   on its committed trees, like the kernel's `ro,nologreplay`. Every other mount
   still refuses a non-empty log; replaying it is the rest of #266.
+- **A filesystem sprouted from a seed is read.** A seed device's own
+  superblock names the seed's fsid, not the sprouted filesystem's, and
+  `mount_pool` refused it as a device of another filesystem. A seeding device
+  given with a sprout is now accepted once the sprout's chunk tree holds a
+  `DEV_ITEM` for it with that fsid and device uuid, and refused otherwise.
+  Checked against a seed and a sprout the kernel made, every file of each read
+  as the kernel wrote it (#270). Writing a seed stays refused.
 - **RAID5 and RAID6 pools are read.** The `raid56` feature no longer refuses
   the mount: data elements are found round the rotating parity, and an element
   whose checksum fails is rebuilt from the rest of its full stripe — from P,
