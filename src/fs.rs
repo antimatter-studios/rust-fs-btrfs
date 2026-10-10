@@ -713,6 +713,15 @@ impl Filesystem {
         Self::open_pool(device, BTreeMap::new(), writable, None)
     }
 
+    /// A read-only open on a superblock already read and selected.
+    pub(crate) fn open_known(
+        device: Arc<dyn BlockRead>,
+        sb: crate::superblock::Superblock,
+        copy: usize,
+    ) -> Result<Self> {
+        Self::open_pool(device, BTreeMap::new(), None, Some((sb, copy)))
+    }
+
     /// Open a filesystem that spans several devices.
     ///
     /// Every device of the pool must be given. A chunk stripe names the
