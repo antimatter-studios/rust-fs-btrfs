@@ -89,13 +89,6 @@ never does.
   DUP chunk; two of RAID5; three of RAID6) is refused at mount, naming the
   chunk. Checked against the kernel-written RAID5 pool without each member,
   RAID6 without every pair and RAID1 without either (#300).
-- **A filesystem sprouted from a seed is read.** A seed device's own
-  superblock names the seed's fsid, not the sprouted filesystem's, and
-  `mount_pool` refused it as a device of another filesystem. A seeding device
-  given with a sprout is now accepted once the sprout's chunk tree holds a
-  `DEV_ITEM` for it with that fsid and device uuid, and refused otherwise.
-  Checked against a seed and a sprout the kernel made, every file of each read
-  as the kernel wrote it (#270). Writing a seed stays refused.
 
 ### Changed
 
