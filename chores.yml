@@ -438,6 +438,10 @@ tasks:
       # a DUP volume with three copies damaged on purpose, and the
       # kernel's read-only scrub of it
       - test-disks/scrub/btrfs-scrub.img
+      # a seed filesystem and the device sprouted from it, its own
+      # directory because the seed is refused for writing on purpose
+      - test-disks/seed/btrfs-seed.img
+      - test-disks/seed/btrfs-sprout.img
     # A hung boot must not hold the VM and the machine-wide slot for
     # ever. The split fixtures alone mount and unmount up to four hundred
     # times, and the populated pair writes eighty thousand files, so this
@@ -453,7 +457,7 @@ tasks:
     cmds:
       - |
         set -eu
-        rm -rf test-disks/snapshot test-disks/dirtylog test-disks/features test-disks/scrub
+        rm -rf test-disks/snapshot test-disks/dirtylog test-disks/features test-disks/scrub test-disks/seed
         rm -f test-disks/btrfs-*.img test-disks/*.superdump test-disks/*.manifest \
               test-disks/*.compression test-disks/*.super test-disks/btrfs-split*.txt
 

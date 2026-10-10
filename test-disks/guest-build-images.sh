@@ -39,7 +39,7 @@ set -euo pipefail
 OUT="$1"
 shift
 
-TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog cli features scrub"
+TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog cli features scrub seed"
 
 # ARGUMENTS FIRST, ENVIRONMENT SECOND. A misspelt target is the caller's
 # mistake and should be named as one wherever it is made; the root and
@@ -1422,6 +1422,99 @@ build_scrub() {
         rm -f "$f"
     done
     note "built scrub/btrfs-scrub"
+}
+
+# ---------------------------------------------------------------------
+# seed — a seed filesystem and the filesystem sprouted from it (#270).
+#
+# `btrfstune -S 1` marks a filesystem as a seed: it mounts read-only
+# from then on, and `btrfs device add` grows a new, writable filesystem
+# on top of it, with its own fsid, whose chunks live partly on the seed
+# device and partly on the new one. The seed device's own superblock
+# still names the seed's fsid, which is what a reader that pairs devices
+# by fsid trips over.
+#
+#   seed/btrfs-seed.img      the seed, by itself a complete filesystem
+#   seed/btrfs-sprout.img    the device added to it
+#   seed/btrfs-seed.manifest    every file of the seed, as the kernel read it
+#   seed/btrfs-sprout.manifest  every file of the sprouted filesystem: the
+#                               seed's (one of them rewritten in the
+#                               sprout) and the new ones
+#
+# In its own directory: the seed is refused for writing on purpose, and
+# the sprout is one half of a two-device filesystem.
+# ---------------------------------------------------------------------
+manifest_of() {
+    ( cd "$1" && find . -mindepth 1 -type f | sort | while read -r p; do
+        printf '%s\t%s\t%s\n' "${p#.}" "$(stat -c%s "$p")" \
+            "$(sha256sum "$p" | cut -d' ' -f1)"
+      done )
+}
+
+build_seed() {
+    local seed="$WORK/btrfs-seed.img" sprout="$WORK/btrfs-sprout.img"
+    local sm="$WORK/btrfs-seed.manifest" pm="$WORK/btrfs-sprout.manifest"
+    local ls lp i f
+    rm -f "$seed" "$sprout" "$sm" "$pm"
+    truncate -s 256M "$seed"
+    truncate -s 256M "$sprout"
+    mkfs.btrfs -f "$seed" >/dev/null
+    mount -o loop "$seed" "$MNT"
+    mkdir -p "$MNT/old"
+    for i in 1 2 3; do
+        echo "seed file $i" > "$MNT/old/file-$i.txt"
+    done
+    dd if=/dev/urandom of="$MNT/old/big.bin" bs=1M count=2 status=none
+    sync
+    manifest_of "$MNT" > "$sm"
+    umount "$MNT"
+    btrfstune -S 1 "$seed"
+
+    ls=$(losetup --find --show "$seed")
+    lp=$(losetup --find --show "$sprout")
+    seed_cleanup() {
+        mountpoint -q "$MNT" && umount "$MNT" || true
+        losetup -d "$ls" 2>/dev/null || true
+        losetup -d "$lp" 2>/dev/null || true
+        btrfs device scan --forget >/dev/null 2>&1 || true
+    }
+    trap 'seed_cleanup; cleanup' EXIT
+    # A seed mounts read-only; adding a device to it sprouts the new
+    # filesystem, and the remount makes that one writable.
+    mount "$ls" "$MNT"
+    btrfs device add -f "$lp" "$MNT" >/dev/null
+    mount -o remount,rw "$MNT"
+    mkdir -p "$MNT/new"
+    for i in 1 2; do
+        echo "sprout file $i" > "$MNT/new/file-$i.txt"
+    done
+    dd if=/dev/urandom of="$MNT/new/big.bin" bs=1M count=2 status=none
+    # A seed file rewritten: the new copy is written into the sprout's
+    # chunks, and the old one stays on the seed.
+    echo "rewritten in the sprout" > "$MNT/old/file-1.txt"
+    sync
+    manifest_of "$MNT" > "$pm"
+    umount "$MNT"
+    losetup -d "$ls"
+    losetup -d "$lp"
+    btrfs device scan --forget >/dev/null 2>&1 || true
+    trap cleanup EXIT
+
+    btrfs inspect-internal dump-super "$seed" | grep -q 'SEEDING' || {
+        echo "guest-build-images: btrfs-seed does not carry the SEEDING flag" >&2
+        exit 1
+    }
+    [ "$(btrfs inspect-internal dump-super "$sprout" | awk '$1 == "num_devices" { print $2 }')" = 2 ] || {
+        echo "guest-build-images: btrfs-sprout does not span two devices" >&2
+        exit 1
+    }
+    mkdir -p "$OUT/seed"
+    for f in "$seed" "$sprout" "$sm" "$pm"; do
+        cp --sparse=always "$f" "$OUT/seed/$(basename "$f").partial"
+        mv -f "$OUT/seed/$(basename "$f").partial" "$OUT/seed/$(basename "$f")"
+        rm -f "$f"
+    done
+    note "built seed/btrfs-seed and seed/btrfs-sprout (a seed and the filesystem sprouted from it)"
 }
 
 # ---------------------------------------------------------------------
