@@ -479,6 +479,7 @@ impl Filesystem {
             ino,
             moves: Vec::new(),
             time: now,
+            root_flags: None,
             edits,
         };
         let dirty: Vec<u64> = {
