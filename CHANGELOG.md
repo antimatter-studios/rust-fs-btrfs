@@ -32,6 +32,16 @@ never does.
   times. `tests/send_stream_kernel.rs` has the guest's `btrfs receive` apply
   it on top of the parent and the kernel show the child exactly, and parses
   the kernel's own incremental stream against `btrfs receive --dump`.
+- **Version-2 send streams are written, with compressed data passed through
+  (#273).** `Filesystem::send_subvolume_with` and
+  `Filesystem::send_subvolume_incremental_with` take `send::SendOptions`: a
+  version-2 stream keeps a preallocated range as a `FALLOCATE`, and with
+  `compressed_data` sends each zlib, LZO or zstd extent as an `ENCODED_WRITE`
+  of its bytes as they are on disk, as `btrfs send --proto 2
+  --compressed-data` does. `tests/send_stream_kernel.rs` has every encoded
+  write match the kernel's own stream byte for byte, and `btrfs receive`
+  rebuild the snapshot with its extents still compressed and its preallocated
+  range still allocated.
 - **`send::StreamError`**, its own error type. A malformed stream is bytes
   handed in, not a damaged volume, so it is kept out of the crate's `Error`.
 - **An unreplayed log tree can be read.** `Filesystem::log` returns every item

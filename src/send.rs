@@ -27,9 +27,12 @@
 //!
 //! Version 2 changes one rule: a `DATA` attribute carries no length and
 //! runs to the end of its command, so a write is no longer limited to what
-//! a `u16` can count. Both versions are read here. Only version 1 is
-//! written, and version 2's new commands (preallocate, inode flags,
-//! encoded writes) are carried through the parser as raw attributes.
+//! a `u16` can count. It adds commands: `FALLOCATE`, which keeps a
+//! preallocated range preallocated, and `ENCODED_WRITE`, which carries a
+//! compressed extent's bytes as they are on disk for the receiver to store
+//! without recompressing. Both versions are read and written here
+//! ([`SendOptions`]); version 2's inode-flag command is carried through the
+//! parser as raw attributes, and not written.
 //!
 //! # What a written stream holds
 //!
@@ -55,10 +58,12 @@ use std::collections::{BTreeMap, VecDeque};
 
 pub mod incremental;
 
+use crate::compression::Compression;
 use crate::error::{Error, Result};
-use crate::fs::{root_item, Filesystem, ROOT_ITEM_KEY};
+use crate::fs::{file_extent, root_item, Filesystem, EXTENT_DATA_KEY, ROOT_ITEM_KEY};
 use crate::inode::{FileType, Inode, Timestamp};
 use crate::subvol::is_subvolume_id;
+use crate::superblock::le64;
 
 /// The thirteen bytes every send stream opens with.
 pub const SEND_STREAM_MAGIC: &[u8; 13] = b"btrfs-stream\0";
@@ -185,6 +190,91 @@ pub mod attr {
     pub const CLONE_OFFSET: u16 = 23;
     /// How much a clone copies.
     pub const CLONE_LEN: u16 = 24;
+    /// A `FALLOCATE`'s mode: `FALLOC_FL_*` bits, a `u32` (version 2).
+    pub const FALLOCATE_MODE: u16 = 25;
+    /// Inode flags (version 2).
+    pub const FILEATTR: u16 = 26;
+    /// How much of the file an encoded write fills (version 2).
+    pub const UNENCODED_FILE_LEN: u16 = 27;
+    /// What the encoded bytes decode to, all of it (version 2).
+    pub const UNENCODED_LEN: u16 = 28;
+    /// Where in the decoded bytes the file's range starts (version 2).
+    pub const UNENCODED_OFFSET: u16 = 29;
+    /// How an encoded write's bytes are compressed, a `u32` (version 2).
+    pub const COMPRESSION: u16 = 30;
+    /// How they are encrypted, a `u32`; always none (version 2).
+    pub const ENCRYPTION: u16 = 31;
+}
+
+/// `FALLOC_FL_KEEP_SIZE`: preallocate without moving the file's size.
+pub const FALLOC_FL_KEEP_SIZE: u32 = 1;
+
+/// An encoded write's compression, as the stream numbers it: not the
+/// number a file extent item stores. LZO is split by the sector size its
+/// segments were cut to.
+pub mod encoded {
+    /// zlib.
+    pub const ZLIB: u32 = 1;
+    /// zstd.
+    pub const ZSTD: u32 = 2;
+    /// LZO in 4 KiB segments; 8, 16, 32 and 64 KiB follow in order.
+    pub const LZO_4K: u32 = 3;
+}
+
+/// What kind of stream to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SendOptions {
+    /// The stream version: 1, which every receiver reads, or 2.
+    pub version: u32,
+    /// Pass compressed extents through as `ENCODED_WRITE`s, as `btrfs
+    /// send --compressed-data` does. Version 2 only.
+    pub compressed_data: bool,
+}
+
+impl Default for SendOptions {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            compressed_data: false,
+        }
+    }
+}
+
+impl SendOptions {
+    /// A version-1 stream: what [`Filesystem::send_subvolume`] writes.
+    pub fn v1() -> Self {
+        Self::default()
+    }
+
+    /// A version-2 stream, compressed extents decoded and written plainly.
+    pub fn v2() -> Self {
+        Self {
+            version: 2,
+            ..Self::default()
+        }
+    }
+
+    /// The same, passing compressed extents through or not.
+    pub fn with_compressed_data(mut self, yes: bool) -> Self {
+        self.compressed_data = yes;
+        self
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.version != 1 && self.version != 2 {
+            return Err(Error::UnsupportedFeature(format!(
+                "send stream version {} is not one this writes",
+                self.version
+            )));
+        }
+        if self.compressed_data && self.version < 2 {
+            return Err(Error::UnsupportedFeature(
+                "compressed data passes through only in a version 2 stream".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// What is wrong with a send stream.
@@ -481,11 +571,12 @@ fn parse_attrs(body: &[u8], base: usize, version: u32) -> StreamResult<Vec<(u16,
     Ok(out)
 }
 
-/// Builds a version-1 stream, one command at a time.
+/// Builds a stream, one command at a time.
 #[derive(Debug)]
 pub struct StreamWriter {
     out: Vec<u8>,
     cmd: Option<(usize, u16)>,
+    version: u32,
 }
 
 impl Default for StreamWriter {
@@ -495,11 +586,21 @@ impl Default for StreamWriter {
 }
 
 impl StreamWriter {
-    /// A stream holding only its header.
+    /// A version-1 stream holding only its header.
     pub fn new() -> Self {
+        Self::with_version(1)
+    }
+
+    /// A stream of `version` holding only its header. The writer does
+    /// not check the number; [`SendOptions`] does.
+    pub fn with_version(version: u32) -> Self {
         let mut out = SEND_STREAM_MAGIC.to_vec();
-        out.extend_from_slice(&1u32.to_le_bytes());
-        Self { out, cmd: None }
+        out.extend_from_slice(&version.to_le_bytes());
+        Self {
+            out,
+            cmd: None,
+            version,
+        }
     }
 
     /// Open a command. Attributes added until the next [`Self::begin`] or
@@ -531,6 +632,28 @@ impl StreamWriter {
     /// Add a `u64` attribute.
     pub fn attr_u64(&mut self, ty: u16, value: u64) -> StreamResult<()> {
         self.attr(ty, &value.to_le_bytes())
+    }
+
+    /// Add a `u32` attribute.
+    pub fn attr_u32(&mut self, ty: u16, value: u32) -> StreamResult<()> {
+        self.attr(ty, &value.to_le_bytes())
+    }
+
+    /// Add the `DATA` attribute: with a length in version 1; in version 2
+    /// with none, running to the end of the command, so it has to be the
+    /// command's last attribute.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError::Malformed`] in version 1 for more than a `u16`
+    /// counts.
+    pub fn attr_data(&mut self, value: &[u8]) -> StreamResult<()> {
+        if self.version < 2 {
+            return self.attr(attr::DATA, value);
+        }
+        self.out.extend_from_slice(&attr::DATA.to_le_bytes());
+        self.out.extend_from_slice(value);
+        Ok(())
     }
 
     /// Add a timestamp attribute.
@@ -600,10 +723,29 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] for one that is not read-only, and
     /// whatever reading the tree returns.
     pub fn send_subvolume(&self, id: u64) -> Result<Vec<u8>> {
+        self.send_subvolume_with(id, SendOptions::default())
+    }
+
+    /// A full send stream of subvolume `id`, of the version and with the
+    /// options `opts` names: [`Filesystem::send_subvolume`] is this with
+    /// [`SendOptions::v1`].
+    ///
+    /// In version 2 a preallocated range is sent as a `FALLOCATE` that
+    /// keeps the size, rather than left out, and with
+    /// [`SendOptions::compressed_data`] a compressed extent is sent as an
+    /// `ENCODED_WRITE` of its bytes as they are on disk, as `btrfs send
+    /// --proto 2 --compressed-data` sends them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Filesystem::send_subvolume`], and
+    /// [`Error::UnsupportedFeature`] for options no stream can carry.
+    pub fn send_subvolume_with(&self, id: u64, opts: SendOptions) -> Result<Vec<u8>> {
+        opts.check()?;
         let subvol = self.send_identity(id)?;
         let tree = self.open_subvolume_at(subvol.bytenr)?;
 
-        let mut w = StreamWriter::new();
+        let mut w = StreamWriter::with_version(opts.version);
         w.begin(cmd::SUBVOL);
         w.attr(attr::PATH, &subvol.name)?;
         w.attr(attr::UUID, &subvol.uuid)?;
@@ -637,7 +779,7 @@ impl Filesystem {
                     continue;
                 }
                 let inode = tree.read_inode(entry.ino)?;
-                self.send_create(&tree, &mut w, &path, &inode)?;
+                self.send_create(&tree, &mut w, &path, &inode, opts)?;
                 if inode.is_dir() {
                     queue.push_back((inode.ino, path.clone(), depth + 1));
                 }
@@ -684,6 +826,7 @@ impl Filesystem {
         w: &mut StreamWriter,
         path: &[u8],
         inode: &Inode,
+        opts: SendOptions,
     ) -> Result<()> {
         let kind = inode.file_type().ok_or_else(|| {
             Error::UnsupportedFeature(format!(
@@ -712,7 +855,7 @@ impl Filesystem {
         }
 
         if kind == FileType::Regular {
-            self.send_data(tree, w, path, inode)?;
+            self.send_data(tree, w, path, inode, opts)?;
         }
         for x in tree.list_xattrs(inode.ino)? {
             w.begin(cmd::SET_XATTR);
@@ -728,36 +871,52 @@ impl Filesystem {
         Ok(())
     }
 
-    /// A file's bytes as `WRITE` commands, one per [`SEND_WRITE_CHUNK`]
-    /// at most. Holes and preallocated ranges are left out: both read as
-    /// zeros, and the closing `TRUNCATE` gives the file its size.
+    /// A file's data, extent item by extent item.
+    ///
+    /// Bytes go as `WRITE` commands, one per [`SEND_WRITE_CHUNK`] at most.
+    /// Holes are left out: they read as zeros, and the closing `TRUNCATE`
+    /// gives the file its size. A preallocated range is left out of a
+    /// version-1 stream for the same reason, and kept as a `FALLOCATE` in a
+    /// version-2 one. A compressed extent goes as an `ENCODED_WRITE` when
+    /// [`SendOptions::compressed_data`] asks and the stream can name its
+    /// compression; otherwise its bytes are decoded and written.
     fn send_data(
         &self,
         tree: &Filesystem,
         w: &mut StreamWriter,
         path: &[u8],
         inode: &Inode,
+        opts: SendOptions,
     ) -> Result<()> {
-        for piece in tree.file_extents(inode.ino)? {
-            // Preallocated: no address, and an extent behind it.
-            if piece.logical.is_none() && piece.extent_start != 0 && !piece.compressed {
-                continue;
+        for ((objectid, key_type, start), item) in tree.item_run(inode.ino, EXTENT_DATA_KEY)? {
+            if objectid != inode.ino || key_type != EXTENT_DATA_KEY {
+                break;
             }
-            let end = piece.start.saturating_add(piece.len).min(inode.size);
-            let mut pos = piece.start;
-            while pos < end {
-                let n = (end - pos).min(SEND_WRITE_CHUNK as u64) as usize;
-                let mut buf = vec![0u8; n];
-                let got = tree.read_at(inode.ino, pos, &mut buf)?;
-                buf.truncate(got);
-                if buf.is_empty() {
-                    break;
+            let x = RawExtent::parse(&item, inode.ino, start)?;
+            match x.kind {
+                EXTENT_INLINE => send_writes(
+                    tree,
+                    w,
+                    path,
+                    inode,
+                    start,
+                    start.saturating_add(x.ram_bytes),
+                )?,
+                EXTENT_PREALLOC if opts.version >= 2 => {
+                    w.begin(cmd::FALLOCATE);
+                    w.attr(attr::PATH, path)?;
+                    w.attr_u32(attr::FALLOCATE_MODE, FALLOC_FL_KEEP_SIZE)?;
+                    w.attr_u64(attr::FILE_OFFSET, start)?;
+                    w.attr_u64(attr::SIZE, x.num_bytes)?;
                 }
-                w.begin(cmd::WRITE);
-                w.attr(attr::PATH, path)?;
-                w.attr_u64(attr::FILE_OFFSET, pos)?;
-                w.attr(attr::DATA, &buf)?;
-                pos += buf.len() as u64;
+                EXTENT_PREALLOC => {}
+                _ if x.disk_bytenr == 0 => {} // a hole
+                _ => {
+                    let end = start.saturating_add(x.num_bytes);
+                    if !(opts.compressed_data && send_encoded(tree, w, path, inode, start, &x)?) {
+                        send_writes(tree, w, path, inode, start, end)?;
+                    }
+                }
             }
         }
         Ok(())
@@ -811,6 +970,149 @@ impl Filesystem {
             bytenr: subvol.bytenr,
         })
     }
+}
+
+/// A file extent item's type byte: inline, regular, preallocated.
+const EXTENT_INLINE: u8 = 0;
+const EXTENT_PREALLOC: u8 = 2;
+
+/// The most a compressed extent holds on disk, and so the most one
+/// `ENCODED_WRITE` carries.
+const MAX_COMPRESSED: u64 = 128 * 1024;
+
+/// One file extent item, its fields as stored.
+struct RawExtent {
+    kind: u8,
+    compression: u8,
+    encryption: u8,
+    other_encoding: u16,
+    ram_bytes: u64,
+    disk_bytenr: u64,
+    disk_num_bytes: u64,
+    offset: u64,
+    num_bytes: u64,
+}
+
+impl RawExtent {
+    fn parse(item: &[u8], ino: u64, start: u64) -> Result<Self> {
+        let need = if item.get(file_extent::TYPE) == Some(&EXTENT_INLINE) {
+            file_extent::INLINE_DATA
+        } else {
+            file_extent::REGULAR_SIZE
+        };
+        if item.len() < need {
+            return Err(Error::BadSuperblock(format!(
+                "inode {ino}: the extent item at {start} is {} bytes, {need} needed",
+                item.len()
+            )));
+        }
+        let regular = |at: usize| {
+            if need == file_extent::REGULAR_SIZE {
+                le64(item, at)
+            } else {
+                0
+            }
+        };
+        Ok(Self {
+            kind: item[file_extent::TYPE],
+            compression: item[file_extent::COMPRESSION],
+            encryption: item[file_extent::ENCRYPTION],
+            other_encoding: u16::from_le_bytes(
+                item[file_extent::OTHER_ENCODING..file_extent::OTHER_ENCODING + 2]
+                    .try_into()
+                    .expect("2 bytes"),
+            ),
+            ram_bytes: le64(item, file_extent::RAM_BYTES),
+            disk_bytenr: regular(file_extent::DISK_BYTENR),
+            disk_num_bytes: regular(file_extent::DISK_NUM_BYTES),
+            offset: regular(file_extent::OFFSET),
+            num_bytes: regular(file_extent::NUM_BYTES),
+        })
+    }
+}
+
+/// The stream's number for an extent's compression, for a volume of
+/// `sectorsize`; `None` for none, or one the stream cannot name.
+fn encoded_compression(on_disk: u8, sectorsize: u32) -> Option<u32> {
+    match Compression::from_byte(on_disk).ok()? {
+        Compression::None => None,
+        Compression::Zlib => Some(encoded::ZLIB),
+        Compression::Zstd => Some(encoded::ZSTD),
+        Compression::Lzo => match sectorsize {
+            4096 => Some(encoded::LZO_4K),
+            8192 => Some(encoded::LZO_4K + 1),
+            16384 => Some(encoded::LZO_4K + 2),
+            32768 => Some(encoded::LZO_4K + 3),
+            65536 => Some(encoded::LZO_4K + 4),
+            _ => None,
+        },
+    }
+}
+
+/// `WRITE`s of the file's bytes from `start` to `end`, cut at its size.
+fn send_writes(
+    tree: &Filesystem,
+    w: &mut StreamWriter,
+    path: &[u8],
+    inode: &Inode,
+    start: u64,
+    end: u64,
+) -> Result<()> {
+    let end = end.min(inode.size);
+    let mut pos = start;
+    while pos < end {
+        let n = (end - pos).min(SEND_WRITE_CHUNK as u64) as usize;
+        let mut buf = vec![0u8; n];
+        let got = tree.read_at(inode.ino, pos, &mut buf)?;
+        buf.truncate(got);
+        if buf.is_empty() {
+            break;
+        }
+        w.begin(cmd::WRITE);
+        w.attr(attr::PATH, path)?;
+        w.attr_u64(attr::FILE_OFFSET, pos)?;
+        w.attr_data(&buf)?;
+        pos += buf.len() as u64;
+    }
+    Ok(())
+}
+
+/// A compressed extent as one `ENCODED_WRITE` of its bytes as they are on
+/// disk, filling the file from `start` to the extent's end or the file's
+/// size, whichever comes first. Whether it was sent: an extent the stream
+/// cannot describe is left to [`send_writes`].
+fn send_encoded(
+    tree: &Filesystem,
+    w: &mut StreamWriter,
+    path: &[u8],
+    inode: &Inode,
+    start: u64,
+    x: &RawExtent,
+) -> Result<bool> {
+    let Some(compression) = encoded_compression(x.compression, tree.sb.sectorsize) else {
+        return Ok(false);
+    };
+    let file_len = x.num_bytes.min(inode.size.saturating_sub(start));
+    if x.encryption != 0
+        || x.other_encoding != 0
+        || file_len == 0
+        || x.disk_num_bytes == 0
+        || x.disk_num_bytes > MAX_COMPRESSED
+    {
+        return Ok(false);
+    }
+    let mut packed = vec![0u8; x.disk_num_bytes as usize];
+    tree.read_data_verified(x.disk_bytenr, &mut packed, true)?;
+    w.begin(cmd::ENCODED_WRITE);
+    w.attr(attr::PATH, path)?;
+    w.attr_u64(attr::FILE_OFFSET, start)?;
+    w.attr_u64(attr::UNENCODED_FILE_LEN, file_len)?;
+    w.attr_u64(attr::UNENCODED_LEN, x.ram_bytes)?;
+    w.attr_u64(attr::UNENCODED_OFFSET, x.offset)?;
+    w.attr_u32(attr::COMPRESSION, compression)?;
+    w.attr_u32(attr::ENCRYPTION, 0)?;
+    w.attr_data(&packed)?;
+    Ok(true)
 }
 
 /// An inode item's device number as a send stream carries it.
@@ -966,6 +1268,51 @@ mod tests {
         let s = parse_send_stream(&stream).unwrap();
         assert_eq!(s.version, 2);
         assert_eq!(s.commands[0].attr(attr::DATA).unwrap(), b"no length here");
+    }
+
+    /// A version-2 writer leaves `DATA` unmeasured, so a write longer than
+    /// a `u16` counts goes in one command and parses back whole.
+    #[test]
+    fn a_version_two_write_carries_more_than_a_u16_counts() {
+        let big: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
+        let mut w = StreamWriter::with_version(2);
+        w.begin(cmd::WRITE);
+        w.attr(attr::PATH, b"f").unwrap();
+        w.attr_u64(attr::FILE_OFFSET, 0).unwrap();
+        w.attr_data(&big).unwrap();
+        let s = parse_send_stream(&w.finish()).unwrap();
+        assert_eq!(s.version, 2);
+        assert_eq!(s.commands[0].attr(attr::DATA).unwrap(), &big[..]);
+
+        let mut w = StreamWriter::new();
+        w.begin(cmd::WRITE);
+        assert!(w.attr_data(&big).is_err(), "version 1 cannot carry it");
+    }
+
+    /// The stream numbers compression its own way, and splits LZO by the
+    /// sector size.
+    #[test]
+    fn an_encoded_write_names_its_compression_as_the_stream_does() {
+        assert_eq!(encoded_compression(1, 4096), Some(encoded::ZLIB));
+        assert_eq!(encoded_compression(3, 4096), Some(encoded::ZSTD));
+        assert_eq!(encoded_compression(2, 4096), Some(encoded::LZO_4K));
+        assert_eq!(encoded_compression(2, 65536), Some(encoded::LZO_4K + 4));
+        assert_eq!(encoded_compression(0, 4096), None);
+        assert_eq!(encoded_compression(9, 4096), None);
+    }
+
+    /// Options no stream can carry are refused before anything is read.
+    #[test]
+    fn options_no_stream_carries_are_refused() {
+        assert!(SendOptions::v1().check().is_ok());
+        assert!(SendOptions::v2().with_compressed_data(true).check().is_ok());
+        assert!(SendOptions::v1()
+            .with_compressed_data(true)
+            .check()
+            .is_err());
+        let mut three = SendOptions::v2();
+        three.version = 3;
+        assert!(three.check().is_err());
     }
 
     #[test]

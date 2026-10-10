@@ -114,7 +114,8 @@ Linux kernel in the guest.
 | Reading a version 1 or 2 stream, every checksum verified | Supported | Unreleased (#273) | | `send_stream_kernel.rs` |
 | Writing a full version-1 stream of a read-only subvolume | Supported | Unreleased (#273) | | `send_stream_kernel.rs` |
 | Incremental send streams, written against a parent snapshot | Supported | Unreleased (#273) | | `send_stream_kernel.rs` |
-| Version-2 writes, clone sources | Upcoming | | #273 (PR #320, #324) | |
+| Version-2 send streams, with `FALLOCATE` and compressed extents passed through as `ENCODED_WRITE` | Supported | Unreleased (#273) | | `send_stream_kernel.rs` |
+| Send clone sources | Upcoming | | #273 (PR #324) | |
 | Applying a stream to an image (receive) | Not supported | | #273 | |
 
 ## Interfaces
