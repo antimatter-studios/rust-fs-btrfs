@@ -38,6 +38,9 @@ pub struct ScrubReport {
     /// Data sectors no checksum covers, counting each copy once: read,
     /// and not judged.
     pub data_unverified: u64,
+    /// RAID5/6 full stripes holding allocated bytes whose parity was
+    /// recomputed and compared.
+    pub parity_stripes: u64,
     /// Every bad copy, in address order.
     pub errors: Vec<ScrubError>,
 }
@@ -45,17 +48,23 @@ pub struct ScrubReport {
 /// One copy of one block or sector that is not what was written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrubError {
-    /// The logical address: the tree block's, or the data sector's.
+    /// The logical address: the tree block's, the data sector's, or for
+    /// a parity element the start of its full stripe.
     pub logical: u64,
-    /// Which copy, from 0.
+    /// Which copy, from 0; for a parity element, 0 for P and 1 for Q.
     pub mirror: usize,
     /// Whether it is a tree block or data.
     pub what: ScrubTarget,
     /// What is wrong with it.
     pub detail: String,
     /// Whether another copy of the same bytes verifies, so the damage is
-    /// recoverable. Nothing here repairs it.
+    /// recoverable; for a parity element, whether the data it is computed
+    /// from verifies. Nothing here repairs it.
     pub repairable: bool,
+    /// The device and byte offset on it of the element that is wrong,
+    /// when the error is about one element on one device: a parity
+    /// element, which has no logical address of its own.
+    pub device: Option<(u64, u64)>,
 }
 
 /// Which kind of block a [`ScrubError`] is about.
@@ -65,6 +74,9 @@ pub enum ScrubTarget {
     TreeBlock,
     /// A data sector.
     Data,
+    /// A RAID5/6 parity element, P or Q, that is not what the data of its
+    /// full stripe computes to.
+    Parity,
 }
 
 impl Filesystem {
@@ -140,6 +152,7 @@ impl Filesystem {
                 what: ScrubTarget::TreeBlock,
                 detail,
                 repairable,
+                device: None,
             });
         }
         Ok(())
@@ -181,6 +194,7 @@ impl Filesystem {
                     what: ScrubTarget::Data,
                     detail,
                     repairable,
+                    device: None,
                 });
             }
         }

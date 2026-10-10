@@ -442,6 +442,15 @@ tasks:
       # directory because the seed is refused for writing on purpose
       - test-disks/seed/btrfs-seed.img
       - test-disks/seed/btrfs-sprout.img
+      # RAID5 and RAID6 pools with a parity element damaged on purpose,
+      # and the element as the kernel's scrub rewrote it
+      - test-disks/scrub/btrfs-scrub-raid5-1.img
+      - test-disks/scrub/btrfs-scrub-raid5-2.img
+      - test-disks/scrub/btrfs-scrub-raid5-3.img
+      - test-disks/scrub/btrfs-scrub-raid6-1.img
+      - test-disks/scrub/btrfs-scrub-raid6-2.img
+      - test-disks/scrub/btrfs-scrub-raid6-3.img
+      - test-disks/scrub/btrfs-scrub-raid6-4.img
     # A hung boot must not hold the VM and the machine-wide slot for
     # ever. The split fixtures alone mount and unmount up to four hundred
     # times, and the populated pair writes eighty thousand files, so this

@@ -100,7 +100,7 @@ fn as_many_errors_as_the_kernel_counted() {
         .iter()
         .map(|e| match e.what {
             ScrubTarget::TreeBlock => per_block,
-            ScrubTarget::Data => 1,
+            ScrubTarget::Data | ScrubTarget::Parity => 1,
         })
         .sum();
     assert!(

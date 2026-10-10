@@ -240,6 +240,28 @@ pub fn rebuild(
     }
 }
 
+/// P, and for RAID6 Q, of a full stripe's data elements in data order:
+/// what its parity elements hold when nothing in it is damaged. Every
+/// element is the same length.
+///
+/// Scrub recomputes these to find a damaged parity element (#301), which
+/// no read ever looks at while the data verifies.
+pub fn parity(data: &[&[u8]], raid6: bool) -> (Vec<u8>, Option<Vec<u8>>) {
+    let len = data.first().map_or(0, |d| d.len());
+    let mut p = vec![0u8; len];
+    for d in data {
+        xor_into(&mut p, d);
+    }
+    let q = raid6.then(|| {
+        let mut q = vec![0u8; len];
+        for (i, d) in data.iter().enumerate() {
+            mul_xor_into(&mut q, d, pow_g(i));
+        }
+        q
+    });
+    (p, q)
+}
+
 fn xor_into(acc: &mut [u8], d: &[u8]) {
     for (a, b) in acc.iter_mut().zip(d) {
         *a ^= b;
@@ -274,6 +296,17 @@ mod tests {
             mul_xor_into(&mut q, d, pow_g(i));
         }
         q
+    }
+
+    #[test]
+    fn parity_is_what_rebuilding_from_it_assumes() {
+        for (k, raid6) in [(2, false), (3, false), (2, true), (4, true)] {
+            let data = sample(k);
+            let refs: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+            let (p, q) = parity(&refs, raid6);
+            assert_eq!(p, p_of(&data));
+            assert_eq!(q, raid6.then(|| q_of(&data)));
+        }
     }
 
     fn sample(k: usize) -> Vec<Vec<u8>> {

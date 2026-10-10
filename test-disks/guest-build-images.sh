@@ -1422,6 +1422,173 @@ build_scrub() {
         rm -f "$f"
     done
     note "built scrub/btrfs-scrub"
+
+    build_scrub_parity raid5 3
+    build_scrub_parity raid6 4
+}
+
+# ---------------------------------------------------------------------
+# scrub parity — RAID5 on three devices and RAID6 on four, each with a
+# parity element damaged on purpose: P in one full stripe of an 8 MiB
+# file, and on RAID6 also Q in the next (#301).
+#
+# A read never looks at parity while the data verifies, so a damaged P
+# or Q is found only by a scrub that recomputes it. WHERE THE ELEMENT
+# LIES IS WORKED OUT HERE, never by the reader under test: the chunk as
+# `dump-tree -t chunk` prints it, and the rotation the kernel uses — data
+# element i of full stripe f on stripe (i + f) mod n, P on (k + f) mod n,
+# Q on (k + 1 + f) mod n, with k = n - 1 or n - 2 data elements.
+#
+# Then a copy of the damaged pool is mounted and scrubbed by the kernel
+# with a scrub that may write, which recomputes RAID5/6 parity and
+# rewrites what it finds wrong (the read-only scrub does not check
+# parity). The element as the kernel rewrote it is hashed into the
+# manifest, beside the addresses of the data elements it was computed
+# from; the copy is discarded.
+#
+#   scrub/btrfs-scrub-<profile>-<n>.img   the damaged members, devid order
+#   scrub/btrfs-scrub-<profile>.manifest
+#     damaged <P|Q> <devid> <physical> <stripe_len>
+#     data <P|Q> <devid>:<physical>...   the full stripe's data elements, in order
+#     kernel <P|Q> <sha256 of the element after the kernel's scrub>
+# ---------------------------------------------------------------------
+build_scrub_parity() {
+    local profile="$1" count="$2" parity i f
+    local manifest="$WORK/btrfs-scrub-$profile.manifest"
+    local loops=() imgs=() copies=()
+    case "$profile" in
+        raid5) parity=1 ;;
+        raid6) parity=2 ;;
+    esac
+    for i in $(seq 1 "$count"); do
+        f="$WORK/btrfs-scrub-$profile-$i.img"
+        rm -f "$f"
+        truncate -s 256M "$f"
+        imgs+=("$f")
+        loops+=("$(losetup --find --show "$f")")
+    done
+    scrub_parity_cleanup() {
+        mountpoint -q "$MNT" && umount "$MNT" || true
+        for f in "${loops[@]}"; do losetup -d "$f" 2>/dev/null || true; done
+        btrfs device scan --forget >/dev/null 2>&1 || true
+    }
+    trap 'scrub_parity_cleanup; cleanup' EXIT
+
+    mkfs.btrfs -f -d "$profile" -m "$profile" "${loops[@]}" >/dev/null 2>&1
+    mount "${loops[0]}" "$MNT"
+    dd if=/dev/urandom of="$MNT/big.bin" bs=1M count=8 status=none
+    echo "small" > "$MNT/small.txt"
+    sync
+    umount "$MNT"
+
+    # big.bin's data extent: the largest one the fs tree names.
+    local x nr
+    read -r x nr < <(btrfs inspect-internal dump-tree -t 5 "${loops[0]}" \
+        | awk '/extent data disk byte/ && $5 != 0 && $7 + 0 > best + 0 { best = $7; at = $5 }
+               END { print at, best }')
+    # The data chunk holding it (type DATA|..., not METADATA): logical,
+    # stripe_len, stripes, then each stripe as devid:offset in stripe order.
+    local chunk
+    chunk=$(btrfs inspect-internal dump-tree -t chunk "${loops[0]}" | awk -v x="$x" '
+        /CHUNK_ITEM/ { logical = $6; sub(/\)$/, "", logical); next }
+        $1 == "length" { len = $2; stripe_len = $6; type = $8; next }
+        $1 == "stripe" && $3 == "devid" {
+            dev[$2] = $4; off[$2] = $6; n = $2 + 1
+            if (type ~ /^DATA/ && x + 0 >= logical + 0 && x + 0 < logical + len) {
+                line = logical " " stripe_len " " n
+                for (j = 0; j < n; j++) line = line " " dev[j] ":" off[j]
+                found = line
+            }
+        }
+        END { print found }')
+    local logical stripe_len n rest
+    local -a stripes
+    read -r logical stripe_len n rest <<< "$chunk"
+    read -r -a stripes <<< "$rest"
+    [ -n "$x" ] && [ -n "$logical" ] && [ "$n" = "$count" ] && [ "${#stripes[@]}" = "$count" ] || {
+        echo "guest-build-images: btrfs-scrub-$profile: no $count-stripe data chunk holds the file (extent '$x', chunk '$chunk')" >&2
+        exit 1
+    }
+    local k=$((n - parity))
+    local fss=$((k * stripe_len))
+    local first=$(( (x - logical + fss - 1) / fss ))
+    [ $(( (first + 2) * fss )) -le $(( x - logical + nr )) ] || {
+        echo "guest-build-images: btrfs-scrub-$profile: the file's extent holds fewer than two whole full stripes" >&2
+        exit 1
+    }
+
+    # element <stripe index> <full stripe>: devid:physical.
+    element() {
+        echo "${stripes[$1]%%:*}:$(( ${stripes[$1]#*:} + $2 * stripe_len ))"
+    }
+    local what fs at line
+    local specs=("P $first")
+    [ "$parity" = 2 ] && specs+=("Q $((first + 1))")
+    : > "$manifest"
+    for spec in "${specs[@]}"; do
+        read -r what fs <<< "$spec"
+        case "$what" in
+            P) at=$(element $(( (k + fs) % n )) "$fs") ;;
+            Q) at=$(element $(( (k + 1 + fs) % n )) "$fs") ;;
+        esac
+        echo "damaged $what ${at%%:*} ${at#*:} $stripe_len" >> "$manifest"
+        line="data $what"
+        for i in $(seq 0 $((k - 1))); do
+            line="$line $(element $(( (i + fs) % n )) "$fs")"
+        done
+        echo "$line" >> "$manifest"
+    done
+
+    for f in "${loops[@]}"; do losetup -d "$f"; done
+    loops=()
+    btrfs device scan --forget >/dev/null 2>&1 || true
+
+    # 64 bytes inside the element's first sector.
+    local devid physical
+    while read -r _ what devid physical _; do
+        dd if=/dev/urandom of="${imgs[$((devid - 1))]}" bs=1 seek=$((physical + 512)) count=64 \
+            conv=notrunc status=none
+    done < <(grep '^damaged ' "$manifest")
+
+    # The kernel's scrub, on a copy: it rewrites the parity it finds wrong.
+    for f in "${imgs[@]}"; do
+        cp --sparse=always "$f" "$f.kernel"
+        copies+=("$f.kernel")
+        loops+=("$(losetup --find --show "$f.kernel")")
+    done
+    btrfs device scan "${loops[@]}" >/dev/null
+    mount "${loops[0]}" "$MNT"
+    {
+        echo "# btrfs scrub start -B -R"
+        btrfs scrub start -B -R "$MNT" 2>&1 | sed 's/^/# /' || true
+    } >> "$manifest"
+    umount "$MNT"
+    for f in "${loops[@]}"; do losetup -d "$f"; done
+    loops=()
+    btrfs device scan --forget >/dev/null 2>&1 || true
+    trap cleanup EXIT
+
+    local before after
+    while read -r _ what devid physical len; do
+        before=$(dd if="${imgs[$((devid - 1))]}" bs=4096 skip=$((physical / 4096)) \
+            count=$((len / 4096)) status=none | sha256sum | cut -d' ' -f1)
+        after=$(dd if="${copies[$((devid - 1))]}" bs=4096 skip=$((physical / 4096)) \
+            count=$((len / 4096)) status=none | sha256sum | cut -d' ' -f1)
+        [ "$before" != "$after" ] || {
+            echo "guest-build-images: btrfs-scrub-$profile: the kernel's scrub left the damaged $what element at device $devid, $physical as it was" >&2
+            exit 1
+        }
+        echo "kernel $what $after" >> "$manifest"
+    done < <(grep '^damaged ' "$manifest")
+    rm -f "${copies[@]}"
+
+    mkdir -p "$OUT/scrub"
+    for f in "${imgs[@]}" "$manifest"; do
+        cp --sparse=always "$f" "$OUT/scrub/$(basename "$f").partial"
+        mv -f "$OUT/scrub/$(basename "$f").partial" "$OUT/scrub/$(basename "$f")"
+        rm -f "$f"
+    done
+    note "built scrub/btrfs-scrub-$profile-1..$count (${profile^^} with parity damaged on purpose)"
 }
 
 # ---------------------------------------------------------------------
