@@ -59,6 +59,13 @@ never does.
   range still allocated.
 - **`send::StreamError`**, its own error type. A malformed stream is bytes
   handed in, not a damaged volume, so it is kept out of the crate's `Error`.
+- **A trim.** `Filesystem::trim_ranges` lists every free run of every block
+  group, from the free-space tree (or the extent tree's gaps without one),
+  mapped to the device range of each copy, and `Filesystem::trim` hands each to
+  a discard the caller supplies, on a read-write mount, changing nothing on the
+  filesystem. Checked against the free runs `btrfs inspect-internal dump-tree`
+  lists and the copies its chunk tree places (#305). RAID5/6 groups are
+  refused.
 - **An unreplayed log tree can be read.** `Filesystem::log` returns every item
   of every subvolume's log tree, with the logged inodes, names and file
   contents, and `Filesystem::mount_ignoring_log` opens such a volume read-only
