@@ -37,7 +37,10 @@
 //! on disk, or both read zeros (a hole or a preallocated range), or both
 //! hold the same inline item. Every other range inside the child's size is
 //! written from the child, zeros included, and a file whose data or size
-//! changed is truncated to the child's size. Then extended attributes are
+//! changed is truncated to the child's size. A file the child adds is sent
+//! as in a full stream, except that a run of data it shares with one of the
+//! parent's files -- a reflink copy -- is cloned from the parent's copy,
+//! which the receiver has. Then extended attributes are
 //! set or removed, the owner set (and the mode after it, because a change
 //! of owner clears set-user-ID), and the mode set. Last, deepest first,
 //! the times of every inode that is new, whose times changed, or that the
@@ -47,7 +50,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::{
-    attr, cmd, SendOptions, StreamWriter, EXTENT_INLINE, EXTENT_PREALLOC, SEND_WRITE_CHUNK,
+    attr, cmd, RawExtent, SendCtx, SendOptions, StreamWriter, EXTENT_INLINE, EXTENT_PREALLOC,
+    SEND_WRITE_CHUNK,
 };
 use crate::error::{Error, Result};
 use crate::fs::{file_extent, Filesystem, EXTENT_DATA_KEY};
@@ -434,6 +438,34 @@ impl Filesystem {
         w.attr(attr::CLONE_UUID, &parent_id.uuid)?;
         w.attr_u64(attr::CLONE_CTRANSID, parent_id.ctransid)?;
 
+        // A file the child adds can clone from the parent's files, which
+        // the receiver holds as they were, or from one added before it.
+        let mut ctx = SendCtx::new(opts, &child_id);
+        let mut parent_names = Namespace::default();
+        for (dir, name, id) in &p.entries {
+            parent_names.add(*dir, name, *id);
+        }
+        for (id, inode) in &p.inodes {
+            if !inode.is_regular_file() {
+                continue;
+            }
+            let path = parent_names.path(*id)?;
+            for ((objectid, key_type, start), item) in ptree.item_run(inode.ino, EXTENT_DATA_KEY)? {
+                if objectid != inode.ino || key_type != EXTENT_DATA_KEY {
+                    break;
+                }
+                let x = RawExtent::parse(&item, inode.ino, start)?;
+                ctx.clones.add(
+                    &x,
+                    start,
+                    parent_id.uuid,
+                    parent_id.ctransid,
+                    &path,
+                    inode.size,
+                );
+            }
+        }
+
         let plan = plan_names(
             &p.entries,
             &c.entries,
@@ -457,7 +489,7 @@ impl Filesystem {
                     w.attr(attr::PATH_LINK, existing)?;
                 }
                 NameOp::Create { path, id } => {
-                    self.send_create(&ctree, &mut w, path, &c.inodes[id], opts)?;
+                    self.send_create(&ctree, &mut w, path, &c.inodes[id], &mut ctx)?;
                 }
                 NameOp::Rmdir(path) => {
                     w.begin(cmd::RMDIR);
