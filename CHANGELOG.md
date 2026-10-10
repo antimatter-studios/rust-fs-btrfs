@@ -68,6 +68,14 @@ never does.
 - **A data sector that fails its checksum is read from the next copy.** The
   second copy of a DUP or RAID1 chunk was used for tree blocks only; a file's
   data now falls back the same way before it is refused (#268).
+- **A pool with members missing mounts degraded.**
+  `Filesystem::mount_pool_degraded` accepts fewer devices than the pool spans,
+  as the kernel's `-o degraded` does, and reads every element on a missing
+  member the other way its chunk offers: the other copy, or a rebuild from
+  parity. A loss some chunk cannot survive (any member of a single, RAID0 or
+  DUP chunk; two of RAID5; three of RAID6) is refused at mount, naming the
+  chunk. Checked against the kernel-written RAID5 pool without each member,
+  RAID6 without every pair and RAID1 without either (#300).
 
 ### Changed
 

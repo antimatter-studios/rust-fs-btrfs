@@ -750,6 +750,32 @@ impl Filesystem {
     /// two of them are not the same filesystem, or when two claim the
     /// same device id.
     pub fn mount_pool(devices: Vec<Arc<dyn BlockRead>>) -> Result<Self> {
+        Self::mount_pool_with(devices, false)
+    }
+
+    /// [`Filesystem::mount_pool`] with members missing, as the kernel's
+    /// `-o degraded` mounts one.
+    ///
+    /// Every element on a missing device is lost, and is read the other
+    /// way its chunk offers: another copy of a mirrored chunk, or a
+    /// rebuild from the rest of a RAID5/6 full stripe and its parity
+    /// (#300). Which members are missing is read from the chunk stripes
+    /// that name a devid no given device carries.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] when some chunk cannot be read
+    /// without the missing members: a single, RAID0 or DUP chunk with a
+    /// stripe on one, a mirrored chunk with every copy on them, more than
+    /// one missing member of a RAID5 chunk or two of a RAID6 chunk. That
+    /// is checked once the chunk map is read, before any file is; the
+    /// mount does not hand out a filesystem that fails on the first read
+    /// that lands on a lost element. Otherwise as [`Filesystem::mount_pool`].
+    pub fn mount_pool_degraded(devices: Vec<Arc<dyn BlockRead>>) -> Result<Self> {
+        Self::mount_pool_with(devices, true)
+    }
+
+    fn mount_pool_with(devices: Vec<Arc<dyn BlockRead>>, degraded: bool) -> Result<Self> {
         if devices.is_empty() {
             return Err(Error::UnsupportedFeature(
                 "a pool needs at least one device".to_string(),
@@ -788,7 +814,7 @@ impl Filesystem {
             .next()
             .expect("at least one device, checked above")
             .clone();
-        Self::open_pool(first, by_id, None, None)
+        Self::open_pool_with(first, by_id, None, None, degraded)
     }
 
     /// `known` is a superblock selection already read from `device`'s
@@ -799,6 +825,19 @@ impl Filesystem {
         devices: BTreeMap<u64, Arc<dyn BlockRead>>,
         writable: Option<Arc<dyn BlockDevice>>,
         known: Option<(crate::superblock::Superblock, usize)>,
+    ) -> Result<Self> {
+        Self::open_pool_with(device, devices, writable, known, false)
+    }
+
+    /// [`Filesystem::open_pool`], and with `degraded` a pool given fewer
+    /// devices than it spans, provided every chunk can be read without
+    /// the rest; see [`Filesystem::mount_pool_degraded`].
+    fn open_pool_with(
+        device: Arc<dyn BlockRead>,
+        devices: BTreeMap<u64, Arc<dyn BlockRead>>,
+        writable: Option<Arc<dyn BlockDevice>>,
+        known: Option<(crate::superblock::Superblock, usize)>,
+        degraded: bool,
     ) -> Result<Self> {
         let (sb, copy) = match known {
             Some(selection) if writable.is_none() => selection,
@@ -825,7 +864,12 @@ impl Filesystem {
         // data it does not even fail. Silently reading one disk of a
         // pool as though it were the whole pool is worse than not
         // opening it.
-        if sb.num_devices > 1 && devices.len() as u64 != sb.num_devices {
+        // DEGRADED, FEWER IS A CHOICE. A pool missing members is still
+        // refused unless the caller asked for it, and then only once the
+        // chunk map shows every chunk survives without them (below).
+        let short_by_choice =
+            degraded && !devices.is_empty() && (devices.len() as u64) < sb.num_devices;
+        if sb.num_devices > 1 && devices.len() as u64 != sb.num_devices && !short_by_choice {
             return Err(Error::UnsupportedFeature(format!(
                 "this filesystem spans {} devices and {} {} given; reading one of them \
                  alone would return the wrong data rather than fail. Open it with \
@@ -854,6 +898,9 @@ impl Filesystem {
 
         // Step 2: the bootstrap map, enough to reach the chunk tree.
         let boot = ChunkMap::bootstrap(&sb)?;
+        if short_by_choice {
+            Self::refuse_unreadable_without_missing(&boot, &devices)?;
+        }
 
         // Step 3: walk the chunk tree through it and fold in every chunk.
         let mut map = boot.clone();
@@ -903,6 +950,10 @@ impl Filesystem {
                     _ => map.insert(chunk)?,
                 }
             }
+        }
+
+        if short_by_choice {
+            Self::refuse_unreadable_without_missing(&map, &devices)?;
         }
 
         // Step 4: the root tree names the fs tree, and the csum tree.
@@ -989,6 +1040,58 @@ impl Filesystem {
         }
     }
 
+    /// Refuse a degraded pool some chunk of which cannot be read without
+    /// the devices that were not given.
+    ///
+    /// A chunk survives losing the devices its redundancy covers: any one
+    /// copy of a RAID1, RAID1C3 or RAID1C4 chunk; one copy of every
+    /// sub-stripe pair of a RAID10 chunk; one member of a RAID5 chunk and
+    /// two of a RAID6 chunk, rebuilt from parity. A single, RAID0 or DUP
+    /// chunk with a stripe on a missing device has lost bytes nothing
+    /// else holds.
+    fn refuse_unreadable_without_missing(
+        map: &ChunkMap,
+        devices: &BTreeMap<u64, Arc<dyn BlockRead>>,
+    ) -> Result<()> {
+        use crate::chunk::ChunkProfile;
+        let present = |devid: &u64| devices.contains_key(devid);
+        for chunk in map.chunks() {
+            let missing: std::collections::BTreeSet<u64> = chunk
+                .stripes
+                .iter()
+                .map(|s| s.devid)
+                .filter(|d| !present(d))
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+            let profile = chunk.profile()?;
+            let survives = match profile {
+                ChunkProfile::Single | ChunkProfile::Raid0 | ChunkProfile::Dup => false,
+                ChunkProfile::Raid1 | ChunkProfile::Raid1c3 | ChunkProfile::Raid1c4 => {
+                    chunk.stripes.iter().any(|s| present(&s.devid))
+                }
+                ChunkProfile::Raid10 => chunk
+                    .stripes
+                    .chunks(usize::from(chunk.sub_stripes.max(1)))
+                    .all(|group| group.iter().any(|s| present(&s.devid))),
+                ChunkProfile::Raid5 => missing.len() <= 1,
+                ChunkProfile::Raid6 => missing.len() <= 2,
+            };
+            if !survives {
+                return Err(Error::UnsupportedFeature(format!(
+                    "the {} chunk at {} has stripes on device(s) {:?}, which were not given, \
+                     and cannot be read without them; a degraded mount reads only what the \
+                     remaining devices still hold whole",
+                    profile.name(),
+                    chunk.logical,
+                    missing
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn read_logical_pool(
         device: &Arc<dyn BlockRead>,
         devices: &BTreeMap<u64, Arc<dyn BlockRead>>,
@@ -1040,13 +1143,30 @@ impl Filesystem {
             if n == 0 {
                 return Err(Error::UnmappedLogical(logical + done as u64));
             }
-            let dev = devices.get(&m.devid).ok_or_else(|| {
-                Error::UnsupportedFeature(format!(
-                    "the range at {} lives on device {}, which was not given",
-                    logical + done as u64,
+            let Some(dev) = devices.get(&m.devid) else {
+                // A LOST ELEMENT, ON A DEGRADED MOUNT (#300). The first
+                // way of reading these bytes names a device that was not
+                // given, so they are read every other way the chunk
+                // offers, in turn: another copy, or a parity rebuild.
+                // Each of those that also needs a missing device fails
+                // and the next is tried. Only the first attempt does
+                // this; the others are what it falls back on.
+                if mirror == 0 {
+                    let attempts = map.read_attempts_at(at)?;
+                    let span = &mut buf[done..done + n];
+                    if (1..attempts).any(|attempt| {
+                        Self::read_logical_pool_mirror(device, devices, map, attempt, at, span)
+                            .is_ok()
+                    }) {
+                        done += n;
+                        continue;
+                    }
+                }
+                return Err(Error::UnsupportedFeature(format!(
+                    "the range at {at} lives on device {}, which was not given",
                     m.devid
-                ))
-            })?;
+                )));
+            };
             dev.read_at(m.physical, &mut buf[done..done + n])?;
             done += n;
         }

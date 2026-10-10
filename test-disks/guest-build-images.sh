@@ -1052,6 +1052,9 @@ build_pool() {
 
     build_parity_pool raid5 3
     build_parity_pool raid6 4
+    # And one with no redundancy at all, which a degraded mount must
+    # refuse: losing either member loses bytes nothing else holds (#300).
+    build_parity_pool raid0 2
 }
 
 # ---------------------------------------------------------------------
