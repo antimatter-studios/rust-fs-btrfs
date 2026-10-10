@@ -41,6 +41,12 @@ never does.
   times. `tests/send_stream_kernel.rs` has the guest's `btrfs receive` apply
   it on top of the parent and the kernel show the child exactly, and parses
   the kernel's own incremental stream against `btrfs receive --dump`.
+- **A read-only scrub.** `Filesystem::scrub` reads every copy of every tree
+  block and data sector the extent tree says is allocated, checks each against
+  its checksum (and a tree block against its own address and filesystem), and
+  reports every bad copy with whether another copy of it verifies. Nothing is
+  repaired. Checked against the kernel's `btrfs scrub start -r` on a DUP volume
+  with three copies damaged on purpose (#268).
 - **Version-2 send streams are written, with compressed data passed through
   (#273).** `Filesystem::send_subvolume_with` and
   `Filesystem::send_subvolume_incremental_with` take `send::SendOptions`: a

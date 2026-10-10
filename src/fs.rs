@@ -1328,6 +1328,35 @@ impl Filesystem {
         Ok(n)
     }
 
+    /// Copy `mirror` of the logical range, read as it lies: no checksum,
+    /// no fallback. For scrub, which judges each copy itself.
+    pub(crate) fn read_mirror_unverified(
+        &self,
+        logical: u64,
+        mirror: usize,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        Self::read_logical_pool_mirror(&self.device, &self.devices, &self.map, mirror, logical, buf)
+    }
+
+    /// Every data checksum the csum tree holds for `[start, start + len)`,
+    /// by sector address; empty on a volume with no csum tree.
+    pub(crate) fn data_digests(&self, start: u64, len: u64) -> Result<crate::csum::SectorDigests> {
+        let Some(csum_root) = self.csum_tree_root else {
+            return Ok(crate::csum::SectorDigests::new());
+        };
+        let reader = self.pool_reader();
+        let tree = reader.tree();
+        crate::csum::digests_for_range(
+            &tree,
+            csum_root,
+            self.sb.csum_type.digest_len(),
+            u64::from(self.sb.sectorsize),
+            start,
+            len,
+        )
+    }
+
     /// A handle over the same device, reading a different tree.
     ///
     /// Used by [`Filesystem::open_subvolume`]. The device, superblock
