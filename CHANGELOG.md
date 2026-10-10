@@ -38,6 +38,15 @@ never does.
   `btrfs send` wrote parses into the commands `btrfs receive --dump` lists and
   replays into the snapshot the kernel shows, and `btrfs receive` rebuilds the
   same snapshot from a stream this crate wrote.
+- **A scrub checks RAID5/6 parity (#301).** `Filesystem::scrub` recomputes P,
+  and Q, for every full stripe holding allocated bytes and compares them with
+  what is on disk, in the sectors some data element holds, as the kernel's
+  scrub does. A mismatch is a `ScrubTarget::Parity` error naming the element's
+  device and offset (`ScrubError::device`), repairable when its data verifies;
+  `ScrubReport::parity_stripes` counts the full stripes checked. Checked
+  against RAID5 and RAID6 pools with P and Q damaged on purpose, located from
+  the chunk tree as btrfs-progs prints it, and the parity the kernel's own
+  scrub wrote back over them.
 - **Incremental send streams are written (#273).**
   `Filesystem::send_subvolume_incremental` writes what changed between two
   read-only snapshots, as `btrfs send -p` does: names taken away, moved and
