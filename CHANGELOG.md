@@ -125,6 +125,12 @@ never does.
 - **A data sector that fails its checksum is read from the next copy.** The
   second copy of a DUP or RAID1 chunk was used for tree blocks only; a file's
   data now falls back the same way before it is refused (#268).
+- **A volume with simple quotas is read.** The `simple_quota` incompat bit
+  refused the mount; it moves no file's bytes, so a read-only mount now
+  accepts it, checked against a volume btrfs-progs 7.1 formatted with
+  `-O squota --rootdir`, which `btrfs check` finds clean. An extent carrying an
+  owner reference, which only a kernel of 6.7 or later writes, is not covered
+  yet. A read-write mount is refused, naming simple quotas (#270).
 - **A pool with members missing mounts degraded.**
   `Filesystem::mount_pool_degraded` accepts fewer devices than the pool spans,
   as the kernel's `-o degraded` does, and reads every element on a missing
@@ -143,12 +149,6 @@ never does.
   still overwritten in place, and any other unchecksummed file is written into
   new extents and committed as one transaction. What that path cannot write yet
   is refused with the case named and #261 cited (#274).
-- **A volume with simple quotas is read.** The `simple_quota` incompat bit
-  refused the mount; it moves no file's bytes, so a read-only mount now
-  accepts it, checked against a volume btrfs-progs 7.1 formatted with
-  `-O squota --rootdir`, which `btrfs check` finds clean. An extent carrying an
-  owner reference, which only a kernel of 6.7 or later writes, is not covered
-  yet. A read-write mount is refused, naming simple quotas (#270).
 
 ### Fixed
 
