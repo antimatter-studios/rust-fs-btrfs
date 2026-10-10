@@ -12,6 +12,15 @@ never does.
   Each feature's state, the release it shipped in, its tracking issue and the
   test that checks it. The README's status table is a short summary pointing
   to it, and `tests/docs_describe_the_code.rs` reads its rows from the page.
+- **A subvolume can be made read-only or writable again (#267, first
+  slice).** `Filesystem::set_subvolume_read_only` sets or clears bit 0 of the
+  subvolume's `ROOT_ITEM` flags and commits it as one copy-on-write
+  transaction, as `btrfs property set <subvol> ro` does. A received subvolume is
+  refused when made writable, because its received UUID would have to be
+  cleared. `tests/subvol_readonly_kernel.rs` has `btrfs check` find the volume
+  clean, `btrfs property get` report the new flags, and the kernel refuse a
+  write into the newly read-only subvolume and accept one into the newly
+  writable snapshot.
 - **The C ABI mounts a pool and opens a subvolume.** `fs_btrfs_mount_pool`
   takes every device of a multi-device filesystem, in any order, and
   `fs_btrfs_open_subvolume` gives a read-only handle rooted at one subvolume

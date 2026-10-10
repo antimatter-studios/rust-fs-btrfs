@@ -44,8 +44,10 @@
 //! as unsigned. A filter of "256 or above" admits it; the range has an
 //! upper end as well as a lower one, and [`LAST_FREE_OBJECTID`] is it.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::fs::Filesystem;
+use crate::super_write::Commit;
+use crate::transaction::DataWrite;
 
 use crate::fs::ROOT_ITEM_KEY;
 
@@ -491,6 +493,126 @@ fn empty_subvolume_dir(dir: &crate::inode::Inode) -> crate::inode::Inode {
         ctime: dir.ctime,
         otime: dir.ctime,
         ..dir.clone()
+    }
+}
+
+/// How many rounds a flag change's plan may take to close over its own
+/// bookkeeping, as for a file write.
+const PLAN_ROUNDS: usize = 64;
+
+/// Where a `ROOT_ITEM`'s received UUID is: after `generation_v2`, the
+/// subvolume's own UUID and its parent's.
+const ROOT_ITEM_RECEIVED_UUID: usize = root_item::GENERATION_V2 + 8 + 2 * 16;
+
+impl Filesystem {
+    /// Make subvolume `id` read-only, or writable again, and commit it.
+    ///
+    /// What `btrfs property set <subvol> ro true|false` does: bit 0 of the
+    /// `ROOT_ITEM`'s flags, in a root tree leaf rewritten copy-on-write as
+    /// one transaction. Nothing inside the subvolume changes. Asking for
+    /// the state it is already in commits nothing.
+    ///
+    /// A received subvolume (one `btrfs receive` made, carrying a received
+    /// UUID) is refused when made writable: an incremental stream applied
+    /// to it later trusts that it has not changed since it was received,
+    /// and the kernel clears the received UUID to keep that true, which
+    /// this does not do yet.
+    ///
+    /// Takes `&mut self` because a commit moves the trees this mount reads;
+    /// the mount is reopened on the new generation, as after
+    /// [`Filesystem::write`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] unless mounted with [`Filesystem::mount_rw`],
+    /// [`Error::NotFound`] for an id no subvolume has, and
+    /// [`Error::UnsupportedFeature`] for a received subvolume made writable
+    /// or a transaction the planner refuses.
+    pub fn set_subvolume_read_only(&mut self, id: u64, read_only: bool) -> Result<()> {
+        if self.writable.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        if !is_subvolume_id(id) {
+            return Err(Error::NotFound);
+        }
+        let item = self
+            .root_tree_items()?
+            .into_iter()
+            .find(|(objectid, key_type, _, _)| *objectid == id && *key_type == ROOT_ITEM_KEY)
+            .map(|(_, _, _, data)| data)
+            .ok_or(Error::NotFound)?;
+        if item.len() < root_item::MIN_SIZE {
+            return Err(Error::UnsupportedFeature(format!(
+                "subvolume {id}'s root item is {} bytes, too short to hold its flags",
+                item.len()
+            )));
+        }
+        let flags = u64::from_le_bytes(
+            item[root_item::FLAGS..root_item::FLAGS + 8]
+                .try_into()
+                .expect("8 bytes"),
+        );
+        let wanted = if read_only {
+            flags | ROOT_SUBVOL_RDONLY
+        } else {
+            flags & !ROOT_SUBVOL_RDONLY
+        };
+        if wanted == flags {
+            return Ok(());
+        }
+        let received = item
+            .get(ROOT_ITEM_RECEIVED_UUID..ROOT_ITEM_RECEIVED_UUID + 16)
+            .is_some_and(|u| u.iter().any(|&b| b != 0));
+        if !read_only && received {
+            return Err(Error::UnsupportedFeature(format!(
+                "subvolume {id} was received from a send stream, and making it writable \
+                 means clearing its received UUID, which is not implemented"
+            )));
+        }
+
+        let leaf = self.root_item_leaf(id)?.ok_or(Error::NotFound)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let change = DataWrite {
+            root: FS_TREE_OBJECTID,
+            time: (now.as_secs(), now.subsec_nanos()),
+            root_flags: Some((id, wanted)),
+            ..Default::default()
+        };
+        let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
+            Error::UnsupportedFeature("the generation counter is exhausted".into())
+        })?;
+        let plan = self.plan_transaction_closed_with(&[leaf], &change, PLAN_ROUNDS)?;
+        let blocks = self.render_plan_with(&plan, &change, generation)?;
+        let root = self.planned_root(&plan).ok_or_else(|| {
+            Error::UnsupportedFeature("the flag change's plan does not move the root tree".into())
+        })?;
+        let delta = plan.usage_delta(u64::from(self.sb.nodesize));
+        let bytes_used = match delta {
+            0 => None,
+            d => Some(
+                u64::try_from(i128::from(self.sb.bytes_used) + d).map_err(|_| {
+                    Error::UnsupportedFeature(format!(
+                        "the superblock's {} bytes used cannot move by {d}",
+                        self.sb.bytes_used
+                    ))
+                })?,
+            ),
+        };
+        self.commit(
+            &blocks,
+            &Commit {
+                generation,
+                root,
+                bytes_used,
+                invalidate_free_space_tree: false,
+                ..Default::default()
+            },
+        )?;
+        let device = std::sync::Arc::clone(self.writable.as_ref().expect("checked above"));
+        *self = Filesystem::mount_rw(device)?;
+        Ok(())
     }
 }
 
