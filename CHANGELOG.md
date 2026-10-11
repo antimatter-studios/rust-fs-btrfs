@@ -102,6 +102,11 @@ never does.
   filesystem. Checked against the free runs `btrfs inspect-internal dump-tree`
   lists and the copies its chunk tree places (#305). RAID5/6 groups are
   refused.
+- **A name can be moved.** `Filesystem::rename` commits one transaction that
+  removes the old entries and reference and files new ones under a fresh
+  index in the destination, replacing a name already there as POSIX `rename`
+  does. The C ABI gains `fs_btrfs_rename` (ENOTDIR, EISDIR, ENOTEMPTY and
+  EINVAL where POSIX says), and `fs.btrfs` gains `mv` (#262).
 - **A read-only scrub.** `Filesystem::scrub` reads every copy of every tree
   block and data sector the extent tree says is allocated, checks each against
   its checksum (and a tree block against its own address and filesystem), and
