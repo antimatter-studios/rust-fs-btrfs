@@ -93,7 +93,7 @@ node_write_oracle         4
 oracle_vm_fixtures        3
 pool_degraded             7
 pool_oracle               4
-pool_write_kernel         4
+pool_write_kernel         5
 prealloc_extent_write     1
 raid56_oracle             6
 raid56_write_kernel       2
@@ -124,6 +124,7 @@ super_write_oracle        3
 test_contract             7
 transaction_oracle        5
 transaction_plan          7
+truncate_kernel           1
 tree_write_oracle         6
 trim_oracle               3
 write_oracle              3
