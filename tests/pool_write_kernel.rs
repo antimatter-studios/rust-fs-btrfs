@@ -253,3 +253,41 @@ fn a_name_and_a_mode_are_changed_on_a_pool() {
         String::from_utf8_lossy(&read.out.stderr)
     );
 }
+
+/// A truncate commits through the same path as the name and attribute
+/// edits, so on a pool it must reopen every member after its commit too
+/// (#336): reopening one device fails on a pool, having committed.
+#[test]
+fn a_file_is_truncated_on_a_pool() {
+    let scratch = Scratch::new("truncate");
+    let members = scratch.members();
+    let mut fs = Filesystem::mount_pool_rw(devices(&members)).expect("the pool mounts read-write");
+    let ino = fs.lookup_path(NOSUM).expect("the nodatasum file").ino;
+    let before = fs.read_file(ino).expect("reading it before the truncate");
+    assert!(before.len() > 8192, "{NOSUM} is {} bytes", before.len());
+    fs.truncate(ino, 4096)
+        .unwrap_or_else(|e| panic!("truncate on a pool: {e}"));
+    assert_eq!(fs.read_file(ino).expect("reading it back"), before[..4096]);
+    drop(fs);
+
+    let images: Vec<String> = members
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let images: Vec<&str> = images.iter().map(String::as_str).collect();
+    let read = guest_kernel_pool_read(
+        &images,
+        "stat -c '%s' \"$MNT/nosum.bin\"; sha256sum \"$MNT/nosum.bin\" | cut -d' ' -f1",
+    );
+    assert_eq!(
+        read.check_status, 0,
+        "btrfs check --readonly does not find the pool clean:\n{}",
+        read.check
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&read.out.stdout).trim(),
+        format!("4096\n{}", sha256_hex(&before[..4096])),
+        "the kernel does not read the truncated file back:\n{}",
+        String::from_utf8_lossy(&read.out.stderr)
+    );
+}
