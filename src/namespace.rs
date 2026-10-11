@@ -467,7 +467,7 @@ impl Filesystem {
 
     /// Plan, render and commit `edits` to the fs tree as one transaction,
     /// then reopen the mount on the generation just written.
-    fn commit_edits(
+    pub(crate) fn commit_edits(
         &mut self,
         ino: u64,
         edits: Vec<ItemEdit>,
@@ -523,7 +523,7 @@ impl Filesystem {
     }
 
     /// Refuse a read-only mount, and one whose tree is not tree 5.
-    fn require_writable_top_level(&self) -> Result<()> {
+    pub(crate) fn require_writable_top_level(&self) -> Result<()> {
         if self.writable.is_none() {
             return Err(Error::ReadOnly);
         }
@@ -557,7 +557,7 @@ impl Filesystem {
     }
 
     /// The transaction id the change commits as.
-    fn next_generation(&self) -> Result<u64> {
+    pub(crate) fn next_generation(&self) -> Result<u64> {
         self.sb
             .generation
             .checked_add(1)
@@ -608,14 +608,14 @@ impl Filesystem {
     }
 
     /// An fs tree item's bytes, if there is one under `key`.
-    fn item_bytes(&self, key: DiskKey) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn item_bytes(&self, key: DiskKey) -> Result<Option<Vec<u8>>> {
         let reader = self.pool_reader();
         let tree = reader.tree();
         Ok(tree.search(self.fs_tree_root, &key)?.map(|i| i.data))
     }
 
     /// An inode item's bytes, as stored.
-    fn raw_inode(&self, ino: u64) -> Result<Vec<u8>> {
+    pub(crate) fn raw_inode(&self, ino: u64) -> Result<Vec<u8>> {
         let raw = self
             .item_bytes(key(ino, INODE_ITEM_KEY, 0))?
             .ok_or(Error::NotFound)?;
@@ -630,7 +630,7 @@ impl Filesystem {
 
     /// The most one item can hold: a leaf's space less its header and
     /// one item header.
-    fn max_item_size(&self) -> usize {
+    pub(crate) fn max_item_size(&self) -> usize {
         self.sb.nodesize as usize - LEAF_HEADER - ITEM_HEADER
     }
 }
@@ -695,7 +695,7 @@ fn put(objectid: u64, key_type: u8, offset: u64, data: Vec<u8>) -> ItemEdit {
     })
 }
 
-fn now() -> (u64, u32) {
+pub(crate) fn now() -> (u64, u32) {
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -717,7 +717,7 @@ fn put_time(b: &mut [u8], at: usize, t: (u64, u32)) {
 
 /// What the kernel changes on an inode it modifies: the transaction that
 /// last touched it, its change counter, and the given times.
-fn touch(raw: &mut [u8], generation: u64, now: (u64, u32), times: &[usize]) {
+pub(crate) fn touch(raw: &mut [u8], generation: u64, now: (u64, u32), times: &[usize]) {
     raw[io::TRANSID..io::TRANSID + 8].copy_from_slice(&generation.to_le_bytes());
     let sequence = le64(raw, io::SEQUENCE).wrapping_add(1);
     raw[io::SEQUENCE..io::SEQUENCE + 8].copy_from_slice(&sequence.to_le_bytes());
@@ -764,7 +764,7 @@ fn new_inode(n: NewInode) -> Vec<u8> {
 }
 
 /// Put what is left of an item, or delete it when nothing is.
-fn put_or_delete(k: DiskKey, rest: Vec<u8>) -> ItemEdit {
+pub(crate) fn put_or_delete(k: DiskKey, rest: Vec<u8>) -> ItemEdit {
     if rest.is_empty() {
         ItemEdit::Delete(k)
     } else {
@@ -796,7 +796,7 @@ fn without_ref(data: &[u8], name: &[u8]) -> Option<(u64, Vec<u8>)> {
 
 /// A `DIR_ITEM` without the record naming `name`, or `None` when no
 /// record holds it.
-fn without_dir_record(data: &[u8], name: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn without_dir_record(data: &[u8], name: &[u8]) -> Option<Vec<u8>> {
     use dir::offsets as d;
     let mut pos = 0;
     while pos + d::NAME <= data.len() {
