@@ -48,7 +48,7 @@ suite.
 | One bad copy of a DUP tree block | Supported: the other copy is read | 0.7.0 | | `dup_mirror_fallback.rs` |
 | One device of a multi-device pool, opened alone | Refused | 0.6.0 | | `pool_oracle.rs` |
 | A pool with members missing, mounted degraded (`mount_pool_degraded`); a loss some chunk cannot survive is refused at mount | Supported, read-only | Unreleased (#300) | | `pool_degraded.rs` |
-| Profiles: raid5, raid6 | Supported for reading, with any one element (RAID6: any two) rebuilt from parity; refused for writing | Unreleased (#268) | #299 | `raid56_oracle.rs` |
+| Profiles: raid5, raid6 | Supported: read, with any one element (RAID6: any two) rebuilt from parity, and written, every write a read-modify-write of the full stripes it touches with P and Q recomputed | Unreleased (#268, #299) | | `raid56_oracle.rs`, `raid56_write_kernel.rs` |
 | Mixed block groups (`mkfs.btrfs -M`) | Supported | 0.3.0 | | `oracle_vm_fixtures.rs` |
 | Subvolumes and snapshots: listing, with id, path, parent, snapshot and read-only flags | Supported | 0.6.0 | | `subvol_oracle.rs` |
 | Subvolumes and snapshots: reading inside one (`open_subvolume`) | Supported, read-only | 0.7.0 | | `subvol_oracle.rs`, `kernel_readback.rs` |
@@ -92,9 +92,8 @@ Linux kernel in the guest.
 | A volume with a `compat_ro` feature the writer does not maintain | Refused for writing | 0.7.0 | | `compat_ro_write_refusal.rs` |
 | A read-write mount whose newest superblock is not the primary | Refused | 0.7.0 (#90) | | `superblock_mirrors.rs` |
 | A volume whose log tree holds entries | Partial: the log is read (`Filesystem::log`) and the volume opens read-only on its committed trees (`mount_ignoring_log`, like `ro,nologreplay`); every other mount refuses it, since the log is not replayed | Unreleased (#266) | #266 | `log_tree_kernel.rs` |
-| A pool of several devices, written | Not supported | | #298 (PR #316) | |
 | A volume whose log tree holds entries | Refused for writing | | #266 (PR #328) | |
-| A pool of several devices, written (`mount_pool_rw`) | Supported, except RAID5/6; a stale, read-only or missing member is refused | Unreleased (#298) | #299 | `pool_write_kernel.rs` |
+| A pool of several devices, written (`mount_pool_rw`) | Supported, RAID5/6 included; a stale, read-only or missing member is refused | Unreleased (#298, #299) | | `pool_write_kernel.rs`, `raid56_write_kernel.rs` |
 | Create, mkdir, symlink, link, unlink, rmdir | Supported | Unreleased (#262) | | `namespace_kernel.rs` |
 | Rename, truncate | Not supported | | #262 (PR #314, #323) | |
 | Extended attributes, ACLs, mode, owner and times, written | Supported on the top-level subvolume; a leaf with no room is refused | Unreleased (#263) | | `attrs_kernel.rs` |
