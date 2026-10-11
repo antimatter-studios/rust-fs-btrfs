@@ -59,7 +59,7 @@ suite.
 | A seed device | Supported, read-only; refused read-write | 0.7.0 (#76) | | `super_flags_refusals.rs` |
 | A filesystem sprouted from a seed, read across the seed and the sprout | Supported, read-only | Unreleased (#270) | | `seed_oracle.rs` |
 | A block group tree volume (`-O block-group-tree`) | Supported, read-only; refused read-write, since block group usage is updated in the extent tree | Unreleased (#270) | | `block_group_tree_oracle.rs` |
-| A volume with simple quotas | Upcoming | | #270 (PR #310) | |
+| A volume with simple quotas (`-O squota`) | Supported, read-only; refused read-write, since extents would be allocated without their owner references. Extents with owner references, which a 6.7+ kernel writes, have no fixture yet | Unreleased (#270) | #270 | `simple_quota_oracle.rs` |
 | Fuzzed decoders | Supported | 0.7.0 | | `fuzz_decoders.rs` |
 
 ## Checking

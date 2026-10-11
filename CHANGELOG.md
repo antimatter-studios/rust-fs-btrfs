@@ -93,6 +93,12 @@ never does.
   write match the kernel's own stream byte for byte, and `btrfs receive`
   rebuild the snapshot with its extents still compressed and its preallocated
   range still allocated.
+- **A volume with simple quotas is read.** The `simple_quota` incompat bit
+  refused the mount; it moves no file's bytes, so a read-only mount now
+  accepts it, checked against a volume btrfs-progs 7.1 formatted with
+  `-O squota --rootdir`, which `btrfs check` finds clean. An extent carrying an
+  owner reference, which only a kernel of 6.7 or later writes, is not covered
+  yet. A read-write mount is refused, naming simple quotas (#270).
 - **A pool of several devices can be written.** `Filesystem::mount_pool_rw`
   opens every member read-write: each copy of a mirrored chunk is written on
   the device its stripe names, and a commit flushes every member and writes
