@@ -368,7 +368,9 @@ impl Filesystem {
     /// same address already holds, so the logical contents of the
     /// filesystem do not change and no tree points anywhere new. That is
     /// what the kernel's repairing scrub does too. A bad copy with no
-    /// good twin is left as it is and listed as unrepairable.
+    /// good twin is left as it is and listed as unrepairable, and so is a
+    /// RAID5/6 parity element (#301): it is computed again from its data,
+    /// not copied from a twin, and that write is not implemented yet.
     ///
     /// # Errors
     ///
@@ -386,7 +388,7 @@ impl Filesystem {
         let mut repaired = Vec::new();
         let mut unrepairable = Vec::new();
         for error in &scrub.errors {
-            if !error.repairable {
+            if !error.repairable || error.what == ScrubTarget::Parity {
                 unrepairable.push(error.clone());
                 continue;
             }
@@ -413,10 +415,15 @@ impl Filesystem {
         let len = match error.what {
             ScrubTarget::TreeBlock => u64::from(self.superblock().nodesize),
             ScrubTarget::Data => u64::from(self.superblock().sectorsize),
+            ScrubTarget::Parity => {
+                return Err(Error::UnsupportedFeature(
+                    "a parity element has no twin to copy; it is computed from its data".into(),
+                ))
+            }
         };
         let digests = match error.what {
             ScrubTarget::Data => self.data_digests(error.logical, len)?,
-            ScrubTarget::TreeBlock => Default::default(),
+            ScrubTarget::TreeBlock | ScrubTarget::Parity => Default::default(),
         };
         for mirror in 0..self.chunk_map().mirrors_at(error.logical)? {
             if mirror == error.mirror {
@@ -433,6 +440,7 @@ impl Filesystem {
                 ScrubTarget::Data => digests
                     .get(&error.logical)
                     .is_some_and(|want| self.superblock().csum_type.verify(&buf, want)),
+                ScrubTarget::Parity => false,
             };
             if good {
                 return Ok(buf);
