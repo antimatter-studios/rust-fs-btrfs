@@ -108,12 +108,6 @@ never does.
   contents, and `Filesystem::mount_ignoring_log` opens such a volume read-only
   on its committed trees, like the kernel's `ro,nologreplay`. Every other mount
   still refuses a non-empty log; replaying it is the rest of #266.
-- **A scrub repairs a bad copy from a good one.** `Filesystem::scrub_repair`,
-  on a read-write mount, scrubs and then writes a copy that verifies over every
-  copy that does not, with no transaction, since the logical contents do not
-  change; a bad copy with no good twin is listed as unrepairable. After it, the
-  kernel's scrub counts no error and `btrfs check` finds the volume clean
-  (#302). A pool of several devices is not repaired yet.
 - **A filesystem sprouted from a seed is read.** A seed device's own
   superblock names the seed's fsid, not the sprouted filesystem's, and
   `mount_pool` refused it as a device of another filesystem. A seeding device
@@ -121,6 +115,12 @@ never does.
   `DEV_ITEM` for it with that fsid and device uuid, and refused otherwise.
   Checked against a seed and a sprout the kernel made, every file of each read
   as the kernel wrote it (#270). Writing a seed stays refused.
+- **A scrub repairs a bad copy from a good one.** `Filesystem::scrub_repair`,
+  on a read-write mount, scrubs and then writes a copy that verifies over every
+  copy that does not, with no transaction, since the logical contents do not
+  change; a bad copy with no good twin is listed as unrepairable. After it, the
+  kernel's scrub counts no error and `btrfs check` finds the volume clean
+  (#302). A pool of several devices is not repaired yet.
 - **RAID5 and RAID6 pools are read.** The `raid56` feature no longer refuses
   the mount: data elements are found round the rotating parity, and an element
   whose checksum fails is rebuilt from the rest of its full stripe — from P,
