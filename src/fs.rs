@@ -640,17 +640,9 @@ impl Filesystem {
                     .into(),
             ));
         }
-        // A PARITY CHUNK IS NOT A MIRROR. Writing one element of a RAID5
-        // or RAID6 stripe without recomputing P and Q leaves parity that
-        // rebuilds the wrong bytes the day a device is lost, and nothing
-        // here recomputes it yet (#299).
-        if self.sb.incompat_flags & crate::superblock::incompat::RAID56 != 0 {
-            return Err(Error::UnsupportedFeature(
-                "this filesystem has RAID5/6 chunks, which can be read but not written: a \
-                 write would leave their parity stale"
-                    .into(),
-            ));
-        }
+        // RAID5/6 is written: every write into a parity chunk is a
+        // read-modify-write of its full stripes, P and Q recomputed
+        // (#299); see `write_parity`.
         Ok(())
     }
 
@@ -859,8 +851,99 @@ impl Filesystem {
     /// contents and some the old, which is the same state a power loss
     /// produces and is what the commit ordering exists to survive.
     pub(crate) fn write_logical_all_mirrors(&self, logical: u64, buf: &[u8]) -> Result<()> {
+        if let Some(chunk) = self
+            .map
+            .chunk_for(logical)
+            .filter(|c| c.parity_count().is_some())
+        {
+            return self.write_parity(chunk, logical, buf);
+        }
         for (device, physical, from, n) in self.mirror_spans(logical, buf.len())? {
             device.write_at(physical, &buf[from..from + n])?;
+        }
+        Ok(())
+    }
+
+    /// A write into a RAID5/6 chunk: a read-modify-write of every full
+    /// stripe it touches (#299).
+    ///
+    /// P, and on RAID6 Q, are computed from every data element of their
+    /// full stripe, so writing a data element alone would leave parity
+    /// that rebuilds the wrong bytes the day a device is lost -- and
+    /// nothing reads parity while the data verifies, so nothing would
+    /// notice until then. For each full stripe the range covers, every
+    /// data element is read from the device its stripe names, the new
+    /// bytes are applied, P and Q are recomputed with
+    /// [`crate::raid56::parity`], and the changed data elements, P and Q
+    /// are written. Partial full stripes are the normal case: a tree
+    /// block is one node, and a file's extent rarely starts on a stripe.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnmappedLogical`] for a range running past the chunk, and
+    /// what [`Filesystem::write_logical_all_mirrors`] returns otherwise.
+    /// Every element of a full stripe is read and checked against its
+    /// device before any of it is written; a device failure part way is
+    /// the RAID5/6 write hole, the same state the kernel's own
+    /// read-modify-write leaves on a power cut.
+    fn write_parity(&self, chunk: &crate::chunk::Chunk, logical: u64, buf: &[u8]) -> Result<()> {
+        let parity = chunk.parity_count().expect("a parity chunk");
+        let data_elements = u64::from(chunk.num_stripes) - parity as u64;
+        let full = data_elements * chunk.stripe_len;
+        let end = logical
+            .checked_add(buf.len() as u64)
+            .ok_or(Error::UnmappedLogical(logical))?;
+        if end > chunk.logical_end() {
+            return Err(Error::UnmappedLogical(chunk.logical_end()));
+        }
+        let mut at = logical;
+        while at < end {
+            let start = chunk.logical + (at - chunk.logical) / full * full;
+            let upto = (start + full).min(end);
+            let plan = chunk.parity_read(start)?;
+            let len = plan.len as usize;
+
+            // Every data element as it is, from the device its stripe names.
+            let mut data = Vec::with_capacity(plan.data.len());
+            for &(devid, physical) in &plan.data {
+                let device = self.write_device(devid)?;
+                Self::writable_span(device, physical, len)?;
+                let mut element = vec![0u8; len];
+                device.read_at(physical, &mut element)?;
+                data.push(element);
+            }
+
+            // The new bytes, element by element.
+            let mut touched = std::collections::BTreeSet::new();
+            let mut x = at;
+            while x < upto {
+                let offset = x - start;
+                let index = (offset / chunk.stripe_len) as usize;
+                let within = (offset % chunk.stripe_len) as usize;
+                let n = ((len - within) as u64).min(upto - x) as usize;
+                let from = (x - logical) as usize;
+                data[index][within..within + n].copy_from_slice(&buf[from..from + n]);
+                touched.insert(index);
+                x += n as u64;
+            }
+
+            let refs: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+            let (p, q) = crate::raid56::parity(&refs, plan.q.is_some());
+            let mut writes: Vec<((u64, u64), &[u8])> = touched
+                .iter()
+                .map(|&i| (plan.data[i], data[i].as_slice()))
+                .collect();
+            writes.push((plan.p, &p));
+            if let (Some(at_q), Some(q)) = (plan.q, q.as_deref()) {
+                writes.push((at_q, q));
+            }
+            for &((devid, physical), _) in &writes {
+                Self::writable_span(self.write_device(devid)?, physical, len)?;
+            }
+            for ((devid, physical), bytes) in writes {
+                self.write_device(devid)?.write_at(physical, bytes)?;
+            }
+            at = upto;
         }
         Ok(())
     }

@@ -1059,6 +1059,13 @@ build_pool() {
 
     build_parity_pool raid5 3
     build_parity_pool raid6 4
+    # The same with a nodatasum file, which the copy-on-write write path
+    # takes, so a parity pool can be written and handed back to the
+    # kernel (#299). Separate images: on the pools above every file has
+    # checksums, which the damaged-device tests rely on to tell a rebuilt
+    # element from a corrupt one.
+    build_parity_pool raid5 3 nosum
+    build_parity_pool raid6 4 nosum
     # And one with no redundancy at all, which a degraded mount must
     # refuse: losing either member loses bytes nothing else holds (#300).
     build_parity_pool raid0 2
@@ -1078,10 +1085,11 @@ build_pool() {
 # order as mkfs.btrfs assigns them (the order the devices are given).
 # ---------------------------------------------------------------------
 build_parity_pool() {
-    local profile="$1" count="$2" i f loops=() imgs=()
-    local manifest="$WORK/btrfs-$profile.manifest"
+    local profile="$1" count="$2" variant="${3:-}" i f loops=() imgs=()
+    local name="btrfs-$profile${variant:+-$variant}"
+    local manifest="$WORK/$name.manifest"
     for i in $(seq 1 "$count"); do
-        f="$WORK/btrfs-$profile-$i.img"
+        f="$WORK/$name-$i.img"
         rm -f "$f"
         truncate -s 256M "$f"
         imgs+=("$f")
@@ -1104,6 +1112,14 @@ build_parity_pool() {
     # Odd-sized, so a file ends partway through a stripe element.
     dd if=/dev/urandom of="$MNT/odd.bin" bs=1 count=200003 status=none
     sync
+    if [ "$variant" = nosum ]; then
+        # Five 64 KiB elements' worth, so a write lands in whole full
+        # stripes and in part of one. A remount with `nodatasum` marks
+        # every inode created under it NODATASUM for good.
+        mount -o remount,nodatasum "$MNT"
+        dd if=/dev/urandom of="$MNT/nosum.bin" bs=64K count=5 status=none
+        sync
+    fi
     btrfs filesystem df "$MNT" | grep -qi "data, $profile" || {
         echo "guest-build-images: the $profile pool holds no $profile data chunk" >&2
         exit 1
@@ -1129,7 +1145,7 @@ build_parity_pool() {
     trap cleanup EXIT
 
     publish "${imgs[@]}" "$manifest"
-    note "built btrfs-$profile-1..$count ($count-device ${profile^^} with content)"
+    note "built $name-1..$count ($count-device ${profile^^} with content${variant:+, $variant})"
 }
 
 # ---------------------------------------------------------------------

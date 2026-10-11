@@ -36,6 +36,15 @@ never does.
   clean, `btrfs property get` report the new flags, and the kernel refuse a
   write into the newly read-only subvolume and accept one into the newly
   writable snapshot.
+- **RAID5 and RAID6 pools are written (#299).** Every write into a parity
+  chunk, a file's extents and the commit's tree blocks alike, is a
+  read-modify-write of each full stripe it touches: the data elements read,
+  the new bytes applied, P and Q recomputed, and the changed elements written
+  to the devices their stripes name. `mount_pool_rw` no longer refuses them.
+  Checked on RAID5 and RAID6 pools the kernel made: after writes into one
+  element, across element and full-stripe boundaries and over whole full
+  stripes, `btrfs check` finds each clean, the kernel reads every file back,
+  and this crate's scrub finds the parity in agreement with the data.
 - **Extended attributes, ACLs, mode, owner and times can be written.**
   `Filesystem::set_xattr`, `remove_xattr`, `set_mode`, `set_owner` and
   `set_times` each commit one transaction on the top-level subvolume and move
