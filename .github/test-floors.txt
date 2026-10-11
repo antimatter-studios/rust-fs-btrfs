@@ -46,6 +46,7 @@ capi                      39
 capi_pool                 5
 capi_subvol               2
 capi_write_kernel         1
+capi                      42
 chore_manifest            15
 chunk_tree_items          3
 ci_profile                67

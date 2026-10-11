@@ -77,6 +77,15 @@ never does.
   does. `tests/subvol_default_kernel.rs` has `btrfs check` find the volume
   clean, `btrfs subvolume get-default` name the new default, and a plain kernel
   mount show its contents.
+- **The C ABI reads and changes a subvolume's read-only flag and the default
+  subvolume (#267).** `fs_btrfs_subvol_is_readonly`,
+  `fs_btrfs_subvol_set_readonly`, `fs_btrfs_subvol_is_default` and
+  `fs_btrfs_subvol_set_default` name a subvolume by the path of its top
+  directory, as a mount shows it, and fail with ENOENT for any other path and
+  EROFS on a handle not opened for writing. Behind them,
+  `Filesystem::subvolume_at` finds a subvolume by that path and
+  `Filesystem::default_subvolume` reads the default back;
+  `tests/subvol_default_kernel.rs` holds both to what the kernel says.
 - **Incremental send streams are written (#273).**
   `Filesystem::send_subvolume_incremental` writes what changed between two
   read-only snapshots, as `btrfs send -p` does: names taken away, moved and
