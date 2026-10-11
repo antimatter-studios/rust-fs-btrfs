@@ -148,6 +148,11 @@ pub(crate) struct DataWrite {
     /// replaces or deletes, and nothing else. Each lands in the leaf a
     /// descent for its key reaches, which the caller marks dirty.
     pub edits: Vec<ItemEdit>,
+    /// Items of the checksum tree put or removed (#261): a checksummed
+    /// file's copies gain `EXTENT_CSUM` items and the extents they
+    /// replace lose theirs. Each lands in the leaf a descent for its key
+    /// reaches in the checksum tree, which the caller marks dirty.
+    pub csum_edits: Vec<ItemEdit>,
 }
 
 /// One change to an item of the tree a [`DataWrite`] names (#262).
@@ -173,7 +178,7 @@ impl ItemEdit {
 ///
 /// A put replaces an item under the same key or inserts a new one in key
 /// order; a delete removes one that must be there. The result must still
-/// fit in one block: splitting an fs tree leaf would add a block and a
+/// fit in one block: splitting a leaf would add a block and a
 /// key to its parent, which a plan of one-for-one rewrites cannot hold,
 /// so a leaf that would overflow is refused before anything is written.
 fn apply_item_edits(
@@ -191,8 +196,8 @@ fn apply_item_edits(
                 }
                 items = insert(nodesize, &items, item.clone()).map_err(|_| {
                     Error::UnsupportedFeature(format!(
-                        "the fs tree leaf at {leaf} has no room for another {}-byte item, and \
-                         splitting an fs tree leaf is not implemented",
+                        "the tree leaf at {leaf} has no room for another {}-byte item, and \
+                         splitting a leaf for an item edit is not implemented",
                         item.data.len()
                     ))
                 })?;
@@ -202,7 +207,7 @@ fn apply_item_edits(
     }
     if items.is_empty() {
         return Err(Error::UnsupportedFeature(format!(
-            "the change empties the fs tree leaf at {leaf}, and removing a leaf from its \
+            "the change empties the tree leaf at {leaf}, and removing a leaf from its \
              tree is not implemented"
         )));
     }
@@ -573,6 +578,18 @@ impl Filesystem {
                 .map(|e| Ok(tree.descend(root, &e.key())?.header.bytenr))
                 .collect::<Result<_>>()?
         };
+        // And each checksum edit's leaf, in the checksum tree.
+        let csum_edit_leaves: Vec<u64> = if data.csum_edits.is_empty() {
+            Vec::new()
+        } else {
+            let root = self.tree_root(crate::csum::CSUM_TREE_OBJECTID)?;
+            let reader = self.pool_reader();
+            let tree = reader.tree();
+            data.csum_edits
+                .iter()
+                .map(|e| Ok(tree.descend(root, &e.key())?.header.bytenr))
+                .collect::<Result<_>>()?
+        };
         let mut edits_applied = 0usize;
         // Each rendered block's first key, by its old address. An edit can
         // change a leaf's first key, and the node above must then carry
@@ -686,6 +703,21 @@ impl Filesystem {
                         }
                     }
 
+                    // Checksum items put or removed, likewise.
+                    if rewrite.owner == crate::csum::CSUM_TREE_OBJECTID {
+                        let here: Vec<&ItemEdit> = data
+                            .csum_edits
+                            .iter()
+                            .zip(&csum_edit_leaves)
+                            .filter(|(_, &leaf)| leaf == rewrite.old)
+                            .map(|(e, _)| e)
+                            .collect();
+                        if !here.is_empty() {
+                            owned = apply_item_edits(self.sb.nodesize, rewrite.old, owned, &here)?;
+                            edits_applied += here.len();
+                        }
+                    }
+
                     // A root tree leaf names other trees' roots.
                     if rewrite.owner == objectid::ROOT_TREE {
                         if let Some(id) = data.default_subvol {
@@ -770,10 +802,11 @@ impl Filesystem {
         }
         // NOR IS AN ITEM EDIT: one whose leaf the plan does not rewrite
         // would be committed as a change that never happened.
-        if edits_applied != data.edits.len() {
+        let edits = data.edits.len() + data.csum_edits.len();
+        if edits_applied != edits {
             return Err(Error::UnsupportedFeature(format!(
-                "the change edits {} items, and the plan rewrote the leaves of {edits_applied}",
-                data.edits.len()
+                "the change edits {edits} items, and the plan rewrote the leaves of \
+                 {edits_applied}"
             )));
         }
         if data.default_subvol.is_some() && applied.default_subvol != 1 {
