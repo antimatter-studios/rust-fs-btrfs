@@ -61,6 +61,13 @@ never does.
   `btrfs send` wrote parses into the commands `btrfs receive --dump` lists and
   replays into the snapshot the kernel shows, and `btrfs receive` rebuilds the
   same snapshot from a stream this crate wrote.
+- **The default subvolume can be chosen (#267).**
+  `Filesystem::set_default_subvolume` repoints the root tree's `default`
+  entry and, for any subvolume but the top level, sets the `DEFAULT_SUBVOL`
+  incompatible feature in the same commit, as `btrfs subvolume set-default`
+  does. `tests/subvol_default_kernel.rs` has `btrfs check` find the volume
+  clean, `btrfs subvolume get-default` name the new default, and a plain kernel
+  mount show its contents.
 - **Incremental send streams are written (#273).**
   `Filesystem::send_subvolume_incremental` writes what changed between two
   read-only snapshots, as `btrfs send -p` does: names taken away, moved and
@@ -70,13 +77,6 @@ never does.
   times. `tests/send_stream_kernel.rs` has the guest's `btrfs receive` apply
   it on top of the parent and the kernel show the child exactly, and parses
   the kernel's own incremental stream against `btrfs receive --dump`.
-- **The default subvolume can be chosen (#267).**
-  `Filesystem::set_default_subvolume` repoints the root tree's `default`
-  entry and, for any subvolume but the top level, sets the `DEFAULT_SUBVOL`
-  incompatible feature in the same commit, as `btrfs subvolume set-default`
-  does. `tests/subvol_default_kernel.rs` has `btrfs check` find the volume
-  clean, `btrfs subvolume get-default` name the new default, and a plain kernel
-  mount show its contents.
 - **A trim.** `Filesystem::trim_ranges` lists every free run of every block
   group, from the free-space tree (or the extent tree's gaps without one),
   mapped to the device range of each copy, and `Filesystem::trim` hands each to
