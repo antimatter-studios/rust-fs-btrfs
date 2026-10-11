@@ -179,6 +179,13 @@ pub fn decompress(
     Ok(out)
 }
 
+/// `input` as one zlib stream, at the level the kernel uses by default
+/// (3): what a zlib-compressed extent holds on disk, before it is padded
+/// to a sector (#265).
+pub(crate) fn compress_zlib(input: &[u8]) -> Vec<u8> {
+    miniz_oxide::deflate::compress_to_vec_zlib(input, 3)
+}
+
 fn decompress_zlib(input: &[u8], ram_bytes: usize) -> Result<Vec<u8>> {
     miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(input, ram_bytes).map_err(|e| {
         Error::BadSuperblock(format!(
@@ -372,6 +379,26 @@ mod tests {
     fn zlib_round_trips() {
         let plain: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
         let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+        let got = decompress(
+            Compression::Zlib,
+            &packed,
+            plain.len(),
+            4096,
+            ShortDecode::Pad,
+        )
+        .unwrap();
+        assert_eq!(got, plain);
+    }
+
+    /// What the write path stores, padded to a sector as on disk, is
+    /// what the read path decodes (#265).
+    #[test]
+    fn a_padded_zlib_extent_the_write_path_makes_decodes() {
+        let plain: Vec<u8> = b"compressible text, ".repeat(7000);
+        let plain = &plain[..MAX_UNCOMPRESSED];
+        let mut packed = compress_zlib(plain);
+        assert!(packed.len() < plain.len() / 4, "{} bytes", packed.len());
+        packed.resize(packed.len().next_multiple_of(4096), 0);
         let got = decompress(
             Compression::Zlib,
             &packed,
