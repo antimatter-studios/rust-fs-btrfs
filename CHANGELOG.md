@@ -103,17 +103,17 @@ never does.
   kernel read it back (#298).
 - **`send::StreamError`**, its own error type. A malformed stream is bytes
   handed in, not a damaged volume, so it is kept out of the crate's `Error`.
+- **An unreplayed log tree can be read.** `Filesystem::log` returns every item
+  of every subvolume's log tree, with the logged inodes, names and file
+  contents, and `Filesystem::mount_ignoring_log` opens such a volume read-only
+  on its committed trees, like the kernel's `ro,nologreplay`. Every other mount
+  still refuses a non-empty log; replaying it is the rest of #266.
 - **A scrub repairs a bad copy from a good one.** `Filesystem::scrub_repair`,
   on a read-write mount, scrubs and then writes a copy that verifies over every
   copy that does not, with no transaction, since the logical contents do not
   change; a bad copy with no good twin is listed as unrepairable. After it, the
   kernel's scrub counts no error and `btrfs check` finds the volume clean
   (#302). A pool of several devices is not repaired yet.
-- **An unreplayed log tree can be read.** `Filesystem::log` returns every item
-  of every subvolume's log tree, with the logged inodes, names and file
-  contents, and `Filesystem::mount_ignoring_log` opens such a volume read-only
-  on its committed trees, like the kernel's `ro,nologreplay`. Every other mount
-  still refuses a non-empty log; replaying it is the rest of #266.
 - **A filesystem sprouted from a seed is read.** A seed device's own
   superblock names the seed's fsid, not the sprouted filesystem's, and
   `mount_pool` refused it as a device of another filesystem. A seeding device
