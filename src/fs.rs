@@ -1562,6 +1562,21 @@ impl Filesystem {
         Ok(n)
     }
 
+    /// The bytes at `physical` on device `devid`, as they lie: one element
+    /// of a RAID5/6 full stripe, for scrub's parity check (#301).
+    pub(crate) fn read_element(&self, devid: u64, physical: u64, buf: &mut [u8]) -> Result<()> {
+        if self.devices.is_empty() {
+            self.device.read_at(physical, buf)?;
+            return Ok(());
+        }
+        let dev = self
+            .devices
+            .get(&devid)
+            .ok_or_else(|| Error::UnsupportedFeature(format!("device {devid} was not given")))?;
+        dev.read_at(physical, buf)?;
+        Ok(())
+    }
+
     /// Copy `mirror` of the logical range, read as it lies: no checksum,
     /// no fallback. For scrub, which judges each copy itself.
     pub(crate) fn read_mirror_unverified(

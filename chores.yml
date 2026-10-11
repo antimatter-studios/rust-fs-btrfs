@@ -107,7 +107,13 @@ chore_min_version: 0.10.0
 #                                                    cargo fetching and
 #                                                    compiling, clap's among
 #                                                    them. Was 368 / 24,411
-#     images      296 /  13,865      385 /  18,000   ~30%
+#     images      384 /  18,065      500 /  23,500   ~30%. 384 / 18,065 is
+#                                                    CI's aarch64 job with
+#                                                    #301's
+#                                                    scrub_parity_oracle.rs,
+#                                                    run 38099812942, over
+#                                                    the old 18,000 bytes;
+#                                                    was 296 / 13,865
 #     oracle      472 /  24,733      615 /  32,500   ~30%. --show-output is
 #                                                    most of it, and it is
 #                                                    the evidence, so it
@@ -442,6 +448,15 @@ tasks:
       # directory because the seed is refused for writing on purpose
       - test-disks/seed/btrfs-seed.img
       - test-disks/seed/btrfs-sprout.img
+      # RAID5 and RAID6 pools with a parity element damaged on purpose,
+      # and the element as the kernel's scrub rewrote it
+      - test-disks/scrub/btrfs-scrub-raid5-1.img
+      - test-disks/scrub/btrfs-scrub-raid5-2.img
+      - test-disks/scrub/btrfs-scrub-raid5-3.img
+      - test-disks/scrub/btrfs-scrub-raid6-1.img
+      - test-disks/scrub/btrfs-scrub-raid6-2.img
+      - test-disks/scrub/btrfs-scrub-raid6-3.img
+      - test-disks/scrub/btrfs-scrub-raid6-4.img
     # A hung boot must not hold the VM and the machine-wide slot for
     # ever. The split fixtures alone mount and unmount up to four hundred
     # times, and the populated pair writes eighty thousand files, so this
@@ -486,7 +501,7 @@ tasks:
     # rather than skipped inside the tests, so what does not run there is
     # visible in the workflow rather than hidden in a green log.
     cmds:
-      - '../rust-fs-core/scripts/tier.sh test:images images 385 18000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh images)'
+      - '../rust-fs-core/scripts/tier.sh test:images images 500 23500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh images)'
 
   test:oracle:
     desc: 'The driver writes, btrfs-progs reads back — every tool call made inside the harness VM'

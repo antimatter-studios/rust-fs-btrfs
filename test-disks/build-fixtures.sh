@@ -127,6 +127,11 @@ artefacts_for() {
             ;;
         scrub)
             echo scrub/btrfs-scrub.img; echo scrub/btrfs-scrub.manifest
+            echo scrub/btrfs-scrub-raid5-1.img; echo scrub/btrfs-scrub-raid5-2.img
+            echo scrub/btrfs-scrub-raid5-3.img; echo scrub/btrfs-scrub-raid5.manifest
+            echo scrub/btrfs-scrub-raid6-1.img; echo scrub/btrfs-scrub-raid6-2.img
+            echo scrub/btrfs-scrub-raid6-3.img; echo scrub/btrfs-scrub-raid6-4.img
+            echo scrub/btrfs-scrub-raid6.manifest
             ;;
         seed)
             echo seed/btrfs-seed.img; echo seed/btrfs-sprout.img

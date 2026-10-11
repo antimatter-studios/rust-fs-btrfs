@@ -68,7 +68,7 @@ suite.
 |---|---|---|---|---|
 | `fsck.btrfs`, check-only: tree-block checksums and keys, extents against their users, block groups, chunks against device extents, the free-space tree, the namespace | Supported | 0.9.0 (#260) | | `cli_fsck_oracle.rs` |
 | Repair (`-y`, `-p`) | Refused (exit 16) | 0.9.0 (#260) | | `cli_fsck_oracle.rs` |
-| Scrub, read-only: every copy of every allocated tree block and data sector checked, each bad copy reported with whether another verifies | Supported | Unreleased (#268) | #301 | `scrub_oracle.rs` |
+| Scrub, read-only: every copy of every allocated tree block and data sector checked, each bad copy reported with whether another verifies, and RAID5/6 parity recomputed for every full stripe holding data, a mismatching P or Q reported by device and offset | Supported | Unreleased (#268, #301) | | `scrub_oracle.rs`, `scrub_parity_oracle.rs` |
 | Scrub repair | Upcoming | | #302 (PR #321) | |
 
 ## Writing
