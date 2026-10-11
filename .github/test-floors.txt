@@ -104,6 +104,7 @@ send_stream_kernel        1
 scrub_oracle              2
 seed_oracle               5
 scrub_parity_oracle       4
+scrub_repair_kernel       2
 shared_tree_block_release 1
 snapshot_shared_write     1
 split_oracle              4
