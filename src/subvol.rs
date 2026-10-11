@@ -571,22 +571,107 @@ impl Filesystem {
         }
 
         let leaf = self.root_item_leaf(id)?.ok_or(Error::NotFound)?;
+        self.commit_root_tree_change(
+            leaf,
+            DataWrite {
+                root_flags: Some((id, wanted)),
+                ..Default::default()
+            },
+            0,
+        )
+    }
+
+    /// Make subvolume `id` the one a mount without `subvol=` shows, and
+    /// commit it.
+    ///
+    /// What `btrfs subvolume set-default` does: the root tree's directory
+    /// (objectid 6) holds one entry, `default`, whose location names a
+    /// subvolume's `ROOT_ITEM`. That entry is pointed at `id`, in place,
+    /// and -- unless `id` is the top-level subvolume, which every kernel
+    /// mounts by default anyway -- the superblock gains the
+    /// `DEFAULT_SUBVOL` incompatible feature, as the kernel sets it, so a
+    /// kernel that does not know the entry refuses the volume rather than
+    /// mounting the wrong tree. Naming the subvolume that is already the
+    /// default commits nothing.
+    ///
+    /// This handle's own reads still start at the top-level subvolume;
+    /// the default is what a kernel mount shows.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] unless mounted with [`Filesystem::mount_rw`],
+    /// [`Error::NotFound`] for an id no subvolume has or a root tree with
+    /// no `default` entry, and [`Error::UnsupportedFeature`] for an entry
+    /// that is not the shape the kernel writes or a transaction the planner
+    /// refuses.
+    pub fn set_default_subvolume(&mut self, id: u64) -> Result<()> {
+        use crate::dir::{name_hash, DIR_ITEM_KEY};
+        use crate::superblock::incompat::DEFAULT_SUBVOL;
+        use crate::transaction::ROOT_TREE_DIR_OBJECTID;
+        if self.writable.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        if !self.subvolumes()?.iter().any(|s| s.id == id) {
+            return Err(Error::NotFound);
+        }
+        let key = (ROOT_TREE_DIR_OBJECTID, DIR_ITEM_KEY, name_hash(b"default"));
+        let entry = self
+            .root_tree_items()?
+            .into_iter()
+            .find(|(o, t, off, _)| (*o, *t, *off) == key)
+            .map(|(_, _, _, data)| data)
+            .ok_or(Error::NotFound)?;
+        let current = entry
+            .get(..8)
+            .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")));
+        let incompat = if id == FS_TREE_OBJECTID {
+            0
+        } else {
+            DEFAULT_SUBVOL
+        };
+        if current == Some(id) && self.sb.incompat_flags & incompat == incompat {
+            return Ok(());
+        }
+        let leaf = {
+            let reader = self.pool_reader();
+            let tree = reader.tree();
+            let key = crate::chunk::DiskKey {
+                objectid: key.0,
+                key_type: key.1,
+                offset: key.2,
+            };
+            tree.descend(self.sb.root, &key)?.header.bytenr
+        };
+        self.commit_root_tree_change(
+            leaf,
+            DataWrite {
+                default_subvol: Some(id),
+                ..Default::default()
+            },
+            incompat,
+        )
+    }
+
+    /// Commit a change to one root tree leaf as a transaction, then reopen
+    /// the mount on the new generation.
+    fn commit_root_tree_change(
+        &mut self,
+        leaf: u64,
+        mut change: DataWrite,
+        incompat: u64,
+    ) -> Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        let change = DataWrite {
-            root: FS_TREE_OBJECTID,
-            time: (now.as_secs(), now.subsec_nanos()),
-            root_flags: Some((id, wanted)),
-            ..Default::default()
-        };
+        change.root = FS_TREE_OBJECTID;
+        change.time = (now.as_secs(), now.subsec_nanos());
         let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
             Error::UnsupportedFeature("the generation counter is exhausted".into())
         })?;
         let plan = self.plan_transaction_closed_with(&[leaf], &change, PLAN_ROUNDS)?;
         let blocks = self.render_plan_with(&plan, &change, generation)?;
         let root = self.planned_root(&plan).ok_or_else(|| {
-            Error::UnsupportedFeature("the flag change's plan does not move the root tree".into())
+            Error::UnsupportedFeature("the change's plan does not move the root tree".into())
         })?;
         let delta = plan.usage_delta(u64::from(self.sb.nodesize));
         let bytes_used = match delta {
@@ -600,7 +685,7 @@ impl Filesystem {
                 })?,
             ),
         };
-        self.commit(
+        self.commit_setting_incompat(
             &blocks,
             &Commit {
                 generation,
@@ -609,8 +694,9 @@ impl Filesystem {
                 invalidate_free_space_tree: false,
                 ..Default::default()
             },
+            incompat,
         )?;
-        let device = std::sync::Arc::clone(self.writable.as_ref().expect("checked above"));
+        let device = std::sync::Arc::clone(self.writable.as_ref().expect("checked by the caller"));
         *self = Filesystem::mount_rw(device)?;
         Ok(())
     }

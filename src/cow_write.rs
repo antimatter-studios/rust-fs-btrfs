@@ -181,6 +181,7 @@ impl Filesystem {
             time: (now.as_secs(), now.subsec_nanos()),
             root_flags: None,
             edits: Vec::new(),
+            default_subvol: None,
         };
 
         // The fs tree leaves the write edits: the inode item's, and each
