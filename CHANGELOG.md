@@ -60,20 +60,6 @@ never does.
   directory whose leaf has no room, and the last name of a file still holding
   data extents, are refused with nothing written; `rename` and `truncate` are
   still to come (#262).
-- **A name can be moved.** `Filesystem::rename` commits one transaction that
-  removes the old entries and reference and files new ones under a fresh
-  index in the destination, replacing a name already there as POSIX `rename`
-  does. The C ABI gains `fs_btrfs_rename` (ENOTDIR, EISDIR, ENOTEMPTY and
-  EINVAL where POSIX says), and `fs.btrfs` gains `mv` (#262).
-- **Extended attributes, ACLs, mode, owner and times can be written.**
-  `Filesystem::set_xattr`, `remove_xattr`, `set_mode`, `set_owner` and
-  `set_times` each commit one transaction on the top-level subvolume and move
-  the inode's change time, as Linux does; an ACL is the
-  `system.posix_acl_access` or `system.posix_acl_default` attribute in the
-  kernel's encoding. The C ABI gains `fs_btrfs_setxattr`,
-  `fs_btrfs_removexattr`, `fs_btrfs_chmod`, `fs_btrfs_chown` and
-  `fs_btrfs_utimens` (with `FS_BTRFS_UTIME_OMIT`). A leaf with no room for a
-  new attribute item is refused with nothing written (#263).
 - **A transaction can put and delete fs tree items.** The planner renders item
   edits into the leaves they land in, and a leaf whose first key changes has
   its parent's key follow it.
@@ -107,6 +93,11 @@ never does.
   filesystem. Checked against the free runs `btrfs inspect-internal dump-tree`
   lists and the copies its chunk tree places (#305). RAID5/6 groups are
   refused.
+- **A name can be moved.** `Filesystem::rename` commits one transaction that
+  removes the old entries and reference and files new ones under a fresh
+  index in the destination, replacing a name already there as POSIX `rename`
+  does. The C ABI gains `fs_btrfs_rename` (ENOTDIR, EISDIR, ENOTEMPTY and
+  EINVAL where POSIX says), and `fs.btrfs` gains `mv` (#262).
 - **A read-only scrub.** `Filesystem::scrub` reads every copy of every tree
   block and data sector the extent tree says is allocated, checks each against
   its checksum (and a tree block against its own address and filesystem), and
