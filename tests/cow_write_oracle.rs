@@ -10,7 +10,9 @@
 //! file's `EXTENT_DATA` item is pointed at the copy, the extent tree
 //! records the new extent and forgets the old one, the free-space tree
 //! and the block groups' `used` follow, and the transaction is committed.
-//! A checksummed file is still refused, as is an extent a snapshot shares.
+//! A checksummed file gets a digest for every sector of each copy, and
+//! the digests of the extents it replaced are removed (#261); an extent a
+//! snapshot shares is still refused.
 //!
 //! # The oracles
 //!
@@ -48,6 +50,12 @@ impl Scratch {
     /// A fresh 256 MiB volume from `mkfs.btrfs`, filled by `script` run
     /// against a read-write kernel mount.
     fn new(name: &str, script: &str) -> Self {
+        Self::with_csum(name, "crc32c", script)
+    }
+
+    /// As [`Scratch::new`], on a volume whose checksum algorithm is
+    /// `algorithm` (`mkfs.btrfs --csum`; crc32c is its default).
+    fn with_csum(name: &str, algorithm: &str, script: &str) -> Self {
         let dir = PathBuf::from(temp_path!("{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         let image = dir.join("fs.img");
@@ -55,12 +63,12 @@ impl Scratch {
             .and_then(|f| f.set_len(256 << 20))
             .unwrap();
         let made = oracle("mkfs.btrfs")
-            .args(["-q", "-f", "-s", "4096", "-n", "16384"])
+            .args(["-q", "-f", "-s", "4096", "-n", "16384", "--csum", algorithm])
             .arg(&image)
             .output();
         assert!(
             made.status.success(),
-            "mkfs.btrfs: {}",
+            "mkfs.btrfs --csum {algorithm}: {}",
             String::from_utf8_lossy(&made.stderr)
         );
         guest_kernel_write_ok(&image.to_string_lossy(), name, script);
@@ -129,7 +137,7 @@ const FILL: &str = "head -c 65536 /dev/urandom > \"$MNT/summed.bin\"\n\
 fn a_copy_on_write_file_is_written_into_new_extents_the_checker_and_kernel_accept() {
     let scratch = Scratch::new("cow-write", FILL);
     let image = scratch.image();
-    let before = kernel_view(&image, "before the write", &[ONE, TWO]);
+    let before = kernel_view(&image, "before the write", &[ONE, TWO, SUMMED]);
 
     // (file, offset, bytes)
     let writes: Vec<(&str, u64, Vec<u8>)> = vec![
@@ -182,7 +190,11 @@ fn a_copy_on_write_file_is_written_into_new_extents_the_checker_and_kernel_accep
 
     assert_btrfs_check_clean(&image, "after copy-on-write writes");
 
-    let after = kernel_view(&image, "after the write", &[ONE, TWO]);
+    let after = kernel_view(&image, "after the write", &[ONE, TWO, SUMMED]);
+    assert_eq!(
+        after[SUMMED], before[SUMMED],
+        "{SUMMED}, which nothing wrote, changed under the writes"
+    );
     for name in [ONE, TWO] {
         assert_eq!(
             after[name].0,
@@ -196,28 +208,119 @@ fn a_copy_on_write_file_is_written_into_new_extents_the_checker_and_kernel_accep
     }
 }
 
-/// A checksummed file is refused by name, and left exactly as it was:
-/// writing it means writing the checksum tree, which this slice does not.
-#[test]
-fn a_checksummed_copy_on_write_file_is_refused_and_untouched() {
-    let scratch = Scratch::new("cow-write-summed", FILL);
-    let image = scratch.image();
-    let before = std::fs::read(&image).unwrap();
+/// The fill for the checksummed tests: two checksummed files written in
+/// one transaction, so their extents are contiguous and the kernel is
+/// free to pack both files' digests into one `EXTENT_CSUM` item, then a
+/// second extent appended to the first file that ends partway through a
+/// sector.
+const SUMMED_FILL: &str = "head -c 65536 /dev/urandom > \"$MNT/a.bin\"\n\
+     head -c 65536 /dev/urandom > \"$MNT/b.bin\"\n\
+     sync\n\
+     head -c 40000 /dev/urandom >> \"$MNT/a.bin\"\n\
+     sync";
 
-    let mut fs = mount_rw(&image);
-    let ino = ino_of(&fs, SUMMED);
-    let err = fs
-        .write(ino, 0, b"this must not land")
-        .expect_err("a checksummed file must be refused");
-    assert!(
-        err.to_string().contains("checksum"),
-        "the refusal should name the checksums: {err}"
-    );
-    drop(fs);
-    assert!(
-        std::fs::read(&image).unwrap() == before,
-        "a refused write changed the image"
-    );
+/// A checksummed file is written copy-on-write with a digest for every
+/// sector of each copy, and the digests of the extents it replaced are
+/// gone (#261) — on a volume of each digest width, crc32c's four bytes
+/// and sha256's thirty-two.
+///
+/// `btrfs check --check-data-csum` reads every data sector on the volume
+/// and compares it with the checksum tree, so a digest computed wrongly,
+/// filed under the wrong address, left behind for a released extent or
+/// missing for a new one is reported there. The kernel verifies each
+/// sector it reads too — a mismatch is an I/O error, never wrong bytes —
+/// and `btrfs scrub` makes it verify every sector of every file.
+#[test]
+fn a_checksummed_file_is_written_with_digests_the_checker_and_kernel_verify() {
+    for algorithm in ["crc32c", "sha256"] {
+        let scratch = Scratch::with_csum(
+            &format!("cow-write-summed-{algorithm}"),
+            algorithm,
+            SUMMED_FILL,
+        );
+        let image = scratch.image();
+        let before = kernel_view(&image, "before the write", &["a.bin", "b.bin"]);
+
+        // (file, offset, bytes). Across a.bin's two extents first, then
+        // inside its second only: a.bin's first extent then moves once,
+        // and a second move could land back in the space the first one
+        // released, which would leave nothing for `filefrag` to see.
+        let writes: Vec<(&str, u64, Vec<u8>)> = vec![
+            ("a.bin", 61440, vec![0xa5; 8192]),
+            ("a.bin", 70000, b"checksummed, inside one extent ".repeat(3)),
+            ("b.bin", 30000, vec![0x5a; 3000]),
+        ];
+
+        let mut fs = mount_rw(&image);
+        let mut expected: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
+        for name in ["a.bin", "b.bin"] {
+            let ino = ino_of(&fs, name);
+            let inode = fs.read_inode(ino).unwrap();
+            assert_eq!(
+                inode.flags & fs_btrfs::write::INODE_NODATASUM,
+                0,
+                "{name} must be checksummed for this to test anything"
+            );
+            expected.insert(name, fs.read_file(ino).unwrap());
+        }
+        for (name, offset, bytes) in &writes {
+            let ino = ino_of(&fs, name);
+            let n = fs.write(ino, *offset, bytes).unwrap_or_else(|e| {
+                panic!(
+                    "{algorithm}: writing {} bytes at {offset} of {name}: {e}",
+                    bytes.len()
+                )
+            });
+            assert_eq!(n, bytes.len(), "a short write");
+            let file = expected.get_mut(name).unwrap();
+            file[*offset as usize..*offset as usize + bytes.len()].copy_from_slice(bytes);
+            // This driver verifies the digests it reads, so this is our
+            // own check of the digests we just wrote, before the oracles'.
+            for other in ["a.bin", "b.bin"] {
+                assert_eq!(
+                    &fs.read_file(ino_of(&fs, other)).unwrap(),
+                    &expected[other],
+                    "{algorithm}: {other} reads back differently through this driver after \
+                     writing {name}"
+                );
+            }
+        }
+        drop(fs);
+
+        assert_btrfs_check_clean(&image, &format!("{algorithm}: after checksummed writes"));
+        let checked = oracle("btrfs")
+            .args(["check", "--readonly", "--check-data-csum"])
+            .arg(&image)
+            .output();
+        assert_eq!(
+            checked.status.code(),
+            Some(0),
+            "{algorithm}: btrfs check --check-data-csum finds data that disagrees with its \
+             digests:\n{}{}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
+        );
+
+        let after = kernel_view(&image, "after the write", &["a.bin", "b.bin"]);
+        for name in ["a.bin", "b.bin"] {
+            assert_eq!(
+                after[name].0,
+                sha256_hex(&expected[name]),
+                "{algorithm}: the kernel reads back different bytes from {name} than were \
+                 written"
+            );
+            assert_ne!(
+                after[name].1, before[name].1,
+                "{algorithm}: {name}'s first extent is where it was, so the write was not \
+                 copy-on-write"
+            );
+        }
+        guest_kernel_write_ok(
+            &image.to_string_lossy(),
+            &format!("{algorithm}: scrub"),
+            "btrfs scrub start -B \"$MNT\" >/dev/null",
+        );
+    }
 }
 
 /// An extent a snapshot still reads is refused, and the image is left
