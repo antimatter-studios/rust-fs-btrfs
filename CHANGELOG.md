@@ -219,6 +219,11 @@ never does.
   `fs_btrfs_readlink`, `fs_btrfs_listxattr` and `fs_btrfs_getxattr` stopped at
   a subvolume's boundary while `fs_btrfs_dir_open` listed what was beyond it;
   every reading call now crosses (#271).
+- **Names, attributes and subvolume flags change on a pool mounted read-write
+  (#336).** `mkdir`, `create`, `set_mode` and the other item-edit changes,
+  and setting a subvolume read-only or the default, reopened one device after
+  their commit and so returned an error on a pool, having committed. They
+  now reopen every member, as the copy-on-write write does.
 - **A transient HTTP 5xx from the chore release download no longer fails a CI
   job.** `scripts/ci-install-chore.sh` retries both downloads up to five times
   on any error; the checksum check still guards what was fetched.
