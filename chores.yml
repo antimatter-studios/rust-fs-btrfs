@@ -123,7 +123,13 @@ chore_min_version: 0.10.0
 #                                                    cold (51 lines of
 #                                                    cargo), run 36616794750;
 #                                                    was 361 / 19,014
-#     kernel      245 /  21,227      320 /  27,600   ~30%. Up from 179 /
+#     kernel      668 /  49,305      870 /  64,100   ~30%. 668 / 49,305 on CI
+#                                                    with #299's
+#                                                    raid56_write_kernel.rs,
+#                                                    run 38121507112, over
+#                                                    the 660 / 54,000 the
+#                                                    tier ran at; was 245 /
+#                                                    21,227. Up from 179 /
 #                                                    16,220 when
 #                                                    free_space_straddle added
 #                                                    its kernel-made volumes'
@@ -551,7 +557,7 @@ tasks:
     # this one line in every pull request, which conflicts inside a queue.
     cmds:
       - test-disks/build-fixtures.sh --check
-      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 660 54000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 870 64100 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
