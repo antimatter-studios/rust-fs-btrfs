@@ -61,6 +61,7 @@
 //! - [`cow_write`] — the copy-on-write file write, which commits a transaction
 //! - [`namespace`] — names in a directory: create, mkdir, symlink, link, unlink, rmdir
 //! - [`attrs`] — what an inode says about itself: extended attributes, ACLs, mode, owner, times
+//! - [`resize`] — the filesystem's size, grown or shrunk on one device
 //! - [`transaction`], [`extent_write`], [`block_group`] and [`commit`] — tree
 //!   rewrites and the commit of a new generation, separate from file writes
 //! - [`send`] — send streams: parsed, and written from a read-only subvolume
@@ -90,6 +91,7 @@ pub mod log_tree;
 pub mod mkfs;
 pub mod namespace;
 pub mod raid56;
+pub mod resize;
 pub mod scrub;
 pub mod send;
 pub mod subvol;

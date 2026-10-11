@@ -398,6 +398,18 @@ int fs_btrfs_utimens(fs_btrfs_fs_t *fs, const char *path, int64_t atime_sec,
                      uint32_t atime_nsec, int64_t mtime_sec,
                      uint32_t mtime_nsec);
 
+/* ---- size ---- */
+
+/*
+ * Make the filesystem `size` bytes (rounded down to a sector), as one
+ * committed transaction: the device item, the superblock's size and its
+ * copy of the device item. The device must already hold that many bytes;
+ * after a shrink the caller may cut it to the new size. Returns 0, or -1:
+ * EROFS on a read-only handle, ENOTSUP for a size past the device, a
+ * shrink past a chunk (moving it is a balance), or several devices.
+ */
+int fs_btrfs_resize(fs_btrfs_fs_t *fs, uint64_t size);
+
 /* ---- Subvolumes ----------------------------------------------------
  *
  * A subvolume is named by the path of its top directory, as a mounted
