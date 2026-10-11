@@ -97,7 +97,7 @@ Linux kernel in the guest.
 | A pool of several devices, written (`mount_pool_rw`) | Supported, except RAID5/6; a stale, read-only or missing member is refused | Unreleased (#298) | #299 | `pool_write_kernel.rs` |
 | Create, mkdir, symlink, link, unlink, rmdir | Supported | Unreleased (#262) | | `namespace_kernel.rs` |
 | Rename, truncate | Not supported | | #262 (PR #314, #323) | |
-| Extended attributes, ACLs, mode, owner and times, written | Not supported | | #263 (PR #312) | |
+| Extended attributes, ACLs, mode, owner and times, written | Supported on the top-level subvolume; a leaf with no room is refused | Unreleased (#263) | | `attrs_kernel.rs` |
 | Compression on write | Not supported | | #265 (PR #325) | |
 | Reflink, clone-range, fallocate, dedupe | Not supported | | #269 | |
 | Subvolumes and snapshots: making one read-only or writable again | Supported | Unreleased (#267) | | `subvol_readonly_kernel.rs` |

@@ -36,6 +36,7 @@
 #
 # <target> <floor>
 acl_oracle                8
+attrs_kernel              1
 backup_ring               1
 block_group_tree_oracle   3
 block_group_used          1
