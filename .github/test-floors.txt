@@ -94,6 +94,7 @@ pool_oracle               4
 pool_write_kernel         3
 prealloc_extent_write     1
 raid56_oracle             6
+raid56_write_kernel       2
 read_file_huge_size       1
 read_path_cost            1
 readlink_kernel_oracle    1
