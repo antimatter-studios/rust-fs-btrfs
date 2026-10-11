@@ -43,6 +43,14 @@ never does.
   clean, `btrfs property get` report the new flags, and the kernel refuse a
   write into the newly read-only subvolume and accept one into the newly
   writable snapshot.
+- **A filesystem can be resized.** `Filesystem::resize` grows a single-device
+  filesystem into a device the caller has already made larger, or shrinks it
+  when no chunk lies past the new end, as one transaction: the chunk tree's
+  device item, the superblock's size and its copy of the device item. The
+  planner now moves chunk tree blocks, within SYSTEM block groups, and the
+  commit moves the superblock's chunk root. The C ABI gains
+  `fs_btrfs_resize`; `fs.btrfs resize` still answers not implemented. Moving
+  chunks (a balance) and pools of several devices are refused (#264).
 - **RAID5 and RAID6 pools are written (#299).** Every write into a parity
   chunk, a file's extents and the commit's tree blocks alike, is a
   read-modify-write of each full stripe it touches: the data elements read,
@@ -65,14 +73,6 @@ never does.
   takes every device of a multi-device filesystem, in any order, and
   `fs_btrfs_open_subvolume` gives a read-only handle rooted at one subvolume
   or snapshot by its id (#271).
-- **A filesystem can be resized.** `Filesystem::resize` grows a single-device
-  filesystem into a device the caller has already made larger, or shrinks it
-  when no chunk lies past the new end, as one transaction: the chunk tree's
-  device item, the superblock's size and its copy of the device item. The
-  planner now moves chunk tree blocks, within SYSTEM block groups, and the
-  commit moves the superblock's chunk root. The C ABI gains
-  `fs_btrfs_resize`; `fs.btrfs resize` still answers not implemented. Moving
-  chunks (a balance) and pools of several devices are refused (#264).
 - **Names can be created and removed.** `Filesystem::create`, `mkdir`,
   `symlink`, `link`, `unlink` and `rmdir` each commit one transaction on the
   top-level subvolume: the inode, its reference, both directory entries and
