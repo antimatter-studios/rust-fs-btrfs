@@ -106,7 +106,8 @@ Linux kernel in the guest.
 | Trim: every free run of every block group handed to a caller's discard, on every copy | Supported; RAID5/6 groups refused | Unreleased (#305) | | `trim_oracle.rs` |
 | RAID5/6 writes | Not supported | | #299 | |
 | Label, written to every superblock copy | Supported | 0.9.0 (#264) | | `cli_label_kernel.rs` |
-| Resize | Not supported (`not implemented`, exit 3) | 0.8.0 | #264 (PR #326) | `tests/cli/test-blocked.sh` |
+| Resize, library and C ABI (`resize`, `fs_btrfs_resize`): one device, grown into a larger device or shrunk when no chunk lies past the end | Supported; moving chunks and pools refused | Unreleased (#264) | | `resize_kernel.rs` |
+| Resize, `fs.btrfs resize` | Not supported (`not implemented`, exit 3) | 0.8.0 | #264 | `tests/cli/test-blocked.sh` |
 
 ## Making a filesystem
 

@@ -103,6 +103,14 @@ never does.
   kernel read it back (#298).
 - **`send::StreamError`**, its own error type. A malformed stream is bytes
   handed in, not a damaged volume, so it is kept out of the crate's `Error`.
+- **A filesystem can be resized.** `Filesystem::resize` grows a single-device
+  filesystem into a device the caller has already made larger, or shrinks it
+  when no chunk lies past the new end, as one transaction: the chunk tree's
+  device item, the superblock's size and its copy of the device item. The
+  planner now moves chunk tree blocks, within SYSTEM block groups, and the
+  commit moves the superblock's chunk root. The C ABI gains
+  `fs_btrfs_resize`; `fs.btrfs resize` still answers not implemented. Moving
+  chunks (a balance) and pools of several devices are refused (#264).
 - **An unreplayed log tree can be read.** `Filesystem::log` returns every item
   of every subvolume's log tree, with the logged inodes, names and file
   contents, and `Filesystem::mount_ignoring_log` opens such a volume read-only

@@ -344,6 +344,18 @@ int fs_btrfs_link(fs_btrfs_fs_t *fs, const char *src, const char *dst);
 int fs_btrfs_unlink(fs_btrfs_fs_t *fs, const char *path);
 int fs_btrfs_rmdir(fs_btrfs_fs_t *fs, const char *path);
 
+/* ---- size ---- */
+
+/*
+ * Make the filesystem `size` bytes (rounded down to a sector), as one
+ * committed transaction: the device item, the superblock's size and its
+ * copy of the device item. The device must already hold that many bytes;
+ * after a shrink the caller may cut it to the new size. Returns 0, or -1:
+ * EROFS on a read-only handle, ENOTSUP for a size past the device, a
+ * shrink past a chunk (moving it is a balance), or several devices.
+ */
+int fs_btrfs_resize(fs_btrfs_fs_t *fs, uint64_t size);
+
 #ifdef __cplusplus
 }
 #endif

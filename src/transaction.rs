@@ -293,7 +293,7 @@ impl Filesystem {
         let mut taken: BTreeSet<u64> = BTreeSet::new();
         for old in touched {
             let place = places[&old];
-            let new = self.next_free_block(&taken)?;
+            let new = self.next_free_block_for(place.owner, &taken)?;
             taken.insert(new);
             plan.rewrites.push(Rewrite {
                 old,
@@ -311,12 +311,24 @@ impl Filesystem {
     /// out, so asking twice gives the same answer twice. Until a
     /// transaction records its allocations, the addresses it has already
     /// chosen are held here.
-    fn next_free_block(&self, taken: &BTreeSet<u64>) -> Result<u64> {
+    ///
+    /// The chunk tree's blocks live in a SYSTEM block group, because the
+    /// superblock's own chunk array has to be able to reach them, and
+    /// every other tree's in a METADATA one (#264), so `owner` decides
+    /// which groups are asked.
+    fn next_free_block_for(&self, owner: u64, taken: &BTreeSet<u64>) -> Result<u64> {
         let nodesize = self.sb.nodesize as u64;
+        let system = owner == objectid::CHUNK_TREE;
         let groups: Vec<_> = self
             .block_groups()?
             .into_iter()
-            .filter(|g| g.holds_metadata())
+            .filter(|g| {
+                if system {
+                    g.flags & crate::chunk::block_group::SYSTEM != 0
+                } else {
+                    g.holds_metadata()
+                }
+            })
             .collect();
 
         for runs in self.free_extents_by_group(&groups)? {
@@ -384,7 +396,12 @@ impl Filesystem {
     /// copy that tree's own block, as the kernel's does (#287).
     fn placements(&self) -> Result<BTreeMap<u64, Placement>> {
         let mut out = BTreeMap::new();
-        let mut roots = vec![(self.sb.root, objectid::ROOT_TREE)];
+        // The chunk tree too: no ROOT_ITEM names it, the superblock does,
+        // and a resize edits its device item (#264).
+        let mut roots = vec![
+            (self.sb.root, objectid::ROOT_TREE),
+            (self.sb.chunk_root, objectid::CHUNK_TREE),
+        ];
 
         while let Some((root, tree)) = roots.pop() {
             if root == 0 {
@@ -562,7 +579,7 @@ impl Filesystem {
         let edit_leaves: Vec<u64> = if data.edits.is_empty() {
             Vec::new()
         } else {
-            let root = self.tree_root(data.root)?;
+            let root = self.edit_root(data.root)?;
             let reader = self.pool_reader();
             let tree = reader.tree();
             data.edits
@@ -791,6 +808,24 @@ impl Filesystem {
             )));
         }
         Ok(out)
+    }
+
+    /// The root of tree `objectid` as a change edits it: the chunk tree's
+    /// from the superblock, every other tree's from its `ROOT_ITEM`.
+    pub(crate) fn edit_root(&self, objectid: u64) -> Result<u64> {
+        if objectid == objectid::CHUNK_TREE {
+            return Ok(self.sb.chunk_root);
+        }
+        self.tree_root(objectid)
+    }
+
+    /// Where the chunk tree's root ends up, for a plan that moves it
+    /// (#264).
+    pub(crate) fn planned_chunk_root(&self, plan: &Plan) -> Option<u64> {
+        plan.rewrites
+            .iter()
+            .find(|r| r.old == self.sb.chunk_root)
+            .map(|r| r.new)
     }
 
     /// Where the root tree ends up, for a plan that moves it.
@@ -2043,7 +2078,7 @@ mod needs_host {
         );
 
         let mut taken = BTreeSet::new();
-        while let Ok(at) = fs.next_free_block(&taken) {
+        while let Ok(at) = fs.next_free_block_for(crate::chunk::objectid::ROOT_TREE, &taken) {
             taken.insert(at);
             for mirror in 0..fs.map.mirrors_at(at).unwrap() {
                 let m = fs.map.map_mirror(at, mirror).unwrap();
