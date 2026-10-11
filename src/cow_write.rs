@@ -56,7 +56,6 @@
 //! writes in place and commits nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
 use crate::chunk::{objectid, DiskKey};
 use crate::error::{Error, Result};
