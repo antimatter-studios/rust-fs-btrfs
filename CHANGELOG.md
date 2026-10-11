@@ -34,6 +34,18 @@ never does.
   against RAID5 and RAID6 pools with P and Q damaged on purpose, located from
   the chunk tree as btrfs-progs prints it, and the parity the kernel's own
   scrub wrote back over them.
+- **A file can be truncated.** `Filesystem::truncate` commits one transaction:
+  shrinking deletes the extent items wholly past the new end and releases
+  each extent one of them was the only reference to — its record, its free
+  space, its block group's `used` and its digests — and references less of
+  the extent it cuts; growing moves only the size, on a no-holes volume. The
+  inode's `nbytes` is recounted as `btrfs check` counts it. The C ABI gains
+  `fs_btrfs_truncate` and `fs.btrfs` gains `truncate`. An extent a snapshot
+  or reflink shares is refused (#262).
+- **A transaction can release a data extent outright.** Beside the extents a
+  copy-on-write write replaces, a change can give up extents with no copy
+  taking their place, with the same refusal of any extent held by more than
+  the item being removed.
 - **A subvolume can be made read-only or writable again (#267, first
   slice).** `Filesystem::set_subvolume_read_only` sets or clears bit 0 of the
   subvolume's `ROOT_ITEM` flags and commits it as one copy-on-write
@@ -84,25 +96,6 @@ never does.
   directory whose leaf has no room, and the last name of a file still holding
   data extents, are refused with nothing written; `rename` and `truncate` are
   still to come (#262).
-- **A checksummed file can be written copy-on-write.** Each copy gets a
-  digest for every sector in the volume's checksum algorithm, and the
-  digests of the extents it replaces are removed — an `EXTENT_CSUM` item the
-  kernel shared between neighbouring extents is cut down to the neighbours'
-  sectors rather than dropped. Most files are checksummed, so most files can
-  now be overwritten; growing a file, filling a hole, and inline,
-  preallocated, compressed or shared extents are still refused (#261).
-- **A file can be truncated.** `Filesystem::truncate` commits one transaction:
-  shrinking deletes the extent items wholly past the new end and releases
-  each extent one of them was the only reference to — its record, its free
-  space, its block group's `used` and its digests — and references less of
-  the extent it cuts; growing moves only the size, on a no-holes volume. The
-  inode's `nbytes` is recounted as `btrfs check` counts it. The C ABI gains
-  `fs_btrfs_truncate` and `fs.btrfs` gains `truncate`. An extent a snapshot
-  or reflink shares is refused (#262).
-- **A transaction can release a data extent outright.** Beside the extents a
-  copy-on-write write replaces, a change can give up extents with no copy
-  taking their place, with the same refusal of any extent held by more than
-  the item being removed.
 - **A transaction can put and delete fs tree items.** The planner renders item
   edits into the leaves they land in, and a leaf whose first key changes has
   its parent's key follow it.
