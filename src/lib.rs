@@ -60,6 +60,7 @@
 //! - [`write`](mod@write) — the in-place file write, which commits nothing
 //! - [`cow_write`] — the copy-on-write file write, which commits a transaction
 //! - [`namespace`] — names in a directory: create, mkdir, symlink, link, unlink, rmdir
+//! - [`attrs`] — what an inode says about itself: extended attributes, ACLs, mode, owner, times
 //! - [`transaction`], [`extent_write`], [`block_group`] and [`commit`] — tree
 //!   rewrites and the commit of a new generation, separate from file writes
 //! - [`send`] — send streams: parsed, and written from a read-only subvolume
@@ -68,6 +69,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod attrs;
 mod backref;
 pub mod block_group;
 pub mod btree;

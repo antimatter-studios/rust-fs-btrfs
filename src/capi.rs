@@ -1449,3 +1449,212 @@ unsafe fn remove(fs: *mut fs_btrfs_fs, path: *const c_char, dir: bool) -> c_int 
         }
     }
 }
+
+// ---------------------------------------------------------------------
+// Attributes (#263): extended attributes, mode, owner, times
+// ---------------------------------------------------------------------
+
+/// The inode `path` names, on a writable handle. A symbolic link is the
+/// link itself, not what it points at. Records the error and returns
+/// `None` on failure.
+unsafe fn attr_target<'a>(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+) -> Option<(&'a mut Filesystem, u64)> {
+    let fs = unsafe { handle_mut(fs) }?;
+    let path = unsafe { borrow_bytes(path, "path") }?;
+    match fs.lookup_path_bytes(path) {
+        Ok(inode) => Some((fs, inode.ino)),
+        Err(e) => {
+            record(&e);
+            None
+        }
+    }
+}
+
+/// 0, or -1 with `result`'s error recorded.
+fn status(result: crate::Result<()>) -> c_int {
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            record(&e);
+            -1
+        }
+    }
+}
+
+/// An attribute name as bytes: EINVAL for NULL or empty, ERANGE for
+/// one longer than Linux allows.
+unsafe fn xattr_name<'a>(name: *const c_char) -> Option<&'a [u8]> {
+    if name.is_null() {
+        set_error("name is NULL".into(), EINVAL);
+        return None;
+    }
+    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+    if name.is_empty() {
+        set_error("an attribute name cannot be empty".into(), EINVAL);
+        return None;
+    }
+    if name.len() > crate::attrs::MAX_XATTR_NAME {
+        set_error(
+            format!(
+                "an attribute name of {} bytes is longer than {}",
+                name.len(),
+                crate::attrs::MAX_XATTR_NAME
+            ),
+            ERANGE,
+        );
+        return None;
+    }
+    Some(name)
+}
+
+/// Set the extended attribute `name` of `path` to the `size` bytes at
+/// `value`, replacing any value it had, as one committed transaction.
+/// ACLs are the attributes `system.posix_acl_access` and
+/// `system.posix_acl_default`, in the kernel's xattr encoding.
+///
+/// Returns 0, or -1 with the error recorded: ENOENT for no such path,
+/// EINVAL for an empty name, ERANGE for a name over 255 bytes, EROFS on
+/// a read-only handle, ENOTSUP for a value too large for one leaf item
+/// or a leaf with no room for it.
+///
+/// # Safety
+///
+/// `fs` must be a live handle; `path` and `name` NUL-terminated; `value`
+/// readable for `size` bytes, or NULL when `size` is 0.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_setxattr(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+    name: *const c_char,
+    value: *const c_void,
+    size: usize,
+) -> c_int {
+    guard(-1, || {
+        let Some(name) = (unsafe { xattr_name(name) }) else {
+            return -1;
+        };
+        if value.is_null() && size != 0 {
+            set_error("value is NULL".into(), EINVAL);
+            return -1;
+        }
+        let value = if size == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(value.cast::<u8>(), size) }
+        };
+        let Some((fs, ino)) = (unsafe { attr_target(fs, path) }) else {
+            return -1;
+        };
+        status(fs.set_xattr(ino, name, value))
+    })
+}
+
+/// Remove the extended attribute `name` from `path`, as one committed
+/// transaction. Returns 0, or -1: ENOENT when the path or the attribute
+/// is not there, otherwise as [`fs_btrfs_setxattr`].
+///
+/// # Safety
+///
+/// `fs` must be a live handle; `path` and `name` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_removexattr(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+    name: *const c_char,
+) -> c_int {
+    guard(-1, || {
+        let Some(name) = (unsafe { xattr_name(name) }) else {
+            return -1;
+        };
+        let Some((fs, ino)) = (unsafe { attr_target(fs, path) }) else {
+            return -1;
+        };
+        status(fs.remove_xattr(ino, name))
+    })
+}
+
+/// Set the permission bits of `path` to the low 12 bits of `mode`,
+/// keeping its type. Returns 0, or -1 as [`fs_btrfs_setxattr`].
+///
+/// # Safety
+///
+/// `fs` must be a live handle and `path` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_chmod(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+    mode: u32,
+) -> c_int {
+    guard(-1, || {
+        let Some((fs, ino)) = (unsafe { attr_target(fs, path) }) else {
+            return -1;
+        };
+        status(fs.set_mode(ino, mode))
+    })
+}
+
+/// Set the owner of `path`. A `uid` or `gid` of `UINT32_MAX` (`-1`, as
+/// POSIX `chown` spells it) leaves that one as it is. Returns 0, or -1
+/// as [`fs_btrfs_setxattr`].
+///
+/// # Safety
+///
+/// `fs` must be a live handle and `path` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_chown(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+    uid: u32,
+    gid: u32,
+) -> c_int {
+    guard(-1, || {
+        let Some((fs, ino)) = (unsafe { attr_target(fs, path) }) else {
+            return -1;
+        };
+        let keep = |id: u32| (id != u32::MAX).then_some(id);
+        status(fs.set_owner(ino, keep(uid), keep(gid)))
+    })
+}
+
+/// `UTIME_OMIT` as Linux spells it: a nanoseconds value that leaves
+/// that time as it is.
+pub const FS_BTRFS_UTIME_OMIT: u32 = (1 << 30) - 2;
+
+/// Set the access and modification times of `path`, each as seconds
+/// since the epoch and nanoseconds. A nanoseconds value of
+/// [`FS_BTRFS_UTIME_OMIT`] leaves that time as it is. The change time
+/// moves to now, as it does on Linux. Returns 0, or -1: EINVAL for
+/// nanoseconds of a second or more, otherwise as [`fs_btrfs_setxattr`].
+///
+/// # Safety
+///
+/// `fs` must be a live handle and `path` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_utimens(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+    atime_sec: i64,
+    atime_nsec: u32,
+    mtime_sec: i64,
+    mtime_nsec: u32,
+) -> c_int {
+    guard(-1, || {
+        let pick = |sec: i64, nsec: u32| (nsec != FS_BTRFS_UTIME_OMIT).then_some((sec, nsec));
+        let (atime, mtime) = (pick(atime_sec, atime_nsec), pick(mtime_sec, mtime_nsec));
+        for (sec, nsec) in [atime, mtime].into_iter().flatten() {
+            if nsec >= 1_000_000_000 {
+                set_error(
+                    format!("{sec}.{nsec}: nanoseconds must be under one second"),
+                    EINVAL,
+                );
+                return -1;
+            }
+        }
+        let Some((fs, ino)) = (unsafe { attr_target(fs, path) }) else {
+            return -1;
+        };
+        status(fs.set_times(ino, atime, mtime))
+    })
+}
