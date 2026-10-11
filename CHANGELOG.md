@@ -27,35 +27,6 @@ never does.
   against RAID5 and RAID6 pools with P and Q damaged on purpose, located from
   the chunk tree as btrfs-progs prints it, and the parity the kernel's own
   scrub wrote back over them.
-- **The C ABI mounts a pool and opens a subvolume.** `fs_btrfs_mount_pool`
-  takes every device of a multi-device filesystem, in any order, and
-  `fs_btrfs_open_subvolume` gives a read-only handle rooted at one subvolume
-  or snapshot by its id (#271).
-- **Send streams are read and written (#273).** `send::parse_send_stream`
-  reads a version 1 or 2 stream and verifies every command's checksum, and
-  `Filesystem::send_subvolume` writes a full version-1 stream of a read-only
-  subvolume. `tests/send_stream_kernel.rs` has the kernel judge both: a stream
-  `btrfs send` wrote parses into the commands `btrfs receive --dump` lists and
-  replays into the snapshot the kernel shows, and `btrfs receive` rebuilds the
-  same snapshot from a stream this crate wrote.
-- **`send::StreamError`**, its own error type. A malformed stream is bytes
-  handed in, not a damaged volume, so it is kept out of the crate's `Error`.
-- **The C ABI reads and changes a subvolume's read-only flag and the default
-  subvolume (#267).** `fs_btrfs_subvol_is_readonly`,
-  `fs_btrfs_subvol_set_readonly`, `fs_btrfs_subvol_is_default` and
-  `fs_btrfs_subvol_set_default` name a subvolume by the path of its top
-  directory, as a mount shows it, and fail with ENOENT for any other path and
-  EROFS on a handle not opened for writing. Behind them,
-  `Filesystem::subvolume_at` finds a subvolume by that path and
-  `Filesystem::default_subvolume` reads the default back;
-  `tests/subvol_default_kernel.rs` holds both to what the kernel says.
-- **The default subvolume can be chosen (#267).**
-  `Filesystem::set_default_subvolume` repoints the root tree's `default`
-  entry and, for any subvolume but the top level, sets the `DEFAULT_SUBVOL`
-  incompatible feature in the same commit, as `btrfs subvolume set-default`
-  does. `tests/subvol_default_kernel.rs` has `btrfs check` find the volume
-  clean, `btrfs subvolume get-default` name the new default, and a plain kernel
-  mount show its contents.
 - **A subvolume can be made read-only or writable again (#267, first
   slice).** `Filesystem::set_subvolume_read_only` sets or clears bit 0 of the
   subvolume's `ROOT_ITEM` flags and commits it as one copy-on-write
@@ -106,6 +77,15 @@ never does.
   does. `tests/subvol_default_kernel.rs` has `btrfs check` find the volume
   clean, `btrfs subvolume get-default` name the new default, and a plain kernel
   mount show its contents.
+- **The C ABI reads and changes a subvolume's read-only flag and the default
+  subvolume (#267).** `fs_btrfs_subvol_is_readonly`,
+  `fs_btrfs_subvol_set_readonly`, `fs_btrfs_subvol_is_default` and
+  `fs_btrfs_subvol_set_default` name a subvolume by the path of its top
+  directory, as a mount shows it, and fail with ENOENT for any other path and
+  EROFS on a handle not opened for writing. Behind them,
+  `Filesystem::subvolume_at` finds a subvolume by that path and
+  `Filesystem::default_subvolume` reads the default back;
+  `tests/subvol_default_kernel.rs` holds both to what the kernel says.
 - **Incremental send streams are written (#273).**
   `Filesystem::send_subvolume_incremental` writes what changed between two
   read-only snapshots, as `btrfs send -p` does: names taken away, moved and
