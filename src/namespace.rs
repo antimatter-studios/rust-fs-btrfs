@@ -480,6 +480,7 @@ impl Filesystem {
             moves: Vec::new(),
             time: now,
             root_flags: None,
+            default_subvol: None,
             edits,
         };
         let dirty: Vec<u64> = {
