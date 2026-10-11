@@ -99,6 +99,18 @@ impl Filesystem {
     /// copy exists to resolve, and a reader picks the newest copy that
     /// verifies.
     pub fn commit(&self, blocks: &[PlacedBlock], commit: &Commit) -> Result<()> {
+        self.commit_setting_incompat(blocks, commit, 0)
+    }
+
+    /// [`Filesystem::commit`], also setting `incompat` in the superblock's
+    /// incompatible feature flags: a transaction that starts using a
+    /// feature has to say so in the same superblock that names it.
+    pub(crate) fn commit_setting_incompat(
+        &self,
+        blocks: &[PlacedBlock],
+        commit: &Commit,
+        incompat: u64,
+    ) -> Result<()> {
         if self.writable.is_none() {
             return Err(Error::ReadOnly);
         }
@@ -108,7 +120,7 @@ impl Filesystem {
         //    a root tree that does not parse is refused while refusing is
         //    still free. One per device: each device's superblock carries
         //    its own `dev_item`, which the commit does not change (#298).
-        let images = self.superblock_images(blocks, commit)?;
+        let images = self.superblock_images(blocks, commit, incompat)?;
 
         // 1. Every tree block, to every mirror. Nothing points at these
         //    yet, so their order among themselves does not matter --
@@ -182,6 +194,7 @@ impl Filesystem {
         &self,
         blocks: &[PlacedBlock],
         commit: &Commit,
+        incompat: u64,
     ) -> Result<Vec<SuperblockImage>> {
         let mut roots = None;
         let mut images = Vec::new();
@@ -189,6 +202,16 @@ impl Filesystem {
             let mut raw = vec![0u8; SUPERBLOCK_SIZE];
             device.read_at(SUPER_OFFSETS[0], &mut raw)?;
             super_write::apply(&mut raw, self.sb.csum_type, commit)?;
+            if incompat != 0 {
+                use crate::superblock::offsets::INCOMPAT_FLAGS;
+                let flags = u64::from_le_bytes(
+                    raw[INCOMPAT_FLAGS..INCOMPAT_FLAGS + 8]
+                        .try_into()
+                        .expect("8 bytes"),
+                );
+                raw[INCOMPAT_FLAGS..INCOMPAT_FLAGS + 8]
+                    .copy_from_slice(&(flags | incompat).to_le_bytes());
+            }
             if roots.is_none() {
                 roots = Some(self.backup_roots(&raw, blocks, commit)?);
             }
