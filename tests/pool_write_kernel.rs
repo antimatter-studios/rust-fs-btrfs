@@ -214,3 +214,42 @@ fn a_read_only_member_is_refused() {
         Err(fs_btrfs::error::Error::ReadOnly)
     ));
 }
+
+/// Names and attributes change on a pool as on one device (#336): each is
+/// committed to every member, and the handle that comes back is the
+/// pool's, not an error from reopening one member alone.
+#[test]
+fn a_name_and_a_mode_are_changed_on_a_pool() {
+    let scratch = Scratch::new("names");
+    let members = scratch.members();
+    let mut fs = Filesystem::mount_pool_rw(devices(&members)).expect("the pool mounts read-write");
+    let root = fs.lookup_path("/").expect("the root").ino;
+    fs.mkdir(root, b"made-on-a-pool", 0o755, 0, 0)
+        .unwrap_or_else(|e| panic!("mkdir on a pool: {e}"));
+    let ino = fs.lookup_path("/big.bin").expect("big.bin").ino;
+    fs.set_mode(ino, 0o640)
+        .unwrap_or_else(|e| panic!("set_mode on a pool: {e}"));
+    assert!(fs.lookup_path("/made-on-a-pool").is_ok());
+    drop(fs);
+
+    let images: Vec<String> = members
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let images: Vec<&str> = images.iter().map(String::as_str).collect();
+    let read = guest_kernel_pool_read(
+        &images,
+        "test -d \"$MNT/made-on-a-pool\" && echo dir; stat -c '%a' \"$MNT/big.bin\"",
+    );
+    assert_eq!(
+        read.check_status, 0,
+        "btrfs check --readonly does not find the pool clean:\n{}",
+        read.check
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&read.out.stdout).trim(),
+        "dir\n640",
+        "the kernel does not see the new directory and the new mode:\n{}",
+        String::from_utf8_lossy(&read.out.stderr)
+    );
+}

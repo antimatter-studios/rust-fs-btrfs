@@ -761,8 +761,9 @@ impl Filesystem {
             },
             incompat,
         )?;
-        let device = std::sync::Arc::clone(self.writable.as_ref().expect("checked by the caller"));
-        *self = Filesystem::mount_rw(device)?;
+        // Every member of a pool, as the copy-on-write write reopens it
+        // (#298): `mount_rw` opens one device and refuses a pool (#336).
+        *self = self.remount_rw()?;
         Ok(())
     }
 }

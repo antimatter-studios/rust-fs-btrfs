@@ -213,6 +213,11 @@ never does.
   tree block outside that group, of every tree a plan can move, instead of the
   first 300 fs and csum leaves; when the kernel's layout offers none, the
   failure names that layout (#279, #280).
+- **Names, attributes and subvolume flags change on a pool mounted read-write
+  (#336).** `mkdir`, `create`, `set_mode` and the other item-edit changes,
+  and setting a subvolume read-only or the default, reopened one device after
+  their commit and so returned an error on a pool, having committed. They
+  now reopen every member, as the copy-on-write write does.
 - **A path with `..` in it resolves.** `lookup_path` and `resolve_path`
   refused it; `..` is now the directory the walk came from, the top's parent
   is the top, and climbing out of a subvolume lands in its parent tree, as the
