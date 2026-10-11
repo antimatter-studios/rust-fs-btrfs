@@ -53,8 +53,6 @@
 //! as an unlink or rmdir would. Truncating is the rest of #262 and not
 //! here yet.
 
-use std::sync::Arc;
-
 use crate::chunk::{objectid, DiskKey};
 use crate::dir::{self, ftype, DIR_INDEX_KEY, DIR_ITEM_KEY, MAX_NAME_LEN};
 use crate::error::{Error, Result};
@@ -687,7 +685,6 @@ impl Filesystem {
                 })?,
             ),
         };
-        let device = Arc::clone(self.writable.as_ref().expect("checked by the caller"));
         self.commit(
             &blocks,
             &Commit {
@@ -698,7 +695,9 @@ impl Filesystem {
                 ..Default::default()
             },
         )?;
-        *self = Filesystem::mount_rw(device)?;
+        // Every member of a pool, as the copy-on-write write reopens it
+        // (#298): `mount_rw` opens one device and refuses a pool (#336).
+        *self = self.remount_rw()?;
         Ok(())
     }
 

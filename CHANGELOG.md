@@ -201,6 +201,11 @@ never does.
   an `awk` that exits early could kill the writer before it with SIGPIPE and
   fail a kernel-oracle test at random (exit 141, #279). Six such readers in
   four tests now read every line, and a guard refuses new ones.
+- **Names, attributes and subvolume flags change on a pool mounted read-write
+  (#336).** `mkdir`, `create`, `set_mode` and the other item-edit changes,
+  and setting a subvolume read-only or the default, reopened one device after
+  their commit and so returned an error on a pool, having committed. They
+  now reopen every member, as the copy-on-write write does.
 - **The block-group used-count test picks a block whose move really crosses
   groups.** It asks the allocator where its next block goes and tries every
   tree block outside that group, of every tree a plan can move, instead of the
