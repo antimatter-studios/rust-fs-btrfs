@@ -145,9 +145,9 @@ fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
          sync\n\
          btrfs balance start --full-balance \"$MNT\" >/dev/null\n\
          for f in $(seq 0 399); do\n\
-           at=$(filefrag -v \"$MNT/f$f\" | awk '$1 == \"0:\" {sub(/\\.\\./, \"\", $4); print $4; exit}')\n\
+           at=$(filefrag -v \"$MNT/f$f\" | awk '$1 == \"0:\" {sub(/\\.\\./, \"\", $4); print $4}')\n\
            echo \"$at f$f\"\n\
-         done | sort -n | head -n 128 | awk 'NR % 2 == 1' | while read -r _ f; do rm \"$MNT/$f\"; done\n\
+         done | sort -n | awk 'NR <= 128 && NR % 2 == 1' | while read -r _ f; do rm \"$MNT/$f\"; done\n\
          sync",
     );
 

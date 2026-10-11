@@ -127,7 +127,7 @@ fn kernel_view(image: &str, what: &str, names: &[&str]) -> Vec<(String, String)>
     for name in names {
         script.push_str(&format!(
             "printf '%s %s\\n' \"$(sha256sum \"$MNT/{name}\" | cut -d' ' -f1)\" \
-             \"$(filefrag -v \"$MNT/{name}\" | awk '$1 == \"0:\" {{print $4; exit}}')\"\n"
+             \"$(filefrag -v \"$MNT/{name}\" | awk '$1 == \"0:\" {{print $4}}')\"\n"
         ));
     }
     guest_kernel_read_ok(image, what, &script)

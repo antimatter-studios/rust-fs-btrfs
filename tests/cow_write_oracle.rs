@@ -96,7 +96,7 @@ fn kernel_view(image: &Path, what: &str, names: &[&str]) -> BTreeMap<String, (St
     for name in names {
         script.push_str(&format!(
             "printf '%s %s %s\\n' {name} \"$(sha256sum \"$MNT/{name}\" | cut -d' ' -f1)\" \
-             \"$(filefrag -v \"$MNT/{name}\" | awk '$1 == \"0:\" {{print $4; exit}}')\"\n"
+             \"$(filefrag -v \"$MNT/{name}\" | awk '$1 == \"0:\" {{print $4}}')\"\n"
         ));
     }
     guest_kernel_read_ok(&image.to_string_lossy(), what, &script)
