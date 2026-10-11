@@ -81,6 +81,7 @@ fstree_oracle             2
 full_backref_move         1
 fuzz_decoders             5
 getxattr_byte_names       1
+guest_scripts_drain_pipes 2
 hard_link_extref          5
 kernel_readback           2
 leaf_edit_oracle          3

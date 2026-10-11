@@ -188,6 +188,10 @@ never does.
 
 ### Fixed
 
+- **Guest scripts read every pipe to the end.** Under `pipefail`, a `head` or
+  an `awk` that exits early could kill the writer before it with SIGPIPE and
+  fail a kernel-oracle test at random (exit 141, #279). Six such readers in
+  four tests now read every line, and a guard refuses new ones.
 - **The block-group used-count test picks a block whose move really crosses
   groups.** It asks the allocator where its next block goes and tries every
   tree block outside that group, of every tree a plan can move, instead of the
