@@ -67,8 +67,6 @@ head -c "$random_size" /dev/urandom >"$SANDBOX/random-sized.bin"
 
 refused 3 "grow the file" /nocow/data.bin "$SANDBOX/longer.bin"
 refused 3 "shorter is not something this library does yet" /nocow/data.bin "$SANDBOX/shorter.bin"
-refused 3 "copy-on-write" /dir/random.bin "$SANDBOX/random-sized.bin"
-refused 3 "checksum.*rust-fs-btrfs#261" /dir/random.bin "$SANDBOX/random-sized.bin"
 refused 3 "copy-on-write|inline" /hello.txt "$SANDBOX/hello-sized.bin"
 refused 3 "^not implemented: .*creating a file is not something this library does yet" /new.txt "$SANDBOX/shorter.bin"
 refused 3 "^not implemented: .*creating a file" /dir/new.txt "$SANDBOX/shorter.bin"
@@ -76,6 +74,14 @@ refused 3 "subvolume or snapshot" /vol/inside.txt "$SANDBOX/shorter.bin"
 refused 1 "is a directory" /dir "$SANDBOX/shorter.bin"
 refused 1 "not a regular file" /link "$SANDBOX/shorter.bin"
 check "the refusals left the image as it was" cmp -s "$img" "$SANDBOX/before.img"
+
+# A checksummed file is overwritten copy-on-write, its digests replaced
+# (#261); tests/cow_write_oracle.rs has btrfs check and the kernel judge it.
+status=0
+fs.btrfs "$img" write /dir/random.bin <"$SANDBOX/random-sized.bin" >/dev/null 2>"$SANDBOX/c.err" || status=$?
+check "write /dir/random.bin, a checksummed file, exits 0, not $status ($(cat "$SANDBOX/c.err"))" test "$status" -eq 0
+check "read /dir/random.bin is what was written" \
+    cmp -s "$SANDBOX/random-sized.bin" <(fs.btrfs "$img" read /dir/random.bin)
 
 # Names (#262): each verb commits one transaction; tests/namespace_kernel.rs
 # has btrfs check and the kernel judge the same changes through the C ABI.

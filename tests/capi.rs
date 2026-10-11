@@ -1003,7 +1003,9 @@ fn can_write_in_place_agrees_with_the_write() {
     };
     assert_eq!(n, payload.len() as i64, "{}", last_error());
 
-    let refused = unsafe {
+    // Not in place, and still written: a checksummed file goes through the
+    // copy-on-write path, its digests replaced (#261).
+    let cow_written = unsafe {
         fs_btrfs_write_file(
             fs,
             cow.as_ptr(),
@@ -1012,8 +1014,12 @@ fn can_write_in_place_agrees_with_the_write() {
             payload.len() as u64,
         )
     };
-    assert_eq!(refused, -1, "a copy-on-write file was written");
-    assert_eq!(fs_btrfs_last_errno(), ENOTSUP_ERRNO, "{}", last_error());
+    assert_eq!(
+        cow_written,
+        payload.len() as i64,
+        "a checksummed file is written copy-on-write: {}",
+        last_error()
+    );
     unsafe { fs_btrfs_umount(fs) };
 }
 
