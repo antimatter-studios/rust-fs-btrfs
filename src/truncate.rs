@@ -109,7 +109,9 @@ impl Filesystem {
             ino,
             moves: Vec::new(),
             time: now,
+            root_flags: None,
             edits,
+            default_subvol: None,
             csum_edits: if released.is_empty() {
                 Vec::new()
             } else {
