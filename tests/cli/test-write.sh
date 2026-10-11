@@ -77,9 +77,37 @@ refused 1 "is a directory" /dir "$SANDBOX/shorter.bin"
 refused 1 "not a regular file" /link "$SANDBOX/shorter.bin"
 check "the refusals left the image as it was" cmp -s "$img" "$SANDBOX/before.img"
 
-# mkdir waits on the same namespace work, #262.
-fs.btrfs "$img" mkdir /newdir >"$SANDBOX/m.out" 2>"$SANDBOX/m.err"
-check "mkdir exits 3" test $? -eq 3
-jq_check "mkdir names what blocks it" '.code == 3 and (.error | test("rust-fs-btrfs#262"))' "$SANDBOX/m.err"
+# Names (#262): each verb commits one transaction; tests/namespace_kernel.rs
+# has btrfs check and the kernel judge the same changes through the C ABI.
+names="$SANDBOX/names.img"
+sparse_copy "$src" "$names"
+name_ok() {
+    local status=0
+    fs.btrfs "$names" "$@" >"$SANDBOX/n.json" 2>"$SANDBOX/n.err" || status=$?
+    check "$* exits 0, not $status ($(cat "$SANDBOX/n.err"))" test "$status" -eq 0
+}
+name_ok mkdir /newdir
+name_ok create --mode 600 /newdir/empty.txt
+name_ok ln -s empty.txt /newdir/link
+name_ok ln /hello.txt /newdir/hello-again
+fs.btrfs "$names" ls /newdir >"$SANDBOX/ls.json" 2>/dev/null
+jq_check "the new directory lists its three names" \
+    '[.[].name] | sort == ["empty.txt", "hello-again", "link"]' "$SANDBOX/ls.json"
+check "the hard link reads as the file it names" \
+    cmp -s <(fs.btrfs "$names" read /hello.txt) <(fs.btrfs "$names" read /newdir/hello-again)
+name_ok rm /newdir/hello-again
+name_ok rm /newdir/link
+name_ok rm /newdir/empty.txt
+name_ok rmdir /newdir
+fs.btrfs "$names" ls / >"$SANDBOX/ls.json" 2>/dev/null
+jq_check "the directory is gone again" 'all(.[]; .name != "newdir")' "$SANDBOX/ls.json"
+status=0
+fs.btrfs "$names" rmdir /dir >/dev/null 2>"$SANDBOX/n.err" || status=$?
+check "rmdir of a directory with entries exits 3, not $status" test "$status" -eq 3
+jq_check "rmdir says the directory is not empty" '.code == 3 and (.error | test("not empty"))' "$SANDBOX/n.err"
+status=0
+fs.btrfs "$names" rm /dir/random.bin >/dev/null 2>"$SANDBOX/n.err" || status=$?
+check "rm of a file's last name while it holds data exits 3, not $status" test "$status" -eq 3
+jq_check "rm names the data it cannot release" '.code == 3 and (.error | test("data extents"))' "$SANDBOX/n.err"
 
 finish
