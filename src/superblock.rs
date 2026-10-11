@@ -285,8 +285,13 @@ pub mod incompat {
     /// The exclusions are deliberate, not accidental:
     ///
     /// - [`ZONED`], [`EXTENT_TREE_V2`], [`RAID_STRIPE_TREE`],
-    ///   [`SIMPLE_QUOTA`], [`REMAP_TREE`] — each restructures something
-    ///   the read path depends on.
+    ///   [`REMAP_TREE`] — each restructures something the read path
+    ///   depends on.
+    ///
+    /// [`SIMPLE_QUOTA`] IS accepted (#270): it adds an owner reference to
+    /// each data extent item and keeps usage in the quota tree, neither of
+    /// which moves a file's bytes. `mount_rw` refuses it, because a write
+    /// would allocate extents without either.
     ///
     /// [`COMPRESS_LZO`] and [`COMPRESS_ZSTD`] ARE accepted, which was
     /// not always so. The concern that kept them out was a reader
@@ -315,7 +320,8 @@ pub mod incompat {
         // and a damaged one is rebuilt from it (#268), against pools the
         // kernel wrote. Never written: `mount_rw` takes one device, and a
         // parity chunk spans several.
-        | RAID56;
+        | RAID56
+        | SIMPLE_QUOTA;
 }
 
 /// `compat_ro_flags` bits: features an implementation may ignore while
@@ -1446,7 +1452,6 @@ pub(crate) mod tests {
             incompat::ZONED,
             incompat::EXTENT_TREE_V2,
             incompat::RAID_STRIPE_TREE,
-            incompat::SIMPLE_QUOTA,
             incompat::REMAP_TREE,
         ] {
             let mut b = sb_bytes();

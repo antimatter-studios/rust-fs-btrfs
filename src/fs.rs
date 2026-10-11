@@ -615,6 +615,19 @@ impl Filesystem {
 
     /// What every read-write mount refuses, a pool's as one device's.
     fn refuse_unwritable(&self) -> Result<()> {
+        // Simple quotas are read and not maintained: an extent this driver
+        // allocated would carry no owner reference and charge no quota
+        // group, and the kernel's accounting would then be wrong (#270).
+        // Checked before the compat_ro features, because a btrfs-progs that
+        // knows simple quotas also turns on the block group tree by default,
+        // and the reason a user can act on is the quotas.
+        if self.sb.incompat_flags & crate::superblock::incompat::SIMPLE_QUOTA != 0 {
+            return Err(Error::UnsupportedFeature(
+                "this volume uses simple quotas, which can be read but not written: a \
+                 write would allocate extents without their owner references"
+                    .into(),
+            ));
+        }
         crate::superblock::refuse_unmaintained_compat_ro(self.sb.compat_ro_flags)?;
         // A SEED DEVICE IS READ-ONLY BY CONSTRUCTION (#76). Another
         // filesystem is layered on it, and writes belong to that sprout;
