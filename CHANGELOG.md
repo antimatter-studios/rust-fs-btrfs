@@ -241,6 +241,12 @@ never does.
   tree block outside that group, of every tree a plan can move, instead of the
   first 300 fs and csum leaves; when the kernel's layout offers none, the
   failure names that layout (#279, #280).
+- **The block-group used-count test asks the kernel for another volume on a
+  layout miss (#343).** About one kernel-made volume in thirty held no block
+  whose move crosses groups cleanly, every candidate's extent item landing in
+  a full extent-tree leaf (#342), and the test failed the run. It now builds a
+  fresh volume, up to three times, and fails only when every one misses,
+  naming each layout.
 - **Names, attributes and subvolume flags change on a pool mounted read-write
   (#336).** `mkdir`, `create`, `set_mode` and the other item-edit changes,
   and setting a subvolume read-only or the default, reopened one device after

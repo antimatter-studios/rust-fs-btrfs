@@ -38,6 +38,14 @@
 //! names the layout — the target group, how the tree blocks are spread
 //! over the groups, and why each crossing plan was passed over — so a
 //! layout miss reads as one rather than as a fault in the driver.
+//!
+//! A LAYOUT MISS ASKS FOR ANOTHER VOLUME. About one volume in thirty holds
+//! no qualifying block: every move that crosses groups lands its extent
+//! item in a full extent-tree leaf, which the driver does not yet split
+//! (#342). The kernel lays each volume out afresh, so the test builds a
+//! new one, up to `ATTEMPTS` times, and fails only when every one misses,
+//! naming each layout (#343). A driver fault on a block that does
+//! qualify fails on the first volume, as it always did.
 
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::super_write::Commit;
@@ -119,17 +127,16 @@ fn tree_blocks(image: &Path) -> Vec<u64> {
         .collect()
 }
 
-#[test]
-fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
-    let dir = PathBuf::from(temp_path!("bg-used"));
-    std::fs::create_dir_all(&dir).unwrap();
-    let image = dir.join("fs.img");
-    std::fs::File::create(&image)
+/// A 2 GiB volume the kernel made and filled in the harness guest, as the
+/// header describes: mixed groups, two full balances, and every other one
+/// of the 128 lowest files deleted.
+fn kernel_volume(image: &Path) {
+    std::fs::File::create(image)
         .and_then(|f| f.set_len(2 << 30))
         .unwrap();
     let made = oracle("mkfs.btrfs")
         .args(["-q", "-f", "-M", "-n", "4096", "-s", "4096"])
-        .arg(&image)
+        .arg(image)
         .output();
     assert!(
         made.status.success(),
@@ -150,7 +157,17 @@ fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
          done | sort -n | awk 'NR <= 128 && NR % 2 == 1' | while read -r _ f; do rm \"$MNT/$f\"; done\n\
          sync",
     );
+}
 
+/// Move a tree block whose move crosses block groups, commit it, and have
+/// `btrfs check` judge the result.
+///
+/// `Err` names the layout when the volume holds no such block that the
+/// driver can move: a fault of the volume, not of the driver, and the
+/// caller's cue to ask the kernel for another. A driver fault on a block
+/// that does qualify still panics here.
+fn commit_across_groups(image: &Path) -> Result<(), String> {
+    let image = image.to_path_buf();
     // Which leaves each group's free-space records sit in, from
     // btrfs-progs. A plan touching a group whose records straddle a leaf
     // is a different defect (#177), so the plan chosen below touches none.
@@ -224,21 +241,20 @@ fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
         }
     }
     // NOT A SKIP, and not the driver's fault either: when nothing is
-    // chosen, the message says what the kernel's layout was, so a layout
-    // miss reads as one rather than as a regression.
-    let (plan, rendered, released, allocated) = chosen.unwrap_or_else(|| {
-        panic!(
-            "the volume the kernel made holds no tree block whose move crosses block groups \
-             cleanly, so the layout, not the driver, is what failed. The allocator's next \
-             block is in the group at {target:?}; the {} tree blocks are spread over groups \
-             {by_group:?}. Of them, {crossed} crossed groups: {on_a_straddle} touched one of \
-             the {} groups whose free-space records straddle a leaf ({straddling:?}), and \
-             {full_leaf} needed an insert into a full extent-tree leaf (first: {})",
+    // chosen, the layout is reported, and the caller asks the kernel for
+    // another volume.
+    let Some((plan, rendered, released, allocated)) = chosen else {
+        return Err(format!(
+            "the allocator's next block is in the group at {target:?}; the {} tree blocks \
+             are spread over groups {by_group:?}. Of them, {crossed} crossed groups: \
+             {on_a_straddle} touched one of the {} groups whose free-space records straddle \
+             a leaf ({straddling:?}), and {full_leaf} needed an insert into a full \
+             extent-tree leaf (first: {})",
             blocks.len(),
             straddling.len(),
             first_full.as_deref().unwrap_or("none")
-        )
-    });
+        ));
+    };
     let root = fs
         .planned_root(&plan)
         .expect("the plan moves the root tree");
@@ -259,5 +275,42 @@ fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
     );
 
     assert_btrfs_check_clean(&image, "a transaction across block groups");
+    Ok(())
+}
+
+/// How many volumes the kernel is asked for before a layout miss fails
+/// the test (#343). About one volume in thirty holds no qualifying block,
+/// every move that crosses groups landing its extent item in a full
+/// extent-tree leaf (#342), so three misses in a row is a layout this
+/// test cannot use, or a driver that no longer moves anything.
+const ATTEMPTS: usize = 3;
+
+#[test]
+fn a_transaction_across_block_groups_keeps_each_groups_used_count_true() {
+    let dir = PathBuf::from(temp_path!("bg-used"));
+    let mut misses = Vec::new();
+    for attempt in 1..=ATTEMPTS {
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("fs.img");
+        kernel_volume(&image);
+        match commit_across_groups(&image) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            Err(layout) => {
+                println!(
+                    "[bg-used] volume {attempt} of {ATTEMPTS} holds no qualifying block: {layout}"
+                );
+                misses.push(format!("volume {attempt}: {layout}"));
+            }
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
+    panic!(
+        "none of the {ATTEMPTS} volumes the kernel made holds a tree block whose move crosses \
+         block groups cleanly, so the layout, not the driver, is what failed (#342, #343):\n{}",
+        misses.join("\n")
+    );
 }
