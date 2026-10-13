@@ -1205,7 +1205,12 @@ impl Filesystem {
                 rewrites: plan.rewrites.clone(),
                 splits: splits.clone(),
             };
-            let leaves = self.leaf_contents(&trial, data, generation)?;
+            // A change the render refuses is the render's to report: given
+            // these splits it makes this same call and fails the same way,
+            // so planning does not take that refusal over (#87).
+            let Ok(leaves) = self.leaf_contents(&trial, data, generation) else {
+                return Ok(splits);
+            };
             let full: BTreeSet<u64> = leaves
                 .iter()
                 .filter(|(_, items)| !crate::leaf_edit::fit(nodesize, items))
