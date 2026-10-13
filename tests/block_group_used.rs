@@ -6,8 +6,10 @@
 //! in the first group that holds metadata, so on a volume whose tree blocks
 //! are spread over several groups the two ends of a move are routinely in
 //! different groups. `bytes_used` still adds up — one allocation per
-//! release — but each group's `BLOCK_GROUP_ITEM.used` did not move, and
-//! `btrfs check` reports "block group [...] used X but extent items used Y".
+//! release, and one more for each leaf a split adds (#342), which the
+//! commit below records as the driver's own callers do — but each group's
+//! `BLOCK_GROUP_ITEM.used` did not move, and `btrfs check` reports "block
+//! group [...] used X but extent items used Y".
 //!
 //! THE VOLUME IS MADE BY THE KERNEL, in the harness guest: 4 KiB nodes and
 //! mixed block groups, so metadata is allocated from the same groups data
@@ -258,11 +260,18 @@ fn commit_across_groups(image: &Path) -> Result<(), String> {
     let root = fs
         .planned_root(&plan)
         .expect("the plan moves the root tree");
+    // A split takes a block no release pays for, so the volume's total
+    // moves by what the plan takes beyond what it gives back.
+    let nodesize = u64::from(fs.superblock().nodesize);
+    let bytes_used =
+        u64::try_from(i128::from(fs.superblock().bytes_used) + plan.usage_delta(nodesize))
+            .expect("bytes_used stays positive");
     fs.commit(
         &rendered,
         &Commit {
             generation,
             root,
+            bytes_used: Some(bytes_used),
             invalidate_free_space_tree: false,
             ..Default::default()
         },
