@@ -240,8 +240,14 @@ impl ItemEdit {
 /// order; a delete removes one that must be there. The result may no
 /// longer fit in one block: the renderer splits it then, as the plan
 /// arranged (#342).
+///
+/// A leaf that is its tree's root may be left with no items: that is the
+/// shape of every tree `mkfs.btrfs` makes empty, the checksum tree of a
+/// filesystem holding no data among them. Any other leaf left empty must
+/// leave its tree, which is not implemented.
 fn apply_item_edits(
     leaf: u64,
+    is_root: bool,
     mut items: Vec<crate::leaf_edit::OwnedItem>,
     edits: &[&ItemEdit],
 ) -> Result<Vec<crate::leaf_edit::OwnedItem>> {
@@ -257,7 +263,7 @@ fn apply_item_edits(
             ItemEdit::Delete(key) => items = delete(&items, key)?,
         }
     }
-    if items.is_empty() {
+    if items.is_empty() && !is_root {
         return Err(Error::UnsupportedFeature(format!(
             "the change empties the tree leaf at {leaf}, and removing a leaf from its \
              tree is not implemented"
@@ -837,7 +843,8 @@ impl Filesystem {
                             .map(|(e, _)| e)
                             .collect();
                         if !here.is_empty() {
-                            owned = apply_item_edits(rewrite.old, owned, &here)?;
+                            let is_root = self.is_tree_root(rewrite.owner, rewrite.old)?;
+                            owned = apply_item_edits(rewrite.old, is_root, owned, &here)?;
                             edits_applied += here.len();
                         }
                     }
@@ -852,7 +859,8 @@ impl Filesystem {
                             .map(|(e, _)| e)
                             .collect();
                         if !here.is_empty() {
-                            owned = apply_item_edits(rewrite.old, owned, &here)?;
+                            let is_root = self.is_tree_root(rewrite.owner, rewrite.old)?;
+                            owned = apply_item_edits(rewrite.old, is_root, owned, &here)?;
                             edits_applied += here.len();
                         }
                     }
@@ -1289,6 +1297,17 @@ impl Filesystem {
              another"
                 .into(),
         ))
+    }
+
+    /// Whether the block at `addr` is tree `owner`'s root. The superblock
+    /// names the root tree's and the chunk tree's roots; the root tree
+    /// names every other's.
+    fn is_tree_root(&self, owner: u64, addr: u64) -> Result<bool> {
+        Ok(match owner {
+            objectid::ROOT_TREE => self.sb.root == addr,
+            objectid::CHUNK_TREE => self.sb.chunk_root == addr,
+            _ => self.tree_root(owner)? == addr,
+        })
     }
 
     /// The extent tree leaves that hold, or would hold, the records for

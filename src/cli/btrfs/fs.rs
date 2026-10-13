@@ -223,9 +223,9 @@ fn command() -> Cmd {
                      PATH is the new name itself, not a directory to move into. A name \
                      already there is replaced, as rename(2) does: a file by a file, an empty \
                      directory by a directory. Committed as one transaction; only the \
-                     top-level subvolume is written, and a replaced file whose last name it \
-                     is while it still holds data is refused with exit 3 \
-                     (rust-fs-btrfs#262).",
+                     top-level subvolume is written. A replaced file's last name takes its \
+                     data with it; one whose data a snapshot or a reflink shares is refused \
+                     with exit 3 (rust-fs-btrfs#262).",
                 ),
         )
         .subcommand(

@@ -38,7 +38,6 @@ const EISDIR: i32 = 21;
 const EINVAL: i32 = 22;
 const EROFS: i32 = 30;
 const ENOTEMPTY: i32 = if cfg!(target_os = "macos") { 66 } else { 39 };
-const ENOTSUP: i32 = if cfg!(target_os = "macos") { 45 } else { 95 };
 
 /// A scratch volume, removed when it drops — including on a panic.
 struct Scratch(PathBuf);
@@ -144,8 +143,6 @@ fn names_moved_through_the_abi_are_clean_and_the_kernel_agrees() {
     refused(fs, "/d3/full", "/keep", ENOTDIR);
     refused(fs, "/nope", "/x", ENOENT);
     refused(fs, "/keep", "/d1/missing/x", ENOENT);
-    // The replaced file's last name, while it still holds data.
-    refused(fs, "/keep", "/d3/moved-big", ENOTSUP);
     assert!(
         std::fs::read(&image).unwrap() == before,
         "a refused rename wrote to the image"
@@ -214,5 +211,38 @@ fn names_moved_through_the_abi_are_clean_and_the_kernel_agrees() {
     assert_btrfs_check_clean(
         std::path::Path::new(&image),
         "after the kernel moved names in our directories",
+    );
+}
+
+/// Replacing a file's last name by rename gives its data back, as unlink
+/// does (#262): its extents, their back references, their checksums and
+/// the block group's count go in the same transaction as the names, and
+/// `btrfs check` and the kernel find a volume with nothing left behind.
+#[test]
+fn a_file_holding_data_replaced_by_rename_gives_its_data_back() {
+    let scratch = Scratch::new("rename-over-data");
+    let image = scratch.image();
+    let fs = unsafe { fs_btrfs_mount_rw(c(&image).as_ptr()) };
+    assert!(!fs.is_null(), "mount_rw: {}", last_error());
+    // big has two names: replacing one leaves the data with the other.
+    ok(fs, "/keep", "/d3/big-link");
+    // Now /big is its last name, and the data goes with it.
+    ok(fs, "/d1/a", "/big");
+    unsafe { fs_btrfs_umount(fs) };
+
+    assert_btrfs_check_clean(
+        std::path::Path::new(&image),
+        "after a rename replaced the last name of a file holding data",
+    );
+    let seen = guest_kernel_read_ok(
+        &image,
+        "after a rename replaced a file holding data",
+        "cd \"$MNT\"\n\
+         stat -c '%n|%F|%h|%s' big d3/big-link\n\
+         cat big",
+    );
+    assert_eq!(
+        seen, "big|regular file|1|2\nd3/big-link|regular empty file|1|0\nx\n",
+        "the kernel sees a different namespace"
     );
 }

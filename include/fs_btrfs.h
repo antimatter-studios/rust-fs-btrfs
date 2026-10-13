@@ -340,8 +340,9 @@ int fs_btrfs_link(fs_btrfs_fs_t *fs, const char *src, const char *dst);
  * An inode losing its last name is deleted with it. Returns 0, or -1:
  * ENOENT for no such name, EISDIR from unlink on a directory, ENOTDIR
  * from rmdir on anything else, ENOTEMPTY for a directory holding
- * entries, and ENOTSUP for the last name of a file still holding data
- * extents, which cannot be released yet.
+ * entries, and ENOTSUP for the last name of a file whose data extents a
+ * snapshot or a reflink shares. A file's last name otherwise takes its
+ * data with it, extents, back references and checksums.
  */
 int fs_btrfs_unlink(fs_btrfs_fs_t *fs, const char *path);
 int fs_btrfs_rmdir(fs_btrfs_fs_t *fs, const char *path);
