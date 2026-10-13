@@ -119,11 +119,18 @@ fn a_commit_fills_its_backup_slot() {
             let new_root = fs
                 .planned_root(&plan)
                 .expect("the plan moves the root tree");
+            // A split takes a block no release pays for (#342).
+            let bytes_used = u64::try_from(
+                i128::from(fs.superblock().bytes_used)
+                    + plan.usage_delta(u64::from(fs.superblock().nodesize)),
+            )
+            .expect("bytes_used stays positive");
             fs.commit(
                 &blocks,
                 &Commit {
                     generation,
                     root: new_root,
+                    bytes_used: Some(bytes_used),
                     invalidate_free_space_tree: true,
                     ..Default::default()
                 },

@@ -268,13 +268,20 @@ fn record_commit(image: &Path, label: &str) -> Vec<Op> {
         "[{label}] expected {CHANGED_FILE}'s inline bytes exactly once in the relocated fs tree"
     );
 
+    // A split takes a block no release pays for (#342), so the volume's
+    // total moves by what the plan takes beyond what it gives back.
+    let bytes_used = u64::try_from(
+        i128::from(fs.superblock().bytes_used)
+            + plan.usage_delta(u64::from(fs.superblock().nodesize)),
+    )
+    .expect("bytes_used stays positive");
     fs.commit(
         &blocks,
         &Commit {
             generation,
             root: new_root,
             root_level: None,
-            bytes_used: None,
+            bytes_used: Some(bytes_used),
             chunk_root: None,
             chunk_root_generation: None,
             invalidate_free_space_tree: true,
