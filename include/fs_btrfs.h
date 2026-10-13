@@ -374,9 +374,9 @@ int fs_btrfs_truncate(fs_btrfs_fs_t *fs, const char *path, uint64_t size);
  * subvolume, and moves the inode's change time as Linux does. `path` is
  * not followed when it is a symbolic link: the link itself changes. Each
  * returns 0, or -1 with the errno: ENOENT for no such path, EROFS on a
- * read-only handle, ENOTSUP for what cannot be written yet (a leaf with
- * no room for a new attribute item, as nothing yet splits an fs tree
- * leaf, or a value too large for one leaf item).
+ * read-only handle, ENOTSUP for what cannot be written yet (a full leaf
+ * that cannot be split -- one a snapshot shares, or one whose parent has
+ * no room for another pointer -- or a value too large for one leaf item).
  */
 
 /*
