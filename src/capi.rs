@@ -1642,7 +1642,7 @@ unsafe fn xattr_name<'a>(name: *const c_char) -> Option<&'a [u8]> {
 /// Returns 0, or -1 with the error recorded: ENOENT for no such path,
 /// EINVAL for an empty name, ERANGE for a name over 255 bytes, EROFS on
 /// a read-only handle, ENOTSUP for a value too large for one leaf item
-/// or a leaf with no room for it.
+/// or a full leaf that cannot be split.
 ///
 /// # Safety
 ///

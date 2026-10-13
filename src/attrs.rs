@@ -21,8 +21,9 @@
 //! # What it refuses
 //!
 //! Anything outside the top-level subvolume; an attribute whose records
-//! under one hash would outgrow a leaf; and a leaf with no room for a
-//! new attribute item, since splitting an fs tree leaf is not written.
+//! under one hash would outgrow a leaf; and a full leaf that cannot be
+//! split: one a snapshot shares, or one whose parent node has no room for
+//! another pointer, since splitting those is not written.
 
 use crate::chunk::DiskKey;
 use crate::dir::{self, ftype, XATTR_ITEM_KEY};

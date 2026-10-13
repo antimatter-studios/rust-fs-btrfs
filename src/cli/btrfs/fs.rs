@@ -198,8 +198,8 @@ fn command() -> Cmd {
                     "Examples:\n  fs.btrfs disk.img ln /data/a /data/also-a\n  \
                      fs.btrfs disk.img ln -s ../etc/hosts /hosts\n\n\
                      A new name is committed as one transaction. Only the top-level \
-                     subvolume is written, and a directory whose leaf has no room for the \
-                     new items is refused with exit 3.",
+                     subvolume is written, and a directory whose full leaf cannot be split \
+                     is refused with exit 3.",
                 ),
         )
         .subcommand(
@@ -311,7 +311,7 @@ fn name_command(
         .after_help(format!(
             "Examples:\n  {examples}\n\n\
              Committed as one transaction. Only the top-level subvolume is written; a \
-             directory whose leaf has no room for the new items, and the last name of a \
+             directory whose full leaf cannot be split, and the last name of a \
              file whose data a snapshot or a reflink shares, are refused with exit 3 \
              (rust-fs-btrfs#262)."
         ));

@@ -138,11 +138,19 @@ fn moving_a_leaf_that_holds_data_by_full_back_reference_keeps_the_volume_consist
     let root = fs
         .planned_root(&plan)
         .expect("the plan moves the root tree");
+    // A split takes a block no release pays for (#342), so the volume's
+    // total moves by what the plan takes beyond what it gives back.
+    let bytes_used = u64::try_from(
+        i128::from(fs.superblock().bytes_used)
+            + plan.usage_delta(u64::from(fs.superblock().nodesize)),
+    )
+    .expect("bytes_used stays positive");
     fs.commit(
         &blocks,
         &Commit {
             generation,
             root,
+            bytes_used: Some(bytes_used),
             invalidate_free_space_tree: false,
             ..Default::default()
         },

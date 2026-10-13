@@ -57,6 +57,25 @@ pub struct Rewrite {
     pub level: u8,
 }
 
+/// A leaf the change fills past one block, and the blocks its split takes
+/// (#342). A leaf whose items no longer fit is divided in two: the first
+/// half goes where its [`Rewrite`] puts it, the second here, and the
+/// parent gains a key pointer to it. A leaf that is its tree's root has no
+/// parent, so the tree grows a level: a new root node over the two halves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Split {
+    /// The leaf that splits, by its address before the change.
+    pub leaf: u64,
+    /// Where its second half goes: a block the change allocates and
+    /// releases nothing for.
+    pub new: u64,
+    /// The tree it is in.
+    pub owner: u64,
+    /// When the leaf was its tree's root: where the new root node, one
+    /// level up, goes.
+    pub root: Option<u64>,
+}
+
 /// What a transaction will do.
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
@@ -64,6 +83,9 @@ pub struct Plan {
     /// commit sequencer writes them all before its barrier, so the order
     /// among them carries no meaning.
     pub rewrites: Vec<Rewrite>,
+    /// Every leaf the change fills past one block (#342), and the blocks
+    /// it takes to split. Each allocates without releasing anything.
+    pub splits: Vec<Split>,
 }
 
 impl Plan {
@@ -72,23 +94,34 @@ impl Plan {
         self.rewrites.iter().map(|r| r.old).collect()
     }
 
-    /// The addresses this takes.
+    /// The addresses this takes: every rewrite's new home, and every block
+    /// a split adds.
     pub fn allocated(&self) -> Vec<u64> {
-        self.rewrites.iter().map(|r| r.new).collect()
+        let mut out: Vec<u64> = self.rewrites.iter().map(|r| r.new).collect();
+        for s in &self.splits {
+            out.push(s.new);
+            out.extend(s.root);
+        }
+        out
     }
 
     /// Which trees the transaction touches, in objectid order.
     pub fn trees(&self) -> BTreeSet<u64> {
-        self.rewrites.iter().map(|r| r.owner).collect()
+        let mut out: BTreeSet<u64> = self.rewrites.iter().map(|r| r.owner).collect();
+        out.extend(self.splits.iter().map(|s| s.owner));
+        out
+    }
+
+    /// The split of the leaf that was at `leaf`, if it splits.
+    pub(crate) fn split_of(&self, leaf: u64) -> Option<&Split> {
+        self.splits.iter().find(|s| s.leaf == leaf)
     }
 
     /// How much `bytes_used` moves.
     ///
-    /// Zero for any plan that rewrites blocks without adding or removing
-    /// any, which is every plan this produces — one release for every
-    /// allocation. It is a method rather than a constant because that
-    /// stops being true the moment a leaf split is implemented, and a
-    /// caller should be asking rather than assuming.
+    /// Zero for a plan that rewrites blocks without adding or removing
+    /// any — one release for every allocation — and a node's worth more
+    /// for each block a split adds (#342).
     pub fn usage_delta(&self, nodesize: u64) -> i128 {
         (self.allocated().len() as i128 - self.released().len() as i128) * nodesize as i128
     }
@@ -204,30 +237,22 @@ impl ItemEdit {
 /// Apply the edits aimed at one leaf to its items.
 ///
 /// A put replaces an item under the same key or inserts a new one in key
-/// order; a delete removes one that must be there. The result must still
-/// fit in one block: splitting a leaf would add a block and a
-/// key to its parent, which a plan of one-for-one rewrites cannot hold,
-/// so a leaf that would overflow is refused before anything is written.
+/// order; a delete removes one that must be there. The result may no
+/// longer fit in one block: the renderer splits it then, as the plan
+/// arranged (#342).
 fn apply_item_edits(
-    nodesize: u32,
     leaf: u64,
     mut items: Vec<crate::leaf_edit::OwnedItem>,
     edits: &[&ItemEdit],
 ) -> Result<Vec<crate::leaf_edit::OwnedItem>> {
-    use crate::leaf_edit::{delete, insert};
+    use crate::leaf_edit::{delete, insert_unbounded};
     for edit in edits {
         match edit {
             ItemEdit::Put(item) => {
                 if items.iter().any(|i| i.key == item.key) {
                     items = delete(&items, &item.key)?;
                 }
-                items = insert(nodesize, &items, item.clone()).map_err(|_| {
-                    Error::UnsupportedFeature(format!(
-                        "the tree leaf at {leaf} has no room for another {}-byte item, and \
-                         splitting a leaf for an item edit is not implemented",
-                        item.data.len()
-                    ))
-                })?;
+                items = insert_unbounded(&items, item.clone())?;
             }
             ItemEdit::Delete(key) => items = delete(&items, key)?,
         }
@@ -610,6 +635,32 @@ impl Filesystem {
         data: &DataWrite,
         generation: u64,
     ) -> Result<Vec<crate::commit::PlacedBlock>> {
+        Ok(self.render(plan, data, generation, false)?.blocks)
+    }
+
+    /// The items each leaf `plan` rewrites holds once the change is
+    /// applied, by the leaf's address before it, however many bytes they
+    /// come to. What the planner asks to find the leaves that split
+    /// (#342); nothing is built.
+    fn leaf_contents(
+        &self,
+        plan: &Plan,
+        data: &DataWrite,
+        generation: u64,
+    ) -> Result<BTreeMap<u64, Vec<crate::leaf_edit::OwnedItem>>> {
+        Ok(self.render(plan, data, generation, true)?.leaves)
+    }
+
+    /// [`Filesystem::render_plan_with`], or with `dry` set, only each
+    /// rewritten leaf's items, with no block built and nothing checked.
+    fn render(
+        &self,
+        plan: &Plan,
+        data: &DataWrite,
+        generation: u64,
+        dry: bool,
+    ) -> Result<Rendered> {
+        use crate::btree::KeyPtr;
         use crate::commit::PlacedBlock;
         use crate::leaf_edit::OwnedItem;
         use crate::tree_write::{build_leaf, build_node, chunk_tree_uuid_of, BlockIdentity};
@@ -668,7 +719,15 @@ impl Filesystem {
         let mut applied = DataApplied::default();
 
         let mut out = Vec::with_capacity(plan.rewrites.len());
+        // Each split leaf's second half, by the leaf's old address: the
+        // first key it holds and where it went, for the node above (#342).
+        let mut halves: BTreeMap<u64, (crate::chunk::DiskKey, u64)> = BTreeMap::new();
+        // In a dry run, each leaf's items.
+        let mut leaves: BTreeMap<u64, Vec<OwnedItem>> = BTreeMap::new();
         for rewrite in rewrites {
+            if dry && rewrite.level > 0 {
+                continue;
+            }
             let block = self.read_tree_block(rewrite.old)?;
             let raw = block.bytes().to_vec();
             let id = BlockIdentity {
@@ -682,25 +741,44 @@ impl Filesystem {
 
             let bytes = match block.body.key_ptrs() {
                 Some(ptrs) => {
-                    // A node: follow every child that moved.
-                    let updated: Vec<_> = ptrs
-                        .iter()
-                        .map(|p| {
-                            let mut p = *p;
-                            if let Some(&key) = first_keys.get(&p.blockptr) {
-                                p.key = key;
-                            }
-                            if let Some(&to) = moved.get(&p.blockptr) {
-                                p.blockptr = to;
-                                p.generation = generation;
-                            }
-                            p
-                        })
-                        .collect();
+                    // A node: follow every child that moved, and point at
+                    // the second half of every child that split (#342).
+                    let mut updated: Vec<KeyPtr> = Vec::with_capacity(ptrs.len() + 1);
+                    let mut gained = 0usize;
+                    for p in ptrs {
+                        let child = p.blockptr;
+                        let mut p = *p;
+                        if let Some(&key) = first_keys.get(&child) {
+                            p.key = key;
+                        }
+                        if let Some(&to) = moved.get(&child) {
+                            p.blockptr = to;
+                            p.generation = generation;
+                        }
+                        updated.push(p);
+                        if let Some(&(key, at)) = halves.get(&child) {
+                            updated.push(KeyPtr {
+                                key,
+                                blockptr: at,
+                                generation,
+                            });
+                            gained += 1;
+                        }
+                    }
                     if let Some(first) = updated.first() {
                         first_keys.insert(rewrite.old, first.key);
                     }
-                    build_node(&self.sb, id, &updated)?
+                    build_node(&self.sb, id, &updated).map_err(|e| {
+                        if gained > 0 {
+                            Error::UnsupportedFeature(format!(
+                                "the node at {} has no room for the key pointer a split leaf \
+                                 below it adds, and splitting a node is not implemented: {e}",
+                                rewrite.old
+                            ))
+                        } else {
+                            e
+                        }
+                    })?
                 }
                 None => {
                     let items = block.body.items().unwrap_or(&[]);
@@ -759,7 +837,7 @@ impl Filesystem {
                             .map(|(e, _)| e)
                             .collect();
                         if !here.is_empty() {
-                            owned = apply_item_edits(self.sb.nodesize, rewrite.old, owned, &here)?;
+                            owned = apply_item_edits(rewrite.old, owned, &here)?;
                             edits_applied += here.len();
                         }
                     }
@@ -774,7 +852,7 @@ impl Filesystem {
                             .map(|(e, _)| e)
                             .collect();
                         if !here.is_empty() {
-                            owned = apply_item_edits(self.sb.nodesize, rewrite.old, owned, &here)?;
+                            owned = apply_item_edits(rewrite.old, owned, &here)?;
                             edits_applied += here.len();
                         }
                     }
@@ -807,7 +885,13 @@ impl Filesystem {
                                     .try_into()
                                     .expect("8 bytes"),
                             );
-                            if let Some(&to) = moved.get(&at) {
+                            // A tree whose root leaf split has a new root
+                            // node, a level up (#342).
+                            let grown = plan.split_of(at).and_then(|s| s.root);
+                            if grown.is_some() {
+                                item.data[root_item::LEVEL] = 1;
+                            }
+                            if let Some(to) = grown.or_else(|| moved.get(&at).copied()) {
                                 item.data[root_item::BYTENR..root_item::BYTENR + 8]
                                     .copy_from_slice(&to.to_le_bytes());
                                 item.data[root_item::GENERATION..root_item::GENERATION + 8]
@@ -825,17 +909,92 @@ impl Filesystem {
                         }
                     }
 
-                    if let Some(first) = owned.first() {
-                        first_keys.insert(rewrite.old, first.key);
+                    if dry {
+                        leaves.insert(rewrite.old, owned);
+                        continue;
                     }
-                    let borrowed: Vec<_> = owned.iter().map(|i| i.as_leaf_item()).collect();
-                    build_leaf(&self.sb, id, &borrowed)?
+                    let split = plan.split_of(rewrite.old);
+                    let fits = crate::leaf_edit::fit(self.sb.nodesize, &owned);
+                    match (fits, split) {
+                        (true, None) => {
+                            if let Some(first) = owned.first() {
+                                first_keys.insert(rewrite.old, first.key);
+                            }
+                            let borrowed: Vec<_> = owned.iter().map(|i| i.as_leaf_item()).collect();
+                            build_leaf(&self.sb, id, &borrowed)?
+                        }
+                        (false, None) => {
+                            return Err(Error::UnsupportedFeature(format!(
+                                "the leaf at {} no longer fits in one block, and the plan has \
+                                 no split for it",
+                                rewrite.old
+                            )))
+                        }
+                        (true, Some(_)) => {
+                            return Err(Error::UnsupportedFeature(format!(
+                                "the plan splits the leaf at {}, whose items still fit in one \
+                                 block",
+                                rewrite.old
+                            )))
+                        }
+                        // Two halves: the first where the rewrite puts the
+                        // leaf, the second in the split's block, and a new
+                        // root over both when the leaf was the root (#342).
+                        (false, Some(split)) => {
+                            let (left, right) =
+                                crate::leaf_edit::split_to_fit(self.sb.nodesize, &owned)?;
+                            let (left_key, right_key) = (left[0].key, right[0].key);
+                            first_keys.insert(rewrite.old, left_key);
+                            halves.insert(rewrite.old, (right_key, split.new));
+                            let right_id = BlockIdentity {
+                                bytenr: split.new,
+                                ..id
+                            };
+                            let borrowed: Vec<_> = right.iter().map(|i| i.as_leaf_item()).collect();
+                            out.push(PlacedBlock {
+                                logical: split.new,
+                                bytes: build_leaf(&self.sb, right_id, &borrowed)?,
+                            });
+                            if let Some(root) = split.root {
+                                let root_id = BlockIdentity {
+                                    bytenr: root,
+                                    level: 1,
+                                    ..id
+                                };
+                                let ptrs = [
+                                    KeyPtr {
+                                        key: left_key,
+                                        blockptr: rewrite.new,
+                                        generation,
+                                    },
+                                    KeyPtr {
+                                        key: right_key,
+                                        blockptr: split.new,
+                                        generation,
+                                    },
+                                ];
+                                out.push(PlacedBlock {
+                                    logical: root,
+                                    bytes: build_node(&self.sb, root_id, &ptrs)?,
+                                });
+                            }
+                            let borrowed: Vec<_> = left.iter().map(|i| i.as_leaf_item()).collect();
+                            build_leaf(&self.sb, id, &borrowed)?
+                        }
+                    }
                 }
             };
 
             out.push(PlacedBlock {
                 logical: rewrite.new,
                 bytes,
+            });
+        }
+
+        if dry {
+            return Ok(Rendered {
+                blocks: Vec::new(),
+                leaves,
             });
         }
 
@@ -899,7 +1058,10 @@ impl Filesystem {
                 applied.recorded
             )));
         }
-        Ok(out)
+        Ok(Rendered {
+            blocks: out,
+            leaves,
+        })
     }
 
     /// The root of tree `objectid` as a change edits it: the chunk tree's
@@ -980,7 +1142,10 @@ impl Filesystem {
 
         for _ in 0..rounds {
             let list: Vec<u64> = seed.iter().copied().collect();
-            let plan = self.plan_transaction(&list)?;
+            let mut plan = self.plan_transaction(&list)?;
+            // The leaves the change fills past a block, and the blocks
+            // their splits take, whose records are this round's too (#342).
+            plan.splits = self.plan_splits(&plan, data)?;
 
             // Every address whose record changes: the old ones lose a
             // METADATA_ITEM, the new ones gain one -- and each data
@@ -1012,6 +1177,118 @@ impl Filesystem {
              moves keeps dirtying extent tree leaves that were not already in it. \
              Breaking that needs reservations rather than another iteration"
         )))
+    }
+
+    /// The leaves `plan` fills past one block, each with the blocks its
+    /// split takes (#342).
+    ///
+    /// Whether a leaf fills depends on every record the change adds, the
+    /// split blocks' own records among them, so this goes round until the
+    /// set of splitting leaves stops changing. Addresses come after the
+    /// rewrites' and never collide with them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] for a split this does not make: of the
+    /// root tree's or the chunk tree's root, which the superblock names
+    /// with its level; of a leaf another tree shares (full back
+    /// references, or more than one reference), whose items other records
+    /// name by its address; and when the set does not settle.
+    fn plan_splits(&self, plan: &Plan, data: &DataWrite) -> Result<Vec<Split>> {
+        use crate::backref::{self, BLOCK_FLAG_FULL_BACKREF};
+        let nodesize = self.sb.nodesize;
+        let generation = self.sb.generation + 1;
+        let places = self.placements()?;
+        let mut splits: Vec<Split> = Vec::new();
+        for _ in 0..8 {
+            let trial = Plan {
+                rewrites: plan.rewrites.clone(),
+                splits: splits.clone(),
+            };
+            // A change the render refuses is the render's to report: given
+            // these splits it makes this same call and fails the same way,
+            // so planning does not take that refusal over (#87).
+            let Ok(leaves) = self.leaf_contents(&trial, data, generation) else {
+                return Ok(splits);
+            };
+            let full: BTreeSet<u64> = leaves
+                .iter()
+                .filter(|(_, items)| !crate::leaf_edit::fit(nodesize, items))
+                .map(|(&old, _)| old)
+                .collect();
+            let have: BTreeSet<u64> = splits.iter().map(|s| s.leaf).collect();
+            if full == have {
+                return Ok(splits);
+            }
+            splits.retain(|s| full.contains(&s.leaf));
+            let mut taken: BTreeSet<u64> = Plan {
+                rewrites: plan.rewrites.clone(),
+                splits: splits.clone(),
+            }
+            .allocated()
+            .into_iter()
+            .collect();
+            for &leaf in full.difference(&have) {
+                let place = places.get(&leaf).ok_or_else(|| {
+                    Error::UnsupportedFeature(format!(
+                        "the leaf at {leaf} fills, and is not reachable from any tree"
+                    ))
+                })?;
+                let is_root = place.parent.is_none();
+                if is_root
+                    && (place.owner == objectid::ROOT_TREE || place.owner == objectid::CHUNK_TREE)
+                {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "the change fills the root leaf of tree {}, whose root and level the \
+                         superblock names, and growing that tree a level is not implemented",
+                        place.owner
+                    )));
+                }
+                let extent_root = self.tree_root(objectid::EXTENT_TREE)?;
+                let record = self.pool_reader().tree().search(
+                    extent_root,
+                    &DiskKey {
+                        objectid: leaf,
+                        key_type: key_type::METADATA_ITEM,
+                        offset: 0,
+                    },
+                )?;
+                if let Some(record) = record {
+                    let shared = backref::flags(&record.data)
+                        .is_some_and(|f| f & BLOCK_FLAG_FULL_BACKREF != 0)
+                        || record
+                            .data
+                            .get(..8)
+                            .is_some_and(|b| b != 1u64.to_le_bytes());
+                    if shared {
+                        return Err(Error::UnsupportedFeature(format!(
+                            "the change fills the leaf at {leaf}, which another tree shares, \
+                             and splitting a shared leaf is not implemented"
+                        )));
+                    }
+                }
+                let new = self.next_free_block_for(place.owner, &taken)?;
+                taken.insert(new);
+                let root = if is_root {
+                    let r = self.next_free_block_for(place.owner, &taken)?;
+                    taken.insert(r);
+                    Some(r)
+                } else {
+                    None
+                };
+                splits.push(Split {
+                    leaf,
+                    new,
+                    owner: place.owner,
+                    root,
+                });
+            }
+        }
+        Err(Error::UnsupportedFeature(
+            "the leaves the change fills did not settle: each round's splits filled \
+             another"
+                .into(),
+        ))
     }
 
     /// The extent tree leaves that hold, or would hold, the records for
@@ -1098,7 +1375,7 @@ impl Filesystem {
         applied: &mut DataApplied,
     ) -> Result<Vec<crate::leaf_edit::OwnedItem>> {
         use crate::extent_write::{record_tree_block, TreeBlockAllocation};
-        use crate::leaf_edit::{delete, insert, OwnedItem};
+        use crate::leaf_edit::{delete, insert_unbounded as insert, OwnedItem};
 
         // Which leaf each address belongs to, by the rule a descent
         // uses — NOT by whether this leaf's existing keys bracket it. A
@@ -1221,13 +1498,40 @@ impl Filesystem {
             // free-space picture that chose it was wrong, and `insert`
             // refuses a duplicate key.
             out = insert(
-                self.sb.nodesize,
                 &out,
                 OwnedItem {
                     key,
                     data: body.to_vec(),
                 },
             )?;
+        }
+
+        // Each block a split adds (#342): the second half of a leaf, and a
+        // new root node over the two when the leaf was its tree's root.
+        // Ordinary records, as a moved block's are.
+        for split in &moves.plan.splits {
+            let blocks = std::iter::once((split.new, 0u8)).chain(split.root.map(|r| (r, 1u8)));
+            for (bytenr, level) in blocks {
+                if !mine(bytenr)? {
+                    continue;
+                }
+                let (key, body) = record_tree_block(
+                    &self.sb,
+                    TreeBlockAllocation {
+                        bytenr,
+                        level,
+                        generation,
+                        owner: split.owner,
+                    },
+                )?;
+                out = insert(
+                    &out,
+                    OwnedItem {
+                        key,
+                        data: body.to_vec(),
+                    },
+                )?;
+            }
         }
 
         // And each copy the write allocated: one reference, inline, from
@@ -1237,7 +1541,6 @@ impl Filesystem {
                 continue;
             }
             out = insert(
-                self.sb.nodesize,
                 &out,
                 OwnedItem {
                     key: DiskKey {
@@ -1422,7 +1725,7 @@ fn apply_convert(
     convert: &Convert,
 ) -> Result<Vec<crate::leaf_edit::OwnedItem>> {
     use crate::backref::{add_inline_keyed, take_inline_shared, Keyed, TREE_BLOCK_REF};
-    use crate::leaf_edit::{delete, insert, OwnedItem};
+    use crate::leaf_edit::{delete, insert_unbounded as insert, OwnedItem};
 
     let [(keyed, expected)] = convert.keyed.as_slice() else {
         return Err(Error::UnsupportedFeature(format!(
@@ -1503,7 +1806,6 @@ fn apply_convert(
     // `TREE_BLOCK_REF` is keyed by the tree, with nothing in the item.
     if let (Keyed::Block { tree }, false) = (keyed, was_inline) {
         return insert(
-            nodesize,
             &out,
             OwnedItem {
                 key: DiskKey {
@@ -1529,13 +1831,19 @@ fn apply_convert(
     }
     out = delete(&out, &record.key)?;
     insert(
-        nodesize,
         &out,
         OwnedItem {
             key: record.key,
             data: body,
         },
     )
+}
+
+/// What [`Filesystem::render`] made: the blocks, or in a dry run each
+/// rewritten leaf's items.
+struct Rendered {
+    blocks: Vec<crate::commit::PlacedBlock>,
+    leaves: BTreeMap<u64, Vec<crate::leaf_edit::OwnedItem>>,
 }
 
 /// How much of a [`DataWrite`] the rendered leaves carried.
@@ -1759,6 +2067,12 @@ impl Filesystem {
         for rewrite in &plan.rewrites {
             *out.entry(group_of(rewrite.new)?).or_default() += nodesize;
             *out.entry(group_of(rewrite.old)?).or_default() -= nodesize;
+        }
+        // A split's blocks are taken and nothing is given back (#342).
+        for split in &plan.splits {
+            for at in std::iter::once(split.new).chain(split.root) {
+                *out.entry(group_of(at)?).or_default() += nodesize;
+            }
         }
         // A data extent counts its own length, not a node's.
         for m in &data.moves {
@@ -2299,6 +2613,7 @@ mod needs_host {
                 owner: crate::chunk::objectid::FS_TREE,
                 level: 0,
             }],
+            splits: Vec::new(),
         };
         let outcome = fs.apply_free_space(items, &plan, &super::DataWrite::default());
         let _ = std::fs::remove_dir_all(&dir);

@@ -86,6 +86,8 @@ guest_scripts_drain_pipes 2
 hard_link_extref          5
 kernel_readback           2
 leaf_edit_oracle          3
+leaf_split                1
+leaf_split_oracle         1
 lib                       232
 log_tree_kernel           1
 lookup_by_name_key        1
