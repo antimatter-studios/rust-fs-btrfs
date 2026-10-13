@@ -843,7 +843,7 @@ impl Filesystem {
                             .map(|(e, _)| e)
                             .collect();
                         if !here.is_empty() {
-                            let is_root = self.tree_root(rewrite.owner)? == rewrite.old;
+                            let is_root = self.is_tree_root(rewrite.owner, rewrite.old)?;
                             owned = apply_item_edits(rewrite.old, is_root, owned, &here)?;
                             edits_applied += here.len();
                         }
@@ -859,7 +859,7 @@ impl Filesystem {
                             .map(|(e, _)| e)
                             .collect();
                         if !here.is_empty() {
-                            let is_root = self.tree_root(rewrite.owner)? == rewrite.old;
+                            let is_root = self.is_tree_root(rewrite.owner, rewrite.old)?;
                             owned = apply_item_edits(rewrite.old, is_root, owned, &here)?;
                             edits_applied += here.len();
                         }
@@ -1297,6 +1297,17 @@ impl Filesystem {
              another"
                 .into(),
         ))
+    }
+
+    /// Whether the block at `addr` is tree `owner`'s root. The superblock
+    /// names the root tree's and the chunk tree's roots; the root tree
+    /// names every other's.
+    fn is_tree_root(&self, owner: u64, addr: u64) -> Result<bool> {
+        Ok(match owner {
+            objectid::ROOT_TREE => self.sb.root == addr,
+            objectid::CHUNK_TREE => self.sb.chunk_root == addr,
+            _ => self.tree_root(owner)? == addr,
+        })
     }
 
     /// The extent tree leaves that hold, or would hold, the records for
