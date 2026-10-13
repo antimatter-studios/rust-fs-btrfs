@@ -45,9 +45,10 @@
 //! Each refusal is a case not yet written, named so a caller can tell
 //! which it met:
 //!
-//! - a checksum tree leaf the change would empty, or a full one that
-//!   cannot be split (its parent node has no room for another pointer):
-//!   removing a leaf and splitting a node are not written yet;
+//! - a checksum tree leaf the change would empty, other than the tree's
+//!   root, or a full one that cannot be split (its parent node has no
+//!   room for another pointer): removing a leaf and splitting a node are
+//!   not written yet;
 //! - a write that **grows** the file, or lands in a **hole**: both
 //!   allocate where the file has no extent item to repoint;
 //! - an **inline** or **preallocated** extent: each changes the item's
