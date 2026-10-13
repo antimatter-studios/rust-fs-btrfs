@@ -98,7 +98,7 @@ Linux kernel in the guest.
 | Create, mkdir, symlink, link, unlink, rmdir; unlinking a file's last name releases its data extents, their back references and checksums | Supported; data a snapshot or a reflink shares is refused | Unreleased (#262) | | `namespace_kernel.rs` |
 | Rename, replacing a name already there as POSIX does (`rename`, `fs_btrfs_rename`, `fs.btrfs mv`) | Supported | Unreleased (#262) | | `rename_kernel.rs` |
 | Truncate (`truncate`, `fs_btrfs_truncate`, `fs.btrfs truncate`): shrinking releases what it cuts; growing on a no-holes volume | Supported; an extent a snapshot or reflink shares is refused | Unreleased (#262) | | `truncate_kernel.rs` |
-| Extended attributes, ACLs, mode, owner and times, written | Supported on the top-level subvolume; a leaf with no room is refused | Unreleased (#263) | | `attrs_kernel.rs` |
+| Extended attributes, ACLs, mode, owner and times, written | Supported on the top-level subvolume; a full leaf a snapshot shares is refused | Unreleased (#263, #342) | | `attrs_kernel.rs`, `leaf_split_oracle.rs` |
 | Compression on write: zlib, for a file marked `chattr +c` or whose compression property names zlib | Supported; zstd and LZO are stored uncompressed | Unreleased (#265) | #265 | `compress_write_kernel.rs` |
 | Reflink, clone-range, fallocate, dedupe | Not supported | | #269 | |
 | Subvolumes and snapshots: making one read-only or writable again | Supported | Unreleased (#267) | | `subvol_readonly_kernel.rs` |

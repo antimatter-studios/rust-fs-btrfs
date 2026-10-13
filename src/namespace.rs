@@ -29,9 +29,10 @@
 //!
 //! - anything outside the top-level subvolume (tree 5), which is the
 //!   only tree a mount writes;
-//! - a leaf with no room for the new items: splitting an fs tree leaf is
-//!   not implemented, so on a large directory a new name can be refused
-//!   with nothing written;
+//! - a full leaf that cannot be split: one a snapshot shares, or one
+//!   whose parent node has no room for another pointer. A full leaf is
+//!   otherwise split in the same transaction, so a large directory goes
+//!   on taking names; a refused one has nothing written;
 //! - a hard link to a directory, and a link whose `INODE_REF` item for
 //!   that parent would outgrow a leaf;
 //! - a symbolic link whose target does not fit inline in one sector.
