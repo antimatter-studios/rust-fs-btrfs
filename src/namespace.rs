@@ -40,7 +40,6 @@
 //! - removing the last name of a file whose data extents a snapshot or a
 //!   reflink shares, which truncate refuses too; otherwise the file's data
 //!   is released with its last name, in the same transaction (#262);
-//! - replacing a file's last name by rename while it still holds data;
 //! - removing a directory that is not empty;
 //! - moving a directory into itself or below itself.
 //!
@@ -298,9 +297,10 @@ impl Filesystem {
     /// replace something else, [`Error::NotAFile`] when something else
     /// would replace a directory, and [`Error::UnsupportedFeature`] for a
     /// directory moved into itself or below itself, a replaced directory
-    /// that is not empty, and a replaced file whose last name it is while
-    /// it still holds data extents. Nothing is written unless everything
-    /// is.
+    /// that is not empty, and a replaced file whose data extents a
+    /// snapshot or a reflink shares, as unlink refuses. A replaced file's
+    /// last name otherwise takes its data with it, in the same
+    /// transaction. Nothing is written unless everything is.
     pub fn rename(
         &mut self,
         old_parent: u64,
@@ -330,7 +330,10 @@ impl Filesystem {
         let now = now();
         let mut p = Pending::default();
 
-        // A name at the destination is replaced.
+        // A name at the destination is replaced, and a file whose last name
+        // that is gives its data back in the same transaction, as unlink
+        // does (#262).
+        let mut replaced: Option<(u64, Vec<DataRelease>)> = None;
         match self.named_inode(new_parent, new_name) {
             Ok(target) if target.ino == child.ino => return Ok(()),
             Ok(target) => {
@@ -341,13 +344,9 @@ impl Filesystem {
                     (false, false) => {}
                 }
                 self.drop_entry(&mut p, new_parent, new_name, target.ino)?;
-                if !self.drop_link(&mut p, &target, new_name)?.is_empty() {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "{:?} is the last name of inode {}, which holds data extents, and \
-                         releasing them while a rename replaces it is not implemented yet",
-                        String::from_utf8_lossy(new_name),
-                        target.ino
-                    )));
+                let releases = self.drop_link(&mut p, &target, new_name)?;
+                if !releases.is_empty() {
+                    replaced = Some((target.ino, releases));
                 }
             }
             Err(Error::NotFound) => {}
@@ -369,7 +368,25 @@ impl Filesystem {
         p.touch(new_parent, &[io::CTIME, io::MTIME]);
         p.touch(child.ino, &[io::CTIME]);
         let edits = p.into_edits(self, generation, now)?;
-        self.commit_edits(child.ino, edits, generation, now)
+        let Some((ino, releases)) = replaced else {
+            return self.commit_edits(child.ino, edits, generation, now);
+        };
+        let released: Vec<(u64, u64)> = releases
+            .iter()
+            .map(|r| (r.old, r.old + r.old_len))
+            .collect();
+        let write = DataWrite {
+            root: objectid::FS_TREE,
+            ino,
+            moves: Vec::new(),
+            time: now,
+            root_flags: None,
+            default_subvol: None,
+            edits,
+            csum_edits: self.csum_edits(&released, &[], false)?,
+            releases,
+        };
+        self.commit_write(write, generation)
     }
 
     /// The inode `name` in `dir` names, refusing a subvolume.
