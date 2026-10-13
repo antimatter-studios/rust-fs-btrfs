@@ -36,9 +36,10 @@
 //!   that parent would outgrow a leaf;
 //! - a symbolic link whose target does not fit inline in one sector.
 //!
-//! - removing the last name of a file that still holds data extents:
-//!   releasing an extent is not implemented outside a copy-on-write
-//!   write, so such a file is refused whole rather than left leaking;
+//! - removing the last name of a file whose data extents a snapshot or a
+//!   reflink shares, which truncate refuses too; otherwise the file's data
+//!   is released with its last name, in the same transaction (#262);
+//! - replacing a file's last name by rename while it still holds data;
 //! - removing a directory that is not empty;
 //! - moving a directory into itself or below itself.
 //!
@@ -63,7 +64,7 @@ use crate::inode::{
 };
 use crate::leaf_edit::OwnedItem;
 use crate::super_write::Commit;
-use crate::transaction::{DataWrite, ItemEdit};
+use crate::transaction::{DataRelease, DataWrite, ItemEdit};
 
 /// How many rounds a change's plan has to close over its own bookkeeping.
 const PLAN_ROUNDS: usize = 64;
@@ -214,8 +215,10 @@ impl Filesystem {
     /// As [`Filesystem::create`]; [`Error::NotFound`] when there is no
     /// such name, [`Error::NotAFile`] for a directory (use
     /// [`Filesystem::rmdir`]), and [`Error::UnsupportedFeature`] for the
-    /// last name of a file that still holds data extents: releasing them
-    /// is not implemented yet, so such a file is left whole.
+    /// last name of a file whose data extents cannot be released here: one
+    /// a snapshot or a reflink shares, as truncate refuses. Otherwise the
+    /// last name takes the file's data with it, in the same transaction:
+    /// each extent, its back reference and its checksums (#262).
     pub fn unlink(&mut self, parent: u64, name: &[u8]) -> Result<()> {
         self.remove_name(parent, name, false)
     }
@@ -252,9 +255,30 @@ impl Filesystem {
         let mut p = Pending::default();
         self.drop_entry(&mut p, parent, name, child.ino)?;
         p.touch(parent, &[io::CTIME, io::MTIME]);
-        self.drop_link(&mut p, &child, name)?;
+        let releases = self.drop_link(&mut p, &child, name)?;
         let edits = p.into_edits(self, generation, now)?;
-        self.commit_edits(child.ino, edits, generation, now)
+        if releases.is_empty() {
+            return self.commit_edits(child.ino, edits, generation, now);
+        }
+        // The file's data goes with its last name: each extent, its back
+        // reference, its checksums and its block group's count, in the
+        // same transaction as the names (#262).
+        let released: Vec<(u64, u64)> = releases
+            .iter()
+            .map(|r| (r.old, r.old + r.old_len))
+            .collect();
+        let write = DataWrite {
+            root: objectid::FS_TREE,
+            ino: child.ino,
+            moves: Vec::new(),
+            time: now,
+            root_flags: None,
+            default_subvol: None,
+            edits,
+            csum_edits: self.csum_edits(&released, &[], false)?,
+            releases,
+        };
+        self.commit_write(write, generation)
     }
 
     /// Move the name `old_name` in `old_parent` to `new_name` in
@@ -316,7 +340,14 @@ impl Filesystem {
                     (false, false) => {}
                 }
                 self.drop_entry(&mut p, new_parent, new_name, target.ino)?;
-                self.drop_link(&mut p, &target, new_name)?;
+                if !self.drop_link(&mut p, &target, new_name)?.is_empty() {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "{:?} is the last name of inode {}, which holds data extents, and \
+                         releasing them while a rename replaces it is not implemented yet",
+                        String::from_utf8_lossy(new_name),
+                        target.ino
+                    )));
+                }
             }
             Err(Error::NotFound) => {}
             Err(e) => return Err(e),
@@ -475,8 +506,10 @@ impl Filesystem {
     }
 
     /// `inode` has lost one name: one link fewer, or — with its last
-    /// name gone — the inode and every item it owns deleted.
-    fn drop_link(&self, p: &mut Pending, inode: &Inode, name: &[u8]) -> Result<()> {
+    /// name gone — the inode and every item it owns deleted. Returns the
+    /// data extents that go with it, for the caller's transaction to
+    /// release (#262); a shared one is refused, as truncate refuses it.
+    fn drop_link(&self, p: &mut Pending, inode: &Inode, name: &[u8]) -> Result<Vec<DataRelease>> {
         let ino = inode.ino;
         // A directory has one link however many names it has had.
         let nlink = if inode.is_dir() { 1 } else { inode.nlink };
@@ -487,20 +520,29 @@ impl Filesystem {
             raw[io::NLINK..io::NLINK + 4].copy_from_slice(&(nlink - 1).to_le_bytes());
             p.set(key(ino, INODE_ITEM_KEY, 0), Some(raw));
             p.touch(ino, &[io::CTIME]);
-            return Ok(());
+            return Ok(Vec::new());
         }
+        let mut releases = Vec::new();
+        let last_snapshot = self.fs_tree_last_snapshot()?;
         for (k, data) in self.items_of(ino)? {
             match k.key_type {
                 // A reference already emptied by this change.
                 INODE_REF_KEY if p.get(self, k)?.is_none() => {}
                 INODE_ITEM_KEY | dir::XATTR_ITEM_KEY => p.remove(self, k)?,
                 EXTENT_DATA_KEY if holds_no_extent(&data) => p.remove(self, k)?,
+                // The whole file goes: cut to nothing, as truncate cuts, so
+                // its extent is released and the item deleted.
                 EXTENT_DATA_KEY => {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "{:?} is the last name of inode {ino}, which holds data extents, \
-                         and releasing them is not implemented yet",
-                        String::from_utf8_lossy(name)
-                    )))
+                    self.shrink_item(ino, 0, 0, last_snapshot, &k, &data, &mut releases)
+                        .map_err(|e| match e {
+                            Error::UnsupportedFeature(why) => Error::UnsupportedFeature(format!(
+                                "{:?} is the last name of inode {ino}, and its data cannot \
+                                 be released: {why}",
+                                String::from_utf8_lossy(name)
+                            )),
+                            other => other,
+                        })?;
+                    p.remove(self, k)?;
                 }
                 other => {
                     return Err(Error::UnsupportedFeature(format!(
@@ -511,7 +553,7 @@ impl Filesystem {
                 }
             }
         }
-        Ok(())
+        Ok(releases)
     }
 
     /// Every fs tree item under `ino`, in key order.

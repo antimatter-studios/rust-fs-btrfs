@@ -35,7 +35,6 @@ const EEXIST: i32 = 17;
 const ENOTDIR: i32 = 20;
 const EISDIR: i32 = 21;
 const ENOTEMPTY: i32 = if cfg!(target_os = "macos") { 66 } else { 39 };
-const ENOTSUP: i32 = if cfg!(target_os = "macos") { 45 } else { 95 };
 
 /// A scratch volume, removed when it drops — including on a panic.
 struct Scratch(PathBuf);
@@ -151,6 +150,12 @@ fn names_made_and_removed_through_the_abi_are_clean_and_the_kernel_agrees() {
         unsafe { fs_btrfs_rmdir(fs, c("/tmpdir").as_ptr()) },
         "rmdir /tmpdir",
     );
+    // The last name of a file holding data: the file goes, and its data
+    // extents and their checksums are released with it (#262).
+    ok(
+        unsafe { fs_btrfs_unlink(fs, c("/data.bin").as_ptr()) },
+        "unlink /data.bin, the last name of a file holding data",
+    );
 
     // Each refusal names its errno and writes nothing.
     let before = std::fs::read(&image).unwrap();
@@ -180,11 +185,6 @@ fn names_made_and_removed_through_the_abi_are_clean_and_the_kernel_agrees() {
         "mkdir under a missing directory",
     );
     refused(
-        unsafe { fs_btrfs_unlink(fs, c("/data.bin").as_ptr()) } != 0,
-        ENOTSUP,
-        "unlink of the last name of a file holding data",
-    );
-    refused(
         unsafe { fs_btrfs_link(fs, c("/new").as_ptr(), c("/new2").as_ptr()) } != 0,
         EISDIR,
         "link of a directory",
@@ -207,7 +207,7 @@ fn names_made_and_removed_through_the_abi_are_clean_and_the_kernel_agrees() {
          readlink new/link\n\
          cmp -s new/hard d/f && echo same-bytes\n\
          lsattr -d nc/inherit | cut -d' ' -f1 | grep -q C && echo nodatacow\n\
-         for p in e x gone tmpdir; do test -e \"$p\" && echo \"$p exists\" || echo \"$p absent\"; done\n\
+         for p in e x gone tmpdir data.bin; do test -e \"$p\" && echo \"$p exists\" || echo \"$p absent\"; done\n\
          ls -A new | tr '\\n' ' '; echo",
     );
     let want = "new|directory|755|1|38\n\
@@ -224,6 +224,7 @@ fn names_made_and_removed_through_the_abi_are_clean_and_the_kernel_agrees() {
                 x absent\n\
                 gone absent\n\
                 tmpdir absent\n\
+                data.bin absent\n\
                 file.txt hard link sub \n";
     assert_eq!(seen, want, "the kernel sees a different namespace");
 

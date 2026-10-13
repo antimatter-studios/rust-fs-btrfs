@@ -111,9 +111,9 @@ status=0
 fs.btrfs "$names" rmdir /dir >/dev/null 2>"$SANDBOX/n.err" || status=$?
 check "rmdir of a directory with entries exits 3, not $status" test "$status" -eq 3
 jq_check "rmdir says the directory is not empty" '.code == 3 and (.error | test("not empty"))' "$SANDBOX/n.err"
-status=0
-fs.btrfs "$names" rm /dir/random.bin >/dev/null 2>"$SANDBOX/n.err" || status=$?
-check "rm of a file's last name while it holds data exits 3, not $status" test "$status" -eq 3
-jq_check "rm names the data it cannot release" '.code == 3 and (.error | test("data extents"))' "$SANDBOX/n.err"
+# The last name of a file holding data: it goes, with its data (#262).
+name_ok rm /dir/random.bin
+fs.btrfs "$names" ls /dir >"$SANDBOX/ls.json" 2>/dev/null
+jq_check "the file holding data is gone" 'all(.[]; .name != "random.bin")' "$SANDBOX/ls.json"
 
 finish

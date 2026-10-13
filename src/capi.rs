@@ -1391,7 +1391,8 @@ pub unsafe extern "C" fn fs_btrfs_link(
 /// Remove the name `path`, and the file with it when that was its last
 /// name. Returns 0, or -1 with the error recorded: ENOENT when there is
 /// no such name, EISDIR for a directory, ENOTSUP for the last name of a
-/// file still holding data extents, which this driver cannot release yet.
+/// file whose data extents a snapshot or a reflink shares. A file's data
+/// goes with its last name otherwise (#262).
 ///
 /// # Safety
 ///
