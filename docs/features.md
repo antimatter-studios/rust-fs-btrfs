@@ -95,7 +95,7 @@ Linux kernel in the guest.
 | A volume whose log tree holds entries | Partial: the log is read (`Filesystem::log`) and the volume opens read-only on its committed trees (`mount_ignoring_log`, like `ro,nologreplay`); every other mount refuses it, since the log is not replayed | Unreleased (#266) | #266 | `log_tree_kernel.rs` |
 | A volume whose log tree holds entries | Refused for writing | | #266 (PR #328) | |
 | A pool of several devices, written (`mount_pool_rw`) | Supported, RAID5/6 included; a stale, read-only or missing member is refused | Unreleased (#298, #299) | | `pool_write_kernel.rs`, `raid56_write_kernel.rs` |
-| Create, mkdir, symlink, link, unlink, rmdir | Supported | Unreleased (#262) | | `namespace_kernel.rs` |
+| Create, mkdir, symlink, link, unlink, rmdir; unlinking a file's last name releases its data extents, their back references and checksums | Supported; data a snapshot or a reflink shares is refused | Unreleased (#262) | | `namespace_kernel.rs` |
 | Rename, replacing a name already there as POSIX does (`rename`, `fs_btrfs_rename`, `fs.btrfs mv`) | Supported | Unreleased (#262) | | `rename_kernel.rs` |
 | Truncate (`truncate`, `fs_btrfs_truncate`, `fs.btrfs truncate`): shrinking releases what it cuts; growing on a no-holes volume | Supported; an extent a snapshot or reflink shares is refused | Unreleased (#262) | | `truncate_kernel.rs` |
 | Extended attributes, ACLs, mode, owner and times, written | Supported on the top-level subvolume; a leaf with no room is refused | Unreleased (#263) | | `attrs_kernel.rs` |

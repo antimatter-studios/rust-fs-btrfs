@@ -150,7 +150,7 @@ impl Filesystem {
     /// a shorter item, or its deletion — with its extent released when
     /// this item was its one reference.
     #[allow(clippy::too_many_arguments)]
-    fn shrink_item(
+    pub(crate) fn shrink_item(
         &self,
         ino: u64,
         size: u64,
