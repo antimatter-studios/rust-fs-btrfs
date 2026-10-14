@@ -6,8 +6,9 @@
 //! filled and sealed by the kernel (`fsverity enable`) in the harness VM.
 //! Its manifest is one line per file: path, size and SHA-256 as the kernel
 //! read them, then for a sealed file `fsverity measure` and the SHA-256 of
-//! the Merkle tree and of the descriptor as `fsverity dump_metadata` reads
-//! them back, and `-` for a file that is not sealed. The builder refuses to
+//! the Merkle tree and of the descriptor as `fsverity digest` builds them,
+//! which the builder keeps only when that digest is the kernel's
+//! measurement, and `-` for a file that is not sealed. The builder refuses to
 //! publish it unless the superblock carries the verity bit, the kernel
 //! measures all six sealed files and `btrfs check` finds it clean.
 //!

@@ -1381,7 +1381,8 @@ build_features() {
 # The manifest is one line per file: path, size, SHA-256 of the contents,
 # then what the kernel reports for a sealed file and `-` for one that is
 # not -- `fsverity measure`, and the SHA-256 of the Merkle tree and of the
-# descriptor as `fsverity dump_metadata` reads them back.
+# descriptor as `fsverity digest` builds them, kept only when that digest
+# is the kernel's measurement.
 #
 # btrfs-verity-tampered.img is a copy with 64 bytes of tamper.bin's second
 # block overwritten. Before it is published, the kernel must read that
@@ -1390,7 +1391,8 @@ build_features() {
 # ---------------------------------------------------------------------
 build_feature_verity() {
     local img="$WORK/btrfs-verity.img" manifest="$WORK/btrfs-verity.manifest"
-    local bad="$WORK/btrfs-verity-tampered.img" p ino disk phys first whole m t d
+    local bad="$WORK/btrfs-verity-tampered.img" p ino disk phys first whole m t d g
+    local -a params
     command -v fsverity >/dev/null || {
         echo "guest-build-images.sh: fsverity (fsverity-utils) is not in the guest." >&2
         echo "  It is installed by scripts/vm-setup.sh; 'chore vm:provision' applies it again." >&2
@@ -1421,14 +1423,25 @@ build_feature_verity() {
     ( cd "$MNT" && find . -mindepth 1 -type f | sort | while read -r p; do
         if m=$(fsverity measure "$p" 2>/dev/null); then
             m=${m%% *}
-            # An empty verity file has no Merkle blocks; fsverity-utils
-            # reports that as ENOTTY instead of emitting an empty tree.
-            if [ "$(stat -c%s "$p")" -eq 0 ]; then
-                t=$(printf '' | sha256sum | cut -d' ' -f1)
-            else
-                t=$(fsverity dump_metadata merkle_tree "$p" | sha256sum | cut -d' ' -f1)
-            fi
-            d=$(fsverity dump_metadata descriptor "$p" | sha256sum | cut -d' ' -f1)
+            # The guest's kernel seals and measures btrfs files, but its
+            # btrfs has no FS_IOC_READ_VERITY_METADATA (Debian 12's 6.1;
+            # the ioctl reached btrfs later), so `fsverity dump_metadata`
+            # answers ENOTTY for every sealed file. `fsverity digest`
+            # builds the tree and the descriptor from the contents with
+            # the parameters the file was sealed with, and they are kept
+            # only when its digest is the kernel's measurement: that is
+            # the hash of the descriptor, which carries the tree's root.
+            params=()
+            [ "$p" = ./sha512-salted.bin ] && params=(--hash-alg=sha512 --salt=0123456789abcdef)
+            g=$(fsverity digest "${params[@]}" --out-merkle-tree="$WORK/verity.tree" \
+                --out-descriptor="$WORK/verity.desc" "$p")
+            [ "${g%% *}" = "$m" ] || {
+                echo "guest-build-images: btrfs-verity: $p: fsverity digest ${g%% *}, the kernel measures $m" >&2
+                exit 1
+            }
+            t=$(sha256sum < "$WORK/verity.tree" | cut -d' ' -f1)
+            d=$(sha256sum < "$WORK/verity.desc" | cut -d' ' -f1)
+            rm -f "$WORK/verity.tree" "$WORK/verity.desc"
         else
             m=- t=- d=-
         fi
