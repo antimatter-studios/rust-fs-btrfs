@@ -113,7 +113,7 @@ send_stream_kernel        1
 scrub_oracle              2
 seed_oracle               5
 scrub_parity_oracle       4
-scrub_repair_kernel       2
+scrub_repair_kernel       7
 resize_kernel             2
 shared_tree_block_release 1
 simple_quota_oracle       3

@@ -26,6 +26,14 @@
 //! the kernel's scrub checks (#301). A full stripe whose data is itself
 //! damaged is left to the data's own report: its parity is computed from
 //! bytes known to be wrong.
+//!
+//! A bad copy is repairable when another way of reading the same bytes
+//! verifies: another copy, or on RAID5/6, where there is only one, a
+//! rebuild from P, Q or both, as the read path makes it (#350). A repair
+//! writes each bad copy on the device its stripe names, so a pool's
+//! copies are repaired member by member, and then computes P and Q again
+//! for every full stripe that had a bad parity element or data repaired,
+//! once that data is right: the kernel's repairing scrub does the same.
 
 use crate::btree::{TreeBlock, TreeGeometry};
 use crate::chunk::{key_type, objectid, Chunk, DiskKey};
@@ -68,9 +76,10 @@ pub struct ScrubError {
     pub what: ScrubTarget,
     /// What is wrong with it.
     pub detail: String,
-    /// Whether another copy of the same bytes verifies, so the damage is
-    /// recoverable; for a parity element, whether the data it is computed
-    /// from verifies. Nothing here repairs it.
+    /// Whether another copy of the same bytes verifies, or on RAID5/6 a
+    /// rebuild of them from parity, so the damage is recoverable; for a
+    /// parity element, whether the data it is computed from verifies.
+    /// [`Filesystem::scrub_repair`] repairs what is.
     pub repairable: bool,
     /// The device and byte offset on it of the element that is wrong,
     /// when the error is about one element on one device: a parity
@@ -100,6 +109,13 @@ impl Filesystem {
     /// list of what to check. A copy that cannot be read is a
     /// [`ScrubError`], not a failure of the scrub.
     pub fn scrub(&self) -> Result<ScrubReport> {
+        Ok(self.scrub_allocated()?.0)
+    }
+
+    /// [`Filesystem::scrub`], and what is allocated, as sorted, merged
+    /// `[start, end)` ranges: the sectors whose parity is worth comparing,
+    /// which a repair compares again once the data beside them is right.
+    fn scrub_allocated(&self) -> Result<(ScrubReport, Vec<(u64, u64)>)> {
         let nodesize = u64::from(self.superblock().nodesize);
         let mut trees: Vec<u64> = Vec::new();
         let mut data: Vec<(u64, u64)> = Vec::new();
@@ -150,7 +166,7 @@ impl Filesystem {
         }
         self.scrub_parity(&merged, &mut report)?;
         report.errors.sort_by_key(|e| (e.logical, e.mirror));
-        Ok(report)
+        Ok((report, merged))
     }
 
     fn scrub_tree_block(
@@ -172,7 +188,13 @@ impl Filesystem {
                 bad.push((mirror, e.to_string()));
             }
         }
-        let repairable = bad.len() < copies;
+        let repairable = bad.len() < copies
+            || (!bad.is_empty()
+                && self
+                    .rebuilt(at, nodesize, |b| {
+                        TreeBlock::parse(b.to_vec(), at, geom).is_ok()
+                    })?
+                    .is_some());
         for (mirror, detail) in bad {
             report.errors.push(ScrubError {
                 logical: at,
@@ -213,11 +235,23 @@ impl Filesystem {
                 }
             }
         }
+        let csum = self.superblock().csum_type;
         for (i, failed) in bad.into_iter().enumerate() {
-            let repairable = failed.len() < copies;
+            if failed.is_empty() {
+                continue;
+            }
+            let at = start + i as u64 * sector;
+            // No copy verifies; on RAID5/6 a rebuild from parity may.
+            let repairable = failed.len() < copies
+                || match digests.get(&at) {
+                    Some(want) => self
+                        .rebuilt(at, sector, |b| csum.verify(b, want))?
+                        .is_some(),
+                    None => false,
+                };
             for (mirror, detail) in failed {
                 report.errors.push(ScrubError {
-                    logical: start + i as u64 * sector,
+                    logical: at,
                     mirror,
                     what: ScrubTarget::Data,
                     detail,
@@ -270,7 +304,6 @@ impl Filesystem {
         let parity = chunk.parity_count().expect("a parity chunk");
         let span = full_stripe_len(chunk, parity);
         let start = chunk.logical + full * span;
-        let plan = chunk.parity_read(start)?;
         report.parity_stripes += 1;
 
         // DATA THAT IS ITSELF DAMAGED is the data scrub's to report, and
@@ -282,13 +315,41 @@ impl Filesystem {
         {
             return Ok(());
         }
+        for bad in self.parity_mismatches(chunk, start, allocated)? {
+            report.errors.push(ScrubError {
+                logical: start,
+                mirror: bad.mirror,
+                what: ScrubTarget::Parity,
+                detail: bad.detail,
+                // The data verified above, so the parity can be
+                // computed again from it.
+                repairable: true,
+                device: Some((bad.devid, bad.physical)),
+            });
+        }
+        Ok(())
+    }
+
+    /// The parity elements of the full stripe at `start` that are not
+    /// what its data elements compute to, compared sector by sector where
+    /// some data element holds allocated bytes; see the module notes.
+    ///
+    /// Nothing, when a data element cannot be read (the data scrub's to
+    /// report) or no sector holds allocated bytes.
+    fn parity_mismatches(
+        &self,
+        chunk: &Chunk,
+        start: u64,
+        allocated: &[(u64, u64)],
+    ) -> Result<Vec<ParityMismatch>> {
+        let plan = chunk.parity_read(start)?;
         let len = plan.len as usize;
         let mut data = Vec::with_capacity(plan.data.len());
         for &(devid, physical) in &plan.data {
             let mut buf = vec![0u8; len];
             // An element that cannot be read is the data scrub's to report.
             if self.read_element(devid, physical, &mut buf).is_err() {
-                return Ok(());
+                return Ok(Vec::new());
             }
             data.push(buf);
         }
@@ -307,9 +368,10 @@ impl Filesystem {
             })
             .collect();
         if checked.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
+        let mut out = Vec::new();
         for (mirror, (want, at)) in [(Some(p), Some(plan.p)), (q, plan.q)]
             .into_iter()
             .enumerate()
@@ -319,8 +381,9 @@ impl Filesystem {
             };
             let name = if mirror == 0 { "P" } else { "Q" };
             let mut got = vec![0u8; len];
-            let detail = match self.read_element(devid, physical, &mut got) {
-                Err(e) => Some(format!("{name} cannot be read: {e}")),
+            let (detail, sectors) = match self.read_element(devid, physical, &mut got) {
+                // Unreadable: every sector it protects is to be written.
+                Err(e) => (format!("{name} cannot be read: {e}"), checked.clone()),
                 Ok(()) => {
                     let bad: Vec<usize> = checked
                         .iter()
@@ -329,31 +392,60 @@ impl Filesystem {
                             got[s * sector..(s + 1) * sector] != want[s * sector..(s + 1) * sector]
                         })
                         .collect();
-                    bad.first().map(|first| {
+                    let Some(first) = bad.first() else {
+                        continue;
+                    };
+                    (
                         format!(
                             "{name} differs from what the data computes to in {} of {} sectors, \
                              the first at byte {} of the element",
                             bad.len(),
                             checked.len(),
                             first * sector
-                        )
-                    })
+                        ),
+                        bad,
+                    )
                 }
             };
-            if let Some(detail) = detail {
-                report.errors.push(ScrubError {
-                    logical: start,
-                    mirror,
-                    what: ScrubTarget::Parity,
-                    detail,
-                    // The data verified above, so the parity can be
-                    // computed again from it.
-                    repairable: true,
-                    device: Some((devid, physical)),
-                });
+            out.push(ParityMismatch {
+                mirror,
+                devid,
+                physical,
+                detail,
+                want,
+                sectors,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The start of the RAID5/6 full stripe holding `logical`, or `None`
+    /// outside a parity chunk.
+    fn full_stripe_start(&self, logical: u64) -> Option<u64> {
+        let chunk = self.chunk_map().chunk_for(logical)?;
+        let span = full_stripe_len(chunk, chunk.parity_count()?);
+        Some(chunk.logical + (logical - chunk.logical) / span * span)
+    }
+
+    /// The first read attempt past the copies of `len` bytes at `at` that
+    /// `verifies` accepts: on RAID5/6, a rebuild from P, Q or both, as the
+    /// read path makes it. A parity chunk has one copy, and a bad one is
+    /// repairable exactly when there is such a rebuild (#350). Every other
+    /// profile has no attempt past its copies, and the answer is `None`.
+    fn rebuilt(
+        &self,
+        at: u64,
+        len: u64,
+        verifies: impl Fn(&[u8]) -> bool,
+    ) -> Result<Option<Vec<u8>>> {
+        let copies = self.chunk_map().mirrors_at(at)?;
+        for attempt in copies..self.chunk_map().read_attempts_at(at)? {
+            let mut buf = vec![0u8; len as usize];
+            if self.read_copy(at, attempt, &mut buf).is_ok() && verifies(&buf) {
+                return Ok(Some(buf));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Copy `mirror` of `buf.len()` bytes at `at`, nothing verified.
@@ -362,42 +454,88 @@ impl Filesystem {
     }
 
     /// Scrub, then write a copy that verifies over every copy that does
-    /// not (#302).
+    /// not (#302), and compute every bad RAID5/6 parity element again
+    /// from its data (#350).
     ///
     /// No transaction: the bytes written are ones another copy of the
-    /// same address already holds, so the logical contents of the
-    /// filesystem do not change and no tree points anywhere new. That is
-    /// what the kernel's repairing scrub does too. A bad copy with no
-    /// good twin is left as it is and listed as unrepairable, and so is a
-    /// RAID5/6 parity element (#301): it is computed again from its data,
-    /// not copied from a twin, and that write is not implemented yet.
+    /// same address already holds, or on RAID5/6 the ones its parity
+    /// rebuilds, so the logical contents of the filesystem do not change
+    /// and no tree points anywhere new. That is what the kernel's
+    /// repairing scrub does too. Each copy is written on the device its
+    /// stripe names, so a pool mounted with [`Filesystem::mount_pool_rw`]
+    /// is repaired member by member.
+    ///
+    /// Parity comes last. Once the data is repaired, P and Q are compared
+    /// again, over the same sectors [`Filesystem::scrub`] compares, for
+    /// every full stripe that had a bad parity element or data repaired,
+    /// and each sector that differs is written as the data computes it. A
+    /// full stripe holding a bad copy nothing verifies keeps its parity:
+    /// computed from that copy, it would rebuild bytes known to be wrong.
     ///
     /// # Errors
     ///
-    /// [`Error::ReadOnly`] unless opened with [`Filesystem::mount_rw`],
-    /// and [`Error::UnsupportedFeature`] on a pool of several devices,
-    /// which a single-device read-write mount cannot write. A write
-    /// failure part way leaves the copies already repaired repaired and
-    /// the rest as they were: each copy is written whole before the next.
+    /// [`Error::ReadOnly`] unless opened with [`Filesystem::mount_rw`] or
+    /// [`Filesystem::mount_pool_rw`]. A write failure part way leaves the
+    /// copies already repaired repaired and the rest as they were: each
+    /// copy is written whole before the next.
     pub fn scrub_repair(&self) -> Result<RepairReport> {
         if !self.is_writable() {
             return Err(Error::ReadOnly);
         }
-        let scrub = self.scrub()?;
+        let (scrub, allocated) = self.scrub_allocated()?;
         let geom = TreeGeometry::from_superblock(self.superblock());
         let mut repaired = Vec::new();
         let mut unrepairable = Vec::new();
+        // Full stripes whose parity is computed again once the data is
+        // right: those with a bad P or Q, and those with data repaired,
+        // whose parity the scrub did not compare.
+        let mut stripes: BTreeSet<u64> = BTreeSet::new();
         for error in &scrub.errors {
-            if !error.repairable || error.what == ScrubTarget::Parity {
+            if error.what == ScrubTarget::Parity {
+                stripes.insert(error.logical);
+                continue;
+            }
+            if !error.repairable {
                 unrepairable.push(error.clone());
                 continue;
             }
             let good = self.verified_copy(error, &geom)?;
             self.write_mirror_in_place(error.logical, error.mirror, &good)?;
             repaired.push((error.what, error.logical, error.mirror));
+            stripes.extend(self.full_stripe_start(error.logical));
+        }
+        let sector = self.superblock().sectorsize as usize;
+        for start in stripes {
+            let chunk = self
+                .chunk_map()
+                .chunk_for(start)
+                .expect("the chunk each full stripe was found in")
+                .clone();
+            let span = full_stripe_len(&chunk, chunk.parity_count().expect("a parity chunk"));
+            let in_stripe = |e: &ScrubError| (start..start + span).contains(&e.logical);
+            let parity_errors = || {
+                scrub
+                    .errors
+                    .iter()
+                    .filter(|e| e.what == ScrubTarget::Parity && in_stripe(e))
+                    .cloned()
+            };
+            if unrepairable.iter().any(in_stripe) {
+                let kept: Vec<ScrubError> = parity_errors().collect();
+                unrepairable.extend(kept);
+                continue;
+            }
+            for bad in self.parity_mismatches(&chunk, start, &allocated)? {
+                for run in runs(&bad.sectors) {
+                    let from = run.start * sector;
+                    let to = run.end * sector;
+                    self.write_element(bad.devid, bad.physical + from as u64, &bad.want[from..to])?;
+                }
+                repaired.push((ScrubTarget::Parity, start, bad.mirror));
+            }
         }
         if !repaired.is_empty() {
-            self.flush_written()?;
+            self.flush_writable()?;
             // A tree block cached from the copy just rewritten is the
             // same bytes, but nothing here relies on that.
             self.forget_tree_blocks();
@@ -410,7 +548,7 @@ impl Filesystem {
     }
 
     /// The bytes of a copy of `error`'s block or sector that verifies, from
-    /// a copy other than the bad one.
+    /// a copy other than the bad one, or on RAID5/6 rebuilt from parity.
     fn verified_copy(&self, error: &ScrubError, geom: &TreeGeometry) -> Result<Vec<u8>> {
         let len = match error.what {
             ScrubTarget::TreeBlock => u64::from(self.superblock().nodesize),
@@ -425,26 +563,25 @@ impl Filesystem {
             ScrubTarget::Data => self.data_digests(error.logical, len)?,
             ScrubTarget::TreeBlock | ScrubTarget::Parity => Default::default(),
         };
+        let csum = self.superblock().csum_type;
+        let verifies = |buf: &[u8]| match error.what {
+            ScrubTarget::TreeBlock => TreeBlock::parse(buf.to_vec(), error.logical, geom).is_ok(),
+            ScrubTarget::Data => digests
+                .get(&error.logical)
+                .is_some_and(|want| csum.verify(buf, want)),
+            ScrubTarget::Parity => false,
+        };
         for mirror in 0..self.chunk_map().mirrors_at(error.logical)? {
             if mirror == error.mirror {
                 continue;
             }
             let mut buf = vec![0u8; len as usize];
-            if self.read_copy(error.logical, mirror, &mut buf).is_err() {
-                continue;
-            }
-            let good = match error.what {
-                ScrubTarget::TreeBlock => {
-                    TreeBlock::parse(buf.clone(), error.logical, geom).is_ok()
-                }
-                ScrubTarget::Data => digests
-                    .get(&error.logical)
-                    .is_some_and(|want| self.superblock().csum_type.verify(&buf, want)),
-                ScrubTarget::Parity => false,
-            };
-            if good {
+            if self.read_copy(error.logical, mirror, &mut buf).is_ok() && verifies(&buf) {
                 return Ok(buf);
             }
+        }
+        if let Some(buf) = self.rebuilt(error.logical, len, verifies)? {
+            return Ok(buf);
         }
         Err(Error::UnsupportedFeature(format!(
             "no copy of {} verifies any more; the scrub found one that did",
@@ -453,15 +590,48 @@ impl Filesystem {
     }
 }
 
+/// One RAID5/6 parity element that is not what its full stripe's data
+/// computes to.
+struct ParityMismatch {
+    /// 0 for P, 1 for Q.
+    mirror: usize,
+    /// The device the element is on, and its byte offset there.
+    devid: u64,
+    physical: u64,
+    /// What is wrong with it.
+    detail: String,
+    /// The element as the data computes it.
+    want: Vec<u8>,
+    /// The sectors of the element, by index, that differ from `want`:
+    /// every compared one, when the element cannot be read at all.
+    sectors: Vec<usize>,
+}
+
+/// `sectors`, sorted, as runs of consecutive indices.
+fn runs(sectors: &[usize]) -> Vec<std::ops::Range<usize>> {
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    for &s in sectors {
+        match out.last_mut() {
+            Some(run) if run.end == s => run.end = s + 1,
+            _ => out.push(s..s + 1),
+        }
+    }
+    out
+}
+
 /// What [`Filesystem::scrub_repair`] did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RepairReport {
     /// The scrub that found what to repair, before anything was written.
     pub scrub: ScrubReport,
-    /// Every bad copy overwritten with a good one: what it is, its
-    /// logical address, and which copy.
+    /// Everything written: each bad copy overwritten with a good one, and
+    /// each RAID5/6 parity element computed again from its data -- what
+    /// it is, its logical address (a parity element's full stripe), and
+    /// which copy (0 for P, 1 for Q).
     pub repaired: Vec<(ScrubTarget, u64, usize)>,
-    /// Every bad copy left as it was, because no copy of it verifies.
+    /// Every bad copy left as it was, because nothing that verifies holds
+    /// its bytes; and every bad parity element of a full stripe holding
+    /// one.
     pub unrepairable: Vec<ScrubError>,
 }
 
