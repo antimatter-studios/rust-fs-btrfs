@@ -36,14 +36,23 @@ use std::sync::Arc;
 struct Scratch(PathBuf);
 
 impl Scratch {
-    /// A 256 MiB volume without the free-space tree, filled by the kernel
+    /// A 2 GiB volume without the free-space tree, filled by the kernel
     /// under the v1 space cache.
+    ///
+    /// NOT SMALLER. The kernel saves no v1 cache for a block group under
+    /// 100 MiB, and it sizes a new chunk at a tenth of the volume, so on
+    /// the 256 MiB volume this once was every group was too small: the
+    /// commit moved `cache_generation` and the root tree held no cache
+    /// header at all (CI run 38538986296). At 2 GiB the data chunk the
+    /// kernel allocates past mkfs's 8 MiB one is about 200 MiB, and that
+    /// group's cache is saved. The file is sparse, so the size costs
+    /// nothing.
     fn new(name: &str) -> Self {
         let dir = PathBuf::from(temp_path!("{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         let image = dir.join("fs.img");
         std::fs::File::create(&image)
-            .and_then(|f| f.set_len(256 << 20))
+            .and_then(|f| f.set_len(2 << 30))
             .unwrap();
         let made = oracle("mkfs.btrfs")
             .args(["-q", "-f", "-R", "^free-space-tree"])
@@ -57,7 +66,8 @@ impl Scratch {
         guest_kernel_write_ok(
             &image.to_string_lossy(),
             name,
-            "cd \"$MNT\"\n\
+            "mount -o remount,space_cache=v1 \"$MNT\"\n\
+             cd \"$MNT\"\n\
              mkdir dir\n\
              for i in 1 2 3 4 5; do echo \"v1 cache file $i\" > dir/file-$i.txt; done\n\
              head -c 8388608 /dev/urandom > big.bin\n\
