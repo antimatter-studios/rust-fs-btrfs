@@ -81,6 +81,11 @@ enum Membership<'a> {
         device: &'a Arc<dyn BlockDevice>,
         dev_item: &'a [u8],
     },
+    /// A device leaves (#303). Every other member's superblock counts one
+    /// device fewer and `size` bytes less, and the device's own
+    /// superblocks are not written: the caller wipes them after the
+    /// commit, see [`crate::devices`].
+    Removed { devid: u64, size: u64 },
 }
 
 /// One tree block, built and placed, waiting to be written.
@@ -161,6 +166,19 @@ impl Filesystem {
         dev_item: &[u8],
     ) -> Result<()> {
         self.commit_with(blocks, commit, 0, Membership::Added { device, dev_item })
+    }
+
+    /// [`Filesystem::commit`], removing device `devid`, of `size` bytes,
+    /// from the filesystem (#303): every other member's superblock counts
+    /// one device fewer, and the device's own are left as they were.
+    pub(crate) fn commit_removing_device(
+        &self,
+        blocks: &[PlacedBlock],
+        commit: &Commit,
+        devid: u64,
+        size: u64,
+    ) -> Result<()> {
+        self.commit_with(blocks, commit, 0, Membership::Removed { devid, size })
     }
 
     /// The commit, with the incompat flags it sets and the device sizes and
@@ -265,7 +283,17 @@ impl Filesystem {
         membership: Membership<'_>,
     ) -> Result<Vec<SuperblockImage>> {
         use crate::superblock::{dev_item_offsets, offsets as so, DEV_ITEM_SIZE};
-        let devices = self.write_devices();
+        // A device leaving gets no superblock from the commit that removes
+        // it (#303).
+        let devices = match membership {
+            Membership::Removed { devid, .. } => self
+                .writable_pool
+                .iter()
+                .filter(|(id, _)| **id != devid)
+                .map(|(_, device)| Arc::clone(device))
+                .collect(),
+            _ => self.write_devices(),
+        };
         // A RESIZE IS ONE DEVICE'S (#264). The superblock's total and its
         // device item's are the same number only when there is one
         // device; a pool member's is its own share, which this does not
@@ -280,7 +308,8 @@ impl Filesystem {
             ));
         }
         // A DEVICE JOINING IS COUNTED BY EVERY MEMBER (#303): one more
-        // device, and its size added to the filesystem's.
+        // device, and its size added to the filesystem's. One leaving is
+        // one fewer, and its size taken away.
         let joined = match membership {
             Membership::Added { device, dev_item } => {
                 if dev_item.len() != DEV_ITEM_SIZE {
@@ -302,6 +331,35 @@ impl Filesystem {
                     dev_item,
                     grown("device count", self.sb.num_devices, 1)?,
                     grown("size", self.sb.total_bytes, size)?,
+                ))
+            }
+            _ => None,
+        };
+        let counted = match (membership, joined) {
+            (_, Some((_, _, num_devices, total))) => Some((num_devices, total)),
+            (Membership::Removed { devid, size }, _) => {
+                // Every member but the one leaving is written: a pool
+                // missing one already would count the wrong devices.
+                if !self.writable_pool.contains_key(&devid)
+                    || devices.len() as u64 + 1 != self.sb.num_devices
+                {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "device {devid} is not one of this mount's {} members, of the {} the \
+                         superblock counts",
+                        self.writable_pool.len(),
+                        self.sb.num_devices
+                    )));
+                }
+                let shrunk = |what: &str, now: u64, by: u64| {
+                    now.checked_sub(by).ok_or_else(|| {
+                        Error::UnsupportedFeature(format!(
+                            "the superblock's {what} of {now} cannot shrink by {by}"
+                        ))
+                    })
+                };
+                Some((
+                    shrunk("device count", self.sb.num_devices, 1)?,
+                    shrunk("size", self.sb.total_bytes, size)?,
                 ))
             }
             _ => None,
@@ -330,7 +388,7 @@ impl Filesystem {
                     raw[at..at + 8].copy_from_slice(&size.to_le_bytes());
                 }
             }
-            if let Some((_, _, num_devices, total)) = joined {
+            if let Some((num_devices, total)) = counted {
                 raw[so::NUM_DEVICES..so::NUM_DEVICES + 8]
                     .copy_from_slice(&num_devices.to_le_bytes());
                 raw[so::TOTAL_BYTES..so::TOTAL_BYTES + 8].copy_from_slice(&total.to_le_bytes());

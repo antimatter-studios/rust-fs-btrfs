@@ -69,6 +69,7 @@ crash_consistency         3
 csum_oracle               6
 csum_width_populated      1
 device_add_kernel         2
+device_remove_kernel      2
 device_replace_kernel     4
 docs_describe_the_code    5
 dup_data_writes           1

@@ -110,7 +110,8 @@ Linux kernel in the guest.
 | Subvolumes and snapshots: create, delete | Not supported | | #267 | |
 | Device add (`add_device`): a device joins a volume or a pool in one committed transaction, its `DEV_ITEM` in the chunk tree and every member's superblock counting it | Supported; a device already in the filesystem, or with no room past its first MiB, is refused | Unreleased (#303) | | `device_add_kernel.rs` |
 | Device replace (`replace_device`): a new device takes a member's place whole, its devid, device UUID, recorded size and every device extent, and the old device's superblocks are wiped | Supported; the old device must be readable, and a smaller new device, or one already in the filesystem, is refused | Unreleased (#303) | | `device_replace_kernel.rs` |
-| Device remove; balance; defragment | Not supported | | #268, #303, #304, #305 | |
+| Device remove (`remove_device`): a device holding no chunk leaves in one committed transaction, its `DEV_ITEM` deleted, every other member's superblock counting it no more, and its own superblocks wiped | Supported for a device holding no chunk; one holding a chunk is refused until balance can relocate it, and so is the last device | Unreleased (#303) | #304 | `device_remove_kernel.rs` |
+| Device remove of a device holding chunks; balance; defragment | Not supported | | #268, #303, #304, #305 | |
 | Trim: every free run of every block group handed to a caller's discard, on every copy | Supported; RAID5/6 groups refused | Unreleased (#305) | | `trim_oracle.rs` |
 | RAID5/6 writes | Not supported | | #299 | |
 | Label, written to every superblock copy; a primary recording another physical offset is refused before any write | Supported | 0.9.0 (#264); address refusal Unreleased (#370) | | `cli_label_kernel.rs`, `super_write` unit regression |
