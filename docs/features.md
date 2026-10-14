@@ -83,6 +83,7 @@ Linux kernel in the guest.
 | Overwrite in place on a `-d dup` volume, both copies | Supported | 0.7.0 | | `dup_data_writes.rs` |
 | Whole transactions: tree edits, splits, relocation, commit order, backup roots | Supported | 0.6.0; backup roots 0.7.0 (#78) | | `transaction_oracle.rs`, `split_oracle.rs`, `commit_order.rs`, `backup_ring.rs` |
 | Free-space tree and block-group `used` kept in step | Supported | 0.6.0; `used` 0.8.0 | | `free_space_oracle.rs`, `block_group_used.rs`, `free_space_straddle.rs` |
+| A volume with the v1 space cache (no free-space tree, `space_cache=v1`): read, checked and written | Supported: the cache is not kept; a commit leaves `cache_generation` behind, so the kernel discards it and rebuilds it at its next mount | Unreleased (#270) | | `space_cache_v1_kernel.rs` |
 | A commit cut at any write | Supported: the volume is the old or the new generation | 0.8.0 | | `crash_consistency.rs` |
 | Copy-on-write writes: overwrites inside a file's existing, unshared, unchecksummed, uncompressed extents | Partial | 0.8.1 (#61) | #261 | `cow_write_oracle.rs` |
 | A write that grows a file or lands in a hole | Refused | 0.8.1 (#61) | #261 | `cow_write_oracle.rs` |

@@ -87,6 +87,7 @@ mod key {
 }
 
 mod oid {
+    pub const ROOT_TREE: u64 = 1;
     pub const CHUNK_TREE: u64 = 3;
     pub const EXTENT_TREE: u64 = 2;
     pub const DEV_TREE: u64 = 4;
@@ -382,6 +383,18 @@ impl Checker<'_> {
     /// space.
     fn item(&mut self, tree: u64, k: &DiskKey, data: &[u8]) {
         match (tree, k.key_type) {
+            // The v1 space cache (#270): without the free-space tree each
+            // block group's free space is saved in a file of the root
+            // tree, and that file's data extents are referenced from there
+            // rather than from a subvolume.
+            (oid::ROOT_TREE, key::EXTENT_DATA) => {
+                let kind = data.get(20).copied().unwrap_or(0);
+                let disk = le64(data, 21).unwrap_or(0);
+                let disk_len = le64(data, 29).unwrap_or(0);
+                if (kind == 1 || kind == 2) && disk != 0 {
+                    self.file_extents.push((tree, k.objectid, disk, disk_len));
+                }
+            }
             (oid::EXTENT_TREE, key::METADATA_ITEM) => {
                 self.tree_extents
                     .insert(k.objectid, le64(data, 0).unwrap_or(0));
