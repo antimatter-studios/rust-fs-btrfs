@@ -224,8 +224,8 @@ fn command() -> Cmd {
                      already there is replaced, as rename(2) does: a file by a file, an empty \
                      directory by a directory. Committed as one transaction; only the \
                      top-level subvolume is written. A replaced file's last name takes its \
-                     data with it; one whose data a snapshot or a reflink shares is refused \
-                     with exit 3 (rust-fs-btrfs#262).",
+                     data with it; one whose data a snapshot may share is refused with exit \
+                     3 (rust-fs-btrfs#262).",
                 ),
         )
         .subcommand(
@@ -247,9 +247,10 @@ fn command() -> Cmd {
                     "Examples:\n  fs.btrfs disk.img truncate /log.txt 0\n  \
                      fs.btrfs disk.img truncate /sparse.img 1073741824\n\n\
                      Committed as one transaction. Shrinking releases the extents wholly past \
-                     the new end; growing needs the volume's no-holes feature. An extent a \
-                     snapshot or reflink shares, and growing a file whose last sector is \
-                     partly past its end, are refused with exit 3 (rust-fs-btrfs#262).",
+                     the new end, or drops the file's reference of one a reflink shares; \
+                     growing needs the volume's no-holes feature. An extent a snapshot may \
+                     share, and growing a file whose last sector is partly past its end, \
+                     are refused with exit 3 (rust-fs-btrfs#262).",
                 ),
         )
         .subcommand(key_command(
@@ -312,7 +313,7 @@ fn name_command(
             "Examples:\n  {examples}\n\n\
              Committed as one transaction. Only the top-level subvolume is written; a \
              directory whose full leaf cannot be split, and the last name of a \
-             file whose data a snapshot or a reflink shares, are refused with exit 3 \
+             file whose data a snapshot may share, are refused with exit 3 \
              (rust-fs-btrfs#262)."
         ));
     if let Some(default) = mode {

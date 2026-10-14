@@ -317,6 +317,57 @@ pub fn add_inline_keyed(item_type: u8, body: &[u8], keyed: Keyed, count: u32) ->
     Ok(rebuild(body, start, refs))
 }
 
+/// `body` with one reference of the inline `EXTENT_DATA_REF` naming
+/// `tree`, `objectid` and `offset` dropped (#262): its count down by one,
+/// or the reference removed when its count was one, and the item's total
+/// down by one. `None` when the item holds no such reference inline.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] when the reference is the item's last:
+/// dropping it is releasing the extent, which is not this edit. And as
+/// [`inline_refs`].
+pub fn drop_inline_data_ref(
+    item_type: u8,
+    body: &[u8],
+    tree: u64,
+    objectid: u64,
+    offset: u64,
+) -> Result<Option<Vec<u8>>> {
+    let start = refs_start(item_type, body)?;
+    let mut refs = inline_refs(item_type, body)?;
+    let mut fields = Vec::with_capacity(24);
+    for v in [tree, objectid, offset] {
+        fields.extend_from_slice(&v.to_le_bytes());
+    }
+    let Some(at) = refs
+        .iter()
+        .position(|r| r.kind == EXTENT_DATA_REF && r.payload[..24] == fields[..])
+    else {
+        return Ok(None);
+    };
+    let total = u64::from_le_bytes(body[..8].try_into().expect("a fixed part"));
+    if total <= 1 {
+        return Err(Error::UnsupportedFeature(format!(
+            "the data reference of inode {objectid} in tree {tree} at {offset} is its extent's \
+             last, and dropping it is releasing the extent"
+        )));
+    }
+    let count = u32::from_le_bytes(
+        refs[at].payload[24..28]
+            .try_into()
+            .expect("28-byte payload"),
+    );
+    if count > 1 {
+        refs[at].payload[24..28].copy_from_slice(&(count - 1).to_le_bytes());
+    } else {
+        refs.remove(at);
+    }
+    let mut head = body[..start].to_vec();
+    head[..8].copy_from_slice(&(total - 1).to_le_bytes());
+    Ok(Some(rebuild(&head, start, refs)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,5 +540,54 @@ mod tests {
         let mut body = header(1, crate::extent_write::EXTENT_FLAG_DATA);
         body.extend(&shared_data(4096, 1)[..6]);
         assert!(inline_refs(key_type::EXTENT_ITEM, &body).is_err());
+    }
+
+    /// An inline data reference: tree, inode, offset, count.
+    fn data_ref(tree: u64, ino: u64, offset: u64, count: u32) -> Vec<u8> {
+        let mut b = vec![EXTENT_DATA_REF];
+        for v in [tree, ino, offset] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&count.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn dropping_one_of_two_data_references_keeps_the_other() {
+        let mut body = header(2, crate::extent_write::EXTENT_FLAG_DATA);
+        body.extend(data_ref(5, 257, 0, 1));
+        body.extend(data_ref(5, 258, 0, 1));
+        let dropped = drop_inline_data_ref(key_type::EXTENT_ITEM, &body, 5, 257, 0)
+            .unwrap()
+            .expect("the reference is there");
+        let mut want = header(1, crate::extent_write::EXTENT_FLAG_DATA);
+        want.extend(data_ref(5, 258, 0, 1));
+        assert_eq!(dropped, want);
+    }
+
+    #[test]
+    fn dropping_one_of_a_counted_data_reference_counts_it_down() {
+        let mut body = header(2, crate::extent_write::EXTENT_FLAG_DATA);
+        body.extend(data_ref(5, 257, 0, 2));
+        let dropped = drop_inline_data_ref(key_type::EXTENT_ITEM, &body, 5, 257, 0)
+            .unwrap()
+            .expect("the reference is there");
+        let mut want = header(1, crate::extent_write::EXTENT_FLAG_DATA);
+        want.extend(data_ref(5, 257, 0, 1));
+        assert_eq!(dropped, want);
+    }
+
+    #[test]
+    fn a_data_reference_held_elsewhere_or_the_last_is_not_dropped() {
+        let mut body = header(2, crate::extent_write::EXTENT_FLAG_DATA);
+        body.extend(data_ref(5, 258, 0, 1));
+        body.extend(shared_data(4096, 1));
+        assert_eq!(
+            drop_inline_data_ref(key_type::EXTENT_ITEM, &body, 5, 257, 0).unwrap(),
+            None
+        );
+        let mut last = header(1, crate::extent_write::EXTENT_FLAG_DATA);
+        last.extend(data_ref(5, 257, 0, 1));
+        assert!(drop_inline_data_ref(key_type::EXTENT_ITEM, &last, 5, 257, 0).is_err());
     }
 }

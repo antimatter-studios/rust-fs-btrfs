@@ -5,8 +5,10 @@
 //! single-extent file, an inline file, an empty file and a reflinked pair.
 //! Through the ABI one file is cut inside its second extent (the third is
 //! released, the second referenced less), one is cut to nothing (its
-//! extent released), the inline one is cut short and the empty one grown —
-//! each call one committed transaction. Then `btrfs check` inspects the
+//! extent released), the inline one is cut short, the empty one grown, and
+//! one of the reflinked pair cut to nothing (one reference of its shared
+//! extent dropped, the extent kept for the other) — each call one
+//! committed transaction. Then `btrfs check` inspects the
 //! whole volume: an extent still recorded but no longer referenced, a
 //! free-space tree or block group `used` that disagrees, digests left for
 //! a released extent, or an inode whose `nbytes` does not match its items
@@ -135,6 +137,8 @@ fn files_truncated_through_the_abi_are_clean_and_the_kernel_agrees() {
 
     let multi = read(fs, "/multi", 1 << 20);
     assert_eq!(multi.len(), 196_608, "/multi is not the size made");
+    let shared = read(fs, "/shared", 1 << 20);
+    assert_eq!(shared.len(), 8192, "/shared is not the size made");
 
     // Inside the second of three extents: the third is released, the
     // second referenced only up to the sector holding the new end.
@@ -147,14 +151,21 @@ fn files_truncated_through_the_abi_are_clean_and_the_kernel_agrees() {
     assert_eq!(truncate(fs, "/empty", 1 << 20), 0, "{}", last_error());
     // The same length: nothing changes.
     assert_eq!(truncate(fs, "/shared", 8192), 0, "{}", last_error());
+    // One of a reflinked pair to nothing: its reference to the extent the
+    // pair shares is dropped, and the extent stays for the other (#262).
+    assert_eq!(truncate(fs, "/shared", 0), 0, "{}", last_error());
 
     assert_eq!(read(fs, "/multi", 1 << 20), &multi[..70_000]);
+    assert!(read(fs, "/shared", 1 << 20).is_empty());
+    assert!(
+        read(fs, "/shared2", 1 << 20) == shared,
+        "/shared2 changed when its reflinked twin was truncated"
+    );
     assert_eq!(read(fs, "/small", 64), b"hello");
     assert_eq!(read(fs, "/empty", 2 << 20), vec![0u8; 1 << 20]);
 
     // Each refusal names its errno and writes nothing.
     let before = std::fs::read(&image).unwrap();
-    refused(fs, "/shared", 0, ENOTSUP);
     refused(fs, "/multi", 100_000, ENOTSUP);
     refused(fs, "/dir", 0, EISDIR);
     refused(fs, "/missing", 0, ENOENT);
@@ -193,7 +204,7 @@ fn files_truncated_through_the_abi_are_clean_and_the_kernel_agrees() {
         &image,
         "after the ABI's truncates",
         "cd \"$MNT\"\n\
-         for f in multi big small empty shared; do \
+         for f in multi big small empty shared shared2; do \
            printf '%s %s %s\\n' \"$f\" \"$(stat -c %s \"$f\")\" \
              \"$(sha256sum \"$f\" | cut -d' ' -f1)\"; done",
     );
@@ -202,20 +213,17 @@ fn files_truncated_through_the_abi_are_clean_and_the_kernel_agrees() {
         ("big", Vec::new()),
         ("small", b"hello".to_vec()),
         ("empty", vec![0u8; 1 << 20]),
+        ("shared", Vec::new()),
+        ("shared2", shared.clone()),
     ]
     .iter()
     .map(|(name, bytes)| format!("{name} {} {}\n", bytes.len(), sha256_hex(bytes)))
     .collect();
-    let mut lines: Vec<&str> = seen.lines().collect();
-    let shared = lines.pop().unwrap_or_default();
+    let lines: Vec<&str> = seen.lines().collect();
     assert_eq!(
         lines.join("\n") + "\n",
         want,
         "the kernel sees the truncated files differently"
-    );
-    assert!(
-        shared.starts_with("shared 8192 "),
-        "the kernel sees /shared, which nothing truncated, differently: {shared}"
     );
 
     // Every sector the kernel can reach, against its digest.
