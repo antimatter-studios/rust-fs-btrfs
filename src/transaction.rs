@@ -2603,14 +2603,6 @@ fn carve(
     out
 }
 
-/// Library tests that need the fs-linux-test-harness VM.
-///
-/// THE NAME IS LOAD-BEARING. `chore test:unit` runs the library's own
-/// tests with `--skip needs_host::`, because that tier must pass on a
-/// runner with no VM and no fixtures — which is what proves the split.
-/// These run in the whole-release suite instead, where the VM is up.
-/// A module named anything else would be run there, fail to reach a
-/// guest, and take the unit tier down with it.
 #[cfg(test)]
 mod held_only_by_tests {
     use super::{held_only_by, EXTENT_DATA_REF};
@@ -2673,6 +2665,14 @@ mod held_only_by_tests {
     }
 }
 
+/// Library tests that need the fs-linux-test-harness VM.
+///
+/// THE NAME IS LOAD-BEARING. `chore test:unit` runs the library's own
+/// tests with `--skip needs_host::`, because that tier must pass on a
+/// runner with no VM and no fixtures — which is what proves the split.
+/// These run in the whole-release suite instead, where the VM is up.
+/// A module named anything else would be run there, fail to reach a
+/// guest, and take the unit tier down with it.
 #[cfg(test)]
 mod needs_host {
     use crate::fs::Filesystem;
