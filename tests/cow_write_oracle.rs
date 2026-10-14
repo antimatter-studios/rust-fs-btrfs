@@ -11,8 +11,10 @@
 //! records the new extent and forgets the old one, the free-space tree
 //! and the block groups' `used` follow, and the transaction is committed.
 //! A checksummed file gets a digest for every sector of each copy, and
-//! the digests of the extents it replaced are removed (#261); an extent a
-//! snapshot shares is still refused.
+//! the digests of the extents it replaced are removed (#261). An extent a
+//! reflink or another item of the file also references is copied and
+//! keeps those references (#261); an extent a snapshot shares is still
+//! refused.
 //!
 //! # The oracles
 //!
@@ -352,5 +354,229 @@ fn a_copy_on_write_extent_a_snapshot_shares_is_refused_and_untouched() {
     assert!(
         std::fs::read(&image).unwrap() == before,
         "a refused write changed the image"
+    );
+}
+
+/// One extent as the kernel's `FIEMAP` reports it, through `filefrag -v`:
+/// where in the file it begins and where on the device, both in blocks,
+/// and whether the kernel calls it shared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Mapped {
+    logical: u64,
+    physical: u64,
+    shared: bool,
+}
+
+/// What the kernel says about each named file: its SHA-256, and every
+/// extent `filefrag -v` lists for it.
+fn kernel_map(image: &Path, what: &str, names: &[&str]) -> BTreeMap<String, (String, Vec<Mapped>)> {
+    let mut script = String::new();
+    for name in names {
+        script.push_str(&format!(
+            "printf 'file %s %s\\n' {name} \"$(sha256sum \"$MNT/{name}\" | cut -d' ' -f1)\"\n\
+             filefrag -v \"$MNT/{name}\" | awk '$1 ~ /^[0-9]+:$/ {{ \
+               sub(/\\.\\./, \"\", $2); sub(/\\.\\./, \"\", $4); \
+               print \"extent\", $2, $4, ($NF ~ /shared/ ? \"shared\" : \"own\") }}'\n"
+        ));
+    }
+    let mut out: BTreeMap<String, (String, Vec<Mapped>)> = BTreeMap::new();
+    let mut current = String::new();
+    for line in guest_kernel_read_ok(&image.to_string_lossy(), what, &script).lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.as_slice() {
+            ["file", name, sha] => {
+                current = name.to_string();
+                out.insert(current.clone(), (sha.to_string(), Vec::new()));
+            }
+            ["extent", logical, physical, flag] => {
+                let parse = |w: &str| {
+                    w.parse::<u64>()
+                        .unwrap_or_else(|e| panic!("{what}: filefrag printed {w:?}: {e}"))
+                };
+                out.get_mut(&current)
+                    .unwrap_or_else(|| panic!("{what}: an extent before any file: {line}"))
+                    .1
+                    .push(Mapped {
+                        logical: parse(logical),
+                        physical: parse(physical),
+                        shared: *flag == "shared",
+                    });
+            }
+            _ => panic!("{what}: an unexpected line from the guest: {line:?}"),
+        }
+    }
+    out
+}
+
+/// The fill for the shared-extent test. `orig.bin` and its reflink
+/// `twin.bin` reference one extent, recorded with a reference from each.
+/// `split.bin` and `whole.bin` are each one 128 KiB extent whose middle
+/// the kernel then overwrote: the item before the overwrite and the item
+/// after it both reference the original extent, at one reference offset,
+/// so its record counts that reference twice. All four are checksummed.
+const SHARED_FILL: &str = "head -c 65536 /dev/urandom > \"$MNT/orig.bin\"\n\
+     head -c 131072 /dev/urandom > \"$MNT/split.bin\"\n\
+     head -c 131072 /dev/urandom > \"$MNT/whole.bin\"\n\
+     sync\n\
+     cp --reflink=always \"$MNT/orig.bin\" \"$MNT/twin.bin\"\n\
+     dd if=/dev/urandom of=\"$MNT/split.bin\" bs=4096 seek=8 count=4 conv=notrunc \
+        status=none\n\
+     dd if=/dev/urandom of=\"$MNT/whole.bin\" bs=4096 seek=8 count=4 conv=notrunc \
+        status=none\n\
+     sync";
+
+/// An extent another reference shares is copied, and keeps the other
+/// references (#261): a reflink's, and another item of the same file
+/// outside the write. An extent whose every reference is an item the
+/// write replaces is released once, however many of its items named it.
+///
+/// `btrfs check` counts every extent's references against the items that
+/// name it, so a reference dropped that should have stayed, one left that
+/// should have gone, or an extent freed while something still reads it is
+/// reported there. The kernel's `FIEMAP` says which extents it considers
+/// shared, which is how the test knows the twin's reference left the
+/// original's extent and the original kept it; `btrfs check
+/// --check-data-csum` and a kernel scrub verify every digest, the kept
+/// extents' among them.
+#[test]
+fn an_extent_a_reflink_or_another_item_shares_is_copied_and_keeps_its_other_references() {
+    let scratch = Scratch::new("cow-write-shared", SHARED_FILL);
+    let image = scratch.image();
+    let names = ["orig.bin", "twin.bin", "split.bin", "whole.bin"];
+    let before = kernel_map(&image, "before the write", &names);
+
+    // The premises, from the kernel: the twins share one extent, and each
+    // split file's third extent is the rest of its first, twelve blocks on.
+    let first = |view: &BTreeMap<String, (String, Vec<Mapped>)>, name: &str| {
+        view[name]
+            .1
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} has no extents"))
+    };
+    assert!(
+        first(&before, "twin.bin").shared
+            && first(&before, "twin.bin").physical == first(&before, "orig.bin").physical,
+        "the reflink did not share orig.bin's extent: {before:?}"
+    );
+    for name in ["split.bin", "whole.bin"] {
+        let extents = &before[name].1;
+        assert!(
+            extents.len() == 3
+                && extents[0].logical == 0
+                && extents[2].logical == 12
+                && extents[2].physical == extents[0].physical + 12,
+            "{name} is not one extent split around a kernel overwrite: {extents:?}"
+        );
+    }
+
+    let mut fs = mount_rw(&image);
+    let mut expected: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
+    for name in names {
+        expected.insert(name, fs.read_file(ino_of(&fs, name)).unwrap());
+    }
+    // (file, offset, bytes): one of the twins; the first item of a split
+    // file only, so the item after the overwrite keeps the extent; and
+    // every item of the other, so the extent goes, released once.
+    let writes: Vec<(&str, u64, Vec<u8>)> = vec![
+        ("twin.bin", 5000, b"a reflink, copied on write ".repeat(100)),
+        ("split.bin", 4096, vec![0xa5; 4096]),
+        ("whole.bin", 16384, vec![0x5a; 81920]),
+    ];
+    for (name, offset, bytes) in &writes {
+        let ino = ino_of(&fs, name);
+        let n = fs
+            .write(ino, *offset, bytes)
+            .unwrap_or_else(|e| panic!("writing {} bytes at {offset} of {name}: {e}", bytes.len()));
+        assert_eq!(n, bytes.len(), "a short write");
+        let file = expected.get_mut(name).unwrap();
+        file[*offset as usize..*offset as usize + bytes.len()].copy_from_slice(bytes);
+        for other in names {
+            assert_eq!(
+                &fs.read_file(ino_of(&fs, other)).unwrap(),
+                &expected[other],
+                "{other} reads back differently through this driver after writing {name}"
+            );
+        }
+    }
+    drop(fs);
+
+    assert_btrfs_check_clean(&image, "after writes into shared extents");
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum finds data that disagrees with its digests:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let after = kernel_map(&image, "after the write", &names);
+    for name in names {
+        assert_eq!(
+            after[name].0,
+            sha256_hex(&expected[name]),
+            "the kernel reads back different bytes from {name} than were written"
+        );
+    }
+    assert_eq!(
+        after["orig.bin"].1,
+        vec![Mapped {
+            shared: false,
+            ..first(&before, "orig.bin")
+        }],
+        "orig.bin's extent should be where it was, and no longer shared once its twin was copied"
+    );
+    assert_ne!(
+        first(&after, "twin.bin").physical,
+        first(&before, "twin.bin").physical,
+        "twin.bin still starts in the extent it shared, so the write was not copy-on-write"
+    );
+    assert_ne!(
+        first(&after, "split.bin").physical,
+        first(&before, "split.bin").physical,
+        "split.bin's first item was not copied"
+    );
+    // Where, not whether shared: the two items naming it may have counted
+    // as sharing it, and only one names it now.
+    let tail = |view: &BTreeMap<String, (String, Vec<Mapped>)>| {
+        view["split.bin"].1.last().map(|m| (m.logical, m.physical))
+    };
+    assert_eq!(
+        tail(&after),
+        tail(&before),
+        "split.bin's last item should still read the extent the write left it"
+    );
+    assert_ne!(
+        first(&after, "whole.bin").physical,
+        first(&before, "whole.bin").physical,
+        "whole.bin's first item was not copied"
+    );
+
+    // The original, now its extent's one reference, is released when
+    // written: the record the twin's write left must be exactly that.
+    let mut fs = mount_rw(&image);
+    let ino = ino_of(&fs, "orig.bin");
+    fs.write(ino, 0, &[0x3c; 4096])
+        .unwrap_or_else(|e| panic!("writing orig.bin after its twin was copied: {e}"));
+    expected.get_mut("orig.bin").unwrap()[..4096].copy_from_slice(&[0x3c; 4096]);
+    drop(fs);
+    assert_btrfs_check_clean(
+        &image,
+        "after writing the last reference of a shared extent",
+    );
+    let last = kernel_map(&image, "after writing orig.bin", &["orig.bin"]);
+    assert_eq!(
+        last["orig.bin"].0,
+        sha256_hex(&expected["orig.bin"]),
+        "the kernel reads back different bytes from orig.bin than were written"
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after writes into shared extents",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
     );
 }
