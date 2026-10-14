@@ -62,7 +62,7 @@
 //! - [`namespace`] — names in a directory: create, mkdir, symlink, link, unlink, rmdir
 //! - [`attrs`] — what an inode says about itself: extended attributes, ACLs, mode, owner, times
 //! - [`resize`] — the filesystem's size, grown or shrunk on one device
-//! - [`devices`] — the devices a filesystem spans: a device added
+//! - [`devices`] — the devices a filesystem spans: a device added or replaced
 //! - [`truncate`] — a regular file's length, shrunk or grown
 //! - [`transaction`], [`extent_write`], [`block_group`] and [`commit`] — tree
 //!   rewrites and the commit of a new generation, separate from file writes
