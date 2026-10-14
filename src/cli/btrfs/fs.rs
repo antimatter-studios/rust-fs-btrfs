@@ -143,9 +143,8 @@ fn command() -> Cmd {
                      The file must exist and get exactly as many bytes as it already holds. \
                      A NODATACOW file (chattr +C) is overwritten in place; any other is written \
                      copy-on-write into new extents and committed as one transaction. A new \
-                     file, a different length, a checksummed file, or a snapshotted, inline, \
-                     preallocated or compressed extent is refused with exit status 3 and the \
-                     reason (rust-fs-btrfs#261).",
+                     file, a different length, or a snapshotted, inline or preallocated extent \
+                     is refused with exit status 3 and the reason (rust-fs-btrfs#261).",
                 ),
         )
         .subcommand(name_command(

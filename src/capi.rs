@@ -1146,8 +1146,8 @@ pub unsafe extern "C" fn fs_btrfs_can_write_in_place(
 /// copy-on-write: the bytes land in newly allocated extents and the
 /// change is committed as one transaction, so a crash leaves the old
 /// contents or the new and never a mixture. What that path cannot write
-/// yet — a checksummed file, a write that grows the file or fills a
-/// hole, an inline, preallocated, compressed or shared extent
+/// yet — a write that grows the file or fills a hole, an inline or
+/// preallocated extent, or an extent a snapshot may share
 /// (rust-fs-btrfs#261) — is refused with ENOTSUP and the case named.
 ///
 /// # Safety
