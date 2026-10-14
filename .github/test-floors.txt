@@ -118,6 +118,7 @@ resize_kernel             2
 shared_tree_block_release 1
 simple_quota_oracle       3
 snapshot_shared_write     1
+space_cache_v1_kernel     2
 split_oracle              4
 subvol_default_kernel     1
 subvol_oracle             8
