@@ -1692,22 +1692,17 @@ impl Filesystem {
     /// repair, which writes a copy that already verified over one that
     /// did not, so the logical contents do not change (#302).
     ///
-    /// Every span is resolved and checked against the device before the
-    /// first byte is written. A pool is refused: its copies live on
-    /// several devices, and this mount writes one.
+    /// Each span goes to the device its stripe names, so on a pool a copy
+    /// is repaired on its own member (#350). On a RAID5/6 chunk copy 0 is
+    /// the data element, and writing back the bytes its parity rebuilt
+    /// leaves that parity true. Every span is resolved and checked
+    /// against its device before the first byte is written.
     pub(crate) fn write_mirror_in_place(
         &self,
         logical: u64,
         mirror: usize,
         buf: &[u8],
     ) -> Result<()> {
-        let device = self.writable.as_ref().ok_or(Error::ReadOnly)?;
-        if !self.devices.is_empty() {
-            return Err(Error::UnsupportedFeature(
-                "repairing a copy in place on a pool of several devices is not supported yet"
-                    .into(),
-            ));
-        }
         let mut spans = Vec::new();
         let mut done = 0usize;
         while done < buf.len() {
@@ -1716,19 +1711,25 @@ impl Filesystem {
             if n == 0 {
                 return Err(Error::UnmappedLogical(logical + done as u64));
             }
+            let device = self.write_device(m.devid)?;
             Self::writable_span(device, m.physical, n)?;
-            spans.push((m.physical, done, n));
+            spans.push((Arc::clone(device), m.physical, done, n));
             done += n;
         }
-        for (physical, from, n) in spans {
+        for (device, physical, from, n) in spans {
             device.write_at(physical, &buf[from..from + n])?;
         }
         Ok(())
     }
 
-    /// Flush the device this mount writes.
-    pub(crate) fn flush_written(&self) -> Result<()> {
-        self.writable.as_ref().ok_or(Error::ReadOnly)?.flush()?;
+    /// Write `buf` at `physical` on device `devid`, as it lies: one
+    /// RAID5/6 parity element, or part of one, computed again from its
+    /// data by scrub repair (#350). The span is checked against the
+    /// device before anything is written.
+    pub(crate) fn write_element(&self, devid: u64, physical: u64, buf: &[u8]) -> Result<()> {
+        let device = self.write_device(devid)?;
+        Self::writable_span(device, physical, buf.len())?;
+        device.write_at(physical, buf)?;
         Ok(())
     }
 

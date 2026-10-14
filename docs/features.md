@@ -69,7 +69,7 @@ suite.
 | `fsck.btrfs`, check-only: tree-block checksums and keys, extents against their users, block groups, chunks against device extents, the free-space tree, the namespace | Supported | 0.9.0 (#260) | | `cli_fsck_oracle.rs` |
 | Repair (`-y`, `-p`) | Refused (exit 16) | 0.9.0 (#260) | | `cli_fsck_oracle.rs` |
 | Scrub, read-only: every copy of every allocated tree block and data sector checked, each bad copy reported with whether another verifies, and RAID5/6 parity recomputed for every full stripe holding data, a mismatching P or Q reported by device and offset | Supported | Unreleased (#268, #301) | | `scrub_oracle.rs`, `scrub_parity_oracle.rs` |
-| Scrub repair (`scrub_repair`): a bad copy rewritten from a good one | Supported on one device; a pool of several devices is not repaired, nor is a RAID5/6 parity element | Unreleased (#302) | | `scrub_repair_kernel.rs` |
+| Scrub repair (`scrub_repair`): a bad copy rewritten from a good one, on one device or on each member of a pool; on RAID5/6 a bad data sector or tree block rebuilt from parity, and a bad P or Q computed again from its data | Supported | Unreleased (#302, #350) | | `scrub_repair_kernel.rs` |
 
 ## Writing
 
