@@ -83,6 +83,7 @@ pub mod commit;
 pub mod compression;
 pub mod cow_write;
 pub mod csum;
+pub mod defrag;
 pub mod devices;
 pub mod dir;
 pub mod error;
