@@ -110,7 +110,7 @@ Linux kernel in the guest.
 | RAID5/6 writes | Not supported | | #299 | |
 | Label, written to every superblock copy | Supported | 0.9.0 (#264) | | `cli_label_kernel.rs` |
 | Resize, library and C ABI (`resize`, `fs_btrfs_resize`): one device, grown into a larger device or shrunk when no chunk lies past the end | Supported; moving chunks and pools refused | Unreleased (#264) | | `resize_kernel.rs` |
-| Resize, `fs.btrfs resize` | Not supported (`not implemented`, exit 3) | 0.8.0 | #264 | `tests/cli/test-blocked.sh` |
+| Resize, `fs.btrfs resize`: a size, `+`/`-` a change, or `max`; an image file made longer before a grow, cut after a shrink (`--force`), and given its length back when the resize is refused | Supported; a chunk past the new end (a balance) and pools refused | Unreleased (#264) | | `cli_resize_kernel.rs`, `tests/cli/test-blocked.sh` |
 
 ## Making a filesystem
 

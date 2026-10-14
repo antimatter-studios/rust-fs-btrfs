@@ -288,8 +288,9 @@ fn parse_uuid(v: &str) -> Option<[u8; 16]> {
     Some(out)
 }
 
-/// A byte count with an optional 1024-based K/M/G/T suffix.
-fn parse_bytes(v: &str) -> Option<u64> {
+/// A byte count with an optional 1024-based K/M/G/T suffix. `fs.btrfs
+/// resize` reads its sizes the same way.
+pub(super) fn parse_bytes(v: &str) -> Option<u64> {
     let (digits, shift) = match v.chars().last()?.to_ascii_uppercase() {
         'K' => (&v[..v.len() - 1], 10),
         'M' => (&v[..v.len() - 1], 20),
