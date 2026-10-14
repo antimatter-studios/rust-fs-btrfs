@@ -1450,10 +1450,15 @@ build_feature_verity() {
       done ) > "$manifest"
     ino=$(stat -c %i "$MNT/nodatasum/tamper.bin")
     umount "$MNT"
-    btrfs inspect-internal dump-super "$img" | grep -q 'VERITY' || {
-        echo "guest-build-images: btrfs-verity does not carry the verity compat_ro bit" >&2
+    # The guest's btrfs-progs 6.2 prints the raw compat_ro mask but does not
+    # know the VERITY name yet. Check the upstream bit value, not its label.
+    local compat_ro
+    compat_ro=$(btrfs inspect-internal dump-super "$img" \
+        | awk '$1 == "compat_ro_flags" { print $2 }')
+    if [ -z "$compat_ro" ] || (( (compat_ro & 4) == 0 )); then
+        echo "guest-build-images: btrfs-verity compat_ro_flags=${compat_ro:-missing} lacks VERITY (0x4)" >&2
         exit 1
-    }
+    fi
     [ "$(grep -c 'sha256:\|sha512:' "$manifest")" -eq 6 ] || {
         echo "guest-build-images: btrfs-verity: the kernel measures $(grep -c 'sha256:\|sha512:' "$manifest") of six sealed files" >&2
         exit 1
