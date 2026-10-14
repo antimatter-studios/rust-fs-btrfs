@@ -158,7 +158,7 @@ pub(crate) struct DataMove {
     /// `used` count this.
     pub disk_len: u64,
     /// The copy's compression type, as the item's `compression` byte
-    /// records it: 0 for none, 1 for zlib.
+    /// records it: 0 for none, 1 zlib, 2 LZO, 3 zstd.
     pub compression: u8,
     /// The key offset of the file's `EXTENT_DATA` item.
     pub file_offset: u64,

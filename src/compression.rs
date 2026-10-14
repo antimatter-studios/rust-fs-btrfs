@@ -1,10 +1,13 @@
-//! Decoding compressed extents.
+//! Decoding compressed extents, and encoding them for the write path.
 //!
 //! Btrfs may store an extent's data compressed, recording which
 //! algorithm in the file-extent item. Three are defined, and a reader
 //! that means to be useful on real volumes needs all three: zstd is the
 //! usual choice on modern installs, zlib the long-standing default, and
-//! LZO the one picked when decode speed matters most.
+//! LZO the one picked when decode speed matters most. The write path
+//! encodes all three too (#265): [`compress`] produces what an extent
+//! of each holds on disk, framing included, before it is padded to a
+//! sector.
 //!
 //! # What is compressed, and what the offsets then mean
 //!
@@ -81,6 +84,32 @@ impl Compression {
     /// Whether data stored under this type needs decoding.
     pub fn is_compressed(self) -> bool {
         self != Compression::None
+    }
+
+    /// The byte a file-extent item records for this type.
+    pub fn to_byte(self) -> u8 {
+        match self {
+            Compression::None => 0,
+            Compression::Zlib => 1,
+            Compression::Lzo => 2,
+            Compression::Zstd => 3,
+        }
+    }
+
+    /// What the compression property (`btrfs.compression`) asks for, read
+    /// as the kernel reads it: a value beginning `zlib`, `lzo` or `zstd`
+    /// names that algorithm (a level may follow, as in `zstd:3`), and `no`
+    /// or `none` declines compression. `None` for anything else,
+    /// including an empty value: no preference, so the inode's flags and
+    /// the mount decide.
+    pub fn from_property(value: &[u8]) -> Option<Self> {
+        match value {
+            b"no" | b"none" => Some(Compression::None),
+            v if v.starts_with(b"zlib") => Some(Compression::Zlib),
+            v if v.starts_with(b"lzo") => Some(Compression::Lzo),
+            v if v.starts_with(b"zstd") => Some(Compression::Zstd),
+            _ => None,
+        }
     }
 }
 
@@ -179,11 +208,123 @@ pub fn decompress(
     Ok(out)
 }
 
+/// What an extent of `input` compressed with `algo` holds on disk, before
+/// it is padded to a sector (#265), or `None` when `algo` is
+/// [`Compression::None`] or its encoder produced something the kernel's
+/// decoder would refuse. Whether the result is worth keeping -- it must
+/// save a sector -- is the caller's decision, as it is the kernel's.
+///
+/// `sectorsize` is the filesystem's sector size, which the LZO framing is
+/// laid out against and the other two ignore.
+pub(crate) fn compress(algo: Compression, input: &[u8], sectorsize: usize) -> Option<Vec<u8>> {
+    match algo {
+        Compression::None => None,
+        Compression::Zlib => Some(compress_zlib(input)),
+        Compression::Lzo => compress_lzo(input, sectorsize),
+        Compression::Zstd => compress_zstd(input),
+    }
+}
+
 /// `input` as one zlib stream, at the level the kernel uses by default
 /// (3): what a zlib-compressed extent holds on disk, before it is padded
 /// to a sector (#265).
 pub(crate) fn compress_zlib(input: &[u8]) -> Vec<u8> {
     miniz_oxide::deflate::compress_to_vec_zlib(input, 3)
+}
+
+/// The largest window a zstd extent's frame may declare: the kernel's
+/// decoder is set up for frames of at most one compression unit, and
+/// refuses a frame asking for more (`ZSTD_BTRFS_MAX_WINDOWLOG`, 17).
+const ZSTD_MAX_WINDOW: u64 = MAX_UNCOMPRESSED as u64;
+
+/// `input` as one zstd frame: what a zstd-compressed extent holds on
+/// disk, before it is padded to a sector (#265).
+///
+/// ruzstd's encoder, at its fastest level (zstd's level 1; the kernel's
+/// default is 3, which ruzstd does not implement -- the format is the
+/// same, only the ratio differs). Its frame declares a 128 KiB window,
+/// which is exactly what the kernel's decoder accepts; the frame header
+/// is read back and checked, so that an encoder that ever declared more
+/// would leave the extent stored uncompressed rather than written in a
+/// form the kernel cannot read.
+pub(crate) fn compress_zstd(input: &[u8]) -> Option<Vec<u8>> {
+    let frame =
+        ruzstd::encoding::compress_to_vec(input, ruzstd::encoding::CompressionLevel::Fastest);
+    (zstd_window(&frame)? <= ZSTD_MAX_WINDOW).then_some(frame)
+}
+
+/// The window a zstd frame's header declares, or `None` for a header this
+/// cannot read.
+///
+/// RFC 8878, section 3.1.1.1: the four-byte magic, the frame header
+/// descriptor, then -- unless the descriptor's single-segment bit is set
+/// -- a window descriptor of a 5-bit exponent and a 3-bit mantissa. A
+/// single-segment frame's window is its content size, which follows the
+/// dictionary id.
+fn zstd_window(frame: &[u8]) -> Option<u64> {
+    const MAGIC: [u8; 4] = 0xFD2F_B528u32.to_le_bytes();
+    if frame.get(..4)? != MAGIC {
+        return None;
+    }
+    let descriptor = *frame.get(4)?;
+    if descriptor & 0x20 == 0 {
+        let window = *frame.get(5)?;
+        let log = 10 + u32::from(window >> 3);
+        let base = 1u64.checked_shl(log)?;
+        return Some(base + (base / 8) * u64::from(window & 7));
+    }
+    let dict_len = [0usize, 1, 2, 4][usize::from(descriptor & 3)];
+    let at = 5 + dict_len;
+    let size = match descriptor >> 6 {
+        0 => u64::from(*frame.get(at)?),
+        1 => u64::from(u16::from_le_bytes(frame.get(at..at + 2)?.try_into().ok()?)) + 256,
+        2 => u64::from(u32::from_le_bytes(frame.get(at..at + 4)?.try_into().ok()?)),
+        _ => u64::from_le_bytes(frame.get(at..at + 8)?.try_into().ok()?),
+    };
+    Some(size)
+}
+
+/// The most one LZO segment may hold: `lzo1x_worst_compress` of a sector,
+/// the size of the buffer the kernel's decoder copies a segment into. A
+/// longer one is refused as corrupt when it is read.
+fn lzo_max_segment(sectorsize: usize) -> usize {
+    sectorsize + sectorsize / 16 + 64 + 3
+}
+
+/// `input` in btrfs's segmented LZO framing, the inverse of
+/// `decompress_lzo` (#265).
+///
+/// Each sector of input is compressed on its own as an LZO1X stream, by
+/// the family's own permissive encoder, and stored behind a four-byte
+/// little-endian length. After each segment, when what is left of the
+/// sector cannot hold the next header -- one to three bytes -- those
+/// bytes are zeroed and the next header starts on the boundary, so no
+/// header straddles a sector. The extent opens with the total length,
+/// those four bytes and any padding included.
+///
+/// `None` when a segment comes out longer than the kernel's decoder
+/// takes one ([`lzo_max_segment`]), which only incompressible input
+/// approaches and which would then be stored uncompressed anyway.
+pub(crate) fn compress_lzo(input: &[u8], sectorsize: usize) -> Option<Vec<u8>> {
+    if sectorsize < LZO_LEN {
+        return None;
+    }
+    let mut out = vec![0u8; LZO_LEN];
+    for sector in input.chunks(sectorsize) {
+        let segment = lzo1x::compress(sector);
+        if segment.len() > lzo_max_segment(sectorsize) {
+            return None;
+        }
+        out.extend_from_slice(&u32::try_from(segment.len()).ok()?.to_le_bytes());
+        out.extend_from_slice(&segment);
+        let left = out.len().next_multiple_of(sectorsize) - out.len();
+        if left < LZO_LEN {
+            out.resize(out.len() + left, 0);
+        }
+    }
+    let total = u32::try_from(out.len()).ok()?;
+    out[..LZO_LEN].copy_from_slice(&total.to_le_bytes());
+    Some(out)
 }
 
 fn decompress_zlib(input: &[u8], ram_bytes: usize) -> Result<Vec<u8>> {
@@ -408,6 +549,143 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got, plain);
+    }
+
+    /// Compressible bytes a whole compression unit long, as every encoder
+    /// test below writes them: text with a counter in it, so LZO and zstd
+    /// find matches without the input being one repeated byte.
+    fn compressible_unit() -> Vec<u8> {
+        let mut out = Vec::with_capacity(MAX_UNCOMPRESSED);
+        let mut line = 0u32;
+        while out.len() < MAX_UNCOMPRESSED {
+            out.extend_from_slice(format!("line {line} of some compressible text\n").as_bytes());
+            line += 1;
+        }
+        out.truncate(MAX_UNCOMPRESSED);
+        out
+    }
+
+    /// What the write path stores for each algorithm, padded to a sector
+    /// as on disk, is what the read path decodes (#265). Self-consistency
+    /// only: the kernel reading these back is tests/compress_write_kernel.rs.
+    #[test]
+    fn every_algorithm_the_write_path_encodes_decodes_padded() {
+        let plain = compressible_unit();
+        for algo in [Compression::Zlib, Compression::Lzo, Compression::Zstd] {
+            let mut packed = compress(algo, &plain, 4096).expect("compressible input encodes");
+            assert!(
+                packed.len() < plain.len() / 2,
+                "{algo:?}: {} bytes from {}",
+                packed.len(),
+                plain.len()
+            );
+            packed.resize(packed.len().next_multiple_of(4096), 0);
+            let got = decompress(algo, &packed, plain.len(), 4096, ShortDecode::Refuse)
+                .unwrap_or_else(|e| panic!("{algo:?}: {e}"));
+            assert_eq!(got, plain, "{algo:?} decodes to different bytes");
+        }
+        assert!(compress(Compression::None, &plain, 4096).is_none());
+    }
+
+    /// The LZO framing the encoder writes: the total counts the whole
+    /// frame, one segment per sector of input, and no header straddles a
+    /// sector -- walked here independently of `decompress_lzo`, header by
+    /// header, so the encoder's padding is checked against the rule rather
+    /// than against the decoder that shares its reading of it.
+    ///
+    /// At 4 KiB a segment ends within three bytes of a boundary only now
+    /// and then, so the walk is also made at 64-byte sectors, where the
+    /// thousands of boundaries make the padding certain to be needed.
+    #[test]
+    fn lzo_frames_put_one_segment_per_sector_and_no_header_across_a_boundary() {
+        let plain = compressible_unit();
+        for sectorsize in [64, 4096] {
+            let framed = compress_lzo(&plain, sectorsize).unwrap();
+            assert_eq!(read_u32(&framed, 0).unwrap() as usize, framed.len());
+            let mut at = LZO_LEN;
+            let mut segments = 0;
+            let mut padded = 0;
+            while at < framed.len() {
+                let room = sectorsize - at % sectorsize;
+                if room < LZO_LEN {
+                    assert_eq!(
+                        &framed[at..at + room],
+                        &vec![0u8; room][..],
+                        "padding at {at}"
+                    );
+                    at += room;
+                    padded += 1;
+                    continue;
+                }
+                let len = read_u32(&framed, at).unwrap() as usize;
+                assert!(
+                    len > 0 && len <= lzo_max_segment(sectorsize),
+                    "segment of {len}"
+                );
+                at += LZO_LEN + len;
+                segments += 1;
+            }
+            assert_eq!(at, framed.len(), "{sectorsize}-byte sectors");
+            assert_eq!(
+                segments,
+                plain.len() / sectorsize,
+                "{sectorsize}-byte sectors"
+            );
+            if sectorsize == 64 {
+                assert!(padded > 0, "no segment ended within a header of a boundary");
+            }
+            let got = decompress(
+                Compression::Lzo,
+                &framed,
+                plain.len(),
+                sectorsize,
+                ShortDecode::Refuse,
+            )
+            .unwrap_or_else(|e| panic!("{sectorsize}-byte sectors: {e}"));
+            assert_eq!(got, plain, "{sectorsize}-byte sectors");
+        }
+    }
+
+    /// A zstd extent's frame declares a window the kernel's decoder
+    /// accepts: one compression unit, no more.
+    #[test]
+    fn zstd_frames_declare_a_window_the_kernel_accepts() {
+        let frame = compress_zstd(&compressible_unit()).unwrap();
+        let window = zstd_window(&frame).expect("a readable frame header");
+        assert!(window <= ZSTD_MAX_WINDOW, "window of {window}");
+        // The header's arithmetic: exponent 7, mantissa 0 is 2^17, and a
+        // single-segment frame's window is its one-byte content size.
+        let mut header = 0xFD2F_B528u32.to_le_bytes().to_vec();
+        assert_eq!(
+            zstd_window(&[&header[..], &[0x00, 7 << 3]].concat()),
+            Some(1 << 17)
+        );
+        assert_eq!(
+            zstd_window(&[&header[..], &[0x00, (7 << 3) | 1]].concat()),
+            Some((1 << 17) + (1 << 14))
+        );
+        header.extend_from_slice(&[0x20, 200]);
+        assert_eq!(zstd_window(&header), Some(200));
+        assert_eq!(zstd_window(b"not a frame"), None);
+    }
+
+    #[test]
+    fn the_compression_property_is_read_as_the_kernel_reads_it() {
+        for (value, want) in [
+            (&b"zlib"[..], Some(Compression::Zlib)),
+            (b"lzo", Some(Compression::Lzo)),
+            (b"zstd", Some(Compression::Zstd)),
+            (b"zstd:3", Some(Compression::Zstd)),
+            (b"no", Some(Compression::None)),
+            (b"none", Some(Compression::None)),
+            (b"", None),
+            (b"brotli", None),
+        ] {
+            assert_eq!(Compression::from_property(value), want, "{value:?}");
+        }
+        for byte in 0..=3 {
+            assert_eq!(Compression::from_byte(byte).unwrap().to_byte(), byte);
+        }
     }
 
     /// The decoded length is checked, not taken on trust: a stream that

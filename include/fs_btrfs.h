@@ -279,6 +279,17 @@ fs_btrfs_fs_t *fs_btrfs_mount_rw(const char *device_path);
 int fs_btrfs_is_writable(fs_btrfs_fs_t *fs);
 
 /*
+ * Compress what this handle writes, as the kernel's compress= mount
+ * option does: `algorithm` is 0 for none (the default), 1 zlib, 2 LZO,
+ * 3 zstd. A file's compression property and its NOCOMPRESS flag come
+ * first, and a file marked COMPRESS (chattr +c) on a handle set to none
+ * is written as zlib. A copy is kept compressed only when that saves a
+ * sector; the first LZO or zstd extent sets the volume's feature flag
+ * for it. Returns 0, or -1 with EINVAL for an algorithm not listed.
+ */
+int fs_btrfs_set_compression(fs_btrfs_fs_t *fs, int algorithm);
+
+/*
  * Whether `path` can be written in place: NODATACOW, unchecksummed, and
  * with every extent unshared, uncompressed and really allocated.
  *

@@ -16,11 +16,14 @@
 //!    covers, and filled with them — the old contents with the write
 //!    applied. The copy is the item's window of the old extent, not the
 //!    whole of it, so the new item references all of its extent from
-//!    offset zero. A file that asks for compression (`chattr +c`, or the
-//!    compression property naming zlib) has a copy of up to 128 KiB
-//!    stored as one zlib stream padded to a sector, when that saves a
-//!    sector (#265); the old extent may be compressed or not, since the
-//!    copy is made from its decoded bytes.
+//!    offset zero. A file that asks for compression (`chattr +c`, the
+//!    compression property, or a mount set to compress) has a copy of up
+//!    to 128 KiB stored compressed, as zlib, LZO or zstd in the kernel's
+//!    framing for each and padded to a sector, when that saves a sector
+//!    (#265); the old extent may be compressed or not, since the copy is
+//!    made from its decoded bytes. The first LZO or zstd extent on a
+//!    volume sets that algorithm's incompatible feature flag, in the same
+//!    commit.
 //! 2. **The file's `EXTENT_DATA` item** is pointed at it, in place: the
 //!    item keeps its size, so its leaf cannot overflow.
 //! 3. **The extent tree** gains an `EXTENT_ITEM` for the new extent, with
@@ -71,6 +74,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::chunk::{objectid, DiskKey};
+use crate::compression::Compression;
 use crate::error::{Error, Result};
 use crate::fs::{Filesystem, EXTENT_DATA_KEY};
 use crate::inode::{Inode, INODE_ITEM_KEY, INODE_NODATACOW, INODE_NODATASUM};
@@ -164,7 +168,7 @@ impl Filesystem {
         // as zeros, and that is what the copy holds there. Then the bytes
         // it is stored as: compressed, for a file that asks for it, when
         // that saves a sector (#265).
-        let zlib = self.compresses_with_zlib(inode)?;
+        let algo = self.compression_for(inode)?;
         let mut encoded: Vec<(Vec<u8>, u8)> = Vec::with_capacity(targets.len());
         for t in &targets {
             let size = usize::try_from(t.len)
@@ -175,12 +179,20 @@ impl Filesystem {
             let to = end.min(t.start + t.len);
             buf[(from - t.start) as usize..(to - t.start) as usize]
                 .copy_from_slice(&data[(from - offset) as usize..(to - offset) as usize]);
-            encoded.push(self.encode_copy(buf, zlib));
+            encoded.push(self.encode_copy(buf, algo));
         }
 
         let lens: Vec<u64> = encoded.iter().map(|(b, _)| b.len() as u64).collect();
         let news = self.find_data_extents(&lens)?;
         let compression: Vec<u8> = encoded.iter().map(|(_, c)| *c).collect();
+        // An algorithm the volume has not used before is announced in the
+        // superblock that first names an extent of it, as the kernel does:
+        // a reader that predates it must refuse the volume, not misread it.
+        let incompat = if compression.iter().any(|&c| c != COMPRESS_NONE) {
+            incompat_for(algo) & !self.sb.incompat_flags
+        } else {
+            0
+        };
         let contents: Vec<(u64, Vec<u8>)> = news
             .iter()
             .copied()
@@ -298,7 +310,7 @@ impl Filesystem {
         for (at, buf) in &contents {
             self.write_logical_all_mirrors(*at, buf)?;
         }
-        self.commit(
+        self.commit_setting_incompat(
             &blocks,
             &Commit {
                 generation,
@@ -308,6 +320,7 @@ impl Filesystem {
                 invalidate_free_space_tree: false,
                 ..Default::default()
             },
+            incompat,
         )?;
 
         // The trees this mount holds are the previous generation's.
@@ -407,42 +420,62 @@ impl Filesystem {
         Ok(out)
     }
 
-    /// Whether copies of `inode` are stored zlib-compressed (#265).
+    /// How copies of `inode` are stored (#265), decided as the kernel
+    /// decides it:
     ///
-    /// A file asks for compression with the `COMPRESS` inode flag
-    /// (`chattr +c`, or `btrfs property set ... compression`, which sets
-    /// it too) and declines it with `NOCOMPRESS`. The property names the
-    /// algorithm; zlib is the only one written here, so a file whose
-    /// property names zstd or LZO is stored uncompressed, which every
-    /// reader accepts — compression is the file's preference, not part
-    /// of its contents.
-    fn compresses_with_zlib(&self, inode: &Inode) -> Result<bool> {
-        if inode.flags & INODE_COMPRESS == 0 || inode.flags & INODE_NOCOMPRESS != 0 {
-            return Ok(false);
+    /// - a `nodatacow` or `nodatasum` file is never compressed: a
+    ///   compressed extent is always copied on write and always
+    ///   checksummed;
+    /// - the compression property (`btrfs.compression`), when it names an
+    ///   algorithm, chooses it, and `no` or `none` declines compression;
+    ///   the property overrides both inode flags, which is what the kernel
+    ///   does with it when it loads the inode;
+    /// - otherwise `NOCOMPRESS` declines it, and the `COMPRESS` flag
+    ///   (`chattr +c`) asks for it in the mount's algorithm, zlib when the
+    ///   mount names none;
+    /// - otherwise the mount decides: [`Filesystem::set_compression`] is
+    ///   the kernel's `compress=` mount option.
+    ///
+    /// Compression is the file's preference, not part of its contents: a
+    /// copy stored uncompressed is read the same by every reader.
+    fn compression_for(&self, inode: &Inode) -> Result<Compression> {
+        if inode.flags & (INODE_NODATACOW | INODE_NODATASUM) != 0 {
+            return Ok(Compression::None);
         }
-        Ok(match self.get_xattr(inode.ino, b"btrfs.compression")? {
-            None => true,
-            Some(algorithm) => algorithm.starts_with(b"zlib"),
-        })
+        if let Some(value) = self.get_xattr(inode.ino, COMPRESSION_PROPERTY)? {
+            if let Some(chosen) = Compression::from_property(&value) {
+                return Ok(chosen);
+            }
+        }
+        if inode.flags & INODE_NOCOMPRESS != 0 {
+            return Ok(Compression::None);
+        }
+        let mount = self.compression();
+        if inode.flags & INODE_COMPRESS != 0 && mount == Compression::None {
+            return Ok(Compression::Zlib);
+        }
+        Ok(mount)
     }
 
-    /// The bytes a copy is stored as, and its compression type: one zlib
-    /// stream padded to a sector when `zlib` and that saves at least a
-    /// sector, as the kernel requires before it keeps a compressed
-    /// extent; otherwise the bytes as they are. A copy longer than a
-    /// compressed extent may hold (128 KiB) is never compressed.
-    fn encode_copy(&self, plain: Vec<u8>, zlib: bool) -> (Vec<u8>, u8) {
+    /// The bytes a copy is stored as, and its compression type: `algo`'s
+    /// encoding padded to a sector when that saves at least a sector, as
+    /// the kernel requires before it keeps a compressed extent; otherwise
+    /// the bytes as they are. A copy longer than a compressed extent may
+    /// hold (128 KiB) is never compressed.
+    fn encode_copy(&self, plain: Vec<u8>, algo: Compression) -> (Vec<u8>, u8) {
         let sector = self.sb.sectorsize as usize;
-        if !zlib || plain.len() > crate::compression::MAX_UNCOMPRESSED {
+        if plain.len() > crate::compression::MAX_UNCOMPRESSED {
             return (plain, COMPRESS_NONE);
         }
-        let mut packed = crate::compression::compress_zlib(&plain);
+        let Some(mut packed) = crate::compression::compress(algo, &plain, sector) else {
+            return (plain, COMPRESS_NONE);
+        };
         let on_disk = packed.len().next_multiple_of(sector);
         if on_disk + sector > plain.len() {
             return (plain, COMPRESS_NONE);
         }
         packed.resize(on_disk, 0);
-        (packed, COMPRESS_ZLIB)
+        (packed, algo.to_byte())
     }
 
     /// The checksum tree edits a write makes (#261), or a truncate
@@ -577,9 +610,23 @@ impl Filesystem {
 const INODE_NOCOMPRESS: u64 = 1 << 3;
 const INODE_COMPRESS: u64 = 1 << 11;
 
-/// An extent item's `compression` byte: none, and zlib.
+/// An extent item's `compression` byte for a copy stored as it is.
 const COMPRESS_NONE: u8 = 0;
-const COMPRESS_ZLIB: u8 = 1;
+
+/// The attribute the kernel keeps the compression property in.
+const COMPRESSION_PROPERTY: &[u8] = b"btrfs.compression";
+
+/// The incompatible feature flag an extent compressed with `algo` needs:
+/// LZO's and zstd's have one each, and zlib, which every kernel with
+/// Btrfs reads, has none.
+fn incompat_for(algo: Compression) -> u64 {
+    use crate::superblock::incompat;
+    match algo {
+        Compression::Lzo => incompat::COMPRESS_LZO,
+        Compression::Zstd => incompat::COMPRESS_ZSTD,
+        Compression::None | Compression::Zlib => 0,
+    }
+}
 
 /// A leaf's header, and the header of each item in it.
 const LEAF_HEADER: usize = 101;

@@ -441,6 +441,12 @@ pub struct Filesystem {
     /// passes through are read, and verified, once. Bounded, least recently
     /// used out.
     nodes: std::sync::Mutex<NodeCache>,
+    /// The compression this mount writes with, as the kernel's
+    /// `compress=` mount option sets it (#265): see
+    /// [`Filesystem::set_compression`]. [`Compression::None`] unless set.
+    ///
+    /// [`Compression::None`]: crate::compression::Compression::None
+    compression: crate::compression::Compression,
 }
 
 /// Tree blocks a mount keeps: 1024, 16 MiB at the default 16 KiB node.
@@ -729,18 +735,45 @@ impl Filesystem {
     }
 
     /// The same devices opened again, for the generation a commit just
-    /// wrote: the trees this mount holds are the previous one's.
+    /// wrote: the trees this mount holds are the previous one's. What the
+    /// mount was set to do, its compression, carries over.
     pub(crate) fn remount_rw(&self) -> Result<Self> {
-        if !self.writable_pool.is_empty() {
-            return Self::mount_pool_rw(self.writable_pool.values().cloned().collect());
-        }
-        let device = self.writable.as_ref().ok_or(Error::ReadOnly)?;
-        Self::mount_rw(Arc::clone(device))
+        let mut fs = if !self.writable_pool.is_empty() {
+            Self::mount_pool_rw(self.writable_pool.values().cloned().collect())?
+        } else {
+            let device = self.writable.as_ref().ok_or(Error::ReadOnly)?;
+            Self::mount_rw(Arc::clone(device))?
+        };
+        fs.compression = self.compression;
+        Ok(fs)
     }
 
     /// Whether this mount can write.
     pub fn is_writable(&self) -> bool {
         self.writable.is_some()
+    }
+
+    /// Compress what this mount writes with `algo`, as the kernel's
+    /// `compress=<algo>` mount option does (#265); [`Compression::None`],
+    /// the default, is a mount without it.
+    ///
+    /// A file's own choice comes first: the compression property, when it
+    /// names an algorithm or declines compression, and then the
+    /// `NOCOMPRESS` flag. A file marked `COMPRESS` (`chattr +c`) on a
+    /// mount that names no algorithm is written as zlib, the kernel's
+    /// default. A copy is stored compressed only when that saves a sector,
+    /// and the first LZO or zstd extent sets that algorithm's
+    /// incompatible feature flag in the same commit.
+    ///
+    /// [`Compression::None`]: crate::compression::Compression::None
+    pub fn set_compression(&mut self, algo: crate::compression::Compression) {
+        self.compression = algo;
+    }
+
+    /// The compression this mount writes with: see
+    /// [`Filesystem::set_compression`].
+    pub fn compression(&self) -> crate::compression::Compression {
+        self.compression
     }
 
     /// Where a mapped range lands on the device, once it is known to be
@@ -1313,6 +1346,7 @@ impl Filesystem {
             fs_tree_root,
             csum_tree_root,
             nodes: std::sync::Mutex::new(NodeCache::new(NODE_CACHE_BLOCKS)),
+            compression: crate::compression::Compression::None,
         };
         Ok(fs)
     }
@@ -1773,6 +1807,7 @@ impl Filesystem {
             // data is checksummed by the same csum tree.
             csum_tree_root: self.csum_tree_root,
             nodes: std::sync::Mutex::new(NodeCache::new(NODE_CACHE_BLOCKS)),
+            compression: self.compression,
         };
         Ok(fs)
     }
