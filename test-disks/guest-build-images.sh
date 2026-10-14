@@ -1421,7 +1421,13 @@ build_feature_verity() {
     ( cd "$MNT" && find . -mindepth 1 -type f | sort | while read -r p; do
         if m=$(fsverity measure "$p" 2>/dev/null); then
             m=${m%% *}
-            t=$(fsverity dump_metadata merkle_tree "$p" | sha256sum | cut -d' ' -f1)
+            # An empty verity file has no Merkle blocks; fsverity-utils
+            # reports that as ENOTTY instead of emitting an empty tree.
+            if [ "$(stat -c%s "$p")" -eq 0 ]; then
+                t=$(printf '' | sha256sum | cut -d' ' -f1)
+            else
+                t=$(fsverity dump_metadata merkle_tree "$p" | sha256sum | cut -d' ' -f1)
+            fi
             d=$(fsverity dump_metadata descriptor "$p" | sha256sum | cut -d' ' -f1)
         else
             m=- t=- d=-
