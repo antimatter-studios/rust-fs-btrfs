@@ -213,6 +213,12 @@ pub(crate) struct DataWrite {
     /// Extents of the file released outright, their file items deleted
     /// by `edits`.
     pub releases: Vec<DataRelease>,
+    /// Extents a reflink shares, of which the file drops one reference
+    /// (#262): the file item deleted by `edits` loses its inline
+    /// `EXTENT_DATA_REF` from the extent's record, which stays for the
+    /// other references -- and so do the extent's bytes, its checksums,
+    /// its free space and its block group's `used`.
+    pub unrefs: Vec<DataRelease>,
 }
 
 /// One change to an item of the tree a [`DataWrite`] names (#262).
@@ -279,6 +285,7 @@ impl DataWrite {
             .iter()
             .flat_map(|m| [m.old, m.new])
             .chain(self.releases.iter().map(|r| r.old))
+            .chain(self.unrefs.iter().map(|r| r.old))
             .collect()
     }
 
@@ -1057,6 +1064,14 @@ impl Filesystem {
             )));
         }
         let released = n + data.releases.len();
+        if applied.unreffed != data.unrefs.len() {
+            return Err(Error::UnsupportedFeature(format!(
+                "the write drops one reference of {} shared data extents, and the plan edited \
+                 the records of {}",
+                data.unrefs.len(),
+                applied.unreffed
+            )));
+        }
         if applied.released != released || applied.recorded != n {
             return Err(Error::UnsupportedFeature(format!(
                 "the write moves {n} data extents and releases {}, and the plan released the \
@@ -1485,6 +1500,50 @@ impl Filesystem {
             applied.released += 1;
         }
 
+        // Each data extent a reflink shares, of which the write drops one
+        // reference (#262): its record stays, less this file item's inline
+        // reference -- counted down, or removed at a count of one -- and
+        // one from its total. A reference held any other way, or the
+        // extent's last, is refused: the last is a release, and a keyed or
+        // shared reference is not edited here.
+        for r in &data.unrefs {
+            if !mine(r.old)? {
+                continue;
+            }
+            let key = DiskKey {
+                objectid: r.old,
+                key_type: key_type::EXTENT_ITEM,
+                offset: r.old_len,
+            };
+            let body = out
+                .iter()
+                .find(|i| i.key == key)
+                .map(|i| i.data.clone())
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(format!(
+                        "the shared data extent at {} has no record where the plan looked",
+                        r.old
+                    ))
+                })?;
+            let dropped = crate::backref::drop_inline_data_ref(
+                key_type::EXTENT_ITEM,
+                &body,
+                data.root,
+                data.ino,
+                r.old_ref_offset,
+            )?
+            .ok_or_else(|| {
+                Error::UnsupportedFeature(format!(
+                    "the shared data extent at {} holds no inline reference from inode {} \
+                     at {} in tree {}, so which of its references to drop is not known",
+                    r.old, data.ino, r.old_ref_offset, data.root
+                ))
+            })?;
+            out = delete(&out, &key)?;
+            out = insert(&out, OwnedItem { key, data: dropped })?;
+            applied.unreffed += 1;
+        }
+
         // Each reference that names a moved full-backref block by its
         // old address becomes the keyed reference an ordinary block of
         // its tree gives its children (#287). Without this the data under
@@ -1874,6 +1933,8 @@ struct DataApplied {
     inodes: usize,
     /// Old data extents whose record was removed.
     released: usize,
+    /// Shared data extents whose record lost one reference.
+    unreffed: usize,
     /// New data extents recorded.
     recorded: usize,
     /// `ROOT_ITEM`s whose flags were set.

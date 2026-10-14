@@ -1391,8 +1391,9 @@ pub unsafe extern "C" fn fs_btrfs_link(
 /// Remove the name `path`, and the file with it when that was its last
 /// name. Returns 0, or -1 with the error recorded: ENOENT when there is
 /// no such name, EISDIR for a directory, ENOTSUP for the last name of a
-/// file whose data extents a snapshot or a reflink shares. A file's data
-/// goes with its last name otherwise (#262).
+/// file whose data extents a snapshot may share. A file's data goes with
+/// its last name otherwise, and an extent a reflink shares loses the
+/// file's reference and stays for the others (#262).
 ///
 /// # Safety
 ///
@@ -1542,9 +1543,9 @@ pub unsafe extern "C" fn fs_btrfs_rename(
 ///
 /// Returns 0, or -1 with the error recorded: ENOENT for no such path,
 /// EISDIR for anything but a regular file, EROFS on a read-only handle,
-/// and ENOTSUP for what cannot be written yet — an extent a snapshot or a
-/// reflink shares, or growing a file whose last sector is partly past its
-/// end.
+/// and ENOTSUP for what cannot be written yet — an extent a snapshot may
+/// share, or growing a file whose last sector is partly past its end. An
+/// extent a reflink shares loses the file's reference and stays.
 ///
 /// # Safety
 ///

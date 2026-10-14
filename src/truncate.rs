@@ -19,9 +19,10 @@
 //!
 //! # What it refuses
 //!
-//! - an extent another reference shares — a snapshot, a reflink, or a
-//!   second item of the same file: releasing one reference of several is
-//!   not written yet (#261);
+//! - an extent a snapshot may share, one from at or before the last
+//!   snapshot; an extent a reflink shares has this file's reference
+//!   dropped and stays for the others (#262), unless that reference is held
+//!   anywhere but inline in the extent's record, or is its last;
 //! - growing a file whose last sector is partly past its end, or that holds
 //!   inline data: the bytes between the old end and the sector boundary
 //!   must read as zeros, which means writing that sector;
@@ -69,6 +70,7 @@ impl Filesystem {
 
         let mut edits = Vec::new();
         let mut releases = Vec::new();
+        let mut unrefs = Vec::new();
         let mut released = Vec::new();
         if size > inode.size {
             self.refuse_growth(ino, inode.size, &items)?;
@@ -76,9 +78,16 @@ impl Filesystem {
             let cut = size.next_multiple_of(sector);
             let last_snapshot = self.fs_tree_last_snapshot()?;
             for (k, d) in &items {
-                if let Some(edit) =
-                    self.shrink_item(ino, size, cut, last_snapshot, k, d, &mut releases)?
-                {
+                if let Some(edit) = self.shrink_item(
+                    ino,
+                    size,
+                    cut,
+                    last_snapshot,
+                    k,
+                    d,
+                    &mut releases,
+                    &mut unrefs,
+                )? {
                     edits.push(edit);
                 }
             }
@@ -118,6 +127,7 @@ impl Filesystem {
                 self.csum_edits(&released, &[], false)?
             },
             releases,
+            unrefs,
         };
         self.commit_write(write, generation)
     }
@@ -148,7 +158,8 @@ impl Filesystem {
 
     /// What shrinking to `size` does to one `EXTENT_DATA` item: nothing,
     /// a shorter item, or its deletion — with its extent released when
-    /// this item was its one reference.
+    /// this item was its one reference, and its reference dropped from the
+    /// extent when a reflink shares it (#262).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn shrink_item(
         &self,
@@ -159,6 +170,7 @@ impl Filesystem {
         k: &DiskKey,
         d: &[u8],
         releases: &mut Vec<DataRelease>,
+        unrefs: &mut Vec<DataRelease>,
     ) -> Result<Option<ItemEdit>> {
         let start = k.offset;
         let unencoded = |d: &[u8]| {
@@ -216,13 +228,6 @@ impl Filesystem {
                             bytenr + offset
                         )));
                     }
-                    if refs != 1 {
-                        return Err(Error::UnsupportedFeature(format!(
-                            "inode {ino}: the extent at {bytenr} has {refs} references — a \
-                             snapshot, a reflink or another item of this file — and \
-                             releasing one reference of several is not implemented"
-                        )));
-                    }
                     if generation <= last_snapshot {
                         return Err(Error::UnsupportedFeature(format!(
                             "inode {ino}: the extent at {bytenr} is from generation \
@@ -230,11 +235,20 @@ impl Filesystem {
                              so the snapshot may still be reading it"
                         )));
                     }
-                    releases.push(DataRelease {
+                    let release = DataRelease {
                         old: bytenr,
                         old_len: extent_len,
                         old_ref_offset: start - offset,
-                    });
+                    };
+                    // Newer than the last snapshot, so every other
+                    // reference is a file item a reflink made -- another
+                    // file's, or another of this file's: this one's is
+                    // dropped and the extent stays for the rest (#262).
+                    if refs == 1 {
+                        releases.push(release);
+                    } else {
+                        unrefs.push(release);
+                    }
                 }
                 Ok(Some(ItemEdit::Delete(*k)))
             }

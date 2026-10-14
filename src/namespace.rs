@@ -37,9 +37,10 @@
 //!   that parent would outgrow a leaf;
 //! - a symbolic link whose target does not fit inline in one sector.
 //!
-//! - removing the last name of a file whose data extents a snapshot or a
-//!   reflink shares, which truncate refuses too; otherwise the file's data
-//!   is released with its last name, in the same transaction (#262);
+//! - removing the last name of a file whose data extents a snapshot may
+//!   share, which truncate refuses too; otherwise the file's data is
+//!   released with its last name, in the same transaction, and an extent a
+//!   reflink shares loses the file's reference and stays (#262);
 //! - removing a directory that is not empty;
 //! - moving a directory into itself or below itself.
 //!
@@ -216,9 +217,10 @@ impl Filesystem {
     /// such name, [`Error::NotAFile`] for a directory (use
     /// [`Filesystem::rmdir`]), and [`Error::UnsupportedFeature`] for the
     /// last name of a file whose data extents cannot be released here: one
-    /// a snapshot or a reflink shares, as truncate refuses. Otherwise the
-    /// last name takes the file's data with it, in the same transaction:
-    /// each extent, its back reference and its checksums (#262).
+    /// a snapshot may share, as truncate refuses. Otherwise the last name
+    /// takes the file's data with it, in the same transaction: each extent,
+    /// its back reference and its checksums, or for an extent a reflink
+    /// shares, the file's reference alone (#262).
     pub fn unlink(&mut self, parent: u64, name: &[u8]) -> Result<()> {
         self.remove_name(parent, name, false)
     }
@@ -255,9 +257,9 @@ impl Filesystem {
         let mut p = Pending::default();
         self.drop_entry(&mut p, parent, name, child.ino)?;
         p.touch(parent, &[io::CTIME, io::MTIME]);
-        let releases = self.drop_link(&mut p, &child, name)?;
+        let (releases, unrefs) = self.drop_link(&mut p, &child, name)?;
         let edits = p.into_edits(self, generation, now)?;
-        if releases.is_empty() {
+        if releases.is_empty() && unrefs.is_empty() {
             return self.commit_edits(child.ino, edits, generation, now);
         }
         // The file's data goes with its last name: each extent, its back
@@ -275,8 +277,13 @@ impl Filesystem {
             root_flags: None,
             default_subvol: None,
             edits,
-            csum_edits: self.csum_edits(&released, &[], false)?,
+            csum_edits: if released.is_empty() {
+                Vec::new()
+            } else {
+                self.csum_edits(&released, &[], false)?
+            },
             releases,
+            unrefs,
         };
         self.commit_write(write, generation)
     }
@@ -298,7 +305,7 @@ impl Filesystem {
     /// would replace a directory, and [`Error::UnsupportedFeature`] for a
     /// directory moved into itself or below itself, a replaced directory
     /// that is not empty, and a replaced file whose data extents a
-    /// snapshot or a reflink shares, as unlink refuses. A replaced file's
+    /// snapshot may share, as unlink refuses. A replaced file's
     /// last name otherwise takes its data with it, in the same
     /// transaction. Nothing is written unless everything is.
     pub fn rename(
@@ -333,7 +340,7 @@ impl Filesystem {
         // A name at the destination is replaced, and a file whose last name
         // that is gives its data back in the same transaction, as unlink
         // does (#262).
-        let mut replaced: Option<(u64, Vec<DataRelease>)> = None;
+        let mut replaced: Option<(u64, Vec<DataRelease>, Vec<DataRelease>)> = None;
         match self.named_inode(new_parent, new_name) {
             Ok(target) if target.ino == child.ino => return Ok(()),
             Ok(target) => {
@@ -344,9 +351,9 @@ impl Filesystem {
                     (false, false) => {}
                 }
                 self.drop_entry(&mut p, new_parent, new_name, target.ino)?;
-                let releases = self.drop_link(&mut p, &target, new_name)?;
-                if !releases.is_empty() {
-                    replaced = Some((target.ino, releases));
+                let (releases, unrefs) = self.drop_link(&mut p, &target, new_name)?;
+                if !releases.is_empty() || !unrefs.is_empty() {
+                    replaced = Some((target.ino, releases, unrefs));
                 }
             }
             Err(Error::NotFound) => {}
@@ -368,7 +375,7 @@ impl Filesystem {
         p.touch(new_parent, &[io::CTIME, io::MTIME]);
         p.touch(child.ino, &[io::CTIME]);
         let edits = p.into_edits(self, generation, now)?;
-        let Some((ino, releases)) = replaced else {
+        let Some((ino, releases, unrefs)) = replaced else {
             return self.commit_edits(child.ino, edits, generation, now);
         };
         let released: Vec<(u64, u64)> = releases
@@ -383,8 +390,13 @@ impl Filesystem {
             root_flags: None,
             default_subvol: None,
             edits,
-            csum_edits: self.csum_edits(&released, &[], false)?,
+            csum_edits: if released.is_empty() {
+                Vec::new()
+            } else {
+                self.csum_edits(&released, &[], false)?
+            },
             releases,
+            unrefs,
         };
         self.commit_write(write, generation)
     }
@@ -526,8 +538,15 @@ impl Filesystem {
     /// `inode` has lost one name: one link fewer, or — with its last
     /// name gone — the inode and every item it owns deleted. Returns the
     /// data extents that go with it, for the caller's transaction to
-    /// release (#262); a shared one is refused, as truncate refuses it.
-    fn drop_link(&self, p: &mut Pending, inode: &Inode, name: &[u8]) -> Result<Vec<DataRelease>> {
+    /// release, and those a reflink shares, of which it drops one
+    /// reference (#262); one a snapshot may share is refused, as truncate
+    /// refuses it.
+    fn drop_link(
+        &self,
+        p: &mut Pending,
+        inode: &Inode,
+        name: &[u8],
+    ) -> Result<(Vec<DataRelease>, Vec<DataRelease>)> {
         let ino = inode.ino;
         // A directory has one link however many names it has had.
         let nlink = if inode.is_dir() { 1 } else { inode.nlink };
@@ -538,9 +557,10 @@ impl Filesystem {
             raw[io::NLINK..io::NLINK + 4].copy_from_slice(&(nlink - 1).to_le_bytes());
             p.set(key(ino, INODE_ITEM_KEY, 0), Some(raw));
             p.touch(ino, &[io::CTIME]);
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let mut releases = Vec::new();
+        let mut unrefs = Vec::new();
         let last_snapshot = self.fs_tree_last_snapshot()?;
         for (k, data) in self.items_of(ino)? {
             match k.key_type {
@@ -551,15 +571,24 @@ impl Filesystem {
                 // The whole file goes: cut to nothing, as truncate cuts, so
                 // its extent is released and the item deleted.
                 EXTENT_DATA_KEY => {
-                    self.shrink_item(ino, 0, 0, last_snapshot, &k, &data, &mut releases)
-                        .map_err(|e| match e {
-                            Error::UnsupportedFeature(why) => Error::UnsupportedFeature(format!(
-                                "{:?} is the last name of inode {ino}, and its data cannot \
+                    self.shrink_item(
+                        ino,
+                        0,
+                        0,
+                        last_snapshot,
+                        &k,
+                        &data,
+                        &mut releases,
+                        &mut unrefs,
+                    )
+                    .map_err(|e| match e {
+                        Error::UnsupportedFeature(why) => Error::UnsupportedFeature(format!(
+                            "{:?} is the last name of inode {ino}, and its data cannot \
                                  be released: {why}",
-                                String::from_utf8_lossy(name)
-                            )),
-                            other => other,
-                        })?;
+                            String::from_utf8_lossy(name)
+                        )),
+                        other => other,
+                    })?;
                     p.remove(self, k)?;
                 }
                 other => {
@@ -571,7 +600,7 @@ impl Filesystem {
                 }
             }
         }
-        Ok(releases)
+        Ok((releases, unrefs))
     }
 
     /// Every fs tree item under `ino`, in key order.
@@ -721,6 +750,7 @@ impl Filesystem {
             edits,
             csum_edits: Vec::new(),
             releases: Vec::new(),
+            unrefs: Vec::new(),
         };
         self.commit_write(write, generation)
     }
