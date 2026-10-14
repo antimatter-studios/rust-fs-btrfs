@@ -847,7 +847,7 @@ fn zero(dev: &dyn BlockDevice, offset: u64, len: u64) -> Result<()> {
 
 /// A random version-4 UUID, from the operating system's generator where
 /// there is one.
-fn random_uuid() -> [u8; 16] {
+pub(crate) fn random_uuid() -> [u8; 16] {
     let mut u = [0u8; 16];
     let filled = std::fs::File::open("/dev/urandom")
         .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut u))

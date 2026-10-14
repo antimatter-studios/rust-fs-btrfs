@@ -66,6 +66,23 @@ use std::sync::Arc;
 /// A device and the superblock image a commit writes to it.
 type SuperblockImage = (Arc<dyn BlockDevice>, Vec<u8>);
 
+/// What a commit changes about the devices its superblocks describe.
+#[derive(Clone, Copy)]
+enum Membership<'a> {
+    /// Nothing: the same devices, at the same sizes.
+    Unchanged,
+    /// The one device's size, which is the filesystem's (#264).
+    Resized(u64),
+    /// A device joins (#303). Every member's superblock counts it in
+    /// `num_devices` and its size in `total_bytes`, and the device gets
+    /// the pool's superblock with `dev_item`, its own device item, in place
+    /// of the member's.
+    Added {
+        device: &'a Arc<dyn BlockDevice>,
+        dev_item: &'a [u8],
+    },
+}
+
 /// One tree block, built and placed, waiting to be written.
 #[derive(Debug, Clone)]
 pub struct PlacedBlock {
@@ -99,7 +116,7 @@ impl Filesystem {
     /// copy exists to resolve, and a reader picks the newest copy that
     /// verifies.
     pub fn commit(&self, blocks: &[PlacedBlock], commit: &Commit) -> Result<()> {
-        self.commit_with(blocks, commit, 0, None)
+        self.commit_with(blocks, commit, 0, Membership::Unchanged)
     }
 
     /// [`Filesystem::commit`], also setting `incompat` in the superblock's
@@ -111,7 +128,7 @@ impl Filesystem {
         commit: &Commit,
         incompat: u64,
     ) -> Result<()> {
-        self.commit_with(blocks, commit, incompat, None)
+        self.commit_with(blocks, commit, incompat, Membership::Unchanged)
     }
 
     /// [`Filesystem::commit`], and when `total_bytes` is given, the
@@ -124,16 +141,36 @@ impl Filesystem {
         commit: &Commit,
         total_bytes: Option<u64>,
     ) -> Result<()> {
-        self.commit_with(blocks, commit, 0, total_bytes)
+        let membership = match total_bytes {
+            Some(size) => Membership::Resized(size),
+            None => Membership::Unchanged,
+        };
+        self.commit_with(blocks, commit, 0, membership)
     }
 
-    /// The commit, with the incompat flags it sets and the size it records.
+    /// [`Filesystem::commit`], adding `device` to the filesystem (#303):
+    /// `dev_item` is the device item the transaction's chunk tree holds for
+    /// it, and goes into its superblock; every member's superblock counts
+    /// it. The new device's superblocks are written before the members',
+    /// see [`crate::devices`].
+    pub(crate) fn commit_adding_device(
+        &self,
+        blocks: &[PlacedBlock],
+        commit: &Commit,
+        device: &Arc<dyn BlockDevice>,
+        dev_item: &[u8],
+    ) -> Result<()> {
+        self.commit_with(blocks, commit, 0, Membership::Added { device, dev_item })
+    }
+
+    /// The commit, with the incompat flags it sets and the device sizes and
+    /// membership it records.
     fn commit_with(
         &self,
         blocks: &[PlacedBlock],
         commit: &Commit,
         incompat: u64,
-        total_bytes: Option<u64>,
+        membership: Membership<'_>,
     ) -> Result<()> {
         if self.writable.is_none() {
             return Err(Error::ReadOnly);
@@ -144,7 +181,7 @@ impl Filesystem {
         //    a root tree that does not parse is refused while refusing is
         //    still free. One per device: each device's superblock carries
         //    its own `dev_item`, which the commit does not change (#298).
-        let images = self.superblock_images(blocks, commit, incompat, total_bytes)?;
+        let images = self.superblock_images(blocks, commit, incompat, membership)?;
 
         // 1. Every tree block, to every mirror. Nothing points at these
         //    yet, so their order among themselves does not matter --
@@ -173,7 +210,7 @@ impl Filesystem {
 
         // 3. The superblocks, in address order, device by device. Each
         //    copy carries its own address, so they are not identical
-        //    images.
+        //    images. A device being added comes first (#303).
         for (device, raw) in &images {
             for &offset in &SUPER_OFFSETS {
                 if !Self::superblock_copy_fits(device, offset) {
@@ -189,7 +226,10 @@ impl Filesystem {
         // 4. The second flush -- the commit point. The superblock writes
         //    carry no FUA, so this is what makes them durable rather
         //    than merely issued. Without it the commit is not a commit.
-        self.flush_writable()?;
+        //    Every device written to, a device being added included.
+        for (device, _) in &images {
+            device.flush()?;
+        }
         Ok(())
     }
 
@@ -214,24 +254,58 @@ impl Filesystem {
     /// member's superblock differs from the others' in its `dev_item`,
     /// and only there, so the same commit applied to each keeps each
     /// device's own.
+    ///
+    /// A device being added gets the first member's image with its own
+    /// device item in it, and comes first in the list.
     fn superblock_images(
         &self,
         blocks: &[PlacedBlock],
         commit: &Commit,
         incompat: u64,
-        total_bytes: Option<u64>,
+        membership: Membership<'_>,
     ) -> Result<Vec<SuperblockImage>> {
-        use crate::superblock::{dev_item_offsets, offsets as so};
+        use crate::superblock::{dev_item_offsets, offsets as so, DEV_ITEM_SIZE};
         let devices = self.write_devices();
         // A RESIZE IS ONE DEVICE'S (#264). The superblock's total and its
         // device item's are the same number only when there is one
         // device; a pool member's is its own share, which this does not
         // compute, so a pool is refused before anything is written.
+        let total_bytes = match membership {
+            Membership::Resized(size) => Some(size),
+            _ => None,
+        };
         if total_bytes.is_some() && devices.len() != 1 {
             return Err(Error::UnsupportedFeature(
                 "resizing a pool of several devices is not supported".into(),
             ));
         }
+        // A DEVICE JOINING IS COUNTED BY EVERY MEMBER (#303): one more
+        // device, and its size added to the filesystem's.
+        let joined = match membership {
+            Membership::Added { device, dev_item } => {
+                if dev_item.len() != DEV_ITEM_SIZE {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "a device item is {DEV_ITEM_SIZE} bytes and the one being added is {}",
+                        dev_item.len()
+                    )));
+                }
+                let size = crate::superblock::DevItem::parse(dev_item)?.total_bytes;
+                let grown = |what: &str, now: u64, by: u64| {
+                    now.checked_add(by).ok_or_else(|| {
+                        Error::UnsupportedFeature(format!(
+                            "the superblock's {what} of {now} cannot grow by {by}"
+                        ))
+                    })
+                };
+                Some((
+                    device,
+                    dev_item,
+                    grown("device count", self.sb.num_devices, 1)?,
+                    grown("size", self.sb.total_bytes, size)?,
+                ))
+            }
+            _ => None,
+        };
         let mut roots = None;
         let mut images = Vec::new();
         for device in devices {
@@ -256,6 +330,11 @@ impl Filesystem {
                     raw[at..at + 8].copy_from_slice(&size.to_le_bytes());
                 }
             }
+            if let Some((_, _, num_devices, total)) = joined {
+                raw[so::NUM_DEVICES..so::NUM_DEVICES + 8]
+                    .copy_from_slice(&num_devices.to_le_bytes());
+                raw[so::TOTAL_BYTES..so::TOTAL_BYTES + 8].copy_from_slice(&total.to_le_bytes());
+            }
             if roots.is_none() {
                 roots = Some(self.backup_roots(&raw, blocks, commit)?);
             }
@@ -263,6 +342,15 @@ impl Filesystem {
             super_write::write_backup(&mut raw, commit.generation, roots);
             super_write::stamp_checksum(&mut raw, self.sb.csum_type);
             images.push((device, raw));
+        }
+        if let Some((device, dev_item, _, _)) = joined {
+            let mut raw = images
+                .first()
+                .map(|(_, raw)| raw.clone())
+                .ok_or(Error::ReadOnly)?;
+            raw[so::DEV_ITEM..so::DEV_ITEM + DEV_ITEM_SIZE].copy_from_slice(dev_item);
+            super_write::stamp_checksum(&mut raw, self.sb.csum_type);
+            images.insert(0, (Arc::clone(device), raw));
         }
         Ok(images)
     }

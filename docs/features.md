@@ -105,7 +105,8 @@ Linux kernel in the guest.
 | Subvolumes and snapshots: choosing the default subvolume | Supported | Unreleased (#267) | | `subvol_default_kernel.rs` |
 | Subvolumes and snapshots: the read-only flag and the default subvolume through the C ABI (`fs_btrfs_subvol_*`) | Supported | Unreleased (#267) | | `capi.rs`, `subvol_default_kernel.rs` |
 | Subvolumes and snapshots: create, delete | Not supported | | #267 | |
-| Device add, remove, replace; balance; defragment | Not supported | | #268, #303, #304, #305 | |
+| Device add (`add_device`): a device joins a volume or a pool in one committed transaction, its `DEV_ITEM` in the chunk tree and every member's superblock counting it | Supported; a device already in the filesystem, or with no room past its first MiB, is refused | Unreleased (#303) | | `device_add_kernel.rs` |
+| Device remove, replace; balance; defragment | Not supported | | #268, #303, #304, #305 | |
 | Trim: every free run of every block group handed to a caller's discard, on every copy | Supported; RAID5/6 groups refused | Unreleased (#305) | | `trim_oracle.rs` |
 | RAID5/6 writes | Not supported | | #299 | |
 | Label, written to every superblock copy | Supported | 0.9.0 (#264) | | `cli_label_kernel.rs` |
