@@ -132,12 +132,14 @@ impl Plan {
 /// The copy holds exactly the bytes the file's item covers, so the new
 /// item references the whole of it — offset zero, `num_bytes` equal to
 /// the extent's length — whatever window of the old extent the old item
-/// referenced. The old extent is released whole, which is right only
-/// because its one reference is this item; the planner refuses anything
-/// else before a `DataMove` is made.
+/// referenced. The old extent is released whole when the write's items
+/// were its only references, once however many of them named it;
+/// otherwise (`old_shared`) it loses this item's reference and stays for
+/// the rest (#261). The planner refuses an extent a snapshot may share
+/// before a `DataMove` is made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DataMove {
-    /// The extent being released.
+    /// The extent the item referenced.
     pub old: u64,
     /// Its length, as the extent tree's `EXTENT_ITEM` key records it.
     pub old_len: u64,
@@ -160,6 +162,12 @@ pub(crate) struct DataMove {
     pub compression: u8,
     /// The key offset of the file's `EXTENT_DATA` item.
     pub file_offset: u64,
+    /// Whether the old extent has references the write does not replace
+    /// — a reflink's, or another item of this file outside the range
+    /// (#261). Then its record loses this item's inline
+    /// `EXTENT_DATA_REF`, as an entry of [`DataWrite::unrefs`] does, and
+    /// its bytes, checksums, free space and block group's `used` stay.
+    pub old_shared: bool,
 }
 
 /// A data extent a transaction releases without a copy taking its place
@@ -289,14 +297,45 @@ impl DataWrite {
             .collect()
     }
 
-    /// Every data extent released, by address, length and reference
-    /// offset: each move's old extent and each outright release.
-    fn released_extents(&self) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
-        self.moves
+    /// Every data extent released, once each, by address and length, with
+    /// the reference offset of each of the write's items that named it:
+    /// each move's old extent that nothing else shares, and each outright
+    /// release.
+    ///
+    /// Two items of one file can name one extent — a write into the middle
+    /// of an extent leaves an item on either side of the new one — and a
+    /// write replacing both releases the extent once, not twice (#261).
+    fn released_extents(&self) -> Vec<(u64, u64, Vec<u64>)> {
+        let mut out: Vec<(u64, u64, Vec<u64>)> = Vec::new();
+        let each = self
+            .moves
             .iter()
+            .filter(|m| !m.old_shared)
             .map(|m| (m.old, m.old_len, m.old_ref_offset))
             .chain(
                 self.releases
+                    .iter()
+                    .map(|r| (r.old, r.old_len, r.old_ref_offset)),
+            );
+        for (old, old_len, ref_offset) in each {
+            match out.iter_mut().find(|(at, _, _)| *at == old) {
+                Some((_, _, offsets)) => offsets.push(ref_offset),
+                None => out.push((old, old_len, vec![ref_offset])),
+            }
+        }
+        out
+    }
+
+    /// Every reference of a shared extent the write drops, by address,
+    /// length and reference offset: each move's old extent another
+    /// reference still holds (#261), and each of [`DataWrite::unrefs`].
+    fn dropped_references(&self) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
+        self.moves
+            .iter()
+            .filter(|m| m.old_shared)
+            .map(|m| (m.old, m.old_len, m.old_ref_offset))
+            .chain(
+                self.unrefs
                     .iter()
                     .map(|r| (r.old, r.old_len, r.old_ref_offset)),
             )
@@ -1063,22 +1102,20 @@ impl Filesystem {
                 data.ino, applied.items, applied.inodes
             )));
         }
-        let released = n + data.releases.len();
-        if applied.unreffed != data.unrefs.len() {
+        let released = data.released_extents().len();
+        let dropped = data.dropped_references().count();
+        if applied.unreffed != dropped {
             return Err(Error::UnsupportedFeature(format!(
-                "the write drops one reference of {} shared data extents, and the plan edited \
-                 the records of {}",
-                data.unrefs.len(),
+                "the write drops {dropped} references of shared data extents, and the plan \
+                 edited the records of {}",
                 applied.unreffed
             )));
         }
         if applied.released != released || applied.recorded != n {
             return Err(Error::UnsupportedFeature(format!(
-                "the write moves {n} data extents and releases {}, and the plan released the \
-                 records of {} and recorded {}",
-                data.releases.len(),
-                applied.released,
-                applied.recorded
+                "the write moves {n} data extents and releases {released}, and the plan \
+                 released the records of {} and recorded {}",
+                applied.released, applied.recorded
             )));
         }
         Ok(Rendered {
@@ -1469,10 +1506,10 @@ impl Filesystem {
 
         // Each data extent the write releases: its record goes, but only
         // once it is shown to be the record the planner refused
-        // everything else for -- one reference, held inline by this very
-        // file item. Anything else would free bytes another file or a
-        // snapshot still reads.
-        for (old, old_len, old_ref_offset) in data.released_extents() {
+        // everything else for -- the write's own items' references, held
+        // inline, and no other. Anything else would free bytes another
+        // file or a snapshot still reads.
+        for (old, old_len, ref_offsets) in data.released_extents() {
             if !mine(old)? {
                 continue;
             }
@@ -1482,38 +1519,36 @@ impl Filesystem {
                 offset: old_len,
             };
             let body = out.iter().find(|i| i.key == key).map(|i| i.data.as_slice());
-            let expected = data_extent_body(1, None, data.root, data.ino, old_ref_offset);
-            let held = body.is_some_and(|b| {
-                b.len() == expected.len()
-                    && b[..8] == expected[..8]
-                    && b[extent_body::FLAGS..] == expected[extent_body::FLAGS..]
-            });
-            if !held {
+            if !body.is_some_and(|b| held_only_by(b, data.root, data.ino, &ref_offsets)) {
                 return Err(Error::UnsupportedFeature(format!(
-                    "the data extent at {} is not recorded as one reference held inline by \
-                     inode {} at {} in tree {}, so releasing it could free bytes something \
+                    "the data extent at {} is not recorded as {} references held inline by \
+                     inode {} at {:?} in tree {}, so releasing it could free bytes something \
                      else reads",
-                    old, data.ino, old_ref_offset, data.root
+                    old,
+                    ref_offsets.len(),
+                    data.ino,
+                    ref_offsets,
+                    data.root
                 )));
             }
             out = delete(&out, &key)?;
             applied.released += 1;
         }
 
-        // Each data extent a reflink shares, of which the write drops one
-        // reference (#262): its record stays, less this file item's inline
-        // reference -- counted down, or removed at a count of one -- and
-        // one from its total. A reference held any other way, or the
+        // Each data extent another reference shares, of which the write
+        // drops one (#262, #261): its record stays, less this file item's
+        // inline reference -- counted down, or removed at a count of one --
+        // and one from its total. A reference held any other way, or the
         // extent's last, is refused: the last is a release, and a keyed or
         // shared reference is not edited here.
-        for r in &data.unrefs {
-            if !mine(r.old)? {
+        for (old, old_len, old_ref_offset) in data.dropped_references() {
+            if !mine(old)? {
                 continue;
             }
             let key = DiskKey {
-                objectid: r.old,
+                objectid: old,
                 key_type: key_type::EXTENT_ITEM,
-                offset: r.old_len,
+                offset: old_len,
             };
             let body = out
                 .iter()
@@ -1521,8 +1556,7 @@ impl Filesystem {
                 .map(|i| i.data.clone())
                 .ok_or_else(|| {
                     Error::UnsupportedFeature(format!(
-                        "the shared data extent at {} has no record where the plan looked",
-                        r.old
+                        "the shared data extent at {old} has no record where the plan looked"
                     ))
                 })?;
             let dropped = crate::backref::drop_inline_data_ref(
@@ -1530,13 +1564,14 @@ impl Filesystem {
                 &body,
                 data.root,
                 data.ino,
-                r.old_ref_offset,
+                old_ref_offset,
             )?
             .ok_or_else(|| {
                 Error::UnsupportedFeature(format!(
-                    "the shared data extent at {} holds no inline reference from inode {} \
-                     at {} in tree {}, so which of its references to drop is not known",
-                    r.old, data.ino, r.old_ref_offset, data.root
+                    "the shared data extent at {old} holds no inline reference from inode {} \
+                     at {old_ref_offset} in tree {}, so which of its references to drop is \
+                     not known",
+                    data.ino, data.root
                 ))
             })?;
             out = delete(&out, &key)?;
@@ -1626,8 +1661,7 @@ impl Filesystem {
                         key_type: key_type::EXTENT_ITEM,
                         offset: m.disk_len,
                     },
-                    data: data_extent_body(1, Some(generation), data.root, data.ino, m.file_offset)
-                        .to_vec(),
+                    data: data_extent_body(generation, data.root, data.ino, m.file_offset).to_vec(),
                 },
             )?;
             applied.recorded += 1;
@@ -1970,21 +2004,14 @@ mod extent_body {
 /// `BTRFS_EXTENT_DATA_REF_KEY`, as an inline reference type.
 const EXTENT_DATA_REF: u8 = 178;
 
-/// A data extent's `EXTENT_ITEM` body with one inline `EXTENT_DATA_REF`
-/// of count one. The generation is left zero when `None`, for a caller
-/// comparing everything else.
-fn data_extent_body(
-    refs: u64,
-    generation: Option<u64>,
-    root: u64,
-    ino: u64,
-    offset: u64,
-) -> [u8; extent_body::SIZE] {
+/// A new data extent's `EXTENT_ITEM` body: one reference, an inline
+/// `EXTENT_DATA_REF` of count one.
+fn data_extent_body(generation: u64, root: u64, ino: u64, offset: u64) -> [u8; extent_body::SIZE] {
     use crate::extent_write::EXTENT_FLAG_DATA;
     use extent_body::*;
     let mut out = [0u8; SIZE];
-    out[REFS..REFS + 8].copy_from_slice(&refs.to_le_bytes());
-    out[GENERATION..GENERATION + 8].copy_from_slice(&generation.unwrap_or(0).to_le_bytes());
+    out[REFS..REFS + 8].copy_from_slice(&1u64.to_le_bytes());
+    out[GENERATION..GENERATION + 8].copy_from_slice(&generation.to_le_bytes());
     out[FLAGS..FLAGS + 8].copy_from_slice(&EXTENT_FLAG_DATA.to_le_bytes());
     out[REF_TYPE] = EXTENT_DATA_REF;
     out[REF_ROOT..REF_ROOT + 8].copy_from_slice(&root.to_le_bytes());
@@ -1992,6 +2019,41 @@ fn data_extent_body(
     out[REF_OFFSET..REF_OFFSET + 8].copy_from_slice(&offset.to_le_bytes());
     out[REF_COUNT..REF_COUNT + 4].copy_from_slice(&1u32.to_le_bytes());
     out
+}
+
+/// Whether a data extent's record `body` holds the references of the
+/// items `ref_offsets` names and nothing else: one in its total for each
+/// entry, every one an inline `EXTENT_DATA_REF` from inode `ino` of tree
+/// `root`, counting the entries at its reference offset (#261).
+///
+/// Releasing the extent is right only then. Two items of one file at one
+/// reference offset share one inline reference of count two, which is how
+/// the kernel records the two halves of an extent a write split.
+fn held_only_by(body: &[u8], root: u64, ino: u64, ref_offsets: &[u64]) -> bool {
+    use crate::extent_write::EXTENT_FLAG_DATA;
+    let Ok(refs) = crate::backref::inline_refs(key_type::EXTENT_ITEM, body) else {
+        return false;
+    };
+    let le64 = |b: &[u8]| u64::from_le_bytes(b.try_into().expect("8 bytes"));
+    let mut want: BTreeMap<u64, u32> = BTreeMap::new();
+    for &offset in ref_offsets {
+        *want.entry(offset).or_default() += 1;
+    }
+    // `inline_refs` succeeded, so the fixed part is there.
+    let total = le64(&body[extent_body::REFS..extent_body::REFS + 8]);
+    let mut seen = BTreeSet::new();
+    total == ref_offsets.len() as u64
+        && crate::backref::flags(body) == Some(EXTENT_FLAG_DATA)
+        && refs.len() == want.len()
+        && refs.iter().all(|r| {
+            let p = &r.payload;
+            r.kind == EXTENT_DATA_REF
+                && le64(&p[..8]) == root
+                && le64(&p[8..16]) == ino
+                && seen.insert(le64(&p[16..24]))
+                && want.get(&le64(&p[16..24]))
+                    == Some(&u32::from_le_bytes(p[24..28].try_into().expect("4 bytes")))
+        })
 }
 
 /// Point the file's `EXTENT_DATA` items at their new extents and stamp
@@ -2397,7 +2459,11 @@ impl Filesystem {
             .released()
             .into_iter()
             .map(|at| (at, nodesize))
-            .chain(data.released_extents().map(|(old, len, _)| (old, len)))
+            .chain(
+                data.released_extents()
+                    .into_iter()
+                    .map(|(old, len, _)| (old, len)),
+            )
             .collect();
         let allocated: Vec<(u64, u64)> = plan
             .allocated()
@@ -2535,6 +2601,68 @@ fn carve(
         });
     }
     out
+}
+
+#[cfg(test)]
+mod held_only_by_tests {
+    use super::{held_only_by, EXTENT_DATA_REF};
+    use crate::extent_write::EXTENT_FLAG_DATA;
+
+    /// A data extent's record: its total, then each inline
+    /// `EXTENT_DATA_REF` as (tree, inode, offset, count).
+    fn record(total: u64, refs: &[(u64, u64, u64, u32)]) -> Vec<u8> {
+        let mut b = total.to_le_bytes().to_vec();
+        b.extend(7u64.to_le_bytes());
+        b.extend(EXTENT_FLAG_DATA.to_le_bytes());
+        for &(tree, ino, offset, count) in refs {
+            b.push(EXTENT_DATA_REF);
+            for v in [tree, ino, offset] {
+                b.extend(v.to_le_bytes());
+            }
+            b.extend(count.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn one_item_holds_a_record_of_one_reference() {
+        let body = record(1, &[(5, 257, 0, 1)]);
+        assert!(held_only_by(&body, 5, 257, &[0]));
+        assert!(!held_only_by(&body, 5, 258, &[0]), "another inode's");
+        assert!(!held_only_by(&body, 256, 257, &[0]), "another tree's");
+        assert!(!held_only_by(&body, 5, 257, &[4096]), "another offset's");
+    }
+
+    #[test]
+    fn two_items_at_one_offset_hold_a_reference_counted_twice() {
+        let body = record(2, &[(5, 257, 0, 2)]);
+        assert!(held_only_by(&body, 5, 257, &[0, 0]));
+        assert!(
+            !held_only_by(&body, 5, 257, &[0]),
+            "one of the two items leaves the other's reference"
+        );
+    }
+
+    #[test]
+    fn items_at_two_offsets_hold_two_references() {
+        let body = record(2, &[(5, 257, 0, 1), (5, 257, 8192, 1)]);
+        assert!(held_only_by(&body, 5, 257, &[8192, 0]));
+        assert!(!held_only_by(&body, 5, 257, &[0]));
+        assert!(!held_only_by(&body, 5, 257, &[0, 0]));
+    }
+
+    #[test]
+    fn a_reference_from_elsewhere_is_never_held() {
+        let reflinked = record(2, &[(5, 257, 0, 1), (5, 258, 0, 1)]);
+        assert!(!held_only_by(&reflinked, 5, 257, &[0]));
+        // A total past its inline references: the rest are keyed items.
+        let keyed = record(2, &[(5, 257, 0, 1)]);
+        assert!(!held_only_by(&keyed, 5, 257, &[0]));
+        assert!(!held_only_by(&keyed, 5, 257, &[0, 0]));
+        // A record cut off inside its reference.
+        let body = record(1, &[(5, 257, 0, 1)]);
+        assert!(!held_only_by(&body[..body.len() - 1], 5, 257, &[0]));
+    }
 }
 
 /// Library tests that need the fs-linux-test-harness VM.

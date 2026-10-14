@@ -249,10 +249,11 @@ int64_t fs_btrfs_getxattr(fs_btrfs_fs_t *fs, const char *path,
 
 /*
  * Btrfs is copy-on-write: a change allocates a new extent, points the
- * file at it, releases the old one and commits a new generation, so a
- * crash leaves the old contents or the new and never a mixture.
- * fs_btrfs_write_file does that for an existing, unchecksummed file
- * whose extents are unshared, uncompressed and really allocated.
+ * file at it, releases the old one -- or drops the file's reference to
+ * it, when a reflink still reads it -- and commits a new generation, so
+ * a crash leaves the old contents or the new and never a mixture.
+ * fs_btrfs_write_file does that for an existing file's extents that are
+ * really allocated and that no snapshot shares.
  *
  * A file marked NODATACOW -- `chattr +C` -- is the exception: its
  * blocks are overwritten where they lie, carry no checksums, and need
@@ -293,9 +294,8 @@ int fs_btrfs_can_write_in_place(fs_btrfs_fs_t *fs, const char *path);
  *
  * A NODATACOW file is written in place; any other is written
  * copy-on-write and committed. Refused with ENOTSUP, the case named,
- * for a checksummed file, a snapshotted or otherwise shared extent, a
- * compressed, inline or preallocated one, a hole, or a write past the
- * end (rust-fs-btrfs#261).
+ * for an extent a snapshot shares, an inline or preallocated one, a
+ * hole, or a write past the end (rust-fs-btrfs#261).
  */
 int64_t fs_btrfs_write_file(fs_btrfs_fs_t *fs, const char *path,
                             const void *buf, uint64_t offset, uint64_t length);

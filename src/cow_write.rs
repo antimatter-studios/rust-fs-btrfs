@@ -23,16 +23,21 @@
 //!    copy is made from its decoded bytes.
 //! 2. **The file's `EXTENT_DATA` item** is pointed at it, in place: the
 //!    item keeps its size, so its leaf cannot overflow.
-//! 3. **The extent tree** loses the old extent's `EXTENT_ITEM` and gains
-//!    one for the new, with an inline `EXTENT_DATA_REF` back to the file.
+//! 3. **The extent tree** gains an `EXTENT_ITEM` for the new extent, with
+//!    an inline `EXTENT_DATA_REF` back to the file, and loses the old
+//!    extent's — once, when two of the write's items named it. An old
+//!    extent with references the write does not replace — a reflink's, or
+//!    another item of this file outside the range — keeps its record, less
+//!    this item's reference, and stays for them (#261).
 //! 4. **The free-space tree** and the **block groups' `used`** follow, and
-//!    the superblock's `bytes_used` moves by whatever the copy is shorter
-//!    than the extent it replaced.
-//! 5. **The checksum tree** loses the old extent's digests — an
-//!    `EXTENT_CSUM` item covering it is deleted, or cut down to the
+//!    the superblock's `bytes_used` moves by the copies' length less that
+//!    of the extents released.
+//! 5. **The checksum tree** loses the released extents' digests — an
+//!    `EXTENT_CSUM` item covering one is deleted, or cut down to the
 //!    sectors of its neighbours it also covers — and, unless the file is
 //!    `nodatasum`, gains one digest per sector of the copy, in the
-//!    volume's checksum algorithm (#261).
+//!    volume's checksum algorithm (#261). An extent kept for its other
+//!    references keeps its digests.
 //! 6. **The inode** is stamped with the transaction, a new change count
 //!    and new change and modification times.
 //!
@@ -53,9 +58,12 @@
 //!   allocate where the file has no extent item to repoint;
 //! - an **inline** or **preallocated** extent: each changes the item's
 //!   kind, not only where it points;
-//! - a **shared** extent — more than one reference, or one the last
-//!   snapshot could still be reading: releasing it would free bytes
-//!   another reader holds.
+//! - an extent a **snapshot** may share — one from at or before the last
+//!   snapshot, which the snapshot reads through a tree block it shares
+//!   and its record counts once for both;
+//! - an extent another reference shares whose reference from this file
+//!   is held anywhere but inline in its record: which entry to count
+//!   down is not known.
 //!
 //! A write in a `nodatacow` file goes to [`Filesystem::write_at`], which
 //! writes in place and commits nothing.
@@ -89,6 +97,10 @@ struct Target {
     extent_len: u64,
     /// Where in that extent the item's window begins.
     extent_offset: u64,
+    /// Whether the extent keeps references the write does not replace:
+    /// a reflink's, or another item of this file outside the range
+    /// (#261). It then loses this item's reference and stays.
+    shared: bool,
 }
 
 impl Filesystem {
@@ -178,10 +190,15 @@ impl Filesystem {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        let released: Vec<(u64, u64)> = targets
-            .iter()
-            .map(|t| (t.extent_start, t.extent_start + t.extent_len))
-            .collect();
+        // Each extent given up, once, however many of the write's items
+        // named it: not one another reference still reads.
+        let mut released: Vec<(u64, u64)> = Vec::new();
+        for t in targets.iter().filter(|t| !t.shared) {
+            let span = (t.extent_start, t.extent_start + t.extent_len);
+            if !released.contains(&span) {
+                released.push(span);
+            }
+        }
         let write = DataWrite {
             root: objectid::FS_TREE,
             ino,
@@ -198,6 +215,7 @@ impl Filesystem {
                     disk_len: bytes.len() as u64,
                     compression,
                     file_offset: t.start,
+                    old_shared: t.shared,
                 })
                 .collect(),
             time: (now.as_secs(), now.subsec_nanos()),
@@ -247,12 +265,17 @@ impl Filesystem {
         })?;
 
         // `bytes_used` is the sum of every group's `used`, which the plan
-        // moved by each copy's length less its extent's.
+        // moved by each copy's length less each released extent's. An
+        // extent another reference keeps is still used.
         let delta = plan.usage_delta(u64::from(self.sb.nodesize))
             + write
                 .moves
                 .iter()
-                .map(|m| i128::from(m.disk_len) - i128::from(m.old_len))
+                .map(|m| i128::from(m.disk_len))
+                .sum::<i128>()
+            - released
+                .iter()
+                .map(|&(start, end)| i128::from(end - start))
                 .sum::<i128>();
         let bytes_used = match delta {
             0 => None,
@@ -294,14 +317,22 @@ impl Filesystem {
 
     /// The extent items `[offset, end)` touches, each checked writable.
     ///
-    /// Every refusal happens here, while nothing is allocated. The checks
-    /// are [`Filesystem::write_at`]'s, for the same reasons: a window
-    /// outside its extent, more than one reference, or an extent from at
-    /// or before the last snapshot.
+    /// Every refusal happens here, while nothing is allocated: a window
+    /// outside its extent, or an extent from at or before the last
+    /// snapshot, which the snapshot may still be reading through a tree
+    /// block it shares — its record counts one reference for both.
+    ///
+    /// An extent newer than the last snapshot is referenced only by file
+    /// items, each counted in its record. One whose references are all
+    /// items this write replaces is released; one with references beyond
+    /// them — a reflink's, or another item of this file outside the range
+    /// — is marked shared, and keeps them (#261).
     fn plan_cow_targets(&self, ino: u64, offset: u64, end: u64) -> Result<Vec<Target>> {
         let pieces = self.file_extents(ino)?;
         let last_snapshot = self.fs_tree_last_snapshot()?;
         let mut out = Vec::new();
+        // Each extent's reference count, from its record.
+        let mut refs_of: BTreeMap<u64, u64> = BTreeMap::new();
         let mut pos = offset;
         while pos < end {
             let Some(piece) = pieces
@@ -336,14 +367,6 @@ impl Filesystem {
                     )));
                 }
             }
-            if refs != 1 {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino}: the extent at {} has {refs} references, so a snapshot or \
-                     another file still reads it, and releasing one reference of several \
-                     is not implemented",
-                    piece.extent_start
-                )));
-            }
             if generation <= last_snapshot {
                 return Err(Error::UnsupportedFeature(format!(
                     "inode {ino}: the extent at {} is from generation {generation}, at or \
@@ -358,8 +381,28 @@ impl Filesystem {
                 extent_start: piece.extent_start,
                 extent_len,
                 extent_offset: piece.ref_offset,
+                shared: false,
             });
+            refs_of.insert(piece.extent_start, refs);
             pos = piece.start + piece.len;
+        }
+        // Shared when the extent has references beyond the write's own
+        // items. More items than its record counts is a record that does
+        // not describe this file, and nothing is written over it.
+        let mut ours: BTreeMap<u64, u64> = BTreeMap::new();
+        for t in &out {
+            *ours.entry(t.extent_start).or_default() += 1;
+        }
+        for t in &mut out {
+            let (items, refs) = (ours[&t.extent_start], refs_of[&t.extent_start]);
+            if items > refs {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino}: {items} of the file's items name the extent at {}, and its \
+                     record counts {refs} references",
+                    t.extent_start
+                )));
+            }
+            t.shared = items < refs;
         }
         Ok(out)
     }
