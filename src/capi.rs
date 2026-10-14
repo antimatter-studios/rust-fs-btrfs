@@ -1094,6 +1094,40 @@ pub unsafe extern "C" fn fs_btrfs_is_writable(fs: *mut fs_btrfs_fs) -> c_int {
     })
 }
 
+/// Compress what this handle writes, as the kernel's `compress=` mount
+/// option does: `algorithm` is the file-extent item's compression byte, 0
+/// for none (the default), 1 zlib, 2 LZO, 3 zstd. A file's compression
+/// property and its `NOCOMPRESS` flag still come first; see
+/// [`Filesystem::set_compression`](crate::fs::Filesystem::set_compression).
+///
+/// Returns 0, or -1 with `EINVAL` for a NULL handle or an algorithm that
+/// is not one of the four.
+///
+/// # Safety
+///
+/// `fs` must be a live handle or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_set_compression(fs: *mut fs_btrfs_fs, algorithm: c_int) -> c_int {
+    guard(-1, || {
+        if fs.is_null() {
+            set_error("fs is NULL".into(), EINVAL);
+            return -1;
+        }
+        let algo = u8::try_from(algorithm)
+            .ok()
+            .and_then(|byte| crate::compression::Compression::from_byte(byte).ok());
+        let Some(algo) = algo else {
+            set_error(
+                format!("compression {algorithm} is not 0 (none), 1 (zlib), 2 (LZO) or 3 (zstd)"),
+                EINVAL,
+            );
+            return -1;
+        };
+        unsafe { &mut *fs }.fs.set_compression(algo);
+        0
+    })
+}
+
 /// Whether `path` can be written in place.
 ///
 /// Answers the question a caller actually has — "will a write to this

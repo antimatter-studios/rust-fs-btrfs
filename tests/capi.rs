@@ -971,6 +971,43 @@ fn a_read_only_handle_says_so_and_refuses() {
     unsafe { fs_btrfs_umount(fs) };
 }
 
+/// A handle's compression is one of the four types the format defines,
+/// by the byte a file-extent item records, and anything else is refused
+/// with EINVAL rather than taken as none (#265).
+#[test]
+fn set_compression_takes_the_four_types_and_refuses_the_rest() {
+    let copy = WritableCopy::new("btrfscapi-compress.img");
+    let fs = copy.open_rw();
+    for algorithm in 0..=3 {
+        assert_eq!(
+            unsafe { fs_btrfs_set_compression(fs, algorithm) },
+            0,
+            "{algorithm}: {}",
+            last_error()
+        );
+        assert_eq!(fs_btrfs_last_errno(), 0);
+    }
+    for algorithm in [4, -1, 256 + 1] {
+        assert_eq!(
+            unsafe { fs_btrfs_set_compression(fs, algorithm) },
+            -1,
+            "{algorithm} was accepted"
+        );
+        assert_eq!(
+            fs_btrfs_last_errno(),
+            EINVAL,
+            "{algorithm}: {}",
+            last_error()
+        );
+    }
+    assert_eq!(
+        unsafe { fs_btrfs_set_compression(std::ptr::null_mut(), 1) },
+        -1
+    );
+    assert_eq!(fs_btrfs_last_errno(), EINVAL, "{}", last_error());
+    unsafe { fs_btrfs_umount(fs) };
+}
+
 /// `can_write_in_place` must agree with what a write actually does —
 /// for both answers. A caller that trusts it should never be surprised
 /// in either direction.
