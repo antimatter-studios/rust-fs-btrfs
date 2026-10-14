@@ -595,6 +595,27 @@ pub struct PoolRead {
 /// (the same fsid, the same devids) cannot stand in for one of these.
 #[track_caller]
 pub fn guest_kernel_pool_read(images: &[&str], script: &str) -> PoolRead {
+    pool_run(images, script, false)
+}
+
+/// [`guest_kernel_pool_read`], mounted **read-write**: the kernel runs
+/// `script` against the pool and unmounts it, and then `btrfs check
+/// --readonly` inspects what the kernel left. The members are copies in
+/// the guest, thrown away afterwards; the images on the host are not
+/// changed.
+///
+/// What a writable mount proves that a read-only one cannot: that the
+/// kernel accepts the pool for writing and can allocate in it, on whichever
+/// device it chooses.
+#[track_caller]
+pub fn guest_kernel_pool_write(images: &[&str], script: &str) -> PoolRead {
+    pool_run(images, script, true)
+}
+
+/// The two pool oracles, the mount read-only (`btrfs check` first) or
+/// read-write (`btrfs check` after the unmount).
+#[track_caller]
+fn pool_run(images: &[&str], script: &str, writable: bool) -> PoolRead {
     let _bracket = GUEST_MOUNT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -614,6 +635,16 @@ pub fn guest_kernel_pool_read(images: &[&str], script: &str) -> PoolRead {
     ));
     let check_status = check.with_extension("check-status");
     let members: Vec<String> = images.iter().map(|i| guest_quote(i)).collect();
+    let check_cmd = format!(
+        "c=0\nbtrfs check --readonly \"${{loops[0]}}\" > {} 2>&1 || c=$?\nprintf %s \"$c\" > {}",
+        guest_quote(&check.to_string_lossy()),
+        guest_quote(&check_status.to_string_lossy()),
+    );
+    let (losetup, options, check_before, check_after) = if writable {
+        ("", "rw", String::from("true"), check_cmd)
+    } else {
+        ("--read-only", "ro", check_cmd, String::from("true"))
+    };
     let guest = format!(
         r#"set -euo pipefail
 mkdir -p {dir}
@@ -632,22 +663,19 @@ btrfs device scan --forget >/dev/null 2>&1 || true
 i=0
 for img in {members}; do
     cp --sparse=always "$img" "$work/member-$i"
-    loops+=("$(losetup --find --show --read-only "$work/member-$i")")
+    loops+=("$(losetup --find --show {losetup} "$work/member-$i")")
     i=$((i + 1))
 done
 btrfs device scan "${{loops[@]}}" >/dev/null
-c=0
-btrfs check --readonly "${{loops[0]}}" > {check} 2>&1 || c=$?
-printf %s "$c" > {check_status}
-mount -t btrfs -o ro "${{loops[0]}}" "$mnt"
+{check_before}
+mount -t btrfs -o {options} "${{loops[0]}}" "$mnt"
 status=0
 MNT="$mnt" bash -euo pipefail -c {script} > {stdout} 2> {stderr} || status=$?
 umount "$mnt"
+{check_after}
 printf %s "$status" > {status}"#,
         dir = guest_quote(&run.dir.to_string_lossy()),
         members = members.join(" "),
-        check = guest_quote(&check.to_string_lossy()),
-        check_status = guest_quote(&check_status.to_string_lossy()),
         script = guest_quote(script),
         stdout = guest_quote(&run.stdout.to_string_lossy()),
         stderr = guest_quote(&run.stderr.to_string_lossy()),
@@ -669,12 +697,13 @@ printf %s "$status" > {status}"#,
     let check_code = std::fs::read_to_string(&check_status)
         .ok()
         .and_then(|s| s.trim().parse().ok())
-        .expect("the guest ran btrfs check before the mount, and recorded its status");
+        .expect("the guest ran btrfs check over the pool, and recorded its status");
     let _ = std::fs::remove_file(&check);
     let _ = std::fs::remove_file(&check_status);
     println!(
-        "[kernel vm] btrfs check + mount -t btrfs -o ro, a pool of {} -> check {check_code}, \
+        "[kernel vm] btrfs check + mount -t btrfs -o {}, a pool of {} -> check {check_code}, \
          script {code}",
+        if writable { "rw" } else { "ro" },
         images.len()
     );
     PoolRead {
