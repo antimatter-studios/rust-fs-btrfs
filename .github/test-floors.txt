@@ -56,6 +56,7 @@ cli_fsck_oracle           4
 cli_label_kernel          2
 cli_mkfs_kernel           5
 cli_oracle                3
+cli_resize_kernel         3
 cli_write_kernel          1
 commit_order              3
 compat_ro_write_refusal   2

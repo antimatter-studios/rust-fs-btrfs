@@ -1,39 +1,43 @@
-# The verbs this library cannot do still exist and answer, by name: status
-# 3, `not implemented` and the reason, nothing on stdout. A script moved
-# here from a filesystem that can do them fails loudly instead of meaning
-# something else. None of them opens the image, so none needs one.
+# What fs.btrfs refuses before it opens the image answers by name: status
+# 3 for a key that cannot be set, status 2 for an unknown key or a size
+# `resize` cannot read, a structured error naming why, and nothing on
+# stdout. None of them opens the image, so none needs one.
+#
+# `resize` was this file's verb that answered `not implemented` until it
+# could resize (#264); what it does to a volume is checked in
+# tests/cli_resize_kernel.rs, in the harness VM.
 source "$(dirname "$0")/lib.sh"
 
 img="$SANDBOX/never-opened.img"
 
-# blocked VERB... -- WHY: status 3, nothing on stdout, `not implemented`
-# naming WHY.
-blocked() {
+# refused STATUS VERB... -- WHY: exit STATUS, nothing on stdout, and a
+# structured error with that code naming WHY.
+refused() {
+    local status="$1"
+    shift
     local why="${*: -1}"
     local args=("${@:1:$#-2}")
     fs.btrfs "$img" "${args[@]}" >"$SANDBOX/b.out" 2>"$SANDBOX/b.err"
-    check "${args[*]} exits 3" test $? -eq 3
+    check "${args[*]} exits $status" test $? -eq "$status"
     check "${args[*]} prints nothing on stdout" test ! -s "$SANDBOX/b.out"
-    jq_check "${args[*]} says not implemented, naming $why" \
-        ".code == 3 and (.error | startswith(\"not implemented\")) and (.error | contains(\"$why\"))" \
+    jq_check "${args[*]} is refused with code $status, naming $why" \
+        ".code == $status and (.error | contains(\"$why\"))" \
         "$SANDBOX/b.err"
 }
 
-blocked resize 20G -- "resize"
-blocked resize 20G --force -- "resize"
+# A read-only key is refused with status 3; an unknown one is a wrong
+# command line.
+refused 3 set total_bytes 1 -- "read-only"
+refused 2 set colour blue -- "colour"
 
-# A read-only key is refused with the same status; an unknown one is a
-# wrong command line.
-fs.btrfs "$img" set total_bytes 1 >"$SANDBOX/ro.out" 2>"$SANDBOX/ro.err"
-check "set total_bytes exits 3" test $? -eq 3
-jq_check "set total_bytes says it is read-only" '.code == 3 and (.error | test("read-only"))' "$SANDBOX/ro.err"
-fs.btrfs "$img" set colour blue >"$SANDBOX/uk.out" 2>"$SANDBOX/uk.err"
-check "set of an unknown key exits 2" test $? -eq 2
-jq_check "set of an unknown key is a structured usage error" '.code == 2' "$SANDBOX/uk.err"
+# A size resize cannot read is a wrong command line, whatever --force says.
+refused 2 resize 20Q -- "not a size"
+refused 2 resize 0 --force -- "not a size"
+refused 2 resize -x -- "not a size"
 
 # --text: `fs.btrfs: <message>`, for a person.
-fs.btrfs --text "$img" resize 20G >/dev/null 2>"$SANDBOX/t.err"
-check "resize --text exits 3" test $? -eq 3
-check "resize --text says so for a person" grep -q '^fs.btrfs: not implemented: ' "$SANDBOX/t.err"
+fs.btrfs --text "$img" set total_bytes 1 >/dev/null 2>"$SANDBOX/t.err"
+check "set total_bytes --text exits 3" test $? -eq 3
+check "set total_bytes --text says so for a person" grep -q '^fs.btrfs: total_bytes is read-only' "$SANDBOX/t.err"
 
 finish

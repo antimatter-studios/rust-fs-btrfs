@@ -1,8 +1,8 @@
 //! The multi-call binary: every name answers as itself, the
 //! repository-named form reaches the same tool, `--version` identifies
-//! the crate, errors are structured, the verbs this library cannot do
-//! answer so by name, and `doctor` tells our program from whatever else
-//! PATH finds under the same name.
+//! the crate, errors are structured, what is refused answers so by name,
+//! and `doctor` tells our program from whatever else PATH finds under the
+//! same name.
 //!
 //! No fixture, no VM: the unit tier.
 
@@ -48,7 +48,8 @@ fn every_name_answers_version_with_itself_the_crate_and_the_version() {
 
 #[test]
 fn the_repository_name_reaches_a_tool_by_verb_and_by_full_name() {
-    let args = ["image.img", "resize", "1G"];
+    // A refusal that opens no image, so the answer is the same anywhere.
+    let args = ["image.img", "set", "total_bytes", "1"];
     let dotted = tool("fs.btrfs").args(args).output().unwrap();
     assert_eq!(dotted.status.code(), Some(3), "{}", stderr(&dotted));
     for word in ["fs", "fs.btrfs"] {
@@ -124,19 +125,13 @@ fn a_wrong_command_line_is_a_structured_error_on_stderr_with_status_2() {
 }
 
 #[test]
-fn the_verbs_this_library_cannot_do_answer_not_implemented_with_status_3() {
+fn what_is_refused_before_the_image_is_opened_answers_by_name() {
     // None of these opens the image: the answer does not depend on it.
-    // `mkdir` was one too until it could make a directory (#262).
-    let message = refused(
-        tool("fs.btrfs").args(["never-opened.img", "resize", "1G"]),
-        3,
-    );
-    assert!(
-        message.starts_with("not implemented: ") && message.contains("resize"),
-        "resize: {message}"
-    );
-    // A key that is not settable is refused as read-only, still status 3;
-    // one that does not exist is a wrong command line.
+    // `resize` answered `not implemented` here until it could resize
+    // (#264), and `mkdir` until it could make a directory (#262).
+    //
+    // A key that is not settable is refused as read-only, status 3; one
+    // that does not exist is a wrong command line.
     let message = refused(
         tool("fs.btrfs").args(["never-opened.img", "set", "total_bytes", "1"]),
         3,
@@ -146,14 +141,26 @@ fn the_verbs_this_library_cannot_do_answer_not_implemented_with_status_3() {
         tool("fs.btrfs").args(["never-opened.img", "set", "colour", "blue"]),
         2,
     );
+    // A size `resize` cannot read is a wrong command line too, naming the
+    // forms it can.
+    for size in ["20Q", "0", "+", "-x"] {
+        let message = refused(
+            tool("fs.btrfs").args(["never-opened.img", "resize", size]),
+            2,
+        );
+        assert!(
+            message.contains(size) && message.contains("max"),
+            "resize {size}: {message}"
+        );
+    }
     // --text: `<tool>: <message>`, for a person.
     let out = tool("fs.btrfs")
-        .args(["--text", "never-opened.img", "resize", "1G"])
+        .args(["--text", "never-opened.img", "set", "total_bytes", "1"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(3));
     assert!(
-        stderr(&out).starts_with("fs.btrfs: not implemented: "),
+        stderr(&out).starts_with("fs.btrfs: total_bytes is read-only"),
         "{}",
         stderr(&out)
     );

@@ -46,8 +46,8 @@ pub const KEYS: &[&str] = &[
     "btrfs",
 ];
 
-/// Why creating, removing or resizing anything is refused: the library
-/// changes the bytes of files that exist, and nothing else yet.
+/// Why `write` refuses to create a file: making one is `create`'s job,
+/// and `write` only changes the bytes of files that exist.
 const COW_BLOCKED: &str = "not something this library does yet (rust-fs-btrfs#262)";
 
 fn command() -> Cmd {
@@ -273,17 +273,39 @@ fn command() -> Cmd {
         )
         .subcommand(
             Cmd::new("resize")
-                .about("Grow or shrink the filesystem (not implemented)")
-                .arg(Arg::new("size").value_name("SIZE").required(true))
+                .about("Grow or shrink the filesystem, and an image file with it")
+                .arg(
+                    Arg::new("size")
+                        .value_name("SIZE")
+                        .required(true)
+                        .allow_hyphen_values(true)
+                        .help(
+                            "The new size (20G), a change to the current one (+1G, -512M), \
+                             or max: all of the device",
+                        ),
+                )
                 .arg(
                     Arg::new("force")
                         .long("force")
                         .action(ArgAction::SetTrue)
-                        .help("Do it without asking"),
+                        .help(
+                            "Shrink, cutting an image file to the new size; or grow at \
+                             --offset, where the partition's end cannot be seen",
+                        ),
                 )
                 .after_help(
-                    "Examples:\n  fs.btrfs disk.img resize 20G --force\n\n\
-                     Answers `not implemented` (exit 3): this library has no resize.",
+                    "Examples:\n  fs.btrfs disk.img resize 20G\n  \
+                     fs.btrfs disk.img resize +1G\n  \
+                     fs.btrfs disk.img resize 448M --force\n  \
+                     truncate -s 8G disk.img && fs.btrfs disk.img resize max\n\n\
+                     K, M, G and T are powers of 1024; the size is rounded down to a whole \
+                     sector. Committed as one transaction: the device item, the superblock's \
+                     size and its copy of the device item. An image file is made longer \
+                     first when it is too short, and cut to the new size after a shrink; a \
+                     device or a partition must already be as large as the filesystem is to \
+                     be. A shrink needs --force. A chunk past the new end, which only a \
+                     balance could move, and a filesystem of several devices are refused \
+                     with exit 3 (rust-fs-btrfs#264), leaving the image as it was.",
                 ),
         )
         .after_help(
@@ -369,9 +391,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
             sub.get_one::<String>("key").map(String::as_str),
         ),
         "set" => set(target, offset, sub),
-        "resize" => Err(CliError::not_implemented(
-            "resize: this library cannot resize a Btrfs filesystem",
-        )),
+        "resize" => resize(target, offset, sub),
         other => unreachable!("clap knows no verb {other}"),
     }
 }
@@ -491,6 +511,126 @@ fn truncate(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Outcome,
         .map_err(|e| btrfs_error(path, e))?;
     let report = Json::object([("path", Json::from(show(path))), ("size", Json::from(size))]);
     Ok(Outcome::report(report).with_text(format!("{} is {size} bytes", show(path))))
+}
+
+/// What `resize SIZE` asks for: a size, a change to the current one, or
+/// all of the device.
+enum NewSize {
+    To(u64),
+    Plus(u64),
+    Minus(u64),
+    Max,
+}
+
+fn new_size(spec: &str) -> Result<NewSize, CliError> {
+    if spec.eq_ignore_ascii_case("max") {
+        return Ok(NewSize::Max);
+    }
+    let bytes = |v: &str| {
+        super::mkfs::parse_bytes(v)
+            .filter(|n| *n > 0)
+            .ok_or_else(|| {
+                CliError::usage(format!(
+                    "resize {spec}: not a size (20G, +1G, -512M or max)"
+                ))
+            })
+    };
+    Ok(match spec.as_bytes().first() {
+        Some(b'+') => NewSize::Plus(bytes(&spec[1..])?),
+        Some(b'-') => NewSize::Minus(bytes(&spec[1..])?),
+        _ => NewSize::To(bytes(spec)?),
+    })
+}
+
+/// Grow or shrink the filesystem, as one committed transaction.
+///
+/// TARGET itself, when it is an image file (not a partition at
+/// `--offset`, not a device node), follows the filesystem: made longer
+/// first when it is too short, given its length back if the resize is
+/// then refused, and cut to the new end after a shrink. Everything that
+/// can be refused without writing is refused before the file is touched.
+fn resize(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Outcome, CliError> {
+    let spec = sub.get_one::<String>("size").expect("clap requires it");
+    let force = sub.get_flag("force");
+    let wanted = new_size(spec)?;
+    let name = target.to_string_lossy();
+    let dev = device::open_rw(target, offset)?;
+    let sb = fs_btrfs::superblock::read_superblock(&*dev)
+        .map(|(sb, _copy)| sb)
+        .map_err(|e| CliError::failed(format!("{name} has no readable Btrfs superblock: {e}")))?;
+    let current = sb.total_bytes;
+    let device_len = dev.size_bytes();
+    let size = match wanted {
+        NewSize::To(n) => n,
+        NewSize::Plus(n) => current.checked_add(n).ok_or_else(|| {
+            CliError::usage(format!("resize {spec}: past the largest size there is"))
+        })?,
+        NewSize::Minus(n) => current.checked_sub(n).ok_or_else(|| {
+            CliError::usage(format!(
+                "resize {spec}: more than the filesystem's {current} bytes"
+            ))
+        })?,
+        NewSize::Max => device_len,
+    };
+    let size = size - size % u64::from(sb.sectorsize);
+    let report = |total: u64, device: u64| {
+        Json::object([
+            ("total_bytes", Json::from(total)),
+            ("previous_total_bytes", Json::from(current)),
+            ("device_bytes", Json::from(device)),
+        ])
+    };
+    if size == current {
+        return Ok(Outcome::report(report(current, device_len))
+            .with_text(format!("{name} is already {current} bytes")));
+    }
+    let growing = size > current;
+    if !growing && !force {
+        return Err(CliError::refused(format!(
+            "{name}: shrinking from {current} to {size} bytes cuts off what lies past the \
+             new end; give --force"
+        )));
+    }
+    if growing && offset != 0 && !force {
+        return Err(CliError::refused(format!(
+            "{name}: at --offset {offset} the partition's end cannot be seen from here, so \
+             growing could reach into whatever follows it; grow the partition first, then \
+             give --force"
+        )));
+    }
+
+    // An image file too short for the new size is made longer first: the
+    // library grows only into bytes the device already has.
+    let extended = growing && size > device_len && dev.can_grow();
+    if extended {
+        dev.set_len(size)
+            .map_err(|e| CliError::failed(format!("{name}: making it {size} bytes: {e}")))?;
+    }
+    let resized = Filesystem::mount_rw(dev.clone()).and_then(|mut fs| fs.resize(size));
+    if let Err(e) = resized {
+        let mut refusal = btrfs_error(name.as_bytes(), e);
+        if extended {
+            if let Err(undo) = dev.set_len(device_len) {
+                refusal = CliError::failed(format!(
+                    "{}; and giving {name} back its {device_len} bytes failed: {undo}",
+                    refusal.message
+                ));
+            }
+        }
+        return Err(refusal);
+    }
+    // After a shrink, an image file is cut to the filesystem's new end.
+    if !growing && dev.can_grow() {
+        dev.set_len(size)
+            .map_err(|e| CliError::failed(format!("{name}: cutting it to {size} bytes: {e}")))?;
+    }
+
+    // The report is what the superblock now says, read back.
+    let total = fs_btrfs::superblock::read_superblock(&*dev)
+        .map(|(sb, _copy)| sb.total_bytes)
+        .map_err(|e| CliError::failed(format!("{name}: reading the size back: {e}")))?;
+    Ok(Outcome::report(report(total, dev.size_bytes()))
+        .with_text(format!("{name} resized from {current} to {total} bytes")))
 }
 
 /// `path` as its directory, resolved, and its last component.
