@@ -2569,6 +2569,130 @@ impl Filesystem {
         Ok(())
     }
 
+    /// A verity file's descriptor, or `None` for a file without verity
+    /// (#270). See [`crate::verity`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for an inode that does not exist;
+    /// [`Error::BadSuperblock`] for a verity file whose descriptor is
+    /// missing, short or contradicts the file; and
+    /// [`Error::UnsupportedFeature`] for an encrypted descriptor, or one
+    /// using a version, hash or block size fs-verity does not define.
+    pub fn verity(&self, ino: u64) -> Result<Option<crate::verity::Verity>> {
+        let inode = self.read_inode(ino)?;
+        self.verity_of(&inode)
+    }
+
+    /// A verity file's Merkle tree, every byte of it as stored: what
+    /// `fsverity dump_metadata merkle_tree` prints. Empty for a file of
+    /// one block or none, and for a file without verity.
+    pub fn verity_merkle_tree(&self, ino: u64) -> Result<Vec<u8>> {
+        let Some(v) = self.verity(ino)? else {
+            return Ok(Vec::new());
+        };
+        let len = usize::try_from(v.tree_size()).map_err(|_| {
+            Error::UnsupportedFeature(format!("inode {ino}'s Merkle tree is too large to hold"))
+        })?;
+        self.verity_tree_bytes(ino, 0, len)
+    }
+
+    fn verity_of(&self, inode: &Inode) -> Result<Option<crate::verity::Verity>> {
+        use crate::verity::{self, DESCRIPTOR_ITEM_SIZE, VERITY_DESC_ITEM_KEY};
+        if inode.flags & verity::INODE_RO_VERITY == 0 {
+            return Ok(None);
+        }
+        let ino = inode.ino;
+        let mut items = self
+            .item_run(ino, VERITY_DESC_ITEM_KEY)?
+            .into_iter()
+            .take_while(|((o, t, _), _)| *o == ino && *t == VERITY_DESC_ITEM_KEY)
+            .map(|((_, _, offset), data)| (offset, data));
+        let head = match items.next() {
+            Some((0, head)) if head.len() >= DESCRIPTOR_ITEM_SIZE => head,
+            _ => {
+                return Err(Error::BadSuperblock(format!(
+                    "inode {ino} is an fs-verity file with no descriptor item"
+                )))
+            }
+        };
+        if head[32] != 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}'s fs-verity descriptor is encrypted ({})",
+                head[32]
+            )));
+        }
+        // The kernel's own ceiling on a descriptor and its signature.
+        const MAX_DESCRIPTOR: u64 = 16384;
+        let size = le64(&head, 0);
+        if size > MAX_DESCRIPTOR {
+            return Err(Error::BadSuperblock(format!(
+                "inode {ino}'s fs-verity descriptor claims {size} bytes"
+            )));
+        }
+        let blob = verity::assemble(items, 1, size as usize, "the fs-verity descriptor")?;
+        verity::Verity::parse(blob, inode.size).map(Some)
+    }
+
+    /// `len` bytes of a verity file's stored Merkle tree from `offset`,
+    /// reading only the items that hold them.
+    fn verity_tree_bytes(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>> {
+        use crate::verity::{self, VERITY_MERKLE_ITEM_KEY};
+        // An item holding byte `offset` begins less than a leaf before it,
+        // since no item is larger than a leaf.
+        let start = DiskKey {
+            objectid: ino,
+            key_type: VERITY_MERKLE_ITEM_KEY,
+            offset: offset.saturating_sub(u64::from(self.sb.nodesize)),
+        };
+        let end = offset.saturating_add(len as u64);
+        let mut items = Vec::new();
+        self.with_fs_tree(|tree, root| {
+            tree.for_each_from(root, &start, &mut |k, data| {
+                if k.objectid != ino || k.key_type != VERITY_MERKLE_ITEM_KEY || k.offset >= end {
+                    return Ok(false);
+                }
+                items.push((k.offset, data.to_vec()));
+                Ok(true)
+            })
+        })?;
+        verity::assemble(items, offset, len, "the fs-verity Merkle tree")
+    }
+
+    /// Fill `buf` with the file's bytes from `from` onwards, and for a
+    /// verity file check every block they come from against its Merkle
+    /// tree first, as the kernel does: a block that does not verify is
+    /// refused, never returned (#270).
+    fn read_range(&self, inode: &Inode, from: u64, buf: &mut [u8]) -> Result<()> {
+        let Some(v) = self.verity_of(inode)? else {
+            return self.read_extents(inode, from, buf);
+        };
+        buf.fill(0);
+        let end = from.saturating_add(buf.len() as u64).min(inode.size);
+        if from >= end {
+            return Ok(());
+        }
+        // Whole blocks, the last one ending where the file does.
+        let bs = v.block_size();
+        let first = from / bs;
+        let (wide_from, wide_end) = (
+            first * bs,
+            end.div_ceil(bs).saturating_mul(bs).min(inode.size),
+        );
+        let mut tree = |offset: u64, len: usize| self.verity_tree_bytes(inode.ino, offset, len);
+        let want = (end - from) as usize;
+        if (wide_from, wide_end) == (from, end) {
+            self.read_extents(inode, from, &mut buf[..want])?;
+            return v.verify(first, &buf[..want], &mut tree);
+        }
+        let mut whole = vec![0u8; (wide_end - wide_from) as usize];
+        self.read_extents(inode, wide_from, &mut whole)?;
+        v.verify(first, &whole, &mut tree)?;
+        let skip = (from - wide_from) as usize;
+        buf[..want].copy_from_slice(&whole[skip..skip + want]);
+        Ok(())
+    }
+
     /// Fill `buf` with the file's bytes from `from` onwards.
     ///
     /// `buf` is zeroed first, so a hole and a preallocated extent need
@@ -2579,7 +2703,7 @@ impl Filesystem {
     /// serving a 4 KiB read of a large file by materialising the whole
     /// of it -- and `inode.size` is a raw `le64`, so "the whole of it"
     /// was whatever the image claimed.
-    fn read_range(&self, inode: &Inode, from: u64, buf: &mut [u8]) -> Result<()> {
+    fn read_extents(&self, inode: &Inode, from: u64, buf: &mut [u8]) -> Result<()> {
         buf.fill(0);
         if buf.is_empty() {
             return Ok(());

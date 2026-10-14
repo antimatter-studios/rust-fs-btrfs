@@ -25,6 +25,9 @@
 #   python3      the compressible payloads the compression fixtures need
 #   util-linux   losetup and mount: the loop mounts, which happen here
 #                and nowhere else
+#   fsverity     `fsverity enable` seals the fs-verity fixture's files, and
+#                `measure` and `dump_metadata` are its reference answer:
+#                the kernel's digest, Merkle tree and descriptor for each
 #
 # THE EXOTIC CHECKSUM MODULES. xxhash, sha256 and blake2 live in
 # separate crypto modules, and a mount of such an image is a bad place
@@ -45,7 +48,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 apt-get update -qq
 apt-get install -y -qq \
-    btrfs-progs attr acl e2fsprogs python3 util-linux \
+    btrfs-progs attr acl e2fsprogs python3 util-linux fsverity \
     curl gcc libc6-dev pkg-config >/dev/null
 
 modprobe loop
