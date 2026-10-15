@@ -1360,6 +1360,147 @@ build_features() {
         rm -f "$f"
     done
     note "built features/btrfs-bgt"
+
+    build_feature_verity
+}
+
+# ---------------------------------------------------------------------
+# features/btrfs-verity — fs-verity (#270): files sealed by the kernel,
+# each with a Merkle tree over its blocks.
+#
+#   small.txt            one block, so no tree: the root hash is the block's
+#   empty                no data: the root hash is all zeros
+#   partial-block.bin    three blocks, the last one short
+#   two-levels.bin       300 blocks of SHA-256: a tree of two levels
+#   sha512-salted.bin    4100 blocks of SHA-512 with a salt: three levels
+#   nodatasum/tamper.bin sixteen blocks with no data checksums, so the
+#                        tampered copy below is caught by verity and by
+#                        nothing else
+#   plain.txt            not sealed
+#
+# The manifest is one line per file: path, size, SHA-256 of the contents,
+# then what the kernel reports for a sealed file and `-` for one that is
+# not -- `fsverity measure`, and the SHA-256 of the Merkle tree and of the
+# descriptor as `fsverity digest` builds them, kept only when that digest
+# is the kernel's measurement.
+#
+# btrfs-verity-tampered.img is a copy with 64 bytes of tamper.bin's second
+# block overwritten. Before it is published, the kernel must read that
+# file's first block from it and refuse the file whole, or the build
+# fails: that is what a reader of the copy is held to.
+# ---------------------------------------------------------------------
+build_feature_verity() {
+    local img="$WORK/btrfs-verity.img" manifest="$WORK/btrfs-verity.manifest"
+    local bad="$WORK/btrfs-verity-tampered.img" p ino disk phys first whole m t d g
+    local -a params
+    command -v fsverity >/dev/null || {
+        echo "guest-build-images.sh: fsverity (fsverity-utils) is not in the guest." >&2
+        echo "  It is installed by scripts/vm-setup.sh; 'chore vm:provision' applies it again." >&2
+        exit 1
+    }
+    rm -f "$img" "$manifest" "$bad"
+    truncate -s 512M "$img"
+    mkfs.btrfs -f "$img" >/dev/null
+    mount -o loop "$img" "$MNT"
+    echo "one block, sealed" > "$MNT/small.txt"
+    : > "$MNT/empty"
+    head -c 10000 /dev/urandom > "$MNT/partial-block.bin"
+    dd if=/dev/urandom of="$MNT/two-levels.bin" bs=4K count=300 status=none
+    dd if=/dev/urandom of="$MNT/sha512-salted.bin" bs=4K count=4100 status=none
+    echo "not sealed" > "$MNT/plain.txt"
+    mkdir "$MNT/nodatasum"
+    chattr +C "$MNT/nodatasum"
+    dd if=/dev/urandom of="$MNT/nodatasum/tamper.bin" bs=4K count=16 status=none
+    sync
+    for p in small.txt empty partial-block.bin two-levels.bin nodatasum/tamper.bin; do
+        fsverity enable "$MNT/$p" || {
+            echo "guest-build-images: the kernel would not enable fs-verity on $p" >&2
+            exit 1
+        }
+    done
+    fsverity enable --hash-alg=sha512 --salt=0123456789abcdef "$MNT/sha512-salted.bin"
+    sync
+    ( cd "$MNT" && find . -mindepth 1 -type f | sort | while read -r p; do
+        if m=$(fsverity measure "$p" 2>/dev/null); then
+            m=${m%% *}
+            # The guest's kernel seals and measures btrfs files, but its
+            # btrfs has no FS_IOC_READ_VERITY_METADATA (Debian 12's 6.1;
+            # the ioctl reached btrfs later), so `fsverity dump_metadata`
+            # answers ENOTTY for every sealed file. `fsverity digest`
+            # builds the tree and the descriptor from the contents with
+            # the parameters the file was sealed with, and they are kept
+            # only when its digest is the kernel's measurement: that is
+            # the hash of the descriptor, which carries the tree's root.
+            params=()
+            [ "$p" = ./sha512-salted.bin ] && params=(--hash-alg=sha512 --salt=0123456789abcdef)
+            g=$(fsverity digest "${params[@]}" --out-merkle-tree="$WORK/verity.tree" \
+                --out-descriptor="$WORK/verity.desc" "$p")
+            [ "${g%% *}" = "$m" ] || {
+                echo "guest-build-images: btrfs-verity: $p: fsverity digest ${g%% *}, the kernel measures $m" >&2
+                exit 1
+            }
+            t=$(sha256sum < "$WORK/verity.tree" | cut -d' ' -f1)
+            d=$(sha256sum < "$WORK/verity.desc" | cut -d' ' -f1)
+            rm -f "$WORK/verity.tree" "$WORK/verity.desc"
+        else
+            m=- t=- d=-
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${p#.}" "$(stat -c%s "$p")" \
+            "$(sha256sum "$p" | cut -d' ' -f1)" "$m" "$t" "$d"
+      done ) > "$manifest"
+    ino=$(stat -c %i "$MNT/nodatasum/tamper.bin")
+    umount "$MNT"
+    # The guest's btrfs-progs 6.2 prints the raw compat_ro mask but does not
+    # know the VERITY name yet. Check the upstream bit value, not its label.
+    local compat_ro
+    compat_ro=$(btrfs inspect-internal dump-super "$img" \
+        | awk '$1 == "compat_ro_flags" { print $2 }')
+    if [ -z "$compat_ro" ] || (( (compat_ro & 4) == 0 )); then
+        echo "guest-build-images: btrfs-verity compat_ro_flags=${compat_ro:-missing} lacks VERITY (0x4)" >&2
+        exit 1
+    fi
+    [ "$(grep -c 'sha256:\|sha512:' "$manifest")" -eq 6 ] || {
+        echo "guest-build-images: btrfs-verity: the kernel measures $(grep -c 'sha256:\|sha512:' "$manifest") of six sealed files" >&2
+        exit 1
+    }
+    btrfs check --readonly "$img" >/dev/null 2>&1 || {
+        echo "guest-build-images: btrfs check does not find btrfs-verity clean" >&2
+        btrfs check --readonly "$img" >&2 || true
+        exit 1
+    }
+
+    disk=$(btrfs inspect-internal dump-tree -t 5 "$img" \
+        | awk -v k="($ino EXTENT_DATA 0)" 'index($0, k) { found = 1; next }
+                                           found && /extent data disk byte/ { print $5; exit }')
+    phys=$(btrfs-map-logical -l $((disk + 4096)) -b 4096 "$img" 2>/dev/null \
+        | awk '$1 == "mirror" && $2 == 1 { print $6; exit }')
+    [ -n "$disk" ] && [ -n "$phys" ] || {
+        echo "guest-build-images: btrfs-verity: tamper.bin's second block was not found" >&2
+        exit 1
+    }
+    cp --sparse=always "$img" "$bad"
+    dd if=/dev/urandom of="$bad" bs=1 seek=$((phys + 512)) count=64 conv=notrunc status=none
+    btrfs device scan --forget >/dev/null 2>&1 || true
+    mount -o loop,ro "$bad" "$MNT"
+    first=refused whole=read
+    dd if="$MNT/nodatasum/tamper.bin" of=/dev/null bs=4K count=1 status=none 2>/dev/null && first=read
+    cat "$MNT/nodatasum/tamper.bin" > /dev/null 2>&1 || whole=refused
+    umount "$MNT"
+    btrfs device scan --forget >/dev/null 2>&1 || true
+    [ "$first" = read ] && [ "$whole" = refused ] || {
+        echo "guest-build-images: btrfs-verity-tampered: the kernel's first block $first, whole file $whole" >&2
+        exit 1
+    }
+    echo "# tampered: /nodatasum/tamper.bin block 1; the kernel reads block 0 and refuses the file" >> "$manifest"
+
+    mkdir -p "$OUT/features"
+    local f
+    for f in "$img" "$manifest" "$bad"; do
+        cp --sparse=always "$f" "$OUT/features/$(basename "$f").partial"
+        mv -f "$OUT/features/$(basename "$f").partial" "$OUT/features/$(basename "$f")"
+        rm -f "$f"
+    done
+    note "built features/btrfs-verity and features/btrfs-verity-tampered"
 }
 
 # ---------------------------------------------------------------------

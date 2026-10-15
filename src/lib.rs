@@ -104,6 +104,7 @@ pub mod transaction;
 pub mod tree_write;
 pub mod trim;
 pub mod truncate;
+pub mod verity;
 pub mod write;
 pub mod xattr;
 
