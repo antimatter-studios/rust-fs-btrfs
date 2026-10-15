@@ -6,8 +6,10 @@
 # What must pass before main takes a merge. github-guard reads this from the
 # default branch on the server and applies it to branch protection.
 #
-#   ci-ok   ci.yml: the one always-run gate. It fails when any job it needs
-#           failed, was cancelled or was skipped: the unit tier with no
+#   ci-ok   ci.yml: the one always-run gate. Quick jobs must succeed on
+#           every event. Full jobs may be skipped only on a quick run;
+#           failures and cancellations always fail. Queue runs require the
+#           complete pipeline: the unit tier with no
 #           fixtures, the kernel-made fixtures built in the
 #           fs-linux-test-harness VM, the whole suite (lint, unit, the
 #           btrfs-progs oracles, the kernel oracles) on x86_64, the

@@ -256,6 +256,14 @@ chore test:cli     # those tools as installed, first on PATH
 CI runs `unit`, `fixtures`, `test`, `test-arm64`, `suite-in-vm`, `cli`,
 aggregated by `ci-ok`.
 
+Pull requests, including every layer of a native `gh stack`, run lint, shell
+guards, unit tests and the API compatibility check. The merge queue runs the
+full fixture, architecture, VM and CLI pipeline on its exact merge tree. Tags
+and `workflow_dispatch` also run the full pipeline; a push to `main` runs the
+quick checks without repeating the queue's oracle work. For an oracle-only
+regression, record the red run on the same branch through manual dispatch or
+the merge queue before pushing its fix. A quick PR pass is not oracle proof.
+
 ## The oracles, and why they are in a VM
 
 `mkfs.btrfs`, `btrfs check` and **the in-kernel Btrfs driver**. The kernel is the
