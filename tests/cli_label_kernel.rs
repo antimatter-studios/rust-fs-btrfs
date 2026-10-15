@@ -74,3 +74,52 @@ fn a_label_too_long_is_refused_and_nothing_changes() {
         "the refused label changed the image"
     );
 }
+
+#[test]
+fn a_misplaced_primary_is_refused_without_changing_the_image() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let image = scratch_dir("label-misplaced").join("btrfs-default.img");
+    std::fs::copy(fixture("btrfs-default.img"), &image).expect("copy the fixture");
+    let expected = label_of(&dump_super(&image));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&image)
+        .unwrap();
+    let mut primary = [0u8; 4096];
+    let mut mirror = [0u8; 4096];
+    file.seek(SeekFrom::Start(64 << 10)).unwrap();
+    file.read_exact(&mut primary).unwrap();
+    file.seek(SeekFrom::Start(64 << 20)).unwrap();
+    file.read_exact(&mut mirror).unwrap();
+    file.seek(SeekFrom::Start(64 << 10)).unwrap();
+    file.write_all(&mirror).unwrap();
+    file.sync_all().unwrap();
+    let before = std::fs::read(&image).unwrap();
+    let out = tool("fs.btrfs")
+        .arg(&image)
+        .args(["set", "label", "MISPLACED"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a misplaced primary was accepted: {out:?}"
+    );
+    assert!(
+        std::fs::read(&image).unwrap() == before,
+        "refusal changed the image"
+    );
+    // Restore only the deliberately damaged input; independent readers must
+    // still see the original volume and label after the refused operation.
+    file.seek(SeekFrom::Start(64 << 10)).unwrap();
+    file.write_all(&primary).unwrap();
+    file.sync_all().unwrap();
+    assert_eq!(label_of(&dump_super(&image)), expected);
+    assert_btrfs_check_clean(&image, "after a refused misplaced-primary label write");
+    let kernel = guest_kernel_read_ok(
+        image.to_str().unwrap(),
+        "the unchanged original label",
+        "btrfs filesystem label \"$MNT\"\n",
+    );
+    assert_eq!(kernel.trim(), expected);
+}
