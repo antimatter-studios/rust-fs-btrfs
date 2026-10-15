@@ -390,6 +390,42 @@ fn put64(raw: &mut [u8], at: usize, value: u64) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_label_write_refuses_a_primary_that_belongs_at_another_offset() {
+        struct Misplaced(std::sync::atomic::AtomicUsize);
+        impl fs_core::BlockRead for Misplaced {
+            fn read_at(&self, _: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+                let mut raw = crate::superblock::tests::sb_bytes();
+                set_bytenr(&mut raw, 64 << 20);
+                stamp_checksum(&mut raw, ChecksumType::Crc32c);
+                buf.copy_from_slice(&raw);
+                Ok(())
+            }
+            fn size_bytes(&self) -> u64 {
+                256 << 20
+            }
+        }
+        impl fs_core::BlockDevice for Misplaced {
+            fn write_at(&self, _: u64, _: &[u8]) -> fs_core::Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            fn is_writable(&self) -> bool {
+                true
+            }
+        }
+        let dev = Misplaced(std::sync::atomic::AtomicUsize::new(0));
+        assert!(
+            set_label(&dev, "replacement").is_err(),
+            "a misplaced primary was accepted"
+        );
+        assert_eq!(
+            dev.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "refusal wrote to the device"
+        );
+    }
+
     /// The slot rule, including the wrap that a single commit would not
     /// exercise.
     #[test]
