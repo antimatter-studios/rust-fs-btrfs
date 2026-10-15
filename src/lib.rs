@@ -73,6 +73,7 @@
 
 pub mod attrs;
 mod backref;
+pub mod balance;
 pub mod block_group;
 pub mod btree;
 pub mod capi;

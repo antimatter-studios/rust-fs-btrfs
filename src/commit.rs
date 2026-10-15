@@ -61,10 +61,27 @@ use crate::super_write::SUPERBLOCK_SIZE;
 use crate::super_write::{self, Commit};
 use crate::superblock::SUPER_OFFSETS;
 use fs_core::BlockDevice;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// A device and the superblock image a commit writes to it.
 type SuperblockImage = (Arc<dyn BlockDevice>, Vec<u8>);
+
+/// What a commit changes in the device item each superblock carries a
+/// copy of.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DeviceChange {
+    /// The filesystem's size and the device's: a resize (#264). One
+    /// device's only, since a pool member's item records its own share,
+    /// so a commit setting it on a pool is refused before anything is
+    /// written.
+    pub total_bytes: Option<u64>,
+    /// What each device's chunks take, by devid: a chunk allocated or
+    /// removed (#304). Each superblock carries its own device's item, so
+    /// each is given its own device's count, and a device not named keeps
+    /// what it has.
+    pub bytes_used: BTreeMap<u64, u64>,
+}
 
 /// One tree block, built and placed, waiting to be written.
 #[derive(Debug, Clone)]
@@ -99,7 +116,7 @@ impl Filesystem {
     /// copy exists to resolve, and a reader picks the newest copy that
     /// verifies.
     pub fn commit(&self, blocks: &[PlacedBlock], commit: &Commit) -> Result<()> {
-        self.commit_with(blocks, commit, 0, None)
+        self.commit_with(blocks, commit, 0, DeviceChange::default())
     }
 
     /// [`Filesystem::commit`], also setting `incompat` in the superblock's
@@ -111,7 +128,7 @@ impl Filesystem {
         commit: &Commit,
         incompat: u64,
     ) -> Result<()> {
-        self.commit_with(blocks, commit, incompat, None)
+        self.commit_with(blocks, commit, incompat, DeviceChange::default())
     }
 
     /// [`Filesystem::commit`], and when `total_bytes` is given, the
@@ -124,16 +141,33 @@ impl Filesystem {
         commit: &Commit,
         total_bytes: Option<u64>,
     ) -> Result<()> {
-        self.commit_with(blocks, commit, 0, total_bytes)
+        let device = DeviceChange {
+            total_bytes,
+            ..Default::default()
+        };
+        self.commit_with(blocks, commit, 0, device)
     }
 
-    /// The commit, with the incompat flags it sets and the size it records.
+    /// [`Filesystem::commit`], and the superblock's copy of the device
+    /// item changed as `device` says: a chunk allocated or removed moves
+    /// the device's `bytes_used` (#304).
+    pub(crate) fn commit_device(
+        &self,
+        blocks: &[PlacedBlock],
+        commit: &Commit,
+        device: DeviceChange,
+    ) -> Result<()> {
+        self.commit_with(blocks, commit, 0, device)
+    }
+
+    /// The commit, with the incompat flags it sets and what it changes in
+    /// the device item.
     fn commit_with(
         &self,
         blocks: &[PlacedBlock],
         commit: &Commit,
         incompat: u64,
-        total_bytes: Option<u64>,
+        device: DeviceChange,
     ) -> Result<()> {
         if self.writable.is_none() {
             return Err(Error::ReadOnly);
@@ -144,7 +178,7 @@ impl Filesystem {
         //    a root tree that does not parse is refused while refusing is
         //    still free. One per device: each device's superblock carries
         //    its own `dev_item`, which the commit does not change (#298).
-        let images = self.superblock_images(blocks, commit, incompat, total_bytes)?;
+        let images = self.superblock_images(blocks, commit, incompat, &device)?;
 
         // 1. Every tree block, to every mirror. Nothing points at these
         //    yet, so their order among themselves does not matter --
@@ -219,7 +253,7 @@ impl Filesystem {
         blocks: &[PlacedBlock],
         commit: &Commit,
         incompat: u64,
-        total_bytes: Option<u64>,
+        device_change: &DeviceChange,
     ) -> Result<Vec<SuperblockImage>> {
         use crate::superblock::{dev_item_offsets, offsets as so};
         let devices = self.write_devices();
@@ -227,13 +261,14 @@ impl Filesystem {
         // device item's are the same number only when there is one
         // device; a pool member's is its own share, which this does not
         // compute, so a pool is refused before anything is written.
-        if total_bytes.is_some() && devices.len() != 1 {
+        if device_change.total_bytes.is_some() && devices.len() != 1 {
             return Err(Error::UnsupportedFeature(
                 "resizing a pool of several devices is not supported".into(),
             ));
         }
         let mut roots = None;
         let mut images = Vec::new();
+        let mut counted = 0usize;
         for device in devices {
             let mut raw = vec![0u8; SUPERBLOCK_SIZE];
             device.read_at(SUPER_OFFSETS[0], &mut raw)?;
@@ -248,13 +283,21 @@ impl Filesystem {
                 raw[INCOMPAT_FLAGS..INCOMPAT_FLAGS + 8]
                     .copy_from_slice(&(flags | incompat).to_le_bytes());
             }
-            if let Some(size) = total_bytes {
+            if let Some(size) = device_change.total_bytes {
                 for at in [
                     so::TOTAL_BYTES,
                     so::DEV_ITEM + dev_item_offsets::TOTAL_BYTES,
                 ] {
                     raw[at..at + 8].copy_from_slice(&size.to_le_bytes());
                 }
+            }
+            let devid_at = so::DEV_ITEM + dev_item_offsets::DEVID;
+            let devid =
+                u64::from_le_bytes(raw[devid_at..devid_at + 8].try_into().expect("8 bytes"));
+            if let Some(used) = device_change.bytes_used.get(&devid) {
+                let at = so::DEV_ITEM + dev_item_offsets::BYTES_USED;
+                raw[at..at + 8].copy_from_slice(&used.to_le_bytes());
+                counted += 1;
             }
             if roots.is_none() {
                 roots = Some(self.backup_roots(&raw, blocks, commit)?);
@@ -263,6 +306,15 @@ impl Filesystem {
             super_write::write_backup(&mut raw, commit.generation, roots);
             super_write::stamp_checksum(&mut raw, self.sb.csum_type);
             images.push((device, raw));
+        }
+        // A count for a device this mount does not write would be a change
+        // the chunk tree records and no superblock does.
+        if counted != device_change.bytes_used.len() {
+            return Err(Error::UnsupportedFeature(format!(
+                "the commit changes the bytes used on {} devices, and {counted} of them are \
+                 devices this mount writes",
+                device_change.bytes_used.len()
+            )));
         }
         Ok(images)
     }

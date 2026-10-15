@@ -284,6 +284,7 @@ impl Filesystem {
             },
             releases,
             unrefs,
+            ..Default::default()
         };
         self.commit_write(write, generation)
     }
@@ -397,6 +398,7 @@ impl Filesystem {
             },
             releases,
             unrefs,
+            ..Default::default()
         };
         self.commit_write(write, generation)
     }
@@ -751,6 +753,7 @@ impl Filesystem {
             csum_edits: Vec::new(),
             releases: Vec::new(),
             unrefs: Vec::new(),
+            ..Default::default()
         };
         self.commit_write(write, generation)
     }

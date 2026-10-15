@@ -421,6 +421,25 @@ int fs_btrfs_utimens(fs_btrfs_fs_t *fs, const char *path, int64_t atime_sec,
  */
 int fs_btrfs_resize(fs_btrfs_fs_t *fs, uint64_t size);
 
+/* ---- balance ---- */
+
+/* `convert` for "convert to single", which has no profile bit of its own. */
+#define FS_BTRFS_BALANCE_SINGLE (1ULL << 48)
+
+/*
+ * Relocate every block group holding any of `kinds` (chunk type bits:
+ * 1 data, 2 system, 4 metadata) into a newly allocated chunk, each as
+ * committed transactions of its own. `convert` is 0 to keep each group's
+ * profile, or the profile each new chunk gets: FS_BTRFS_BALANCE_SINGLE,
+ * or one profile bit (1 << 5 for DUP); a group already in it stays where
+ * it is. Returns how many groups were relocated, or -1: EROFS on a
+ * read-only handle, EINVAL for no kinds, an unknown kind or a `convert`
+ * naming no single profile, ENOTSUP for what relocation does not do yet
+ * (metadata and system groups, several devices, profiles one device
+ * cannot hold, shared extents).
+ */
+int64_t fs_btrfs_balance(fs_btrfs_fs_t *fs, uint64_t kinds, uint64_t convert);
+
 /* ---- Subvolumes ----------------------------------------------------
  *
  * A subvolume is named by the path of its top directory, as a mounted

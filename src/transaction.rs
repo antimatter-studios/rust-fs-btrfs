@@ -219,6 +219,29 @@ pub(crate) struct DataWrite {
     /// other references -- and so do the extent's bytes, its checksums,
     /// its free space and its block group's `used`.
     pub unrefs: Vec<DataRelease>,
+    /// Items of any tree put or removed, each with the tree it is in
+    /// (#304): a relocation's chunk, device, extent, free-space and file
+    /// items. Each lands in the leaf a descent for its key reaches in its
+    /// tree, which [`Filesystem::plan_transaction_closed_with`] marks
+    /// dirty itself. Applied after everything else a leaf is given.
+    pub tree_edits: Vec<(u64, ItemEdit)>,
+    /// Data extents moved whole to a new address with every reference
+    /// kept (#304). What the free-space tree and the block groups' `used`
+    /// count; the extents' records and the file items naming them move by
+    /// `tree_edits`.
+    pub relocations: Vec<Relocation>,
+}
+
+/// A data extent copied whole to a new address, every reference to it
+/// kept (#304): the same bytes, records and checksums, somewhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Relocation {
+    /// Where the extent is.
+    pub old: u64,
+    /// Where its copy goes.
+    pub new: u64,
+    /// Its length on disk, as its `EXTENT_ITEM` key records it.
+    pub len: u64,
 }
 
 /// One change to an item of the tree a [`DataWrite`] names (#262).
@@ -286,7 +309,25 @@ impl DataWrite {
             .flat_map(|m| [m.old, m.new])
             .chain(self.releases.iter().map(|r| r.old))
             .chain(self.unrefs.iter().map(|r| r.old))
+            .chain(self.relocations.iter().flat_map(|r| [r.old, r.new]))
             .collect()
+    }
+
+    /// Every range the write frees on disk and every range it takes, as
+    /// `(start, length)`, data only: what the free-space tree and the
+    /// block groups' `used` follow besides the tree blocks.
+    fn data_released(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.released_extents()
+            .map(|(old, len, _)| (old, len))
+            .chain(self.relocations.iter().map(|r| (r.old, r.len)))
+    }
+
+    /// See [`DataWrite::data_released`].
+    fn data_allocated(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.moves
+            .iter()
+            .map(|m| (m.new, m.disk_len))
+            .chain(self.relocations.iter().map(|r| (r.new, r.len)))
     }
 
     /// Every data extent released, by address, length and reference
@@ -715,6 +756,8 @@ impl Filesystem {
                 .map(|e| Ok(tree.descend(root, &e.key())?.header.bytenr))
                 .collect::<Result<_>>()?
         };
+        // And each edit of any other tree, in that tree (#304).
+        let tree_edit_leaves = self.tree_edit_leaves(data)?;
         let mut edits_applied = 0usize;
         // Each rendered block's first key, by its old address. An edit can
         // change a leaf's first key, and the node above must then carry
@@ -924,6 +967,21 @@ impl Filesystem {
                         }
                     }
 
+                    // Items of any tree put or removed (#304), after
+                    // everything else this leaf was given.
+                    let here: Vec<&ItemEdit> = data
+                        .tree_edits
+                        .iter()
+                        .zip(&tree_edit_leaves)
+                        .filter(|((tree, _), &leaf)| *tree == rewrite.owner && leaf == rewrite.old)
+                        .map(|((_, e), _)| e)
+                        .collect();
+                    if !here.is_empty() {
+                        let is_root = self.is_tree_root(rewrite.owner, rewrite.old)?;
+                        owned = apply_item_edits(rewrite.old, is_root, owned, &here)?;
+                        edits_applied += here.len();
+                    }
+
                     if dry {
                         leaves.insert(rewrite.old, owned);
                         continue;
@@ -1037,7 +1095,7 @@ impl Filesystem {
         }
         // NOR IS AN ITEM EDIT: one whose leaf the plan does not rewrite
         // would be committed as a change that never happened.
-        let edits = data.edits.len() + data.csum_edits.len();
+        let edits = data.edits.len() + data.csum_edits.len() + data.tree_edits.len();
         if edits_applied != edits {
             return Err(Error::UnsupportedFeature(format!(
                 "the change edits {edits} items, and the plan rewrote the leaves of \
@@ -1094,6 +1152,30 @@ impl Filesystem {
             return Ok(self.sb.chunk_root);
         }
         self.tree_root(objectid)
+    }
+
+    /// The leaf each of `data`'s edits of other trees lands in, in
+    /// order: the one a descent for its key reaches in its tree (#304).
+    fn tree_edit_leaves(&self, data: &DataWrite) -> Result<Vec<u64>> {
+        if data.tree_edits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let reader = self.pool_reader();
+        let tree = reader.tree();
+        let mut roots: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut out = Vec::with_capacity(data.tree_edits.len());
+        for (owner, edit) in &data.tree_edits {
+            let root = match roots.get(owner) {
+                Some(&root) => root,
+                None => {
+                    let root = self.edit_root(*owner)?;
+                    roots.insert(*owner, root);
+                    root
+                }
+            };
+            out.push(tree.descend(root, &edit.key())?.header.bytenr);
+        }
+        Ok(out)
     }
 
     /// Where the chunk tree's root ends up, for a plan that moves it
@@ -1162,6 +1244,9 @@ impl Filesystem {
         rounds: usize,
     ) -> Result<Plan> {
         let mut seed: BTreeSet<u64> = dirty.iter().copied().collect();
+        // The leaves the edits of other trees land in are dirty from the
+        // start: nothing else would find them (#304).
+        seed.extend(self.tree_edit_leaves(data)?);
 
         for _ in 0..rounds {
             let list: Vec<u64> = seed.iter().copied().collect();
@@ -2155,11 +2240,11 @@ impl Filesystem {
             }
         }
         // A data extent counts its own length, not a node's.
-        for m in &data.moves {
-            *out.entry(group_of(m.new)?).or_default() += i128::from(m.disk_len);
+        for (new, len) in data.data_allocated() {
+            *out.entry(group_of(new)?).or_default() += i128::from(len);
         }
-        for (old, old_len, _) in data.released_extents() {
-            *out.entry(group_of(old)?).or_default() -= i128::from(old_len);
+        for (old, len) in data.data_released() {
+            *out.entry(group_of(old)?).or_default() -= i128::from(len);
         }
         out.retain(|_, delta| *delta != 0);
         Ok(out)
@@ -2397,13 +2482,13 @@ impl Filesystem {
             .released()
             .into_iter()
             .map(|at| (at, nodesize))
-            .chain(data.released_extents().map(|(old, len, _)| (old, len)))
+            .chain(data.data_released())
             .collect();
         let allocated: Vec<(u64, u64)> = plan
             .allocated()
             .into_iter()
             .map(|at| (at, nodesize))
-            .chain(data.moves.iter().map(|m| (m.new, m.disk_len)))
+            .chain(data.data_allocated())
             .collect();
 
         let mut out: Vec<OwnedItem> = Vec::with_capacity(items.len());
