@@ -20,8 +20,15 @@
 //! ```
 //!
 //! `ROOT_BACKREF` is the one used here: one item per subvolume giving
-//! its parent and its name, which is exactly what building a path needs.
-//! `ROOT_REF` says the same thing from the other end.
+//! its parent, the directory of the parent its entry sits in, and its
+//! name, which is exactly what building a path needs. `ROOT_REF` says
+//! the same thing from the other end.
+//!
+//! The directory matters. A subvolume made inside an ordinary directory
+//! of its parent, rather than in the parent's top directory, is listed by
+//! `btrfs subvolume list` with that directory in its path: `top/nested`,
+//! not `nested` (#362). The directory's own path is read from the
+//! parent's tree, one `INODE_REF` at a time up to its top directory.
 //!
 //! # Four things that were measured
 //!
@@ -81,6 +88,8 @@ use crate::fs::root_item;
 /// Byte offsets within `struct btrfs_root_ref`, which both the reference
 /// and the back-reference use.
 mod root_ref {
+    /// `u64`. The directory of the parent the subvolume's entry is in.
+    pub const DIRID: usize = 0;
     /// `u16`. How many bytes of name follow.
     pub const NAME_LEN: usize = 16;
     /// The name itself.
@@ -183,6 +192,26 @@ impl Filesystem {
         // the parent may be read after the child.
         let mut names: std::collections::BTreeMap<u64, (u64, Vec<u8>)> =
             std::collections::BTreeMap::new();
+        // Each subvolume's link in its path: the directory its entry sits
+        // in, from the parent's top directory, then its name.
+        let mut links: std::collections::BTreeMap<u64, (u64, Vec<u8>)> =
+            std::collections::BTreeMap::new();
+        let mut roots: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+        let le64 = |data: &[u8], at: usize| {
+            u64::from_le_bytes(data[at..at + 8].try_into().expect("8 bytes"))
+        };
+        for (objectid, key_type, _, data) in &items {
+            if *key_type == ROOT_ITEM_KEY
+                && is_subvolume_id(*objectid)
+                && data.len() >= root_item::MIN_SIZE
+            {
+                roots.insert(*objectid, le64(data, root_item::BYTENR));
+            }
+        }
+        // Each parent's tree is opened once, and only when an entry sits
+        // somewhere other than its top directory.
+        let mut trees: std::collections::BTreeMap<u64, Filesystem> =
+            std::collections::BTreeMap::new();
         for (objectid, key_type, offset, data) in &items {
             if *key_type != ROOT_BACKREF_KEY || !is_subvolume_id(*objectid) {
                 continue;
@@ -190,6 +219,26 @@ impl Filesystem {
             let Some(name) = reference_name(data) else {
                 continue;
             };
+            let dirid = le64(data, root_ref::DIRID);
+            let mut link = Vec::new();
+            if dirid != FIRST_FREE_OBJECTID {
+                let tree = match trees.entry(*offset) {
+                    std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        let bytenr = roots.get(offset).ok_or_else(|| {
+                            Error::UnsupportedFeature(format!(
+                                "subvolume {objectid} names subvolume {offset} as its \
+                                 parent, which has no root item"
+                            ))
+                        })?;
+                        e.insert(self.reroot(*bytenr)?)
+                    }
+                };
+                link = tree.directory_path(dirid)?;
+                link.push(b'/');
+            }
+            link.extend_from_slice(&name);
+            links.insert(*objectid, (*offset, link));
             names.insert(*objectid, (*offset, name));
         }
 
@@ -201,20 +250,17 @@ impl Filesystem {
             {
                 continue;
             }
-            let le64 =
-                |at: usize| u64::from_le_bytes(data[at..at + 8].try_into().expect("8 bytes"));
-
             let (parent, name) = names.get(objectid).cloned().unwrap_or((0, Vec::new()));
 
             out.push(Subvolume {
                 id: *objectid,
                 parent,
-                path: path_of(*objectid, &names),
+                path: path_of(*objectid, &links),
                 name,
-                bytenr: le64(root_item::BYTENR),
-                generation: le64(root_item::GENERATION),
-                last_snapshot: le64(root_item::LAST_SNAPSHOT),
-                read_only: le64(root_item::FLAGS) & ROOT_SUBVOL_RDONLY != 0,
+                bytenr: le64(data, root_item::BYTENR),
+                generation: le64(data, root_item::GENERATION),
+                last_snapshot: le64(data, root_item::LAST_SNAPSHOT),
+                read_only: le64(data, root_item::FLAGS) & ROOT_SUBVOL_RDONLY != 0,
                 // A snapshot records the generation it was taken at in
                 // its key's offset; a subvolume created empty has zero.
                 is_snapshot: *offset != 0,
@@ -247,7 +293,19 @@ fn reference_name(data: &[u8]) -> Option<Vec<u8>> {
     Some(data[root_ref::NAME..end].to_vec())
 }
 
+/// The name in the first record of an `INODE_REF` item: an 8-byte index,
+/// a 2-byte length, then the name. A directory has exactly one record,
+/// because a directory cannot be hard-linked.
+fn inode_ref_name(data: &[u8]) -> Option<Vec<u8>> {
+    let len = usize::from(u16::from_le_bytes(data.get(8..10)?.try_into().ok()?));
+    Some(data.get(10..10 + len)?.to_vec())
+}
+
 /// The path a subvolume is reached by, built from its chain of parents.
+///
+/// Each entry of `names` is a subvolume's parent and its link in the path:
+/// its name, after the directory of the parent it sits in when that is not
+/// the parent's top directory.
 ///
 /// Bounded rather than recursive: a filesystem whose references form a
 /// cycle would otherwise hang here, and a listing is exactly the tool
@@ -274,6 +332,50 @@ fn path_of(id: u64, names: &std::collections::BTreeMap<u64, (u64, Vec<u8>)>) -> 
 }
 
 impl Filesystem {
+    /// The path of directory `dir` from this tree's top directory: the
+    /// name in each directory's one `INODE_REF`, up to the top directory,
+    /// whose own path is empty.
+    ///
+    /// # Errors
+    ///
+    /// A directory with no `INODE_REF`, or whose references never reach
+    /// the top directory, is refused rather than listed under a partial
+    /// path. Otherwise as the tree walk.
+    fn directory_path(&self, dir: u64) -> Result<Vec<u8>> {
+        let mut parts: Vec<Vec<u8>> = Vec::new();
+        let mut at = dir;
+        // A tree deeper than this is a loop, not a directory hierarchy.
+        for _ in 0..65_536 {
+            if at == FIRST_FREE_OBJECTID {
+                parts.reverse();
+                return Ok(parts.join(&b'/'));
+            }
+            let ((_, _, parent), data) = self
+                .item_run(at, crate::inode::INODE_REF_KEY)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(format!(
+                        "directory {at} has no reference to its parent"
+                    ))
+                })?;
+            if parent == at {
+                break;
+            }
+            parts.push(inode_ref_name(&data).ok_or_else(|| {
+                Error::UnsupportedFeature(format!(
+                    "directory {at}'s reference to its parent is {} bytes, too short \
+                     for the name it holds",
+                    data.len()
+                ))
+            })?);
+            at = parent;
+        }
+        Err(Error::UnsupportedFeature(format!(
+            "directory {dir}'s parents do not reach the top directory"
+        )))
+    }
+
     /// Open one subvolume as a filesystem of its own.
     ///
     /// A subvolume is a separate tree over the same device. Everything
@@ -826,6 +928,34 @@ mod tests {
         assert_eq!(path_of(5, &names), "/");
         assert_eq!(path_of(256, &names), "sub");
         assert_eq!(path_of(257, &names), "sub/inner");
+    }
+
+    /// A link that carries the directory its entry sits in keeps it, at
+    /// its place in the chain (#362).
+    #[test]
+    fn a_link_through_a_directory_stays_in_the_path() {
+        let mut links = std::collections::BTreeMap::new();
+        links.insert(256u64, (5u64, b"top/nested".to_vec()));
+        links.insert(257u64, (256u64, b"dir/deeper/inner".to_vec()));
+
+        assert_eq!(path_of(256, &links), "top/nested");
+        assert_eq!(path_of(257, &links), "top/nested/dir/deeper/inner");
+    }
+
+    /// A directory's name is read from its `INODE_REF` by the declared
+    /// length, and a length that runs past the item is refused.
+    #[test]
+    fn an_inode_ref_name_is_read_from_its_declared_length() {
+        let mut item = 2u64.to_le_bytes().to_vec();
+        item.extend_from_slice(&3u16.to_le_bytes());
+        item.extend_from_slice(b"top");
+        assert_eq!(inode_ref_name(&item).as_deref(), Some(&b"top"[..]));
+
+        let mut lying = 2u64.to_le_bytes().to_vec();
+        lying.extend_from_slice(&99u16.to_le_bytes());
+        lying.extend_from_slice(b"top");
+        assert_eq!(inode_ref_name(&lying), None);
+        assert_eq!(inode_ref_name(&[0u8; 9]), None, "too short for a header");
     }
 
     /// References that form a cycle must not hang the listing — which is

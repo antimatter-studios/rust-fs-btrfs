@@ -349,6 +349,12 @@ build_compression() {
 #   sub/inner  a subvolume nested inside that one
 #   snap       a snapshot of `sub`, taken before `sub` is written to again
 #   rosnap     a read-only snapshot of `sub`
+#   top/nested a subvolume inside the ordinary directory `top`, made last
+#              so the ids of the others do not move
+#
+# `top/nested` is there because its path is not the chain of subvolume
+# names: `btrfs subvolume list` prints `top/nested`, the directory it sits
+# in included, where names alone give `nested` (#362).
 #
 # `sub` gains a file AFTER `snap` is taken, so the two are genuinely
 # divergent rather than identical — a driver that resolved a snapshot to
@@ -379,6 +385,8 @@ build_subvol() {
     sync
     # Now make `sub` differ from its snapshots.
     echo "added after the snapshot" > "$MNT/sub/after.txt"
+    btrfs subvolume create "$MNT/top/nested" >/dev/null
+    echo "in top/nested" > "$MNT/top/nested/d.txt"
     sync
 
     {
@@ -387,7 +395,7 @@ build_subvol() {
         echo "# driver's own enumeration is compared against."
         btrfs subvolume list -pcgu "$MNT"
         echo "# --- what each subvolume holds, one line per path"
-        for s in top sub sub/inner snap rosnap; do
+        for s in top sub sub/inner snap rosnap top/nested; do
             [ -e "$MNT/$s" ] || continue
             printf 'contains %s:' "$s"
             find "$MNT/$s" -maxdepth 1 -type f -printf ' %f' 2>/dev/null || true

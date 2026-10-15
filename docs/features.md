@@ -50,7 +50,7 @@ suite.
 | A pool with members missing, mounted degraded (`mount_pool_degraded`); a loss some chunk cannot survive is refused at mount | Supported, read-only | Unreleased (#300) | | `pool_degraded.rs` |
 | Profiles: raid5, raid6 | Supported: read, with any one element (RAID6: any two) rebuilt from parity, and written, every write a read-modify-write of the full stripes it touches with P and Q recomputed | Unreleased (#268, #299) | | `raid56_oracle.rs`, `raid56_write_kernel.rs` |
 | Mixed block groups (`mkfs.btrfs -M`) | Supported | 0.3.0 | | `oracle_vm_fixtures.rs` |
-| Subvolumes and snapshots: listing, with id, path, parent, snapshot and read-only flags | Supported | 0.6.0 | | `subvol_oracle.rs` |
+| Subvolumes and snapshots: listing, with id, path, parent, snapshot and read-only flags | Supported | 0.6.0; the path of one inside an ordinary directory Unreleased (#362) | | `subvol_oracle.rs` |
 | Subvolumes and snapshots: reading inside one (`open_subvolume`) | Supported, read-only | 0.7.0 | | `subvol_oracle.rs`, `kernel_readback.rs` |
 | A path that crosses into a subvolume (`resolve_path`) | Supported | 0.7.0 | | `subvol_oracle.rs`, `capi_subvol.rs` |
 | An extent item whose window falls outside its extent | Refused | 0.7.0 | | `extent_window_read.rs`, `compressed_extent_window.rs` |
