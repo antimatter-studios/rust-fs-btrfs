@@ -691,7 +691,9 @@ fn a_write_into_a_hole_adds_an_extent_the_checker_and_kernel_accept() {
     drop(fs);
 
     assert_btrfs_check_clean(&image, "after a write into a hole");
-    guest_kernel_read_ok(
+    // A scrub needs a read-write mount: on a read-only one the kernel
+    // refuses it with EROFS, as the other scrubs in this file show.
+    guest_kernel_write_ok(
         &image.to_string_lossy(),
         "scrub after a write into a hole",
         "btrfs scrub start -B \"$MNT\" >/dev/null",
@@ -716,13 +718,46 @@ fn a_write_into_a_hole_adds_an_extent_the_checker_and_kernel_accept() {
             words[0] * words[1]
         })
         .collect();
+
+    let after = kernel_map(&image, "after the hole write", &[HOLEY, CONTROL]);
+    // The values every comparison below rests on, written before any of
+    // them can fail, into the directory CI keeps as the logs artifact.
+    let starts = |name: &str| {
+        after[name]
+            .1
+            .iter()
+            .map(|m| m.logical.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let report = Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp/logs/hole-write-oracle.json");
+    std::fs::create_dir_all(report.parent().unwrap()).unwrap();
+    std::fs::write(
+        &report,
+        format!(
+            "{{\"image_sha256\":\"{}\",\"driver_nbytes\":{},\"control_nbytes\":{},\
+             \"kernel_stat_bytes\":[{}],\"holey_sha256\":\"{}\",\"control_sha256\":\"{}\",\
+             \"holey_extent_starts\":[{}],\"control_extent_starts\":[{}]}}\n",
+            sha256_hex(&std::fs::read(&image).unwrap()),
+            inode.nbytes,
+            control.nbytes,
+            blocks
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            after[HOLEY].0,
+            after[CONTROL].0,
+            starts(HOLEY),
+            starts(CONTROL),
+        ),
+    )
+    .unwrap();
     assert_eq!(
         blocks,
         vec![inode.nbytes, control.nbytes],
         "the kernel's stat of {HOLEY} and {CONTROL} disagrees with nbytes"
     );
-
-    let after = kernel_map(&image, "after the hole write", &[HOLEY, CONTROL]);
     assert_eq!(
         after[HOLEY].0,
         sha256_hex(&expected),
