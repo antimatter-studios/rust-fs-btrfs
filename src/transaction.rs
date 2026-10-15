@@ -137,6 +137,11 @@ impl Plan {
 /// otherwise (`old_shared`) it loses this item's reference and stays for
 /// the rest (#261). The planner refuses an extent a snapshot may share
 /// before a `DataMove` is made.
+///
+/// A copy stored compressed is split into extents of one compression
+/// unit each (#357): the first takes the item's place, covering less of
+/// the file than the item did ([`DataMove::len`] is less than
+/// [`DataMove::item_len`]), and each of the rest is a [`DataAdd`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DataMove {
     /// The extent the item referenced.
@@ -152,6 +157,10 @@ pub(crate) struct DataMove {
     /// The copy's length as the file sees it: the item's `num_bytes` and
     /// `ram_bytes`.
     pub len: u64,
+    /// The item's `num_bytes` before the move, which the item must still
+    /// hold: `len`, unless the copy was split into several extents and
+    /// this is the first (#357).
+    pub item_len: u64,
     /// The copy's length on disk: `len` for a copy stored as it is, the
     /// compressed length rounded up to a sector for one compressed
     /// (#265). The extent's record, its free space and its block group's
@@ -168,6 +177,21 @@ pub(crate) struct DataMove {
     /// `EXTENT_DATA_REF`, as an entry of [`DataWrite::unrefs`] does, and
     /// its bytes, checksums, free space and block group's `used` stay.
     pub old_shared: bool,
+}
+
+/// A data extent a write allocates with no item to repoint (#357): a unit
+/// of a copy split into several, after the first. Its `EXTENT_DATA` item,
+/// which references the whole of it from offset zero, is inserted by the
+/// change's [`DataWrite::edits`]; this is its extent tree record, its free
+/// space and its block group's `used`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DataAdd {
+    /// Where the extent goes.
+    pub new: u64,
+    /// Its length on disk, as [`DataMove::disk_len`].
+    pub disk_len: u64,
+    /// The key offset of the file's `EXTENT_DATA` item referencing it.
+    pub file_offset: u64,
 }
 
 /// A data extent a transaction releases without a copy taking its place
@@ -198,6 +222,8 @@ pub(crate) struct DataWrite {
     pub ino: u64,
     /// Each extent replaced.
     pub moves: Vec<DataMove>,
+    /// Each extent allocated with no item to repoint (#357).
+    pub adds: Vec<DataAdd>,
     /// The modification time stamped on the inode, as seconds and
     /// nanoseconds since the epoch.
     pub time: (u64, u32),
@@ -292,9 +318,20 @@ impl DataWrite {
         self.moves
             .iter()
             .flat_map(|m| [m.old, m.new])
+            .chain(self.adds.iter().map(|a| a.new))
             .chain(self.releases.iter().map(|r| r.old))
             .chain(self.unrefs.iter().map(|r| r.old))
             .collect()
+    }
+
+    /// Every data extent the write allocates, by address, length on disk
+    /// and the key offset of the file item referencing it: each move's
+    /// copy, and each extent added (#357).
+    pub(crate) fn allocations(&self) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
+        self.moves
+            .iter()
+            .map(|m| (m.new, m.disk_len, m.file_offset))
+            .chain(self.adds.iter().map(|a| (a.new, a.disk_len, a.file_offset)))
     }
 
     /// Every data extent released, once each, by address and length, with
@@ -1111,10 +1148,11 @@ impl Filesystem {
                 applied.unreffed
             )));
         }
-        if applied.released != released || applied.recorded != n {
+        let recorded = data.allocations().count();
+        if applied.released != released || applied.recorded != recorded {
             return Err(Error::UnsupportedFeature(format!(
-                "the write moves {n} data extents and releases {released}, and the plan \
-                 released the records of {} and recorded {}",
+                "the write allocates {recorded} data extents and releases {released}, and the \
+                 plan released the records of {} and recorded {}",
                 applied.released, applied.recorded
             )));
         }
@@ -1649,19 +1687,19 @@ impl Filesystem {
 
         // And each copy the write allocated: one reference, inline, from
         // the file item that now names it at offset zero.
-        for m in &data.moves {
-            if !mine(m.new)? {
+        for (new, disk_len, file_offset) in data.allocations() {
+            if !mine(new)? {
                 continue;
             }
             out = insert(
                 &out,
                 OwnedItem {
                     key: DiskKey {
-                        objectid: m.new,
+                        objectid: new,
                         key_type: key_type::EXTENT_ITEM,
-                        offset: m.disk_len,
+                        offset: disk_len,
                     },
-                    data: data_extent_body(generation, data.root, data.ino, m.file_offset).to_vec(),
+                    data: data_extent_body(generation, data.root, data.ino, file_offset).to_vec(),
                 },
             )?;
             applied.recorded += 1;
@@ -2114,16 +2152,17 @@ fn apply_file_write(
                     && d[fe::OTHER_ENCODING..fe::OTHER_ENCODING + 2] == [0, 0];
                 if !regular
                     || le64(d, fe::DISK_BYTENR) != m.old
-                    || le64(d, fe::NUM_BYTES) != m.len
+                    || le64(d, fe::NUM_BYTES) != m.item_len
                     || item.key.offset.checked_sub(le64(d, fe::OFFSET)) != Some(m.old_ref_offset)
                 {
                     return Err(Error::UnsupportedFeature(format!(
                         "inode {}'s extent item at {} is not the regular extent of {} bytes at \
                          {} the write was planned against",
-                        data.ino, item.key.offset, m.len, m.old
+                        data.ino, item.key.offset, m.item_len, m.old
                     )));
                 }
                 put64(d, fe::GENERATION, generation);
+                put64(d, fe::NUM_BYTES, m.len);
                 put64(d, fe::RAM_BYTES, m.len);
                 put64(d, fe::DISK_BYTENR, m.new);
                 put64(d, fe::DISK_NUM_BYTES, m.disk_len);
@@ -2217,8 +2256,8 @@ impl Filesystem {
             }
         }
         // A data extent counts its own length, not a node's.
-        for m in &data.moves {
-            *out.entry(group_of(m.new)?).or_default() += i128::from(m.disk_len);
+        for (new, disk_len, _) in data.allocations() {
+            *out.entry(group_of(new)?).or_default() += i128::from(disk_len);
         }
         for (old, old_len, _) in data.released_extents() {
             *out.entry(group_of(old)?).or_default() -= i128::from(old_len);
@@ -2469,7 +2508,7 @@ impl Filesystem {
             .allocated()
             .into_iter()
             .map(|at| (at, nodesize))
-            .chain(data.moves.iter().map(|m| (m.new, m.disk_len)))
+            .chain(data.allocations().map(|(new, disk_len, _)| (new, disk_len)))
             .collect();
 
         let mut out: Vec<OwnedItem> = Vec::with_capacity(items.len());

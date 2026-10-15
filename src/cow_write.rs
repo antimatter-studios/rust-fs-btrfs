@@ -17,16 +17,21 @@
 //!    applied. The copy is the item's window of the old extent, not the
 //!    whole of it, so the new item references all of its extent from
 //!    offset zero. A file that asks for compression (`chattr +c`, the
-//!    compression property, or a mount set to compress) has a copy of up
-//!    to 128 KiB stored compressed, as zlib, LZO or zstd in the kernel's
-//!    framing for each and padded to a sector, when that saves a sector
-//!    (#265); the old extent may be compressed or not, since the copy is
-//!    made from its decoded bytes. The first LZO or zstd extent on a
-//!    volume sets that algorithm's incompatible feature flag, in the same
-//!    commit.
-//! 2. **The file's `EXTENT_DATA` item** is pointed at it, in place: the
-//!    item keeps its size, so its leaf cannot overflow.
-//! 3. **The extent tree** gains an `EXTENT_ITEM` for the new extent, with
+//!    compression property, or a mount set to compress) has its copy
+//!    stored compressed, as zlib, LZO or zstd in the kernel's framing for
+//!    each and padded to a sector, when that saves a sector (#265); the
+//!    old extent may be compressed or not, since the copy is made from
+//!    its decoded bytes. A compressed extent decodes to at most one
+//!    compression unit (128 KiB), so a longer copy is split into units,
+//!    each a new extent of its own and each compressed or not on its own
+//!    account, as the kernel stores a long range (#357). The first LZO or
+//!    zstd extent on a volume sets that algorithm's incompatible feature
+//!    flag, in the same commit.
+//! 2. **The file's `EXTENT_DATA` item** is pointed at the copy, or at a
+//!    split copy's first unit, in place: the item keeps its size. Each
+//!    further unit gets an item of its own, inserted after it, and a leaf
+//!    that overflows is split.
+//! 3. **The extent tree** gains an `EXTENT_ITEM` for each new extent, with
 //!    an inline `EXTENT_DATA_REF` back to the file, and loses the old
 //!    extent's — once, when two of the write's items named it. An old
 //!    extent with references the write does not replace — a reflink's, or
@@ -80,7 +85,7 @@ use crate::fs::{Filesystem, EXTENT_DATA_KEY};
 use crate::inode::{Inode, INODE_ITEM_KEY, INODE_NODATACOW, INODE_NODATASUM};
 use crate::leaf_edit::OwnedItem;
 use crate::super_write::Commit;
-use crate::transaction::{DataMove, DataWrite, ItemEdit};
+use crate::transaction::{DataAdd, DataMove, DataWrite, ItemEdit};
 use crate::write::window_inside_extent;
 
 /// How many rounds a write's plan has to close over its own bookkeeping.
@@ -105,6 +110,21 @@ struct Target {
     /// a reflink's, or another item of this file outside the range
     /// (#261). It then loses this item's reference and stays.
     shared: bool,
+}
+
+/// One extent of a write's copies: a whole item's copy, or one unit of a
+/// copy split into several (#357).
+struct Piece {
+    /// The index of the item it copies, in the write's targets.
+    target: usize,
+    /// Where in the file it begins.
+    file_offset: u64,
+    /// How much of the file it covers.
+    len: u64,
+    /// The bytes it is stored as.
+    bytes: Vec<u8>,
+    /// Its compression type, as the item records it.
+    compression: u8,
 }
 
 impl Filesystem {
@@ -167,10 +187,18 @@ impl Filesystem {
         // laid over them. Past the end of the file the last sector reads
         // as zeros, and that is what the copy holds there. Then the bytes
         // it is stored as: compressed, for a file that asks for it, when
-        // that saves a sector (#265).
+        // that saves a sector (#265). A compressed extent decodes to at
+        // most one compression unit, so a copy that asks for compression
+        // and is longer than that is split into units, each an extent of
+        // its own, as the kernel stores a long range (#357).
         let algo = self.compression_for(inode)?;
-        let mut encoded: Vec<(Vec<u8>, u8)> = Vec::with_capacity(targets.len());
-        for t in &targets {
+        let unit = if algo == Compression::None {
+            usize::MAX
+        } else {
+            crate::compression::MAX_UNCOMPRESSED
+        };
+        let mut pieces: Vec<Piece> = Vec::with_capacity(targets.len());
+        for (target, t) in targets.iter().enumerate() {
             let size = usize::try_from(t.len)
                 .map_err(|_| Error::UnsupportedFeature(format!("an extent of {} bytes", t.len)))?;
             let mut buf = vec![0u8; size];
@@ -179,12 +207,23 @@ impl Filesystem {
             let to = end.min(t.start + t.len);
             buf[(from - t.start) as usize..(to - t.start) as usize]
                 .copy_from_slice(&data[(from - offset) as usize..(to - offset) as usize]);
-            encoded.push(self.encode_copy(buf, algo));
+            let mut at = t.start;
+            for chunk in buf.chunks(unit) {
+                let (bytes, compression) = self.encode_copy(chunk.to_vec(), algo);
+                pieces.push(Piece {
+                    target,
+                    file_offset: at,
+                    len: chunk.len() as u64,
+                    bytes,
+                    compression,
+                });
+                at += chunk.len() as u64;
+            }
         }
 
-        let lens: Vec<u64> = encoded.iter().map(|(b, _)| b.len() as u64).collect();
+        let lens: Vec<u64> = pieces.iter().map(|p| p.bytes.len() as u64).collect();
         let news = self.find_data_extents(&lens)?;
-        let compression: Vec<u8> = encoded.iter().map(|(_, c)| *c).collect();
+        let compression: Vec<u8> = pieces.iter().map(|p| p.compression).collect();
         // An algorithm the volume has not used before is announced in the
         // superblock that first names an extent of it, as the kernel does:
         // a reader that predates it must refuse the volume, not misread it.
@@ -193,10 +232,51 @@ impl Filesystem {
         } else {
             0
         };
+        let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
+            Error::UnsupportedFeature("the generation counter is exhausted".into())
+        })?;
+
+        // The first piece of each item's copy takes the item's place; each
+        // piece after it is a new extent with an item of its own (#357).
+        let mut moves: Vec<DataMove> = Vec::with_capacity(targets.len());
+        let mut adds: Vec<DataAdd> = Vec::new();
+        let mut edits: Vec<ItemEdit> = Vec::new();
+        for (p, &new) in pieces.iter().zip(&news) {
+            let t = &targets[p.target];
+            let disk_len = p.bytes.len() as u64;
+            if p.file_offset == t.start {
+                moves.push(DataMove {
+                    old: t.extent_start,
+                    old_len: t.extent_len,
+                    old_ref_offset: t.start - t.extent_offset,
+                    new,
+                    len: p.len,
+                    item_len: t.len,
+                    disk_len,
+                    compression: p.compression,
+                    file_offset: t.start,
+                    old_shared: t.shared,
+                });
+            } else {
+                adds.push(DataAdd {
+                    new,
+                    disk_len,
+                    file_offset: p.file_offset,
+                });
+                edits.push(ItemEdit::Put(OwnedItem {
+                    key: DiskKey {
+                        objectid: ino,
+                        key_type: EXTENT_DATA_KEY,
+                        offset: p.file_offset,
+                    },
+                    data: regular_extent_item(generation, new, disk_len, p.len, p.compression),
+                }));
+            }
+        }
         let contents: Vec<(u64, Vec<u8>)> = news
             .iter()
             .copied()
-            .zip(encoded.into_iter().map(|(b, _)| b))
+            .zip(pieces.into_iter().map(|p| p.bytes))
             .collect();
 
         let now = std::time::SystemTime::now()
@@ -214,40 +294,28 @@ impl Filesystem {
         let write = DataWrite {
             root: objectid::FS_TREE,
             ino,
-            moves: targets
-                .iter()
-                .zip(&contents)
-                .zip(&compression)
-                .map(|((t, (new, bytes)), &compression)| DataMove {
-                    old: t.extent_start,
-                    old_len: t.extent_len,
-                    old_ref_offset: t.start - t.extent_offset,
-                    new: *new,
-                    len: t.len,
-                    disk_len: bytes.len() as u64,
-                    compression,
-                    file_offset: t.start,
-                    old_shared: t.shared,
-                })
-                .collect(),
+            moves,
+            adds,
             time: (now.as_secs(), now.subsec_nanos()),
             root_flags: None,
-            edits: Vec::new(),
+            edits,
             default_subvol: None,
             csum_edits: self.csum_edits(&released, &contents, summed)?,
             releases: Vec::new(),
             unrefs: Vec::new(),
         };
 
-        // The fs tree leaves the write edits: the inode item's, and each
-        // extent item's. Everything else the transaction touches follows
-        // from these and from the data moves.
+        // The fs tree leaves the write edits: the inode item's, each
+        // extent item's, and the leaf each added item lands in. Everything
+        // else the transaction touches follows from these and from the
+        // data moves.
         let dirty: Vec<u64> = {
             let reader = self.pool_reader();
             let tree = reader.tree();
             let mut leaves = BTreeSet::new();
             let keys = std::iter::once((INODE_ITEM_KEY, 0))
-                .chain(targets.iter().map(|t| (EXTENT_DATA_KEY, t.start)));
+                .chain(targets.iter().map(|t| (EXTENT_DATA_KEY, t.start)))
+                .chain(write.adds.iter().map(|a| (EXTENT_DATA_KEY, a.file_offset)));
             for (key_type, key_offset) in keys {
                 let key = DiskKey {
                     objectid: ino,
@@ -267,9 +335,6 @@ impl Filesystem {
             leaves.into_iter().collect()
         };
 
-        let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
-            Error::UnsupportedFeature("the generation counter is exhausted".into())
-        })?;
         let plan = self.plan_transaction_closed_with(&dirty, &write, PLAN_ROUNDS)?;
         let blocks = self.render_plan_with(&plan, &write, generation)?;
         let root = self.planned_root(&plan).ok_or_else(|| {
@@ -281,9 +346,8 @@ impl Filesystem {
         // extent another reference keeps is still used.
         let delta = plan.usage_delta(u64::from(self.sb.nodesize))
             + write
-                .moves
-                .iter()
-                .map(|m| i128::from(m.disk_len))
+                .allocations()
+                .map(|(_, disk_len, _)| i128::from(disk_len))
                 .sum::<i128>()
             - released
                 .iter()
@@ -461,7 +525,8 @@ impl Filesystem {
     /// encoding padded to a sector when that saves at least a sector, as
     /// the kernel requires before it keeps a compressed extent; otherwise
     /// the bytes as they are. A copy longer than a compressed extent may
-    /// hold (128 KiB) is never compressed.
+    /// hold (128 KiB) is never compressed; the write splits a copy that
+    /// asks for compression into units before it gets here (#357).
     fn encode_copy(&self, plain: Vec<u8>, algo: Compression) -> (Vec<u8>, u8) {
         let sector = self.sb.sectorsize as usize;
         if plain.len() > crate::compression::MAX_UNCOMPRESSED {
@@ -615,6 +680,30 @@ const COMPRESS_NONE: u8 = 0;
 
 /// The attribute the kernel keeps the compression property in.
 const COMPRESSION_PROPERTY: &[u8] = b"btrfs.compression";
+
+/// A regular `EXTENT_DATA` item referencing the whole of the `len` bytes
+/// stored as `disk_len` at `bytenr`, written in transaction `generation`
+/// (#357).
+fn regular_extent_item(
+    generation: u64,
+    bytenr: u64,
+    disk_len: u64,
+    len: u64,
+    compression: u8,
+) -> Vec<u8> {
+    use crate::fs::file_extent as fe;
+    let mut d = vec![0u8; fe::REGULAR_SIZE];
+    let mut put = |at: usize, v: u64| d[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    put(fe::GENERATION, generation);
+    put(fe::RAM_BYTES, len);
+    put(fe::DISK_BYTENR, bytenr);
+    put(fe::DISK_NUM_BYTES, disk_len);
+    put(fe::OFFSET, 0);
+    put(fe::NUM_BYTES, len);
+    d[fe::COMPRESSION] = compression;
+    d[fe::TYPE] = crate::fs::EXTENT_REGULAR;
+    d
+}
 
 /// The incompatible feature flag an extent compressed with `algo` needs:
 /// LZO's and zstd's have one each, and zlib, which every kernel with
