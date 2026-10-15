@@ -16,6 +16,11 @@
 //! check --check-data-csum` (every on-disk sector against its digest)
 //! read the volume, the kernel's reads give back each file's bytes, and a
 //! kernel scrub reads every extent again.
+//!
+//! A third volume holds files the kernel wrote as one extent several
+//! hundred KiB long. A copy of one is longer than a compression unit, and
+//! is stored compressed as several extents of at most 128 KiB each, as
+//! the kernel stores a long range (#357).
 
 use fs_btrfs::compression::Compression;
 use fs_btrfs::fs::Filesystem;
@@ -31,6 +36,13 @@ use std::sync::Arc;
 /// How long each file is: one extent, well under a compression unit.
 const FILE_LEN: usize = 65536;
 
+/// The most a compressed extent may decode to (`BTRFS_MAX_UNCOMPRESSED`).
+const COMPRESSION_UNIT: u64 = 128 * 1024;
+
+/// How long each long file is: three compression units and five sectors,
+/// so a copy of it is three whole units and a short one.
+const LONG_LEN: usize = 3 * 131_072 + 20_480;
+
 /// `BTRFS_FEATURE_INCOMPAT_COMPRESS_LZO` and `..._COMPRESS_ZSTD`.
 const INCOMPAT_COMPRESS_LZO: u64 = 1 << 3;
 const INCOMPAT_COMPRESS_ZSTD: u64 = 1 << 4;
@@ -42,6 +54,11 @@ impl Scratch {
     /// A fresh volume holding `files`, each 64 KiB the kernel wrote, then
     /// `marks` run in the mount's directory.
     fn new(name: &str, files: &[&str], marks: &str) -> Self {
+        Self::with_len(name, files, FILE_LEN, marks)
+    }
+
+    /// As [`Scratch::new`], each file `len` bytes long.
+    fn with_len(name: &str, files: &[&str], len: usize, marks: &str) -> Self {
         let dir = PathBuf::from(temp_path!("{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         let image = dir.join("fs.img");
@@ -59,7 +76,7 @@ impl Scratch {
         );
         let mut script = String::from("cd \"$MNT\"\n");
         for file in files {
-            script.push_str(&format!("head -c {FILE_LEN} /dev/urandom > {file}\n"));
+            script.push_str(&format!("head -c {len} /dev/urandom > {file}\n"));
         }
         script.push_str("sync\n");
         script.push_str(marks);
@@ -86,7 +103,13 @@ fn mount_rw(image: &Path) -> Filesystem {
 
 /// Text a compressor shrinks several times over.
 fn text() -> Vec<u8> {
-    b"a line of very compressible text, ".repeat(2000)[..FILE_LEN].to_vec()
+    text_of(FILE_LEN)
+}
+
+/// `len` bytes of that text.
+fn text_of(len: usize) -> Vec<u8> {
+    let line = b"a line of very compressible text, ";
+    line.repeat(len / line.len() + 1)[..len].to_vec()
 }
 
 /// Bytes no compressor shrinks: xorshift64 output.
@@ -126,6 +149,34 @@ fn extent_compression(dump: &str) -> BTreeMap<u64, Vec<u8>> {
                 panic!("dump-tree printed a compression that is not a byte: {line}")
             });
         out.entry(ino).or_default().push(byte);
+    }
+    out
+}
+
+/// Every regular file extent in `dump` (`dump-tree` of the fs tree): its
+/// inode, and how much of the file its item covers (`num_bytes`, which
+/// `dump-tree` prints as the `nr` after `extent data offset`).
+fn extent_lengths(dump: &str) -> BTreeMap<u64, Vec<u64>> {
+    let mut out: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    let mut inode = None;
+    for line in dump.lines() {
+        if let Some(key) = line.split("key (").nth(1) {
+            inode = key
+                .contains(" EXTENT_DATA ")
+                .then(|| key.split(' ').next().and_then(|n| n.parse::<u64>().ok()))
+                .flatten();
+            continue;
+        }
+        let (Some(ino), Some(rest)) = (inode, line.split("extent data offset ").nth(1)) else {
+            continue;
+        };
+        let len = rest
+            .split(" nr ")
+            .nth(1)
+            .and_then(|n| n.split(' ').next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("dump-tree printed an extent with no length: {line}"));
+        out.entry(ino).or_default().push(len);
     }
     out
 }
@@ -382,4 +433,69 @@ fn a_mount_set_to_compress_writes_lzo_and_zstd_and_sets_their_feature_flags() {
 
     lzo.extend(zstd);
     judge(&image, &inodes, &lzo);
+}
+
+/// A copy longer than one compression unit is stored compressed as
+/// several extents of at most 128 KiB each, one item per extent, as the
+/// kernel stores a long range (#357). Each file was written by the kernel
+/// uncompressed, as one extent several hundred KiB long, and then asked
+/// for zlib (`chattr +c`), LZO or zstd (the compression property).
+#[test]
+fn a_copy_longer_than_a_compression_unit_is_compressed_in_units() {
+    let files = ["long-zlib.bin", "long-lzo.bin", "long-zstd.bin"];
+    let scratch = Scratch::with_len(
+        "compress-long",
+        &files,
+        LONG_LEN,
+        "chattr +c long-zlib.bin\n\
+         btrfs property set long-lzo.bin compression lzo\n\
+         btrfs property set long-zstd.bin compression zstd",
+    );
+    let image = scratch.image();
+
+    let mut fs = mount_rw(&image);
+    let before = extent_lengths(&dump_tree(&image, "5"));
+    for name in files {
+        let ino = fs.lookup_path(&format!("/{name}")).unwrap().ino;
+        let lengths = before.get(&ino).cloned().unwrap_or_default();
+        assert!(
+            lengths.iter().any(|&len| len > COMPRESSION_UNIT),
+            "the kernel wrote {name} as extents of {lengths:?} bytes, none longer than a \
+             compression unit, so its copy would not be either"
+        );
+    }
+
+    let mut cases: Vec<Case> = [
+        ("long-zlib.bin", 1),
+        ("long-lzo.bin", 2),
+        ("long-zstd.bin", 3),
+    ]
+    .into_iter()
+    .map(|(name, compression)| Case {
+        name,
+        bytes: text_of(LONG_LEN),
+        compression,
+    })
+    .collect();
+    let inodes = write_cases(&mut fs, &mut cases);
+    drop(fs);
+
+    let after = extent_lengths(&dump_tree(&image, "5"));
+    for case in &cases {
+        let lengths = after.get(&inodes[case.name]).cloned().unwrap_or_default();
+        assert!(
+            lengths.len() >= 4 && lengths.iter().all(|&len| len <= COMPRESSION_UNIT),
+            "{} is stored as extents of {lengths:?} bytes; a copy of {LONG_LEN} bytes asking \
+             for compression is four extents of at most {COMPRESSION_UNIT}",
+            case.name
+        );
+        assert_eq!(
+            lengths.iter().sum::<u64>(),
+            LONG_LEN as u64,
+            "{}'s extents do not cover the file exactly once: {lengths:?}",
+            case.name
+        );
+    }
+
+    judge(&image, &inodes, &cases);
 }

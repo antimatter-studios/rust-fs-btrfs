@@ -11,5 +11,4 @@
   kernel's `compress=` mount option. A copy is kept compressed only when
   that saves a sector, a `nodatasum` file is never compressed, and the
   first LZO or zstd extent on a volume sets the feature flag announcing
-  it, in the same commit. A copy longer than one compression unit
-  (128 KiB) is still stored uncompressed (#357).
+  it, in the same commit.

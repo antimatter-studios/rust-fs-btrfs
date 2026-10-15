@@ -117,6 +117,7 @@ impl Filesystem {
             root: crate::chunk::objectid::FS_TREE,
             ino,
             moves: Vec::new(),
+            adds: Vec::new(),
             time: now,
             root_flags: None,
             edits,
