@@ -195,6 +195,42 @@ fn a_nested_subvolume_carries_its_parents_path() {
     assert_eq!(inner.parent, sub.id, "and its parent is that subvolume");
 }
 
+/// A subvolume inside an ordinary directory carries that directory in its
+/// path (#362).
+///
+/// The fixture makes `nested` inside the directory `top` of the default
+/// subvolume, and `btrfs subvolume list` prints it as `top/nested`. A path
+/// built from the chain of subvolume names alone reports `nested`, which
+/// names nothing on the filesystem: the reference records the directory
+/// the subvolume sits in, and that directory's own path has to be read
+/// out of the parent's tree.
+#[test]
+fn a_subvolume_in_an_ordinary_directory_carries_that_directory() {
+    let fs = mount();
+    let subs = fs.subvolumes().expect("list");
+
+    let nested = subs
+        .iter()
+        .find(|s| s.name == b"nested")
+        .expect("the fixture has a subvolume inside the directory `top`");
+    assert_eq!(
+        nested.path, "top/nested",
+        "the path runs through the directory the subvolume sits in"
+    );
+    assert_eq!(
+        nested.parent, FS_TREE_OBJECTID,
+        "and its parent is the default subvolume, which holds that directory"
+    );
+    assert!(
+        reference()
+            .iter()
+            .any(|r| r.id == nested.id && r.path == nested.path),
+        "btrfs-progs lists subvolume {} at {:?}",
+        nested.id,
+        nested.path
+    );
+}
+
 /// Snapshots are distinguished from subvolumes, and read-only ones from
 /// writable ones.
 ///
@@ -456,6 +492,7 @@ fn a_path_crosses_into_subvolumes() {
         ("/sub/inner/c.txt", "in sub/inner\n"),
         ("/snap/b.txt", "in sub\n"),
         ("/rosnap/b.txt", "in sub\n"),
+        ("/top/nested/d.txt", "in top/nested\n"),
     ] {
         let got = fs.read_path(path).unwrap_or_else(|e| panic!("{path}: {e}"));
         assert_eq!(String::from_utf8_lossy(&got), want, "{path}");
