@@ -584,9 +584,21 @@ fn an_extent_a_reflink_or_another_item_shares_is_copied_and_keeps_its_other_refe
 /// `holey.bin`: 64 KiB of data, a 64 KiB hole the kernel leaves with no
 /// item at all on a `no-holes` volume (mkfs's default), then 64 KiB more,
 /// written in one transaction so the hole is the file's only gap.
+///
+/// `control.bin` is made the same way, and then the kernel itself writes
+/// the same 9000 bytes of 0xc3 at offset 70000 into its hole, in a later
+/// transaction. It is the reference the driver's write is held to: the
+/// `nbytes`, bytes and extent layout the kernel produced for the same
+/// write into the same hole.
 const HOLE_FILL: &str = "head -c 65536 /dev/urandom > \"$MNT/holey.bin\"\n\
      dd if=/dev/urandom of=\"$MNT/holey.bin\" bs=65536 seek=2 count=1 conv=notrunc \
      status=none\n\
+     head -c 65536 /dev/urandom > \"$MNT/control.bin\"\n\
+     dd if=/dev/urandom of=\"$MNT/control.bin\" bs=65536 seek=2 count=1 conv=notrunc \
+     status=none\n\
+     sync\n\
+     head -c 9000 /dev/zero | tr '\\000' '\\303' \
+     | dd of=\"$MNT/control.bin\" bs=1 seek=70000 conv=notrunc status=none\n\
      sync";
 
 /// A write into a hole of an existing file allocates a new extent,
@@ -602,6 +614,7 @@ const HOLE_FILL: &str = "head -c 65536 /dev/urandom > \"$MNT/holey.bin\"\n\
 #[test]
 fn a_write_into_a_hole_adds_an_extent_the_checker_and_kernel_accept() {
     const HOLEY: &str = "holey.bin";
+    const CONTROL: &str = "control.bin";
     let scratch = Scratch::new("cow-write-hole", HOLE_FILL);
     let image = scratch.image();
     let before = kernel_map(&image, "before the hole write", &[HOLEY]);
@@ -626,7 +639,18 @@ fn a_write_into_a_hole_adds_an_extent_the_checker_and_kernel_accept() {
         "{HOLEY}'s hole does not read as zeros"
     );
 
+    // What the kernel made of the same write into the same hole.
+    let control_ino = ino_of(&fs, CONTROL);
+    let control = fs.read_inode(control_ino).unwrap();
+    assert_eq!(control.size, 196_608, "{CONTROL} is not the size made");
+    let control_bytes = fs.read_file(control_ino).unwrap();
+
     let (offset, bytes) = (70_000u64, vec![0xc3u8; 9000]);
+    assert_eq!(
+        &control_bytes[offset as usize..offset as usize + bytes.len()],
+        &bytes[..],
+        "the kernel's control write did not land where this test writes"
+    );
     let generation = fs.superblock().generation;
     let n = fs
         .write(ino, offset, &bytes)
@@ -643,11 +667,21 @@ fn a_write_into_a_hole_adds_an_extent_the_checker_and_kernel_accept() {
         inode.size, 196_608,
         "a write inside the file moved its size"
     );
-    // [70000, 79000) touches the sectors from 65536 to 81920: four.
+    // The kernel, not this test's arithmetic, says how many sectors the
+    // write allocates: its own write into the same hole of `control.bin`.
+    assert!(
+        inode.nbytes > 131_072 && inode.nbytes.is_multiple_of(4096),
+        "nbytes did not grow by whole sectors: {}",
+        inode.nbytes
+    );
     assert_eq!(
-        inode.nbytes,
-        131_072 + 16_384,
-        "nbytes did not grow by the four sectors the write allocates"
+        inode.nbytes, control.nbytes,
+        "nbytes is not what the kernel's own write into the same hole gave {CONTROL}"
+    );
+    assert_eq!(
+        expected[65536..131_072],
+        control_bytes[65536..131_072],
+        "the hole does not read as the kernel's control write left it"
     );
     assert_eq!(
         fs.read_file(ino).unwrap(),
@@ -663,7 +697,32 @@ fn a_write_into_a_hole_adds_an_extent_the_checker_and_kernel_accept() {
         "btrfs scrub start -B \"$MNT\" >/dev/null",
     );
 
-    let after = kernel_map(&image, "after the hole write", &[HOLEY]);
+    let blocks = guest_kernel_read_ok(
+        &image.to_string_lossy(),
+        "the kernel's nbytes after a write into a hole",
+        &format!("stat -c '%b %B' \"$MNT/{HOLEY}\" \"$MNT/{CONTROL}\""),
+    );
+    let blocks: Vec<u64> = blocks
+        .lines()
+        .map(|line| {
+            let words: Vec<u64> = line
+                .split_whitespace()
+                .map(|w| {
+                    w.parse()
+                        .unwrap_or_else(|e| panic!("stat printed {line:?}: {e}"))
+                })
+                .collect();
+            assert_eq!(words.len(), 2, "stat printed {line:?}");
+            words[0] * words[1]
+        })
+        .collect();
+    assert_eq!(
+        blocks,
+        vec![inode.nbytes, control.nbytes],
+        "the kernel's stat of {HOLEY} and {CONTROL} disagrees with nbytes"
+    );
+
+    let after = kernel_map(&image, "after the hole write", &[HOLEY, CONTROL]);
     assert_eq!(
         after[HOLEY].0,
         sha256_hex(&expected),
@@ -674,6 +733,17 @@ fn a_write_into_a_hole_adds_an_extent_the_checker_and_kernel_accept() {
         3,
         "the kernel does not see a new extent where the hole was: {:?}",
         after[HOLEY].1
+    );
+    assert_eq!(
+        after[HOLEY].1.iter().map(|m| m.logical).collect::<Vec<_>>(),
+        after[CONTROL]
+            .1
+            .iter()
+            .map(|m| m.logical)
+            .collect::<Vec<_>>(),
+        "{HOLEY}'s extents do not begin where the kernel's own write put {CONTROL}'s: {:?} {:?}",
+        after[HOLEY].1,
+        after[CONTROL].1
     );
     for (old, new) in before[HOLEY]
         .1
