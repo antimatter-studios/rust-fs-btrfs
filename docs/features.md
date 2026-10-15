@@ -112,7 +112,7 @@ Linux kernel in the guest.
 | Device remove, replace; balance; defragment | Not supported | | #268, #303, #304, #305 | |
 | Trim: every free run of every block group handed to a caller's discard, on every copy | Supported; RAID5/6 groups refused | Unreleased (#305) | | `trim_oracle.rs` |
 | RAID5/6 writes | Not supported | | #299 | |
-| Label, written to every superblock copy | Supported | 0.9.0 (#264) | | `cli_label_kernel.rs` |
+| Label, written to every superblock copy; a primary recording another physical offset is refused before any write | Supported | 0.9.0 (#264); address refusal Unreleased (#370) | | `cli_label_kernel.rs`, `super_write` unit regression |
 | Resize, library and C ABI (`resize`, `fs_btrfs_resize`): one device, grown into a larger device or shrunk when no chunk lies past the end | Supported; moving chunks and pools refused | Unreleased (#264) | | `resize_kernel.rs` |
 | Resize, `fs.btrfs resize`: a size, `+`/`-` a change, or `max`; an image file made longer before a grow, cut after a shrink (`--force`), and given its length back when the resize is refused | Supported; a chunk past the new end (a balance) and pools refused | Unreleased (#264) | | `cli_resize_kernel.rs`, `tests/cli/test-blocked.sh` |
 

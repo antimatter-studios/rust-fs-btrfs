@@ -350,7 +350,7 @@ pub fn set_label(dev: &dyn fs_core::BlockDevice, label: &str) -> Result<()> {
     const COPIES: [u64; 3] = [64 << 10, 64 << 20, 256 << 30];
     let mut primary = vec![0u8; SUPERBLOCK_SIZE];
     dev.read_at(COPIES[0], &mut primary)?;
-    let sb = Superblock::parse(&primary)?;
+    let sb = Superblock::parse_at(&primary, COPIES[0])?;
     if sb.num_devices > 1 {
         return Err(Error::UnsupportedFeature(format!(
             "this filesystem spans {} devices, and every one of them carries the label",
