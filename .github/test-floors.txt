@@ -122,7 +122,7 @@ snapshot_shared_write     1
 space_cache_v1_kernel     2
 split_oracle              4
 subvol_default_kernel     1
-subvol_oracle             8
+subvol_oracle             12
 subvol_readonly_kernel    1
 superblock_mirrors        4
 super_flags_refusals      3
