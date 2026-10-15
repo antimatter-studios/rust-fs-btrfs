@@ -580,3 +580,109 @@ fn an_extent_a_reflink_or_another_item_shares_is_copied_and_keeps_its_other_refe
         "btrfs scrub start -B \"$MNT\" >/dev/null",
     );
 }
+
+/// `holey.bin`: 64 KiB of data, a 64 KiB hole the kernel leaves with no
+/// item at all on a `no-holes` volume (mkfs's default), then 64 KiB more,
+/// written in one transaction so the hole is the file's only gap.
+const HOLE_FILL: &str = "head -c 65536 /dev/urandom > \"$MNT/holey.bin\"\n\
+     dd if=/dev/urandom of=\"$MNT/holey.bin\" bs=65536 seek=2 count=1 conv=notrunc \
+     status=none\n\
+     sync";
+
+/// A write into a hole of an existing file allocates a new extent,
+/// inserts an `EXTENT_DATA` item for it and moves the inode's `nbytes`
+/// by the sectors it adds, leaving `size` alone (#261).
+///
+/// The write starts and ends partway through a sector, so the extent
+/// holds zeros before and after the bytes written, which is what the
+/// hole read as. `btrfs check --check-data-csum` sees an extent with no
+/// record, a record with no item, a wrong `nbytes` or a missing digest;
+/// the kernel reads every byte back, and `filefrag` reports an extent
+/// where the hole was.
+#[test]
+fn a_write_into_a_hole_adds_an_extent_the_checker_and_kernel_accept() {
+    const HOLEY: &str = "holey.bin";
+    let scratch = Scratch::new("cow-write-hole", HOLE_FILL);
+    let image = scratch.image();
+    let before = kernel_map(&image, "before the hole write", &[HOLEY]);
+    assert_eq!(
+        before[HOLEY].1.len(),
+        2,
+        "{HOLEY} must be two extents around one hole for this to test anything: {:?}",
+        before[HOLEY].1
+    );
+
+    let mut fs = mount_rw(&image);
+    let ino = ino_of(&fs, HOLEY);
+    let inode = fs.read_inode(ino).unwrap();
+    assert_eq!(inode.size, 196_608, "{HOLEY} is not the size made");
+    assert_eq!(
+        inode.nbytes, 131_072,
+        "{HOLEY} must hold 128 KiB, its hole none"
+    );
+    let mut expected = fs.read_file(ino).unwrap();
+    assert!(
+        expected[65536..131_072].iter().all(|&b| b == 0),
+        "{HOLEY}'s hole does not read as zeros"
+    );
+
+    let (offset, bytes) = (70_000u64, vec![0xc3u8; 9000]);
+    let generation = fs.superblock().generation;
+    let n = fs
+        .write(ino, offset, &bytes)
+        .unwrap_or_else(|e| panic!("writing {} bytes into {HOLEY}'s hole: {e}", bytes.len()));
+    assert_eq!(n, bytes.len(), "a short write");
+    expected[offset as usize..offset as usize + bytes.len()].copy_from_slice(&bytes);
+    assert_eq!(
+        fs.superblock().generation,
+        generation + 1,
+        "one committed transaction"
+    );
+    let inode = fs.read_inode(ino).unwrap();
+    assert_eq!(
+        inode.size, 196_608,
+        "a write inside the file moved its size"
+    );
+    // [70000, 79000) touches the sectors from 65536 to 81920: four.
+    assert_eq!(
+        inode.nbytes,
+        131_072 + 16_384,
+        "nbytes did not grow by the four sectors the write allocates"
+    );
+    assert_eq!(
+        fs.read_file(ino).unwrap(),
+        expected,
+        "{HOLEY} reads back differently through this driver after the write"
+    );
+    drop(fs);
+
+    assert_btrfs_check_clean(&image, "after a write into a hole");
+    guest_kernel_read_ok(
+        &image.to_string_lossy(),
+        "scrub after a write into a hole",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+
+    let after = kernel_map(&image, "after the hole write", &[HOLEY]);
+    assert_eq!(
+        after[HOLEY].0,
+        sha256_hex(&expected),
+        "the kernel reads back different bytes from {HOLEY} than were written"
+    );
+    assert_eq!(
+        after[HOLEY].1.len(),
+        3,
+        "the kernel does not see a new extent where the hole was: {:?}",
+        after[HOLEY].1
+    );
+    for (old, new) in before[HOLEY]
+        .1
+        .iter()
+        .zip([&after[HOLEY].1[0], &after[HOLEY].1[2]])
+    {
+        assert_eq!(
+            old.physical, new.physical,
+            "an extent the write did not touch moved"
+        );
+    }
+}
