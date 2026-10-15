@@ -57,8 +57,9 @@ pub const VERITY_MERKLE_ITEM_KEY: u8 = 37;
 pub const INODE_RO_VERITY: u64 = 1 << 32;
 
 /// Size of `struct btrfs_verity_descriptor_item`: `size`, two reserved
-/// `u64`s and the `encryption` byte.
-pub const DESCRIPTOR_ITEM_SIZE: usize = 33;
+/// `u64`s and the `encryption` byte, packed without trailing padding.
+/// The kernel-made oracle fixture stores all six headers as 25 bytes.
+pub const DESCRIPTOR_ITEM_SIZE: usize = 25;
 
 /// Size of `struct fsverity_descriptor` without its signature.
 pub const DESCRIPTOR_SIZE: usize = 256;

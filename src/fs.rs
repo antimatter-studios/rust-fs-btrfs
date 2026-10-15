@@ -2616,10 +2616,10 @@ impl Filesystem {
                 )))
             }
         };
-        if head[32] != 0 {
+        if head[24] != 0 {
             return Err(Error::UnsupportedFeature(format!(
                 "inode {ino}'s fs-verity descriptor is encrypted ({})",
-                head[32]
+                head[24]
             )));
         }
         // The kernel's own ceiling on a descriptor and its signature.

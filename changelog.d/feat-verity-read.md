@@ -11,4 +11,5 @@
   SHA-512, salted or not. `tests/verity_oracle.rs` holds each to what the
   kernel reports for a volume it sealed, and has a tampered block refused
   where the kernel refuses it. A volume with verity files is still refused
-  read-write.
+  read-write. The packed Btrfs descriptor header is read as the 25 bytes
+  stored by the kernel, including its encryption byte at offset 24.

@@ -60,7 +60,7 @@ suite.
 | A filesystem sprouted from a seed, read across the seed and the sprout | Supported, read-only | Unreleased (#270) | | `seed_oracle.rs` |
 | A block group tree volume (`-O block-group-tree`) | Supported, read-only; refused read-write, since block group usage is updated in the extent tree | Unreleased (#270) | | `block_group_tree_oracle.rs` |
 | A volume with simple quotas (`-O squota`) | Supported, read-only; refused read-write, since extents would be allocated without their owner references. Extents with owner references, which a 6.7+ kernel writes, have no fixture yet | Unreleased (#270) | #270 | `simple_quota_oracle.rs` |
-| fs-verity files (`fsverity enable`): every block read checked against the file's Merkle tree and refused when it does not verify, as the kernel refuses it; the descriptor, digest (`fsverity measure`) and Merkle tree read back (`verity`, `verity_merkle_tree`) | Supported, read-only; a volume with verity files is refused read-write, since a data write would leave a sealed file's tree stale. A signed descriptor's signature is read but not checked | Unreleased (#270) | | `verity_oracle.rs` |
+| fs-verity files (`fsverity enable`): every block read checked against the file's Merkle tree and refused when it does not verify, as the kernel refuses it; the descriptor, digest (`fsverity measure`) and Merkle tree read back (`verity`, `verity_merkle_tree`) | Supported, read-only; a volume with verity files is refused read-write, since a data write would leave a sealed file's tree stale. A signed descriptor's signature is read but not checked | Unreleased (#356) | #270 | `verity_oracle.rs` |
 | Fuzzed decoders | Supported | 0.7.0 | | `fuzz_decoders.rs` |
 
 ## Checking
