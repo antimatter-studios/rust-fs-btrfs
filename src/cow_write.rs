@@ -62,8 +62,8 @@
 //!   root, or a full one that cannot be split (its parent node has no
 //!   room for another pointer): removing a leaf and splitting a node are
 //!   not written yet;
-//! - a write that **grows** the file, or lands in a **hole**: both
-//!   allocate where the file has no extent item to repoint;
+//! - a write that **grows** the file: it allocates past the end, where
+//!   the size and the last item both move;
 //! - an **inline** or **preallocated** extent: each changes the item's
 //!   kind, not only where it points;
 //! - an extent a **snapshot** may share — one from at or before the last
@@ -110,6 +110,10 @@ struct Target {
     /// a reflink's, or another item of this file outside the range
     /// (#261). It then loses this item's reference and stays.
     shared: bool,
+    /// A span of a hole, whole sectors of it, which has no item or
+    /// extent to replace: its copy is a new extent with an item of its
+    /// own, and adds its length to the inode's `nbytes` (#261).
+    hole: bool,
 }
 
 /// One extent of a write's copies: a whole item's copy, or one unit of a
@@ -244,7 +248,7 @@ impl Filesystem {
         for (p, &new) in pieces.iter().zip(&news) {
             let t = &targets[p.target];
             let disk_len = p.bytes.len() as u64;
-            if p.file_offset == t.start {
+            if p.file_offset == t.start && !t.hole {
                 moves.push(DataMove {
                     old: t.extent_start,
                     old_len: t.extent_len,
@@ -285,11 +289,36 @@ impl Filesystem {
         // Each extent given up, once, however many of the write's items
         // named it: not one another reference still reads.
         let mut released: Vec<(u64, u64)> = Vec::new();
-        for t in targets.iter().filter(|t| !t.shared) {
+        for t in targets.iter().filter(|t| !t.shared && !t.hole) {
             let span = (t.extent_start, t.extent_start + t.extent_len);
             if !released.contains(&span) {
                 released.push(span);
             }
+        }
+        // A hole filled adds what it now covers to the inode's `nbytes`,
+        // and the inode item says so; the times move as for any write.
+        let filled: u64 = targets.iter().filter(|t| t.hole).map(|t| t.len).sum();
+        if filled > 0 {
+            use crate::inode::offsets as io;
+            let mut raw = self.raw_inode(ino)?;
+            let nbytes = inode.nbytes.checked_add(filled).ok_or_else(|| {
+                Error::UnsupportedFeature(format!("inode {ino}: nbytes overflows"))
+            })?;
+            raw[io::NBYTES..io::NBYTES + 8].copy_from_slice(&nbytes.to_le_bytes());
+            crate::namespace::touch(
+                &mut raw,
+                generation,
+                (now.as_secs(), now.subsec_nanos()),
+                &[io::CTIME, io::MTIME],
+            );
+            edits.push(ItemEdit::Put(OwnedItem {
+                key: DiskKey {
+                    objectid: ino,
+                    key_type: INODE_ITEM_KEY,
+                    offset: 0,
+                },
+                data: raw,
+            }));
         }
         let write = DataWrite {
             root: objectid::FS_TREE,
@@ -410,16 +439,42 @@ impl Filesystem {
         let mut out = Vec::new();
         // Each extent's reference count, from its record.
         let mut refs_of: BTreeMap<u64, u64> = BTreeMap::new();
+        let sector = u64::from(self.sb.sectorsize);
         let mut pos = offset;
         while pos < end {
             let Some(piece) = pieces
                 .iter()
                 .find(|p| pos >= p.start && pos < p.start + p.len)
             else {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino}: offset {pos} is a hole, and filling it adds an extent \
-                     rather than replacing one"
-                )));
+                // A hole: whole sectors of it, from the sector the write
+                // starts in to the one it ends in, never past the next
+                // item. The sectors read as zeros, and the copy keeps them.
+                let start = (pos / sector * sector).max(
+                    pieces
+                        .iter()
+                        .map(|p| p.start + p.len)
+                        .filter(|&e| e <= pos)
+                        .max()
+                        .unwrap_or(0),
+                );
+                let next = pieces
+                    .iter()
+                    .map(|p| p.start)
+                    .filter(|&s| s > pos)
+                    .min()
+                    .unwrap_or(u64::MAX);
+                let stop = end.div_ceil(sector).saturating_mul(sector).min(next);
+                out.push(Target {
+                    start,
+                    len: stop - start,
+                    extent_start: 0,
+                    extent_len: 0,
+                    extent_offset: 0,
+                    shared: false,
+                    hole: true,
+                });
+                pos = stop;
+                continue;
             };
             // A compressed extent's window is in its decoded bytes, which
             // reading it already bounds by `ram_bytes`; on disk the whole
@@ -459,6 +514,7 @@ impl Filesystem {
                 extent_len,
                 extent_offset: piece.ref_offset,
                 shared: false,
+                hole: false,
             });
             refs_of.insert(piece.extent_start, refs);
             pos = piece.start + piece.len;
@@ -467,10 +523,10 @@ impl Filesystem {
         // items. More items than its record counts is a record that does
         // not describe this file, and nothing is written over it.
         let mut ours: BTreeMap<u64, u64> = BTreeMap::new();
-        for t in &out {
+        for t in out.iter().filter(|t| !t.hole) {
             *ours.entry(t.extent_start).or_default() += 1;
         }
-        for t in &mut out {
+        for t in out.iter_mut().filter(|t| !t.hole) {
             let (items, refs) = (ours[&t.extent_start], refs_of[&t.extent_start]);
             if items > refs {
                 return Err(Error::UnsupportedFeature(format!(
