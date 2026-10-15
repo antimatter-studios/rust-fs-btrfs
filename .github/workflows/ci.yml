@@ -171,6 +171,8 @@ jobs:
             echo "::error::test-disks/ has images; this job must prove the unit tier needs none"
             exit 1
           fi
+      - name: Shell guard prerequisites
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ripgrep
       - name: chore lint
         run: chore lint
       - name: chore test:scripts
