@@ -36,8 +36,9 @@ name: CI
 #                request, not the release. What btrfs-progs and the kernel
 #                make of the tools' work is judged in the oracle and kernel
 #                tiers (tests/cli_*.rs), where the VM is.
-#   ci-ok        the one required check: green only when every job above
-#                ran and succeeded (failed, cancelled OR skipped fails it).
+#   ci-ok        the one required check: all quick jobs must succeed on
+#                every event; all full jobs must also succeed in the queue.
+#                Only the listed full jobs may be skipped on quick runs.
 #
 # WHAT THIS REPLACED, AND WHY IT MATTERS MORE HERE THAN ANYWHERE ELSE.
 # The old `kernel-gate` job was a list of fifty-odd steps: it installed
@@ -86,6 +87,8 @@ on:
   # queue reads `ci-ok` only from a workflow that triggers here. That run,
   # not "branches must be up to date", is what keeps main to trees CI ran.
   merge_group:
+  # Explicit full-suite evidence for an oracle regression before it is queued.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -99,14 +102,11 @@ env:
   CHORE_VERSION: "0.11.0"
 
 jobs:
-  # Does this change need the full pipeline? rust-fs-core's
-  # scripts/code-changed.sh reads the change's paths and says false only when
-  # every one is documentation. The change is the pull request's diff, the
-  # merge queue group's (its base_sha to its head_sha: what the queue is about
-  # to land), or a push to main's (before to after); a tag or a push it cannot
-  # diff runs everything. The fixture build, and with it every job that needs
-  # its images, runs only when the answer is true, and ci-ok accepts their
-  # skip when, and only when, it is false.
+  # Pull requests, including every stack layer, run the quick checks. The
+  # merge queue runs the complete suite on the tree it will land. A push to
+  # main does not repeat that expensive run. Tags and manual dispatches run
+  # everything too. The existing `code` output is the full-pipeline decision;
+  # ci-ok accepts only the named full jobs' intentional skips on quick runs.
   changes:
     name: changes (does this need the full pipeline?)
     runs-on: ubuntu-24.04
@@ -125,34 +125,14 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           REF: ${{ github.ref }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
-          MQ_BASE: ${{ github.event.merge_group.base_sha }}
-          MQ_HEAD: ${{ github.event.merge_group.head_sha }}
-          PUSH_BEFORE: ${{ github.event.before }}
-          PUSH_AFTER: ${{ github.event.after }}
         run: |
           set -euo pipefail
-          range=
+          code=true
           case "$EVENT" in
-            pull_request) range="$PR_BASE...$PR_HEAD" ;;
-            merge_group) range="$MQ_BASE...$MQ_HEAD" ;;
-            push)
-              case "$REF" in
-                refs/heads/*)
-                  if [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != 0000000000000000000000000000000000000000 ] &&
-                    git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
-                    range="$PUSH_BEFORE...$PUSH_AFTER"
-                  fi ;;
-              esac ;;
+            pull_request) code=false ;;
+            push) [ "$REF" != refs/heads/main ] || code=false ;;
           esac
-          if [ -n "$range" ]; then
-            git diff --name-only "$range" | tee changed.txt
-            code="$(bash ../rust-fs-core/scripts/code-changed.sh < changed.txt)"
-          else
-            code=true
-          fi
-          echo "code=$code ($EVENT${range:+ $range})"
+          echo "full pipeline: $code ($EVENT $REF)"
           echo "code=$code" >> "$GITHUB_OUTPUT"
 
   unit:
@@ -191,6 +171,10 @@ jobs:
             echo "::error::test-disks/ has images; this job must prove the unit tier needs none"
             exit 1
           fi
+      - name: chore lint
+        run: chore lint
+      - name: chore test:scripts
+        run: chore test:scripts
       - name: chore test:unit
         # The DEBUG profile, which is the point: overflow-checks are on
         # here and off in release, and the task sets
@@ -612,14 +596,14 @@ jobs:
       - name: Every job ran and succeeded
         env:
           NEEDS: ${{ toJSON(needs) }}
-          # false only for a change to documentation alone: then, and only
-          # then, a skipped job is not a failed one.
           CODE: ${{ needs.changes.outputs.code }}
+          FULL_JOBS: '["fixtures", "test", "test-arm64", "suite-in-vm", "cli"]'
         run: |
           set -euo pipefail
+          case "$CODE" in true|false) ;; *) echo "::error::missing full-pipeline decision"; exit 1 ;; esac
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
-          echo "code changed: $CODE"
-          bad="$(echo "$NEEDS" | jq -r --arg code "$CODE" '[to_entries[] | select(.value.result != "success" and ($code != "false" or .value.result != "skipped")) | .key] | join(", ")')"
+          echo "full pipeline: $CODE"
+          bad="$(echo "$NEEDS" | jq -r --arg code "$CODE" --argjson full "$FULL_JOBS" '[to_entries[] | select(.value.result != "success" and (($code == "false" and .value.result == "skipped" and (.key as $job | $full | index($job) != null)) | not)) | .key] | join(", ")')"
           if [ -n "$bad" ]; then
             echo "::error::not green: $bad (failed, cancelled or skipped)"
             exit 1
