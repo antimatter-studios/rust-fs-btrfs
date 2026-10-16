@@ -227,7 +227,7 @@ vars:
   FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
   # It is also the version of every family script the tiers run in place
   # from that checkout, so moving it is how they are upgraded.
-  FS_CORE_REF: v0.3.12
+  FS_CORE_REF: v0.3.13
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   LINUX_HARNESS_REF: v0.2.0
 
@@ -806,6 +806,7 @@ tasks:
       - bash ../rust-fs-core/scripts/family-check.sh
       - bash ../rust-fs-core/scripts/agents-core-check.sh
       - bash ../rust-fs-core/scripts/changelog-check.sh
+      - bash ../rust-fs-core/scripts/features-check.sh
       - cargo fmt --check
       # `--features cli`: the command-line tools' target requires it, and
       # clippy silently leaves out a target whose features are off.
