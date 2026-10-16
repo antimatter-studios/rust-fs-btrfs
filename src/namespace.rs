@@ -285,6 +285,7 @@ impl Filesystem {
             },
             releases,
             unrefs,
+            ..Default::default()
         };
         self.commit_write(write, generation)
     }
@@ -399,6 +400,7 @@ impl Filesystem {
             },
             releases,
             unrefs,
+            ..Default::default()
         };
         self.commit_write(write, generation)
     }
@@ -754,6 +756,7 @@ impl Filesystem {
             csum_edits: Vec::new(),
             releases: Vec::new(),
             unrefs: Vec::new(),
+            ..Default::default()
         };
         self.commit_write(write, generation)
     }
@@ -775,6 +778,13 @@ impl Filesystem {
                 for edit in &write.csum_edits {
                     leaves.insert(tree.descend(root, &edit.key())?.header.bytenr);
                 }
+            }
+            for (t, edit) in &write.tree_edits {
+                leaves.insert(
+                    tree.descend(self.edit_root(*t)?, &edit.key())?
+                        .header
+                        .bytenr,
+                );
             }
             leaves.into_iter().collect()
         };
@@ -829,7 +839,7 @@ impl Filesystem {
 
     /// `parent`, checked to be a directory with no entry `name`, and
     /// `name` checked to be one a directory can hold.
-    fn writable_parent(&self, parent: u64, name: &[u8]) -> Result<Inode> {
+    pub(crate) fn writable_parent(&self, parent: u64, name: &[u8]) -> Result<Inode> {
         check_name(name)?;
         let dir = self.read_inode(parent)?;
         if !dir.is_dir() {
@@ -866,7 +876,7 @@ impl Filesystem {
     }
 
     /// One past the highest `DIR_INDEX` in `dir`, or the first index.
-    fn next_dir_index(&self, dir: u64) -> Result<u64> {
+    pub(crate) fn next_dir_index(&self, dir: u64) -> Result<u64> {
         let last = self.last_key_at_or_before(&key(dir, DIR_INDEX_KEY, u64::MAX))?;
         Ok(match last {
             Some(k) if k.objectid == dir && k.key_type == DIR_INDEX_KEY => k

@@ -76,6 +76,17 @@ pub struct Split {
     pub root: Option<u64>,
 }
 
+/// A tree the change makes, and where its one leaf goes (#267): a new
+/// subvolume's tree, whose root leaf holds its top directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Created {
+    /// Where the tree's root leaf goes: a block the change allocates and
+    /// releases nothing for.
+    pub new: u64,
+    /// The tree it roots.
+    pub owner: u64,
+}
+
 /// What a transaction will do.
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
@@ -86,6 +97,9 @@ pub struct Plan {
     /// Every leaf the change fills past one block (#342), and the blocks
     /// it takes to split. Each allocates without releasing anything.
     pub splits: Vec<Split>,
+    /// Every tree the change makes (#267). Each allocates its root leaf
+    /// without releasing anything.
+    pub created: Vec<Created>,
 }
 
 impl Plan {
@@ -102,6 +116,7 @@ impl Plan {
             out.push(s.new);
             out.extend(s.root);
         }
+        out.extend(self.created.iter().map(|c| c.new));
         out
     }
 
@@ -109,6 +124,7 @@ impl Plan {
     pub fn trees(&self) -> BTreeSet<u64> {
         let mut out: BTreeSet<u64> = self.rewrites.iter().map(|r| r.owner).collect();
         out.extend(self.splits.iter().map(|s| s.owner));
+        out.extend(self.created.iter().map(|c| c.owner));
         out
     }
 
@@ -121,7 +137,7 @@ impl Plan {
     ///
     /// Zero for a plan that rewrites blocks without adding or removing
     /// any — one release for every allocation — and a node's worth more
-    /// for each block a split adds (#342).
+    /// for each block a split adds (#342) or a new tree takes (#267).
     pub fn usage_delta(&self, nodesize: u64) -> i128 {
         (self.allocated().len() as i128 - self.released().len() as i128) * nodesize as i128
     }
@@ -259,6 +275,26 @@ pub(crate) struct DataWrite {
     /// other references -- and so do the extent's bytes, its checksums,
     /// its free space and its block group's `used`.
     pub unrefs: Vec<DataRelease>,
+    /// Items of other trees put or removed, each with the tree it is in
+    /// (#267): a new subvolume's `ROOT_ITEM` and references in the root
+    /// tree, and its entry in the UUID tree. Each lands in the leaf a
+    /// descent for its key reaches in that tree, which the caller marks
+    /// dirty.
+    pub tree_edits: Vec<(u64, ItemEdit)>,
+    /// Trees the change makes, one leaf each (#267). The plan gives each
+    /// leaf a block, and the tree's `ROOT_ITEM` -- which `tree_edits` must
+    /// put -- is pointed at it.
+    pub new_trees: Vec<NewTree>,
+}
+
+/// A tree a [`DataWrite`] makes (#267): its objectid, and the items of
+/// its one leaf, in key order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NewTree {
+    /// The tree's objectid, which its `ROOT_ITEM` is filed under.
+    pub objectid: u64,
+    /// Everything in its root leaf.
+    pub items: Vec<crate::leaf_edit::OwnedItem>,
 }
 
 /// One change to an item of the tree a [`DataWrite`] names (#262).
@@ -797,6 +833,15 @@ impl Filesystem {
                 .map(|e| Ok(tree.descend(root, &e.key())?.header.bytenr))
                 .collect::<Result<_>>()?
         };
+        // And each other tree's edit's leaf, in its own tree (#267).
+        let tree_edit_leaves: Vec<u64> = {
+            let reader = self.pool_reader();
+            let tree = reader.tree();
+            data.tree_edits
+                .iter()
+                .map(|(t, e)| Ok(tree.descend(self.edit_root(*t)?, &e.key())?.header.bytenr))
+                .collect::<Result<_>>()?
+        };
         let mut edits_applied = 0usize;
         // Each rendered block's first key, by its old address. An edit can
         // change a leaf's first key, and the node above must then carry
@@ -954,8 +999,42 @@ impl Filesystem {
                         }
                     }
 
+                    // Other trees' items put or removed, likewise (#267).
+                    let here: Vec<&ItemEdit> = data
+                        .tree_edits
+                        .iter()
+                        .zip(&tree_edit_leaves)
+                        .filter(|((t, _), &leaf)| *t == rewrite.owner && leaf == rewrite.old)
+                        .map(|((_, e), _)| e)
+                        .collect();
+                    if !here.is_empty() {
+                        let is_root = self.is_tree_root(rewrite.owner, rewrite.old)?;
+                        owned = apply_item_edits(rewrite.old, is_root, owned, &here)?;
+                        edits_applied += here.len();
+                    }
+
                     // A root tree leaf names other trees' roots.
                     if rewrite.owner == objectid::ROOT_TREE {
+                        // A tree the change makes is rooted where the plan
+                        // put its leaf (#267).
+                        for created in &plan.created {
+                            for item in &mut owned {
+                                if item.key.objectid != created.owner
+                                    || item.key.key_type != ROOT_ITEM_KEY
+                                    || item.data.len() < root_item::GENERATION_V2 + 8
+                                {
+                                    continue;
+                                }
+                                item.data[root_item::BYTENR..root_item::BYTENR + 8]
+                                    .copy_from_slice(&created.new.to_le_bytes());
+                                item.data[root_item::LEVEL] = 0;
+                                for at in [root_item::GENERATION, root_item::GENERATION_V2] {
+                                    item.data[at..at + 8]
+                                        .copy_from_slice(&generation.to_le_bytes());
+                                }
+                                applied.created += 1;
+                            }
+                        }
                         if let Some(id) = data.default_subvol {
                             applied.default_subvol += point_default_at(&mut owned, id)?;
                         }
@@ -1095,6 +1174,49 @@ impl Filesystem {
             });
         }
 
+        // Each tree the change makes: one leaf, at the block the plan gave
+        // it, holding everything the change put in it (#267).
+        if plan.created.len() != data.new_trees.len() {
+            return Err(Error::UnsupportedFeature(format!(
+                "the change makes {} trees, and the plan placed {}",
+                data.new_trees.len(),
+                plan.created.len()
+            )));
+        }
+        if !plan.created.is_empty() {
+            let uuid = chunk_tree_uuid_of(self.read_tree_block(self.sb.root)?.bytes());
+            for (created, tree) in plan.created.iter().zip(&data.new_trees) {
+                if created.owner != tree.objectid {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "the plan placed tree {} where the change makes tree {}",
+                        created.owner, tree.objectid
+                    )));
+                }
+                let id = BlockIdentity {
+                    bytenr: created.new,
+                    owner: created.owner,
+                    generation,
+                    level: 0,
+                    flags: crate::tree_write::flags_for_new_block(),
+                    chunk_tree_uuid: uuid,
+                };
+                let borrowed: Vec<_> = tree.items.iter().map(|i| i.as_leaf_item()).collect();
+                out.push(PlacedBlock {
+                    logical: created.new,
+                    bytes: build_leaf(&self.sb, id, &borrowed)?,
+                });
+            }
+        }
+        // NOR IS A NEW TREE whose ROOT_ITEM the plan did not point at it:
+        // its leaf would be written and recorded, and nothing would read it.
+        if applied.created != plan.created.len() {
+            return Err(Error::UnsupportedFeature(format!(
+                "the change makes {} trees, and the plan pointed {} root items at them",
+                plan.created.len(),
+                applied.created
+            )));
+        }
+
         // NOT A SKIP. A group whose `used` moves but whose item was in no
         // leaf the plan rewrites keeps the old count, and `btrfs check`
         // then reports "block group [...] used X but extent items used
@@ -1119,7 +1241,7 @@ impl Filesystem {
         }
         // NOR IS AN ITEM EDIT: one whose leaf the plan does not rewrite
         // would be committed as a change that never happened.
-        let edits = data.edits.len() + data.csum_edits.len();
+        let edits = data.edits.len() + data.csum_edits.len() + data.tree_edits.len();
         if edits_applied != edits {
             return Err(Error::UnsupportedFeature(format!(
                 "the change edits {edits} items, and the plan rewrote the leaves of \
@@ -1171,10 +1293,12 @@ impl Filesystem {
     /// The root of tree `objectid` as a change edits it: the chunk tree's
     /// from the superblock, every other tree's from its `ROOT_ITEM`.
     pub(crate) fn edit_root(&self, objectid: u64) -> Result<u64> {
-        if objectid == objectid::CHUNK_TREE {
-            return Ok(self.sb.chunk_root);
+        match objectid {
+            objectid::CHUNK_TREE => Ok(self.sb.chunk_root),
+            // No `ROOT_ITEM` names the root tree; the superblock does.
+            objectid::ROOT_TREE => Ok(self.sb.root),
+            _ => self.tree_root(objectid),
         }
-        self.tree_root(objectid)
     }
 
     /// Where the chunk tree's root ends up, for a plan that moves it
@@ -1247,6 +1371,9 @@ impl Filesystem {
         for _ in 0..rounds {
             let list: Vec<u64> = seed.iter().copied().collect();
             let mut plan = self.plan_transaction(&list)?;
+            // A block for each tree the change makes (#267), whose records
+            // are this round's too.
+            plan.created = self.plan_created(&plan, data)?;
             // The leaves the change fills past a block, and the blocks
             // their splits take, whose records are this round's too (#342).
             plan.splits = self.plan_splits(&plan, data)?;
@@ -1306,8 +1433,8 @@ impl Filesystem {
         let mut splits: Vec<Split> = Vec::new();
         for _ in 0..8 {
             let trial = Plan {
-                rewrites: plan.rewrites.clone(),
                 splits: splits.clone(),
+                ..plan.clone()
             };
             // A change the render refuses is the render's to report: given
             // these splits it makes this same call and fails the same way,
@@ -1326,8 +1453,8 @@ impl Filesystem {
             }
             splits.retain(|s| full.contains(&s.leaf));
             let mut taken: BTreeSet<u64> = Plan {
-                rewrites: plan.rewrites.clone(),
                 splits: splits.clone(),
+                ..plan.clone()
             }
             .allocated()
             .into_iter()
@@ -1393,6 +1520,26 @@ impl Filesystem {
              another"
                 .into(),
         ))
+    }
+
+    /// A block for the root leaf of each tree `data` makes (#267), after
+    /// the rewrites' and never colliding with them.
+    ///
+    /// # Errors
+    ///
+    /// As allocating a block for a rewrite.
+    fn plan_created(&self, plan: &Plan, data: &DataWrite) -> Result<Vec<Created>> {
+        let mut taken: BTreeSet<u64> = plan.rewrites.iter().map(|r| r.new).collect();
+        let mut out = Vec::with_capacity(data.new_trees.len());
+        for tree in &data.new_trees {
+            let new = self.next_free_block_for(tree.objectid, &taken)?;
+            taken.insert(new);
+            out.push(Created {
+                new,
+                owner: tree.objectid,
+            });
+        }
+        Ok(out)
     }
 
     /// Whether the block at `addr` is tree `owner`'s root. The superblock
@@ -1689,6 +1836,30 @@ impl Filesystem {
                     },
                 )?;
             }
+        }
+
+        // Each tree the change makes (#267): its root leaf, recorded as
+        // that tree's own block.
+        for created in &moves.plan.created {
+            if !mine(created.new)? {
+                continue;
+            }
+            let (key, body) = record_tree_block(
+                &self.sb,
+                TreeBlockAllocation {
+                    bytenr: created.new,
+                    level: 0,
+                    generation,
+                    owner: created.owner,
+                },
+            )?;
+            out = insert(
+                &out,
+                OwnedItem {
+                    key,
+                    data: body.to_vec(),
+                },
+            )?;
         }
 
         // And each copy the write allocated: one reference, inline, from
@@ -2019,6 +2190,8 @@ struct DataApplied {
     root_flags: usize,
     /// `default` entries repointed.
     default_subvol: usize,
+    /// `ROOT_ITEM`s pointed at a tree the change makes.
+    created: usize,
 }
 
 /// Offsets within a data extent's `EXTENT_ITEM` body carrying one inline
@@ -2255,11 +2428,15 @@ impl Filesystem {
             *out.entry(group_of(rewrite.new)?).or_default() += nodesize;
             *out.entry(group_of(rewrite.old)?).or_default() -= nodesize;
         }
-        // A split's blocks are taken and nothing is given back (#342).
+        // A split's blocks are taken and nothing is given back (#342),
+        // and so is a new tree's leaf (#267).
         for split in &plan.splits {
             for at in std::iter::once(split.new).chain(split.root) {
                 *out.entry(group_of(at)?).or_default() += nodesize;
             }
+        }
+        for created in &plan.created {
+            *out.entry(group_of(created.new)?).or_default() += nodesize;
         }
         // A data extent counts its own length, not a node's.
         for (new, disk_len, _) in data.allocations() {
@@ -2866,7 +3043,7 @@ mod needs_host {
                 owner: crate::chunk::objectid::FS_TREE,
                 level: 0,
             }],
-            splits: Vec::new(),
+            ..Plan::default()
         };
         let outcome = fs.apply_free_space(items, &plan, &super::DataWrite::default());
         let _ = std::fs::remove_dir_all(&dir);

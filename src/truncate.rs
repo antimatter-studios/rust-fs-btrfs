@@ -129,6 +129,7 @@ impl Filesystem {
             },
             releases,
             unrefs,
+            ..Default::default()
         };
         self.commit_write(write, generation)
     }

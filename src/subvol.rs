@@ -870,6 +870,354 @@ impl Filesystem {
     }
 }
 
+/// `BTRFS_UUID_TREE_OBJECTID`: the index from a subvolume's UUID to its id.
+const UUID_TREE_OBJECTID: u64 = 9;
+
+/// `BTRFS_UUID_KEY_SUBVOL`: a UUID tree item naming the subvolume whose own
+/// UUID it is filed under.
+const UUID_KEY_SUBVOL: u8 = 251;
+
+/// `BTRFS_INODE_ROOT_ITEM_INIT`: set in the inode a `ROOT_ITEM` embeds, so
+/// the kernel knows the item is not one a pre-2.6.30 kernel wrote.
+const INODE_ROOT_ITEM_INIT: u64 = 1 << 31;
+
+/// The size of `struct btrfs_root_item`, as every `ROOT_ITEM` the kernel
+/// writes today is.
+const ROOT_ITEM_SIZE: usize = 439;
+
+/// Offsets within `struct btrfs_root_item` past the ones [`root_item`]
+/// names, which only a new item needs.
+mod root_item_more {
+    /// `u64`. The bytes of tree blocks the tree holds.
+    pub const BYTES_USED: usize = 192;
+    /// `u32`. How many directory entries refer to the tree.
+    pub const REFS: usize = 216;
+    /// `[u8; 16]`. The subvolume's own UUID.
+    pub const UUID: usize = 247;
+    /// `u64`. The transaction that last changed the tree's contents.
+    pub const CTRANSID: usize = 295;
+    /// `u64`. The transaction that made the tree.
+    pub const OTRANSID: usize = 303;
+    /// `btrfs_timespec`. When the tree's contents last changed.
+    pub const CTIME: usize = 327;
+    /// `btrfs_timespec`. When the tree was made.
+    pub const OTIME: usize = 339;
+}
+
+/// The top directory of a subvolume, inode 256 in every tree the kernel
+/// makes.
+const TOP_DIR: u64 = FIRST_FREE_OBJECTID;
+
+impl Filesystem {
+    /// Create an empty subvolume `name` in directory `parent` of the
+    /// top-level subvolume, and commit it. Returns its id.
+    ///
+    /// What `btrfs subvolume create` does, as one transaction: a new tree
+    /// whose one leaf holds the subvolume's top directory (inode 256, with
+    /// permission bits `mode` and owned by `uid`:`gid`), its `ROOT_ITEM`,
+    /// `ROOT_REF` and `ROOT_BACKREF` in the root tree, its UUID in the
+    /// UUID tree, and an entry in `parent` naming the new tree. Each was
+    /// read off subvolumes the kernel made:
+    ///
+    /// - the id is one past the highest objectid in the root tree's free
+    ///   range, and never below 256;
+    /// - the entry's location is the `ROOT_ITEM`'s key, offset zero, where
+    ///   a snapshot's entry has an offset of all ones;
+    /// - the `ROOT_ITEM` embeds a directory inode of generation 1, size 3,
+    ///   one link, a node's worth of bytes, mode 040755 and flags
+    ///   `ROOT_ITEM_INIT`, and carries the transaction as its generation,
+    ///   `ctransid` and `otransid`;
+    /// - the top directory starts with sequence zero and no inode flags: a
+    ///   subvolume does not inherit the flags of the directory it is made
+    ///   in, as an ordinary directory does.
+    ///
+    /// A subvolume does inherit the `btrfs.*` properties of its parent
+    /// subvolume's top directory, which this does not copy, so a top-level
+    /// subvolume carrying one is refused rather than given a subvolume
+    /// that silently lacks it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] unless mounted with [`Filesystem::mount_rw`],
+    /// or when the top-level subvolume is read-only;
+    /// [`Error::NotADirectory`] if `parent` is not one;
+    /// [`Error::UnsupportedFeature`] for a name that is invalid or already
+    /// present, a mount of a subvolume other than the top level, a
+    /// filesystem with no UUID tree or with quotas enabled (whose quota
+    /// group for the subvolume is not made), a top-level subvolume with a
+    /// `btrfs.*` property to inherit, and whatever the planner refuses --
+    /// among them a root tree leaf that would have to split while it is
+    /// the root tree's only block. Nothing is written unless everything
+    /// is.
+    pub fn create_subvolume(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<u64> {
+        use crate::chunk::objectid::ROOT_TREE;
+        use crate::dir::{ftype, name_hash, offsets as d, DIR_INDEX_KEY, DIR_ITEM_KEY};
+        use crate::inode::{offsets as io, INODE_ITEM_KEY, INODE_ITEM_SIZE, INODE_REF_KEY};
+        use crate::leaf_edit::OwnedItem;
+        use crate::namespace::{now, touch};
+        use crate::transaction::{ItemEdit, NewTree};
+
+        self.require_writable_top_level()?;
+        let items = self.root_tree_items()?;
+        let top_flags = items
+            .iter()
+            .find(|(o, t, _, d)| {
+                *o == FS_TREE_OBJECTID && *t == ROOT_ITEM_KEY && d.len() >= root_item::MIN_SIZE
+            })
+            .map(|(_, _, _, d)| le64(d, root_item::FLAGS))
+            .ok_or(Error::NotFound)?;
+        if top_flags & ROOT_SUBVOL_RDONLY != 0 {
+            return Err(Error::ReadOnly);
+        }
+        if self.tree_root(UUID_TREE_OBJECTID).is_err() {
+            return Err(Error::UnsupportedFeature(
+                "the filesystem has no UUID tree to index a new subvolume in".into(),
+            ));
+        }
+        if self.tree_root(QUOTA_TREE_OBJECTID).is_ok() {
+            return Err(Error::UnsupportedFeature(
+                "quotas are enabled, and the quota group a new subvolume belongs to is not \
+                 created"
+                    .into(),
+            ));
+        }
+        let top = self.root_inode()?.ino;
+        if let Some(prop) = self
+            .list_xattrs(top)?
+            .into_iter()
+            .find(|x| x.name.starts_with(b"btrfs."))
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "the top-level subvolume carries the property {:?}, which a new subvolume \
+                 inherits, and inheriting it is not implemented",
+                String::from_utf8_lossy(&prop.name)
+            )));
+        }
+        let dir = self.writable_parent(parent, name)?;
+        let id = next_subvolume_id(&items)?;
+        let generation = self.next_generation()?;
+        let now = now();
+        let index = self.next_dir_index(parent)?;
+        let uuid = crate::mkfs::random_uuid();
+
+        // The parent's two entries, naming the new tree's ROOT_ITEM.
+        let mut entry = vec![0u8; d::NAME];
+        entry[d::LOCATION..d::LOCATION + 8].copy_from_slice(&id.to_le_bytes());
+        entry[d::LOCATION + 8] = ROOT_ITEM_KEY;
+        entry[d::TRANSID..d::TRANSID + 8].copy_from_slice(&generation.to_le_bytes());
+        entry[d::NAME_LEN..d::NAME_LEN + 2].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        entry[d::TYPE] = ftype::DIR;
+        entry.extend_from_slice(name);
+        let hash_key = key(parent, DIR_ITEM_KEY, name_hash(name));
+        let mut by_hash = self.item_bytes(hash_key)?.unwrap_or_default();
+        by_hash.extend_from_slice(&entry);
+        if by_hash.len() > self.max_item_size() {
+            return Err(Error::UnsupportedFeature(format!(
+                "directory {parent}'s names sharing the hash of {:?} would outgrow a leaf",
+                String::from_utf8_lossy(name)
+            )));
+        }
+        // The directory's size counts the name once per entry.
+        let mut parent_raw = self.raw_inode(parent)?;
+        let size = le64(&parent_raw, io::SIZE) + 2 * name.len() as u64;
+        parent_raw[io::SIZE..io::SIZE + 8].copy_from_slice(&size.to_le_bytes());
+        touch(&mut parent_raw, generation, now, &[io::CTIME, io::MTIME]);
+        let edits = vec![
+            ItemEdit::Put(OwnedItem {
+                key: hash_key,
+                data: by_hash,
+            }),
+            ItemEdit::Put(OwnedItem {
+                key: key(parent, DIR_INDEX_KEY, index),
+                data: entry,
+            }),
+            ItemEdit::Put(OwnedItem {
+                key: key(parent, INODE_ITEM_KEY, 0),
+                data: parent_raw,
+            }),
+        ];
+
+        // The root tree's three items, and the UUID tree's one.
+        let mut reference = Vec::with_capacity(root_ref::NAME + name.len());
+        reference.extend_from_slice(&parent.to_le_bytes());
+        reference.extend_from_slice(&index.to_le_bytes());
+        reference.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        reference.extend_from_slice(name);
+        let uuid_key = key(
+            u64::from_le_bytes(uuid[..8].try_into().expect("8 bytes")),
+            UUID_KEY_SUBVOL,
+            u64::from_le_bytes(uuid[8..].try_into().expect("8 bytes")),
+        );
+        // A UUID already filed holds a list of ids, which this one joins.
+        let mut ids = {
+            let reader = self.pool_reader();
+            reader
+                .tree()
+                .search(self.tree_root(UUID_TREE_OBJECTID)?, &uuid_key)?
+                .map(|item| item.data)
+                .unwrap_or_default()
+        };
+        ids.extend_from_slice(&id.to_le_bytes());
+        let tree_edits = vec![
+            (
+                ROOT_TREE,
+                ItemEdit::Put(OwnedItem {
+                    key: key(FS_TREE_OBJECTID, ROOT_REF_KEY, id),
+                    data: reference.clone(),
+                }),
+            ),
+            (
+                ROOT_TREE,
+                ItemEdit::Put(OwnedItem {
+                    key: key(id, ROOT_ITEM_KEY, 0),
+                    data: new_root_item(self.sb.nodesize, generation, uuid, now),
+                }),
+            ),
+            (
+                ROOT_TREE,
+                ItemEdit::Put(OwnedItem {
+                    key: key(id, ROOT_BACKREF_KEY, FS_TREE_OBJECTID),
+                    data: reference,
+                }),
+            ),
+            (
+                UUID_TREE_OBJECTID,
+                ItemEdit::Put(OwnedItem {
+                    key: uuid_key,
+                    data: ids,
+                }),
+            ),
+        ];
+
+        // The new tree: its top directory, flags left clear, and that
+        // directory's `..`.
+        let mut inode = vec![0u8; INODE_ITEM_SIZE];
+        inode[io::GENERATION..io::GENERATION + 8].copy_from_slice(&generation.to_le_bytes());
+        inode[io::TRANSID..io::TRANSID + 8].copy_from_slice(&generation.to_le_bytes());
+        inode[io::NLINK..io::NLINK + 4].copy_from_slice(&1u32.to_le_bytes());
+        inode[io::UID..io::UID + 4].copy_from_slice(&uid.to_le_bytes());
+        inode[io::GID..io::GID + 4].copy_from_slice(&gid.to_le_bytes());
+        inode[io::MODE..io::MODE + 4].copy_from_slice(&(S_IFDIR | (mode & 0o7777)).to_le_bytes());
+        for at in [io::ATIME, io::CTIME, io::MTIME, io::OTIME] {
+            put_time(&mut inode, at, now);
+        }
+        let mut dotdot = 0u64.to_le_bytes().to_vec();
+        dotdot.extend_from_slice(&2u16.to_le_bytes());
+        dotdot.extend_from_slice(b"..");
+        let new_trees = vec![NewTree {
+            objectid: id,
+            items: vec![
+                OwnedItem {
+                    key: key(TOP_DIR, INODE_ITEM_KEY, 0),
+                    data: inode,
+                },
+                OwnedItem {
+                    key: key(TOP_DIR, INODE_REF_KEY, TOP_DIR),
+                    data: dotdot,
+                },
+            ],
+        }];
+
+        self.commit_write(
+            DataWrite {
+                root: FS_TREE_OBJECTID,
+                ino: dir.ino,
+                time: now,
+                edits,
+                tree_edits,
+                new_trees,
+                ..Default::default()
+            },
+            generation,
+        )?;
+        Ok(id)
+    }
+}
+
+/// `S_IFDIR`.
+const S_IFDIR: u32 = 0o040_000;
+
+/// `BTRFS_QUOTA_TREE_OBJECTID`: present while quotas are enabled.
+const QUOTA_TREE_OBJECTID: u64 = 8;
+
+/// The id a new subvolume gets: one past the highest objectid in the root
+/// tree's free range, as `btrfs_find_highest_objectid` finds it, and never
+/// below [`FIRST_FREE_OBJECTID`].
+fn next_subvolume_id(items: &[(u64, u8, u64, Vec<u8>)]) -> Result<u64> {
+    let highest = items
+        .iter()
+        .map(|(objectid, ..)| *objectid)
+        .filter(|&o| o <= LAST_FREE_OBJECTID)
+        .max()
+        .unwrap_or(0)
+        .max(FIRST_FREE_OBJECTID - 1);
+    if highest >= LAST_FREE_OBJECTID {
+        return Err(Error::UnsupportedFeature(
+            "the root tree has no subvolume ids left".into(),
+        ));
+    }
+    Ok(highest + 1)
+}
+
+/// A new subvolume's `ROOT_ITEM`, as the kernel writes one for `btrfs
+/// subvolume create`. Its root block is left zero: the renderer points it
+/// at wherever the plan puts the tree's leaf.
+fn new_root_item(nodesize: u32, generation: u64, uuid: [u8; 16], now: (u64, u32)) -> Vec<u8> {
+    use crate::inode::offsets as io;
+    use root_item_more as m;
+    let nodesize = u64::from(nodesize);
+    let mut b = vec![0u8; ROOT_ITEM_SIZE];
+    // The embedded inode: a directory nobody reads, filled in as the
+    // kernel fills it.
+    b[io::GENERATION..io::GENERATION + 8].copy_from_slice(&1u64.to_le_bytes());
+    b[io::SIZE..io::SIZE + 8].copy_from_slice(&3u64.to_le_bytes());
+    b[io::NBYTES..io::NBYTES + 8].copy_from_slice(&nodesize.to_le_bytes());
+    b[io::NLINK..io::NLINK + 4].copy_from_slice(&1u32.to_le_bytes());
+    b[io::MODE..io::MODE + 4].copy_from_slice(&(S_IFDIR | 0o755).to_le_bytes());
+    b[io::FLAGS..io::FLAGS + 8].copy_from_slice(&INODE_ROOT_ITEM_INIT.to_le_bytes());
+
+    for at in [
+        root_item::GENERATION,
+        root_item::GENERATION_V2,
+        m::CTRANSID,
+        m::OTRANSID,
+    ] {
+        b[at..at + 8].copy_from_slice(&generation.to_le_bytes());
+    }
+    b[root_item::ROOT_DIRID..root_item::ROOT_DIRID + 8].copy_from_slice(&TOP_DIR.to_le_bytes());
+    b[m::BYTES_USED..m::BYTES_USED + 8].copy_from_slice(&nodesize.to_le_bytes());
+    b[m::REFS..m::REFS + 4].copy_from_slice(&1u32.to_le_bytes());
+    b[m::UUID..m::UUID + 16].copy_from_slice(&uuid);
+    put_time(&mut b, m::CTIME, now);
+    put_time(&mut b, m::OTIME, now);
+    b
+}
+
+fn key(objectid: u64, key_type: u8, offset: u64) -> crate::chunk::DiskKey {
+    crate::chunk::DiskKey {
+        objectid,
+        key_type,
+        offset,
+    }
+}
+
+fn le64(b: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes"))
+}
+
+/// A `btrfs_timespec`: seconds, then nanoseconds.
+fn put_time(b: &mut [u8], at: usize, t: (u64, u32)) {
+    b[at..at + 8].copy_from_slice(&t.0.to_le_bytes());
+    b[at + 8..at + 12].copy_from_slice(&t.1.to_le_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -970,5 +1318,50 @@ mod tests {
         // Any answer will do; not returning is the failure.
         let path = path_of(256, &names);
         assert!(!path.is_empty());
+    }
+
+    /// A new subvolume takes the id after the highest in the free range,
+    /// whatever internal trees are numbered below and above it.
+    #[test]
+    fn a_new_subvolume_takes_the_next_free_id() {
+        let item = |objectid: u64| (objectid, ROOT_ITEM_KEY, 0u64, Vec::new());
+        let negative = u64::MAX - 8;
+        assert_eq!(
+            next_subvolume_id(&[item(1), item(2), item(5), item(negative)]),
+            Ok(FIRST_FREE_OBJECTID)
+        );
+        assert_eq!(
+            next_subvolume_id(&[item(5), item(256), item(259), item(negative)]),
+            Ok(260)
+        );
+        assert!(next_subvolume_id(&[item(LAST_FREE_OBJECTID)]).is_err());
+    }
+
+    /// A new subvolume's root item carries its tree's generation, its
+    /// top directory and its UUID where the root item's reader finds them.
+    #[test]
+    fn a_new_root_item_is_filled_where_it_is_read() {
+        use root_item_more as m;
+        let b = new_root_item(16384, 9, [7; 16], (100, 5));
+        assert_eq!(b.len(), ROOT_ITEM_SIZE);
+        assert!(b.len() >= root_item::MIN_SIZE);
+        for at in [
+            root_item::GENERATION,
+            root_item::GENERATION_V2,
+            m::CTRANSID,
+            m::OTRANSID,
+        ] {
+            assert_eq!(le64(&b, at), 9, "generation at {at}");
+        }
+        assert_eq!(le64(&b, root_item::ROOT_DIRID), TOP_DIR);
+        assert_eq!(le64(&b, root_item::FLAGS), 0, "writable");
+        assert_eq!(le64(&b, root_item::LAST_SNAPSHOT), 0);
+        assert_eq!(le64(&b, m::BYTES_USED), 16384, "one leaf");
+        assert_eq!(&b[m::REFS..m::REFS + 4], &1u32.to_le_bytes());
+        assert_eq!(&b[m::UUID..m::UUID + 16], &[7; 16]);
+        assert_eq!(le64(&b, m::OTIME), 100);
+        assert_eq!(le64(&b, m::CTIME), 100);
+        // The root block is the plan's to fill in.
+        assert_eq!(le64(&b, root_item::BYTENR), 0);
     }
 }

@@ -335,6 +335,7 @@ impl Filesystem {
             csum_edits: self.csum_edits(&released, &contents, summed)?,
             releases,
             unrefs,
+            ..Default::default()
         };
 
         // The fs tree leaves the change edits -- the inode's, and each

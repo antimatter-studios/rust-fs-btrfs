@@ -332,6 +332,7 @@ impl Filesystem {
             csum_edits: self.csum_edits(&released, &contents, summed)?,
             releases: Vec::new(),
             unrefs: Vec::new(),
+            ..Default::default()
         };
 
         // The fs tree leaves the write edits: the inode item's, each
