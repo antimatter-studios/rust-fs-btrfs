@@ -15,7 +15,7 @@
 
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::inode::{INODE_ITEM_KEY, INODE_REF_KEY};
-use fs_btrfs::log_tree::LoggedTree;
+use fs_btrfs::log_tree::{LoggedTree, DIR_LOG_INDEX_KEY};
 use fs_btrfs::Error;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, fixture, guest_kernel_read_ok, guest_kernel_report,
@@ -388,6 +388,52 @@ fn replays_as_the_kernel_does(fixture_name: &str, tag: &str) {
 #[test]
 fn a_read_write_mount_replays_the_log_as_the_kernel_does() {
     replays_as_the_kernel_does(DIRTY_LOG_FIXTURE, "dirtylog");
+}
+
+/// The second fixture's log, checked to hold each change its recipe made
+/// before the replay is judged: a fixture whose fsyncs fell back to a
+/// commit would hold nothing to replay, and pass for the wrong reason.
+#[test]
+fn a_log_of_data_and_names_replays_as_the_kernel_does() {
+    let image = fixture(REPLAY_FIXTURE);
+    {
+        let dev = Arc::new(FileDevice::open(&image).expect("open the fixture"));
+        let fs = Filesystem::mount_ignoring_log(dev as Arc<dyn BlockRead>)
+            .expect("a mount that ignores the log opens a volume with one");
+        let log = fs
+            .log()
+            .expect("read the log")
+            .expect("the log is not empty");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        for path in ["/big.bin", "/grow.bin", "/shrink.bin"] {
+            let ino = fs.lookup_path(path).unwrap().ino;
+            assert!(
+                top.inodes().contains(&ino),
+                "the log holds no inode item for {path} (inode {ino}): {keys:?}"
+            );
+        }
+        assert!(
+            top.inode_named(256, b"new.bin").is_some(),
+            "the log names no new.bin: {keys:?}"
+        );
+        let d = fs.lookup_path("/d").unwrap().ino;
+        assert!(
+            top.items
+                .iter()
+                .any(|i| i.key.objectid == d && i.key.key_type == DIR_LOG_INDEX_KEY),
+            "the log holds no index range for directory d (inode {d}): {keys:?}"
+        );
+    }
+    replays_as_the_kernel_does(REPLAY_FIXTURE, "dirtylog-replay");
 }
 
 /// Prove this is a metadata-only recovery before asking mount_rw to
