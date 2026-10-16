@@ -368,6 +368,97 @@ pub fn drop_inline_data_ref(
     Ok(Some(rebuild(&head, start, refs)))
 }
 
+/// `body` with one more reference from the file item of inode `objectid`
+/// in `tree` that puts the extent's first byte at file offset `offset`
+/// (#269): an inline `EXTENT_DATA_REF` already naming those three counted
+/// up, or a new one put where the kernel puts it, and the item's total up
+/// by one.
+///
+/// The kernel's place for a new one: past every inline reference of a
+/// lower type, and among the data references before the first whose
+/// [hash](crate::extent_write::data_ref_hash) is smaller than its own,
+/// so they run from the largest hash down. It searches them in that order
+/// and stops at the first smaller one, so a reference put anywhere else
+/// is one it cannot find when it comes to drop it. Every other reference
+/// keeps its place.
+///
+/// # Errors
+///
+/// As [`inline_refs`].
+pub fn add_inline_data_ref(
+    item_type: u8,
+    body: &[u8],
+    tree: u64,
+    objectid: u64,
+    offset: u64,
+) -> Result<Vec<u8>> {
+    use crate::extent_write::data_ref_hash;
+    let start = refs_start(item_type, body)?;
+    let mut refs = inline_refs(item_type, body)?;
+    let mut fields = Vec::with_capacity(28);
+    for v in [tree, objectid, offset] {
+        fields.extend_from_slice(&v.to_le_bytes());
+    }
+    let hash_of = |p: &[u8]| {
+        let field = |at: usize| u64::from_le_bytes(p[at..at + 8].try_into().expect("8 bytes"));
+        data_ref_hash(field(0), field(8), field(16))
+    };
+    let want = data_ref_hash(tree, objectid, offset);
+
+    let mut at = refs.len();
+    let mut same = None;
+    for (i, r) in refs.iter().enumerate() {
+        if r.kind > EXTENT_DATA_REF {
+            at = i;
+            break;
+        }
+        if r.kind < EXTENT_DATA_REF {
+            continue;
+        }
+        if r.payload[..24] == fields[..] {
+            same = Some(i);
+            break;
+        }
+        if hash_of(&r.payload) < want {
+            at = i;
+            break;
+        }
+    }
+    match same {
+        Some(i) => {
+            let had = u32::from_le_bytes(refs[i].payload[24..28].try_into().expect("28 bytes"));
+            let count = had.checked_add(1).ok_or_else(|| {
+                Error::UnsupportedFeature(format!(
+                    "the data reference of inode {objectid} in tree {tree} at {offset} already \
+                     counts {had} items, the most it can"
+                ))
+            })?;
+            refs[i].payload[24..28].copy_from_slice(&count.to_le_bytes());
+        }
+        None => {
+            fields.extend_from_slice(&1u32.to_le_bytes());
+            refs.insert(
+                at,
+                InlineRef {
+                    kind: EXTENT_DATA_REF,
+                    payload: fields,
+                },
+            );
+        }
+    }
+    let total = u64::from_le_bytes(body[..8].try_into().expect("a fixed part"));
+    let total = total.checked_add(1).ok_or_else(|| {
+        Error::UnsupportedFeature("the extent's reference count is at its limit".into())
+    })?;
+    let mut out = body[..start].to_vec();
+    out[..8].copy_from_slice(&total.to_le_bytes());
+    for r in &refs {
+        out.push(r.kind);
+        out.extend_from_slice(&r.payload);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,5 +680,77 @@ mod tests {
         let mut last = header(1, crate::extent_write::EXTENT_FLAG_DATA);
         last.extend(data_ref(5, 257, 0, 1));
         assert!(drop_inline_data_ref(key_type::EXTENT_ITEM, &last, 5, 257, 0).is_err());
+    }
+
+    /// The hash of an inline data reference built by [`data_ref`].
+    fn hash(tree: u64, ino: u64, offset: u64) -> u64 {
+        crate::extent_write::data_ref_hash(tree, ino, offset)
+    }
+
+    #[test]
+    fn an_added_data_reference_counts_up_one_already_there() {
+        let mut body = header(1, crate::extent_write::EXTENT_FLAG_DATA);
+        body.extend(data_ref(5, 257, 0, 1));
+        let added = add_inline_data_ref(key_type::EXTENT_ITEM, &body, 5, 257, 0).unwrap();
+        let mut want = header(2, crate::extent_write::EXTENT_FLAG_DATA);
+        want.extend(data_ref(5, 257, 0, 2));
+        assert_eq!(added, want);
+    }
+
+    #[test]
+    fn added_data_references_run_from_the_largest_hash_down() {
+        // Six references added one at a time, in whatever order: the item
+        // holds them by descending hash, whichever order they came in.
+        let wanted: Vec<(u64, u64, u64)> = (257..263).map(|ino| (5, ino, 0)).collect();
+        let mut body = header(0, crate::extent_write::EXTENT_FLAG_DATA);
+        for &(t, i, o) in wanted.iter().rev() {
+            body = add_inline_data_ref(key_type::EXTENT_ITEM, &body, t, i, o).unwrap();
+        }
+        let mut sorted = wanted.clone();
+        sorted.sort_by_key(|&(t, i, o)| std::cmp::Reverse(hash(t, i, o)));
+        let mut want = header(6, crate::extent_write::EXTENT_FLAG_DATA);
+        for (t, i, o) in sorted {
+            want.extend(data_ref(t, i, o, 1));
+        }
+        assert_eq!(body, want);
+
+        let mut again = header(0, crate::extent_write::EXTENT_FLAG_DATA);
+        for &(t, i, o) in &wanted {
+            again = add_inline_data_ref(key_type::EXTENT_ITEM, &again, t, i, o).unwrap();
+        }
+        assert_eq!(
+            again, want,
+            "the order depends on the hashes, not on arrival"
+        );
+    }
+
+    #[test]
+    fn an_added_data_reference_goes_after_lower_types_and_before_shared_ones() {
+        let mut body = header(2, crate::extent_write::EXTENT_FLAG_DATA);
+        body.push(EXTENT_OWNER_REF);
+        body.extend_from_slice(&5u64.to_le_bytes());
+        body.extend(shared_data(4096, 1));
+        let added = add_inline_data_ref(key_type::EXTENT_ITEM, &body, 5, 300, 8192).unwrap();
+        let mut want = header(3, crate::extent_write::EXTENT_FLAG_DATA);
+        want.push(EXTENT_OWNER_REF);
+        want.extend_from_slice(&5u64.to_le_bytes());
+        want.extend(data_ref(5, 300, 8192, 1));
+        want.extend(shared_data(4096, 1));
+        assert_eq!(added, want);
+    }
+
+    #[test]
+    fn adding_a_data_reference_leaves_the_others_where_they_were() {
+        // Two shared references in an order this module's own sort would
+        // reverse: adding a data reference must not reorder them.
+        let mut body = header(2, crate::extent_write::EXTENT_FLAG_DATA);
+        body.extend(shared_data(12288, 1));
+        body.extend(shared_data(4096, 1));
+        let added = add_inline_data_ref(key_type::EXTENT_ITEM, &body, 5, 257, 0).unwrap();
+        let mut want = header(3, crate::extent_write::EXTENT_FLAG_DATA);
+        want.extend(data_ref(5, 257, 0, 1));
+        want.extend(shared_data(12288, 1));
+        want.extend(shared_data(4096, 1));
+        assert_eq!(added, want);
     }
 }

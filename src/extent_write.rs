@@ -163,10 +163,47 @@ pub fn used_after_allocating(group: &crate::block_group::BlockGroup, bytes: u64)
     Ok(group.used + bytes)
 }
 
+/// The hash a data extent's `EXTENT_DATA_REF` is ordered by (#269): the
+/// key offset of one filed as an item of its own, and the order of those
+/// kept inline in the extent item, the largest first.
+///
+/// The format defines it as two CRC-32C runs, each seeded with all ones
+/// and with no inversion on the way out, as [`crate::dir::name_hash`]
+/// is: one over the tree's objectid, one over the inode's and then the
+/// file offset, each a little-endian `u64`. The first is shifted up 31
+/// bits, not 32, and the two are combined with exclusive or.
+///
+/// `tests/clone_kernel.rs` holds this to the kernel: every data reference
+/// it files as an item of its own is keyed by this hash of its fields.
+pub fn data_ref_hash(tree: u64, objectid: u64, offset: u64) -> u64 {
+    let raw = |seed: u32, bytes: &[u8]| !crc32c::crc32c_append(!seed, bytes);
+    let high = raw(u32::MAX, &tree.to_le_bytes());
+    let low = raw(
+        raw(u32::MAX, &objectid.to_le_bytes()),
+        &offset.to_le_bytes(),
+    );
+    (u64::from(high) << 31) ^ u64::from(low)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::block_group::BlockGroup;
+
+    /// The two runs are separate: the tree's alone, and the inode's
+    /// continued over the offset. Built here from the CRC crate's
+    /// ordinary (inverted) form, which is a different route to the same
+    /// numbers; the kernel holds the function itself to account in
+    /// `tests/clone_kernel.rs`.
+    #[test]
+    fn the_data_ref_hash_is_two_uninverted_crc_runs() {
+        let plain = |bytes: &[u8]| crc32c::crc32c(bytes);
+        let mut both = 257u64.to_le_bytes().to_vec();
+        both.extend_from_slice(&4096u64.to_le_bytes());
+        let want = (u64::from(!plain(&5u64.to_le_bytes())) << 31) ^ u64::from(!plain(&both));
+        assert_eq!(data_ref_hash(5, 257, 4096), want);
+        assert_ne!(data_ref_hash(5, 257, 4096), data_ref_hash(5, 4096, 257));
+    }
     use crate::chunk::block_group as bg_flags;
 
     /// The level goes in the key and nowhere else.
