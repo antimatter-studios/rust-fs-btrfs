@@ -64,6 +64,7 @@
 //! - [`resize`] — the filesystem's size, grown or shrunk on one device
 //! - [`devices`] — the devices a filesystem spans: a device added, replaced or removed
 //! - [`truncate`] — a regular file's length, shrunk or grown
+//! - [`clone`](mod@clone) — a range of one file cloned into another, sharing its extents
 //! - [`transaction`], [`extent_write`], [`block_group`] and [`commit`] — tree
 //!   rewrites and the commit of a new generation, separate from file writes
 //! - [`send`] — send streams: parsed, and written from a read-only subvolume
@@ -79,6 +80,7 @@ pub mod btree;
 pub mod capi;
 pub mod check;
 pub mod chunk;
+pub mod clone;
 pub mod commit;
 pub mod compression;
 pub mod cow_write;

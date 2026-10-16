@@ -1610,6 +1610,57 @@ pub unsafe extern "C" fn fs_btrfs_truncate(
     })
 }
 
+/// Clone `len` bytes of the regular file at `src`, from `src_offset`,
+/// into the regular file at `dst` at `dst_offset`, as one committed
+/// transaction (#269): the two share those extents, and no data is
+/// copied. A `len` of zero clones to the end of `src`, as `FICLONERANGE`
+/// does; `src` and `dst` may be one file when the ranges do not overlap.
+///
+/// Returns 0, or -1 with the error recorded: ENOENT for no such path,
+/// EISDIR for anything but a regular file, EROFS on a read-only handle,
+/// and ENOTSUP for a range the kernel's rules refuse (offsets that are
+/// not whole sectors, a length that is not either and does not reach the
+/// end of `src`, a range past that end) and for what cannot be written
+/// yet: a destination range that already holds data, inline data, an
+/// extent whose references are kept as items of their own, a volume
+/// without no-holes.
+///
+/// # Safety
+///
+/// `fs` must be a live handle, and `src` and `dst` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_clone_range(
+    fs: *mut fs_btrfs_fs,
+    src: *const c_char,
+    src_offset: u64,
+    dst: *const c_char,
+    dst_offset: u64,
+    len: u64,
+) -> c_int {
+    guard(-1, || {
+        let Some(fs) = (unsafe { handle_mut(fs) }) else {
+            return -1;
+        };
+        let Some(src) = (unsafe { borrow_bytes(src, "src") }) else {
+            return -1;
+        };
+        let Some(dst) = (unsafe { borrow_bytes(dst, "dst") }) else {
+            return -1;
+        };
+        let cloned = fs.lookup_path_bytes(src).and_then(|from| {
+            let to = fs.lookup_path_bytes(dst)?;
+            fs.clone_range(from.ino, src_offset, to.ino, dst_offset, len)
+        });
+        match cloned {
+            Ok(()) => 0,
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
+}
+
 // ---------------------------------------------------------------------
 // Attributes (#263): extended attributes, mode, owner, times
 // ---------------------------------------------------------------------

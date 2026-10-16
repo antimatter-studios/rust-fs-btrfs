@@ -231,6 +231,22 @@ pub(crate) struct DataRelease {
     pub old_ref_offset: u64,
 }
 
+/// A data extent a clone shares (#269): a file item the change puts
+/// names it, so its record gains that item's inline `EXTENT_DATA_REF` --
+/// counted up, or added where the kernel puts it -- and one on its total.
+/// Its bytes, its checksums, its free space and its block group's `used`
+/// stay as they are, since nothing is allocated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DataShare {
+    /// The extent shared.
+    pub bytenr: u64,
+    /// Its length, as the extent tree's `EXTENT_ITEM` key records it.
+    pub len: u64,
+    /// The file offset at which the extent's first byte would sit for the
+    /// new item: its key offset less its offset into the extent.
+    pub ref_offset: u64,
+}
+
 /// The file-data half of a transaction: one file whose extents move.
 ///
 /// Empty for a transaction that only relocates tree blocks, which is
@@ -275,6 +291,10 @@ pub(crate) struct DataWrite {
     /// other references -- and so do the extent's bytes, its checksums,
     /// its free space and its block group's `used`.
     pub unrefs: Vec<DataRelease>,
+    /// Extents a clone shares, each gaining one reference from inode
+    /// `ino` of tree `root` (#269): one per file item `edits` puts that
+    /// names one.
+    pub shares: Vec<DataShare>,
     /// Items of other trees put or removed, each with the tree it is in
     /// (#267): a new subvolume's `ROOT_ITEM` and references in the root
     /// tree, and its entry in the UUID tree. Each lands in the leaf a
@@ -1258,6 +1278,14 @@ impl Filesystem {
         // closed over, so a part not applied means the leaf it is in was
         // missed — and committing without it leaves an extent nothing
         // references, or an item naming one nothing records.
+        if applied.shared != data.shares.len() {
+            return Err(Error::UnsupportedFeature(format!(
+                "the clone adds a reference to {} data extents, and the plan edited the \
+                 records of {}",
+                data.shares.len(),
+                applied.shared
+            )));
+        }
         let n = data.moves.len();
         let inode = usize::from(n > 0);
         if applied.items != n || applied.inodes != inode {
@@ -1390,6 +1418,11 @@ impl Filesystem {
 
             let before = seed.len();
             seed.extend(self.extent_leaves_for(&touched)?);
+            // A shared extent's record gains a reference, and nothing is
+            // allocated or freed: its extent tree leaf is dirty, and no
+            // free-space or block group leaf is (#269).
+            let shared: Vec<u64> = data.shares.iter().map(|s| s.bytenr).collect();
+            seed.extend(self.extent_leaves_for(&shared)?);
             // The free-space tree tracks the same moves from the other
             // side, so its leaves for those addresses are dirty too.
             seed.extend(self.free_space_leaves_for(&touched)?);
@@ -1768,6 +1801,60 @@ impl Filesystem {
             out = delete(&out, &key)?;
             out = insert(&out, OwnedItem { key, data: dropped })?;
             applied.unreffed += 1;
+        }
+
+        // Each data extent a clone shares (#269): its record stays, with
+        // the new file item's inline reference added -- counted up, or put
+        // where the kernel looks for it -- and one more on its total. A
+        // record whose references are kept as items of their own, or
+        // that would outgrow what the kernel keeps inline, is refused:
+        // filing a reference as an item is not written here.
+        for s in &data.shares {
+            if !mine(s.bytenr)? {
+                continue;
+            }
+            let key = DiskKey {
+                objectid: s.bytenr,
+                key_type: key_type::EXTENT_ITEM,
+                offset: s.len,
+            };
+            let body = out
+                .iter()
+                .find(|i| i.key == key)
+                .map(|i| i.data.clone())
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(format!(
+                        "the data extent at {} a clone shares has no record where the plan \
+                         looked",
+                        s.bytenr
+                    ))
+                })?;
+            let keyed = out.iter().any(|i| {
+                i.key.objectid == s.bytenr
+                    && matches!(
+                        i.key.key_type,
+                        crate::backref::EXTENT_DATA_REF | crate::backref::SHARED_DATA_REF
+                    )
+            });
+            let added = crate::backref::add_inline_data_ref(
+                key_type::EXTENT_ITEM,
+                &body,
+                data.root,
+                data.ino,
+                s.ref_offset,
+            )?;
+            let limit = max_inline_extent_item(self.sb.nodesize);
+            if keyed || (added.len() > body.len() && added.len() >= limit) {
+                return Err(Error::UnsupportedFeature(format!(
+                    "the data extent at {} keeps its references as items of their own, or \
+                     would at {} bytes inline, and filing one that way is not implemented",
+                    s.bytenr,
+                    added.len()
+                )));
+            }
+            out = delete(&out, &key)?;
+            out = insert(&out, OwnedItem { key, data: added })?;
+            applied.shared += 1;
         }
 
         // Each reference that names a moved full-backref block by its
@@ -2184,6 +2271,8 @@ struct DataApplied {
     released: usize,
     /// Shared data extents whose record lost one reference.
     unreffed: usize,
+    /// Data extents whose record gained one reference from a clone.
+    shared: usize,
     /// New data extents recorded.
     recorded: usize,
     /// `ROOT_ITEM`s whose flags were set.
