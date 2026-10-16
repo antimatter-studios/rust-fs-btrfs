@@ -1365,9 +1365,11 @@ impl Filesystem {
     /// bytes are somewhere this filesystem cannot see.
     /// A tree walker over this filesystem's pool.
     ///
-    /// The four lines this replaces —
+    /// The four lines this replaces — both forms are run side by side,
+    /// over a real image, by `needs_host::both_pool_reader_forms_walk_the_same_root_tree`
+    /// below; `self` is private here, so a doctest cannot build either —
     ///
-    /// ```ignore
+    /// ```text
     /// let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
     ///     Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
     /// };
@@ -1383,7 +1385,7 @@ impl Filesystem {
     ///
     /// Callers write:
     ///
-    /// ```ignore
+    /// ```text
     /// let reader = self.pool_reader();
     /// let tree = reader.tree();
     /// ```
@@ -3502,5 +3504,76 @@ mod tests {
              devid 2, and reported success: wrong data rather than an error, which is \
              why the mount path must not use it on a pool"
         );
+    }
+}
+
+/// Host-oracle tests, run in the harness VM; see `transaction.rs` for why
+/// the module is named `needs_host`.
+#[cfg(test)]
+mod needs_host {
+    use super::Filesystem;
+    use crate::btree::Tree;
+    use crate::Result;
+    use fs_btrfs_test_support::{oracle, temp_path};
+    use fs_core::FileDevice;
+    use std::sync::Arc;
+
+    /// The two reader construction forms in [`Filesystem::pool_reader`]'s
+    /// documentation walk the same root tree to the same items.
+    ///
+    /// The first is the closure-plus-`Tree::from_superblock` form the
+    /// helper replaced; the second is `pool_reader().tree()`. Both are
+    /// written out here exactly as the documentation shows them, over an
+    /// image `mkfs.btrfs` made, so the documented forms are executed
+    /// rather than ignored.
+    #[test]
+    fn both_pool_reader_forms_walk_the_same_root_tree() {
+        let dir = std::path::PathBuf::from(temp_path!("pool-reader-forms"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("fs.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(256 * 1024 * 1024)
+            .unwrap();
+        let made = oracle("mkfs.btrfs")
+            .args(["-q", "-f", "-s", "4096", "-n", "16384"])
+            .arg(&img)
+            .output();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let fs = Filesystem::mount(Arc::new(FileDevice::open(&img).unwrap())).unwrap();
+
+        let collect = |tree: &Tree<'_>| {
+            let mut keys = Vec::new();
+            tree.for_each(fs.sb.root, &mut |key, data| {
+                keys.push((key.objectid, key.key_type, key.offset, data.to_vec()));
+                Ok(true)
+            })
+            .unwrap();
+            keys
+        };
+
+        // The form the helper replaced.
+        let read = |logical: u64, buf: &mut [u8]| -> Result<()> {
+            Filesystem::read_logical_pool(&fs.device, &fs.devices, &fs.map, logical, buf)
+        };
+        let tree = Tree::from_superblock(&fs.sb, &read);
+        let replaced = collect(&tree);
+
+        // The form callers write now.
+        let reader = fs.pool_reader();
+        let tree = reader.tree();
+        let current = collect(&tree);
+
+        assert!(
+            replaced.len() >= 4,
+            "a fresh mkfs.btrfs root tree holds at least the extent, \
+             dev, fs and csum ROOT_ITEMs; walked {}",
+            replaced.len()
+        );
+        assert_eq!(replaced, current);
     }
 }
