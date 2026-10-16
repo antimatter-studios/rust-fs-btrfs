@@ -1,4 +1,5 @@
-//! The devices a filesystem spans: adding one, and replacing one (#303).
+//! The devices a filesystem spans: adding one, replacing one, and removing
+//! one (#303).
 //!
 //! # Adding a device
 //!
@@ -79,6 +80,20 @@
 //! member, and a mount or a device that cannot write. The old device must
 //! be readable: rebuilding a missing or failed device from its mirrors is
 //! not implemented.
+//!
+//! # Removing a device
+//!
+//! A device leaves in one committed transaction, the add undone: its
+//! `DEV_ITEM` deleted from the chunk tree, and every other member's
+//! superblock counting one device fewer and its size less. Then the
+//! device's own superblocks are wiped, after the commit is flushed: cut
+//! before the wipe, the device still carries a superblock of an older
+//! generation, which the members' newer one does not count.
+//!
+//! Only a device that holds no chunk can be removed so far: one with a
+//! `DEV_EXTENT` on it holds a stripe of some chunk, which has to be
+//! relocated onto the other devices first, and that is a balance (#304).
+//! The last device is refused too, as is a mount that cannot write.
 
 use std::sync::Arc;
 
@@ -332,14 +347,7 @@ impl Filesystem {
         target.flush()?;
 
         // 3. The old device is no longer one.
-        let blank = vec![0u8; SUPERBLOCK_SIZE];
-        for &offset in &SUPER_OFFSETS {
-            if offset + SUPERBLOCK_SIZE as u64 > source.size_bytes() {
-                continue;
-            }
-            source.write_at(offset, &blank)?;
-        }
-        source.flush()?;
+        wipe_superblocks(&source)?;
 
         let members = if self.writable_pool.is_empty() {
             vec![target]
@@ -355,6 +363,114 @@ impl Filesystem {
                 })
                 .collect()
         };
+        *self = Filesystem::mount_pool_rw(members)?;
+        Ok(())
+    }
+
+    /// Remove device `devid` from the filesystem, as one committed
+    /// transaction, and wipe its superblocks. The mount becomes the one of
+    /// the devices that are left.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] unless the mount can write, and
+    /// [`Error::UnsupportedFeature`] for a devid that is not a member, the
+    /// last device, and a device that holds a chunk, each before anything
+    /// is written.
+    pub fn remove_device(&mut self, devid: u64) -> Result<()> {
+        if self.writable.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        let Some(device) = self.writable_pool.get(&devid).cloned() else {
+            return Err(Error::UnsupportedFeature(
+                if self.writable_pool.is_empty() && devid == self.sb.dev_item.devid {
+                    format!("device {devid} is the filesystem's only device")
+                } else {
+                    format!("device {devid} is not a member of this filesystem")
+                },
+            ));
+        };
+        let extents = self.device_extents(devid)?;
+        if !extents.is_empty() {
+            return Err(Error::UnsupportedFeature(format!(
+                "device {devid} holds {} device extents: moving its chunks onto the other \
+                 devices is a balance, which is not implemented",
+                extents.len()
+            )));
+        }
+
+        let key = DiskKey {
+            objectid: objectid::DEV_ITEMS,
+            key_type: key_type::DEV_ITEM,
+            offset: devid,
+        };
+        let (item, leaf) = {
+            let reader = self.pool_reader();
+            let tree = reader.tree();
+            let item = tree
+                .search(self.sb.chunk_root, &key)?
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(format!(
+                        "the chunk tree has no item for device {devid}"
+                    ))
+                })?
+                .data;
+            (item, tree.descend(self.sb.chunk_root, &key)?.header.bytenr)
+        };
+        let size = crate::superblock::DevItem::parse(&item)?.total_bytes;
+        let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
+            Error::UnsupportedFeature("the generation counter is exhausted".into())
+        })?;
+        let write = DataWrite {
+            root: objectid::CHUNK_TREE,
+            edits: vec![ItemEdit::Delete(key)],
+            ..Default::default()
+        };
+        let plan = self.plan_transaction_closed_with(&[leaf], &write, PLAN_ROUNDS)?;
+        let blocks = self.render_plan_with(&plan, &write, generation)?;
+        let root = self.planned_root(&plan).ok_or_else(|| {
+            Error::UnsupportedFeature("removing a device's plan does not move the root tree".into())
+        })?;
+        let chunk_root = self.planned_chunk_root(&plan).ok_or_else(|| {
+            Error::UnsupportedFeature(
+                "removing a device's plan does not move the chunk tree".into(),
+            )
+        })?;
+        let bytes_used = match plan.usage_delta(u64::from(self.sb.nodesize)) {
+            0 => None,
+            d => Some(
+                u64::try_from(i128::from(self.sb.bytes_used) + d).map_err(|_| {
+                    Error::UnsupportedFeature(format!(
+                        "the superblock's {} bytes used cannot move by {d}",
+                        self.sb.bytes_used
+                    ))
+                })?,
+            ),
+        };
+        self.commit_removing_device(
+            &blocks,
+            &Commit {
+                generation,
+                root,
+                bytes_used,
+                chunk_root: Some(chunk_root),
+                chunk_root_generation: Some(generation),
+                invalidate_free_space_tree: false,
+                ..Default::default()
+            },
+            devid,
+            size,
+        )?;
+
+        // The device is no longer counted; now it no longer says it is one.
+        wipe_superblocks(&device)?;
+
+        let members = self
+            .writable_pool
+            .iter()
+            .filter(|(id, _)| **id != devid)
+            .map(|(_, d)| Arc::clone(d))
+            .collect();
         *self = Filesystem::mount_pool_rw(members)?;
         Ok(())
     }
@@ -417,6 +533,20 @@ impl Filesystem {
             Error::UnsupportedFeature("the chunk tree holds no device item at all".into())
         })
     }
+}
+
+/// Zero every superblock copy `device` holds, and flush, so that no scan
+/// finds it as a member of anything.
+fn wipe_superblocks(device: &Arc<dyn BlockDevice>) -> Result<()> {
+    let blank = vec![0u8; SUPERBLOCK_SIZE];
+    for &offset in &SUPER_OFFSETS {
+        if offset + SUPERBLOCK_SIZE as u64 > device.size_bytes() {
+            continue;
+        }
+        device.write_at(offset, &blank)?;
+    }
+    device.flush()?;
+    Ok(())
 }
 
 #[cfg(test)]
