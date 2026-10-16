@@ -1,0 +1,34 @@
+name: Isolated teardown regression
+
+on:
+  pull_request:
+    paths:
+      - scripts/test.sh
+      - tests/scripts/vm-teardown-retry.sh
+      - .github/workflows/teardown-regression.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CHORE_VERSION: "0.11.0"
+
+jobs:
+  teardown:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: Resolve pinned siblings
+        run: chore siblings
+      - name: Exercise the isolated lifecycle regression
+        run: bash ../rust-fs-core/scripts/tier.sh test:teardown teardown 6 1200 -- bash tests/scripts/vm-teardown-retry.sh
+      - name: Keep teardown evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: teardown-regression
+          path: tmp/logs/teardown.log
+          if-no-files-found: error

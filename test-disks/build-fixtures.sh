@@ -123,6 +123,20 @@ artefacts_for() {
             ;;
         dirtylog)
             echo dirtylog/btrfs-dirty-log.img
+            echo dirtylog/btrfs-dirty-log-replay.img
+            echo dirtylog/btrfs-dirty-log-replay.logdump
+            echo dirtylog/btrfs-dirty-log-inode.img
+            echo dirtylog/btrfs-dirty-log-inode.logdump
+            echo dirtylog/btrfs-dirty-log-inline.img
+            echo dirtylog/btrfs-dirty-log-inline.logdump
+            echo dirtylog/btrfs-dirty-log-mixedlog.img
+            echo dirtylog/btrfs-dirty-log-mixedlog.logdump
+            echo dirtylog/btrfs-dirty-log-compressedinline.img
+            echo dirtylog/btrfs-dirty-log-compressedinline.logdump
+            echo dirtylog/btrfs-dirty-log-externalextent.img
+            echo dirtylog/btrfs-dirty-log-externalextent.logdump
+            echo dirtylog/btrfs-dirty-log-sizechange.img
+            echo dirtylog/btrfs-dirty-log-sizechange.logdump
             ;;
         cli)
             echo cli/btrfs-cli.img; echo cli/btrfs-cli.superdump; echo cli/btrfs-cli.manifest

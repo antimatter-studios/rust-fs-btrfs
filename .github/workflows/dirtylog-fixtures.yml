@@ -1,0 +1,54 @@
+name: Kernel-made dirty-log fixtures
+
+# The focused producer route for the dirty-log fixtures (#266): it builds
+# only the `dirtylog` target in the harness VM, so a change to how those
+# images are made gets the native dump's verdict without the whole
+# pipeline. Every producer assertion still runs; this proves the images
+# and their transcripts, not replay, which the full pipeline still owns.
+on:
+  pull_request:
+    paths:
+      - test-disks/guest-build-images.sh
+      - .github/workflows/dirtylog-fixtures.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CHORE_VERSION: "0.11.0"
+
+jobs:
+  dirtylog:
+    name: dirtylog fixtures (harness VM, x86_64 KVM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - name: Build the dirtylog target only
+        run: test-disks/build-fixtures.sh dirtylog
+      - name: chore vm:status (the VM is down again)
+        if: always()
+        run: '! chore vm:status'
+      - name: Keep the native transcripts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dirtylog-transcripts
+          path: test-disks/dirtylog/*.logdump
+          if-no-files-found: warn

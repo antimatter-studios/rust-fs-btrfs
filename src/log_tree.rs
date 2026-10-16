@@ -5,7 +5,7 @@
 //! from a **log root tree**, and points the superblock's `log_root` at
 //! that. The next mount replays the log into the real trees. Until then
 //! the committed trees hold the state before the `fsync`, which is why
-//! every mount here refuses such a volume with [`Error::DirtyLog`]:
+//! read-only mounts refuse such a volume with [`Error::DirtyLog`]:
 //! reading past the log returns bytes an application was told had been
 //! durably replaced.
 //!
@@ -20,10 +20,11 @@
 //! data. [`Filesystem::log`] returns every item of every log tree, raw,
 //! with accessors for the logged inodes, names and file contents.
 //!
-//! # What it does not do
+//! # Limited replay
 //!
-//! Replay. Folding the log into the trees is the rest of #266; until it
-//! lands, a writable mount still refuses a non-empty log.
+//! A writable mount can recover logged inode metadata for existing empty
+//! regular files in tree 5. References must be unchanged; other records,
+//! new inodes and data or namespace changes remain refused (#266).
 //! [`Filesystem::mount_ignoring_log`] opens such a volume **read-only**,
 //! reading the committed trees as the kernel's `-o ro,nologreplay`
 //! does: an explicit opt-in, because what was `fsync`ed is invisible
@@ -127,8 +128,10 @@ impl LoggedTree {
 
 /// Offsets within a file extent item.
 mod fe {
+    pub const RAM_BYTES: usize = 8;
     pub const COMPRESSION: usize = 16;
     pub const ENCRYPTION: usize = 17;
+    pub const OTHER_ENCODING: usize = 18;
     pub const TYPE: usize = 20;
     pub const INLINE_DATA: usize = 21;
     pub const DISK_BYTENR: usize = 21;
@@ -155,7 +158,172 @@ fn le64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes"))
 }
 
+/// Whether a logged file extent item only rewrites the bytes of a
+/// committed inline extent at the same length: both inline, neither
+/// compressed, encrypted or otherwise encoded, and each one's
+/// `ram_bytes` naming exactly the data it carries.
+fn same_length_inline(committed: &[u8], logged: &[u8]) -> bool {
+    let plain = |d: &[u8]| {
+        d.len() > fe::INLINE_DATA
+            && d[fe::TYPE] == 0
+            && d[fe::COMPRESSION] == 0
+            && d[fe::ENCRYPTION] == 0
+            && d[fe::OTHER_ENCODING..fe::TYPE] == [0, 0]
+            && le64(d, fe::RAM_BYTES) == (d.len() - fe::INLINE_DATA) as u64
+    };
+    plain(committed) && plain(logged) && committed.len() == logged.len()
+}
+
 impl Filesystem {
+    /// Recover existing empty regular files in tree 5, and existing
+    /// regular files whose only logged data is a same-length rewrite of
+    /// their one uncompressed inline extent. Everything is validated
+    /// before the first write; other data, names and other trees remain
+    /// refused until their replay has independent oracle proof.
+    pub(crate) fn replay_inode_only_log(&mut self) -> Result<()> {
+        use crate::chunk::objectid;
+        use crate::inode::INODE_ITEM_SIZE;
+        use crate::leaf_edit::OwnedItem;
+        use crate::transaction::{DataWrite, ItemEdit};
+        use std::collections::BTreeSet;
+
+        let log = self.log()?.ok_or(Error::DirtyLog)?;
+        if log.trees.len() != 1 || log.trees[0].subvolume != objectid::FS_TREE {
+            return Err(Error::DirtyLog);
+        }
+        self.require_writable_top_level()?;
+        let top = &log.trees[0];
+        let mut edits = Vec::new();
+        let mut pins = Vec::new();
+        {
+            let reader = self.pool_reader();
+            let tree = reader.tree();
+            let mut roots = 0;
+            tree.for_each(log.log_root, &mut |key, _| {
+                if key.objectid != TREE_LOG_OBJECTID
+                    || key.key_type != ROOT_ITEM_KEY
+                    || key.offset != objectid::FS_TREE
+                {
+                    return Err(Error::DirtyLog);
+                }
+                roots += 1;
+                Ok(true)
+            })?;
+            if roots != 1 {
+                return Err(Error::DirtyLog);
+            }
+            for item in &top.items {
+                let committed = tree
+                    .search(self.fs_tree_root, &item.key)?
+                    .ok_or(Error::DirtyLog)?;
+                match item.key.key_type {
+                    INODE_ITEM_KEY if item.key.offset == 0 => {
+                        if item.data.len() != INODE_ITEM_SIZE
+                            || committed.data.len() != INODE_ITEM_SIZE
+                        {
+                            return Err(Error::DirtyLog);
+                        }
+                        let before = Inode::parse(&committed.data, item.key.objectid)?;
+                        let after = Inode::parse(&item.data, item.key.objectid)?;
+                        let committed_extents =
+                            tree.find_all(self.fs_tree_root, before.ino, EXTENT_DATA_KEY)?;
+                        let logged_extents: Vec<_> = top.extents(before.ino).collect();
+                        // An empty file logs no data; an inline file logs
+                        // its one extent at offset 0, checked below.
+                        let extents_match = if before.size == 0 {
+                            before.nbytes == 0
+                                && committed_extents.is_empty()
+                                && logged_extents.is_empty()
+                        } else {
+                            committed_extents.len() == 1
+                                && logged_extents.len() == 1
+                                && logged_extents[0].key.offset == 0
+                        };
+                        // The kernel logs an inode's `nbytes` as 0 and
+                        // replay keeps the committed count, adjusting it
+                        // only for extents the log changes; a same-length
+                        // rewrite changes none (fixture
+                        // btrfs-dirty-log-inline: committed 33, logged 0).
+                        if !before.is_regular_file()
+                            || !after.is_regular_file()
+                            || before.size != after.size
+                            || (after.nbytes != before.nbytes && after.nbytes != 0)
+                            || !extents_match
+                            || before.generation != after.generation
+                            || before.ino < crate::inode::FIRST_FREE_OBJECTID
+                            || before.nlink == 0
+                            || before.nlink != after.nlink
+                            || before.flags != after.flags
+                            || before.rdev != after.rdev
+                            || before.block_group != after.block_group
+                        {
+                            return Err(Error::DirtyLog);
+                        }
+                        let mut data = item.data.clone();
+                        data[crate::inode::offsets::NBYTES..crate::inode::offsets::NBYTES + 8]
+                            .copy_from_slice(&before.nbytes.to_le_bytes());
+                        edits.push(ItemEdit::Put(OwnedItem {
+                            key: item.key,
+                            data,
+                        }));
+                    }
+                    // Only a same-length rewrite of the committed inline
+                    // extent, of an inode whose metadata is in this log
+                    // and whose size is that extent's length.
+                    EXTENT_DATA_KEY
+                        if item.key.offset == 0
+                            && same_length_inline(&committed.data, &item.data)
+                            && top.inode(item.key.objectid)?.is_some_and(|i| {
+                                i.size == (item.data.len() - fe::INLINE_DATA) as u64
+                            }) =>
+                    {
+                        edits.push(ItemEdit::Put(OwnedItem {
+                            key: item.key,
+                            data: item.data.clone(),
+                        }));
+                    }
+                    // References may only repeat the already committed
+                    // bytes of an inode whose metadata is in this log.
+                    INODE_REF_KEY
+                        if committed.data == item.data
+                            && top.inodes().contains(&item.key.objectid) => {}
+                    _ => return Err(Error::DirtyLog),
+                }
+            }
+            if edits.is_empty() {
+                return Err(Error::DirtyLog);
+            }
+            // Log blocks have no extent-tree allocation. Pin all of
+            // them until the same commit both installs the inode items
+            // and clears the log, preserving recovery after a crash.
+            let mut stack = vec![log.log_root, top.root];
+            let mut seen = BTreeSet::new();
+            while let Some(at) = stack.pop() {
+                if !seen.insert(at) {
+                    return Err(Error::DirtyLog);
+                }
+                let block = tree.read_block(at)?;
+                pins.push((at, u64::from(self.sb.nodesize)));
+                if let Some(children) = block.body.key_ptrs() {
+                    stack.extend(children.iter().map(|child| child.blockptr));
+                }
+            }
+        }
+        let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
+            Error::UnsupportedFeature("the log replay generation overflows".into())
+        })?;
+        self.pinned.extend(pins);
+        self.commit_write_with(
+            DataWrite {
+                root: objectid::FS_TREE,
+                edits,
+                ..Default::default()
+            },
+            generation,
+            true,
+        )
+    }
+
     /// Open a volume read-only whatever its log holds, reading the
     /// committed trees and leaving the log unreplayed — the kernel's
     /// `-o ro,nologreplay`.
@@ -348,5 +516,55 @@ mod tests {
         assert_eq!(tree.inode_named(256, b"ab"), None);
         assert_eq!(tree.inode_named(257, b"abc"), None);
         assert!(tree.inode(258).unwrap().is_none());
+    }
+
+    fn inline(data: &[u8]) -> Vec<u8> {
+        let mut d = vec![0u8; fe::INLINE_DATA];
+        d[fe::RAM_BYTES..fe::RAM_BYTES + 8].copy_from_slice(&(data.len() as u64).to_le_bytes());
+        d.extend_from_slice(data);
+        d
+    }
+
+    #[test]
+    fn only_a_plain_same_length_inline_rewrite_is_replayable() {
+        let committed = inline(b"committed");
+        assert!(same_length_inline(&committed, &inline(b"rewritten")));
+        assert!(
+            !same_length_inline(&committed, &inline(b"longer data")),
+            "size change"
+        );
+        for at in [
+            fe::COMPRESSION,
+            fe::ENCRYPTION,
+            fe::OTHER_ENCODING,
+            fe::OTHER_ENCODING + 1,
+        ] {
+            let mut encoded = inline(b"rewritten");
+            encoded[at] = 1;
+            assert!(
+                !same_length_inline(&committed, &encoded),
+                "encoding byte {at}"
+            );
+            assert!(
+                !same_length_inline(&encoded, &inline(b"rewritten")),
+                "committed byte {at}"
+            );
+        }
+        let mut external = inline(b"rewritten");
+        external[fe::TYPE] = 1;
+        assert!(
+            !same_length_inline(&committed, &external),
+            "external extent"
+        );
+        let mut ram = inline(b"rewritten");
+        ram[fe::RAM_BYTES] = 3;
+        assert!(
+            !same_length_inline(&committed, &ram),
+            "ram_bytes disagrees with data"
+        );
+        assert!(
+            !same_length_inline(&inline(b""), &inline(b"")),
+            "no inline data"
+        );
     }
 }

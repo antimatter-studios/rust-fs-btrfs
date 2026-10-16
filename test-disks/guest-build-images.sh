@@ -1203,6 +1203,326 @@ build_dirtylog() {
     mv -f "$OUT/dirtylog/btrfs-dirty-log.img.partial" "$OUT/dirtylog/btrfs-dirty-log.img"
     rm -f "$copy" "$WORK/dirty-log.super"
     note "built btrfs-dirty-log (log_root $log_root)"
+    build_dirtylog_replay
+    build_dirtylog_inode
+    build_dirtylog_inline
+    build_dirtylog_refused mixedlog 'compress=no,max_inline=2048' mixedlog
+    build_dirtylog_refused compressedinline 'compress-force=zlib,max_inline=2048' compressedinline
+    build_dirtylog_refused externalextent 'compress=no,max_inline=0' externalextent
+    build_dirtylog_refused sizechange 'compress=no,max_inline=2048' sizechange
+}
+
+# fsync_path <path> — fsync one file or directory, and nothing else.
+#
+# Not `sync`, which commits the whole filesystem and would empty the log
+# this recipe exists to fill; not `dd conv=fsync`, which cannot open a
+# directory.
+fsync_path() {
+    python3 -c 'import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+os.fsync(fd)
+os.close(fd)' "$1"
+}
+
+# Metadata-only recovery, separate from the data/name replay fixtures.
+# An empty, committed file has no data extents to replay. Its existing
+# name and owner stay fixed; only chmod is made durable through fsync.
+# See https://btrfs.readthedocs.io/en/latest/btrfs-man5.html (treelog).
+build_dirtylog_inode() {
+    local img="$WORK/btrfs-dirty-log-inode.img" copy="$WORK/btrfs-dirty-log-inode-copy.img"
+    local log_root ino log_tree
+    truncate -s 256M "$img"
+    mkfs.btrfs -f "$img" >/dev/null
+    mount -o loop,commit=300 "$img" "$MNT"
+    touch "$MNT/metadata-only"
+    chmod 0600 "$MNT/metadata-only"
+    chown 12345:23456 "$MNT/metadata-only"
+    sync
+    ino=$(stat -c '%i' "$MNT/metadata-only")
+    chmod 0640 "$MNT/metadata-only"
+    fsync_path "$MNT/metadata-only"
+    cp --sparse=always "$img" "$copy"
+    umount "$MNT"
+    log_root=$(btrfs inspect-internal dump-super "$copy" | awk '$1 == "log_root" { print $2 }')
+    if [ -z "$log_root" ] || [ "$log_root" = 0 ]; then
+        echo "guest-build-images: inode-only fsync left no log; chore fixtures dirtylog must produce one" >&2
+        exit 1
+    fi
+    btrfs inspect-internal dump-tree -t 18446744073709551610 "$copy" \
+        > "$OUT/dirtylog/btrfs-dirty-log-inode.logdump"
+    # TREE_LOG is the log root tree, not subvolume 5's log tree. Follow
+    # its ROOT_ITEM's bytenr explicitly, keeping both native dumps.
+    log_tree=$(python3 - "$OUT/dirtylog/btrfs-dirty-log-inode.logdump" <<'PY'
+import re, sys
+dump = open(sys.argv[1]).read()
+keys = re.findall(r'item \d+ key \((\S+) (\S+) (\S+)\)', dump)
+assert keys == [('TREE_LOG', 'ROOT_ITEM', '5')], ('unexpected log roots', keys)
+roots = re.findall(r'\bbytenr (\d+)\b', dump)
+assert len(roots) == 1 and int(roots[0]) > 0, ('missing log tree block', roots)
+print(roots[0])
+PY
+    )
+    btrfs inspect-internal dump-tree --follow -b "$log_tree" "$copy" \
+        >> "$OUT/dirtylog/btrfs-dirty-log-inode.logdump"
+    python3 - "$OUT/dirtylog/btrfs-dirty-log-inode.logdump" "$ino" <<'PY'
+import re, sys
+dump = open(sys.argv[1]).read()
+keys = re.findall(r'item \d+ key \((\S+) (\S+) (\S+)\)', dump)
+assert (sys.argv[2], 'INODE_ITEM', '0') in keys, ('missing logged inode', keys)
+assert all(kind in ('ROOT_ITEM', 'INODE_ITEM', 'INODE_REF')
+           for _, kind, _ in keys), ('not an inode-only log', keys)
+PY
+    cp --sparse=always "$copy" "$OUT/dirtylog/btrfs-dirty-log-inode.img.partial"
+    mv -f "$OUT/dirtylog/btrfs-dirty-log-inode.img.partial" \
+        "$OUT/dirtylog/btrfs-dirty-log-inode.img"
+    note "built btrfs-dirty-log-inode (log_root $log_root, inode $ino, mode 0600 -> 0640; dump-tree verified inode-only records)"
+}
+
+# Same-length overwrite of an existing, committed inline file. The size,
+# name and owner stay fixed; only the inline bytes change before fsync:
+# 33 bytes over 33, so no byte of the committed text survives.
+# The native dump decides the record shape; the producer refuses any log
+# that is not inode, inode ref and file extent records.
+build_dirtylog_inline() {
+    local img="$WORK/btrfs-dirty-log-inline.img" copy="$WORK/btrfs-dirty-log-inline-copy.img"
+    local log_root ino log_tree
+    truncate -s 256M "$img"
+    mkfs.btrfs -f "$img" >/dev/null
+    mount -o loop,commit=300,compress=no,max_inline=2048 "$img" "$MNT"
+    printf 'committed-inline-bytes-0123456789' > "$MNT/inline-overwrite"
+    sync
+    ino=$(stat -c '%i' "$MNT/inline-overwrite")
+    python3 -c 'import os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY)
+os.pwrite(fd, b"replayed-inline-bytes-ABCDEFGHIJK", 0)
+os.fsync(fd)
+os.close(fd)' "$MNT/inline-overwrite"
+    cp --sparse=always "$img" "$copy"
+    umount "$MNT"
+    log_root=$(btrfs inspect-internal dump-super "$copy" | awk '$1 == "log_root" { print $2 }')
+    if [ -z "$log_root" ] || [ "$log_root" = 0 ]; then
+        echo "guest-build-images: inline overwrite fsync left no log; chore fixtures dirtylog must produce one" >&2
+        exit 1
+    fi
+    # The copy was taken while mounted and is never mounted again, so its
+    # digest names the exact crash image this transcript describes.
+    {
+        printf 'image sha256: %s\n' "$(sha256sum "$copy" | awk '{ print $1 }')"
+        btrfs inspect-internal dump-tree -t 18446744073709551610 "$copy"
+    } > "$OUT/dirtylog/btrfs-dirty-log-inline.logdump"
+    log_tree=$(python3 - "$OUT/dirtylog/btrfs-dirty-log-inline.logdump" <<'PY'
+import re, sys
+dump = open(sys.argv[1]).read()
+keys = re.findall(r'item \d+ key \((\S+) (\S+) (\S+)\)', dump)
+assert keys == [('TREE_LOG', 'ROOT_ITEM', '5')], ('unexpected log roots', keys)
+roots = re.findall(r'\bbytenr (\d+)\b', dump)
+assert len(roots) == 1 and int(roots[0]) > 0, ('missing log tree block', roots)
+print(roots[0])
+PY
+    )
+    btrfs inspect-internal dump-tree --follow -b "$log_tree" "$copy" \
+        >> "$OUT/dirtylog/btrfs-dirty-log-inline.logdump"
+    python3 - "$OUT/dirtylog/btrfs-dirty-log-inline.logdump" "$ino" <<'PY'
+import re, sys
+dump = open(sys.argv[1]).read()
+keys = re.findall(r'item \d+ key \((\S+) (\S+) (\S+)\)', dump)
+assert (sys.argv[2], 'INODE_ITEM', '0') in keys, ('missing logged inode', keys)
+assert (sys.argv[2], 'EXTENT_DATA', '0') in keys, ('missing logged extent', keys)
+assert all(kind in ('ROOT_ITEM', 'INODE_ITEM', 'INODE_REF', 'EXTENT_DATA')
+           for _, kind, _ in keys), ('not an inline overwrite log', keys)
+assert 'inline' in dump, ('logged extent is not inline', dump)
+PY
+    test "$(sha256sum "$copy" | awk '{ print $1 }')" = \
+        "$(awk '/^image sha256: / { print $3 }' "$OUT/dirtylog/btrfs-dirty-log-inline.logdump")" || {
+        echo "guest-build-images: inline crash image changed after its transcript was taken" >&2
+        exit 1
+    }
+    cp --sparse=always "$copy" "$OUT/dirtylog/btrfs-dirty-log-inline.img.partial"
+    mv -f "$OUT/dirtylog/btrfs-dirty-log-inline.img.partial" \
+        "$OUT/dirtylog/btrfs-dirty-log-inline.img"
+    note "built btrfs-dirty-log-inline (log_root $log_root, inode $ino, 33-byte inline overwrite; dump-tree verified record kinds)"
+}
+
+# A kernel-made log of a shape replay does not support. Each shape has
+# its own image, mount options and mutation; the native transcript is
+# bound to the exact image by sha256 and superblock, and the record that
+# makes the shape unsupported is asserted from the native dump, not ours.
+build_dirtylog_refused() {
+    local shape="$1" opts="$2" kind="$3"
+    local img="$WORK/btrfs-dirty-log-$shape.img" copy="$WORK/btrfs-dirty-log-$shape-copy.img"
+    local out="$OUT/dirtylog/btrfs-dirty-log-$shape" log_root log_tree
+    truncate -s 256M "$img"
+    mkfs.btrfs -f "$img" >/dev/null
+    mount -o "loop,commit=300,$opts" "$img" "$MNT"
+    case "$kind" in
+        mixedlog|sizechange|compressedinline)
+            printf 'committed-inline-bytes-0123456789' > "$MNT/f" ;;
+        externalextent)
+            head -c 8192 /dev/zero | tr '\0' 'c' > "$MNT/f" ;;
+    esac
+    sync
+    python3 -c 'import os, sys
+kind, d = sys.argv[1], sys.argv[2]
+fd = os.open(d + "/f", os.O_WRONLY)
+if kind == "sizechange":
+    os.pwrite(fd, b"replayed-and-longer-inline-bytes-0123456789", 0)
+elif kind == "externalextent":
+    os.pwrite(fd, b"r" * 8192, 0)
+elif kind == "compressedinline":
+    # Same 33-byte length, but one repeated byte: zlib shrinks it, so
+    # compress-force stores it as a compressed inline extent. The earlier
+    # text payload did not shrink and fell back to an uncompressed one.
+    os.pwrite(fd, b"z" * 33, 0)
+else:
+    os.pwrite(fd, b"replayed-inline-bytes-ABCDEFGHIJK", 0)
+if kind == "mixedlog":
+    open(d + "/g", "w").close()
+    os.rename(d + "/g", d + "/h")
+os.fsync(fd)
+if kind == "mixedlog":
+    dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+os.close(fd)' "$kind" "$MNT"
+    cp --sparse=always "$img" "$copy"
+    umount "$MNT"
+    log_root=$(btrfs inspect-internal dump-super "$copy" | awk '$1 == "log_root" { print $2 }')
+    if [ -z "$log_root" ] || [ "$log_root" = 0 ]; then
+        echo "guest-build-images: $shape fsync left no log; chore fixtures dirtylog must produce one" >&2
+        exit 1
+    fi
+    {
+        printf 'image sha256: %s\n' "$(sha256sum "$copy" | awk '{ print $1 }')"
+        btrfs inspect-internal dump-super "$copy"
+        btrfs inspect-internal dump-tree -t 18446744073709551610 "$copy"
+    } > "$out.logdump.partial"
+    log_tree=$(python3 - "$out.logdump.partial" <<'PY2'
+import re, sys
+dump = open(sys.argv[1]).read()
+roots = re.findall(r'\bbytenr (\d+)\b', dump.split('item 0 key (TREE_LOG', 1)[1])
+print(roots[0])
+PY2
+    )
+    btrfs inspect-internal dump-tree --follow -b "$log_tree" "$copy" >> "$out.logdump.partial"
+    python3 - "$out.logdump.partial" "$kind" <<'PY2'
+import re, sys
+dump, kind = open(sys.argv[1]).read(), sys.argv[2]
+want = {
+    'mixedlog': r'DIR_INDEX|DIR_ITEM',
+    'compressedinline': r'type 0 \(inline\)[\s\S]*compression [1-3]|compression [1-3]',
+    'externalextent': r'type 1 \(regular\)|extent data disk byte [1-9]',
+    'sizechange': r'inline extent data size 4[0-9]',
+}[kind]
+assert re.search(want, dump), (kind, 'native dump does not show the unsupported shape')
+if kind == 'compressedinline':
+    # The native tool must print a compressed inline extent: nonzero
+    # compression on the inline line itself, stored smaller than its bytes.
+    inline = [(int(n), int(r)) for n, r in re.findall(
+        r'inline extent data size (\d+) ram_bytes (\d+) compression [1-3]\b', dump)]
+    assert any(n < r for n, r in inline), (kind, 'native dump shows no compressed inline extent', inline)
+PY2
+    mv -f "$out.logdump.partial" "$out.logdump"
+    cp --sparse=always "$copy" "$out.img.partial"
+    mv -f "$out.img.partial" "$out.img"
+    note "built btrfs-dirty-log-$shape (log_root $log_root; native dump attests $kind)"
+}
+
+# ---------------------------------------------------------------------
+# dirtylog/btrfs-dirty-log-replay — a log tree holding every kind of
+# change a replay folds back in (#266): data and names.
+#
+# Committed by a sync, then changed and made durable by fsyncs alone, the
+# image copied while mounted as `build_dirtylog` does:
+#
+# - big.bin, 256 KiB: 4 KiB overwritten in the middle, so the log holds
+#   one new extent inside a committed one that replay has to split;
+# - new.bin: created with 128 KiB, a new extent and its checksums;
+# - grow.bin: 8 KiB appended to 8 KiB, a new extent after a committed one;
+# - shrink.bin: 64 KiB truncated to 10000 bytes;
+# - d/: gone.bin removed (its last name, so its data goes too),
+#   old-name.txt renamed to new-name.txt, fresh.txt created and fsynced,
+#   and then the directory fsynced, so the log holds its names and the
+#   index ranges they speak for.
+#
+# The directory goes first: if any fsync here fell back to a full commit,
+# everything logged before it would be committed instead, and the
+# data changes after it would still be in the log. The test reads the
+# log and names any change missing from it, rather than finding nothing
+# to replay.
+# ---------------------------------------------------------------------
+# Emit a finite yes-style payload: yes | head terminates yes with SIGPIPE,
+# which aborts this script under pipefail despite writing the right bytes.
+repeat_bytes() {
+    python3 -c 'import sys
+pattern = (sys.argv[1] + "\n").encode()
+size = int(sys.argv[2])
+sys.stdout.buffer.write((pattern * (size // len(pattern) + 1))[:size])' "$1" "$2"
+}
+
+build_dirtylog_replay() {
+    local img="$WORK/btrfs-dirty-log-replay.img" copy="$WORK/btrfs-dirty-log-replay-copy.img"
+    local log_root
+    rm -f "$img" "$copy"
+    truncate -s 256M "$img"
+    mkfs.btrfs -f "$img" >/dev/null
+    mount -o loop,commit=300 "$img" "$MNT"
+    repeat_bytes 'committed big' 262144 > "$MNT/big.bin"
+    repeat_bytes 'committed grow' 8192 > "$MNT/grow.bin"
+    repeat_bytes 'committed shrink' 65536 > "$MNT/shrink.bin"
+    mkdir "$MNT/d"
+    printf 'kept\n' > "$MNT/d/keep.txt"
+    repeat_bytes 'committed gone' 12288 > "$MNT/d/gone.bin"
+    printf 'renamed\n' > "$MNT/d/old-name.txt"
+    sync
+
+    rm "$MNT/d/gone.bin"
+    mv "$MNT/d/old-name.txt" "$MNT/d/new-name.txt"
+    printf 'fresh\n' > "$MNT/d/fresh.txt"
+    fsync_path "$MNT/d/fresh.txt"
+    fsync_path "$MNT/d"
+    repeat_bytes 'FSYNCED BIG' 4096 |
+        dd of="$MNT/big.bin" bs=4096 seek=16 conv=notrunc status=none
+    fsync_path "$MNT/big.bin"
+    repeat_bytes 'created new' 131072 > "$MNT/new.bin"
+    fsync_path "$MNT/new.bin"
+    repeat_bytes 'appended grow' 8192 >> "$MNT/grow.bin"
+    fsync_path "$MNT/grow.bin"
+    truncate -s 10000 "$MNT/shrink.bin"
+    fsync_path "$MNT/shrink.bin"
+
+    cp --sparse=always "$img" "$copy"
+    umount "$MNT"
+    rm -f "$img"
+    log_root=$(btrfs inspect-internal dump-super "$copy" | awk '$1 == "log_root" { print $2 }')
+    if [ -z "$log_root" ] || [ "$log_root" = 0 ]; then
+        echo "guest-build-images: the dirty-log replay image has log_root '${log_root}' — the fsyncs did not leave a log tree" >&2
+        exit 1
+    fi
+    # The native tools' own view of this exact crash image, taken before
+    # it leaves the guest: the image's sha256, its superblock, the log
+    # root tree and the log tree that root tree points at.
+    {
+        printf 'image sha256: %s\n' "$(sha256sum "$copy" | awk '{ print $1 }')"
+        btrfs inspect-internal dump-super "$copy"
+        btrfs inspect-internal dump-tree -t 18446744073709551610 "$copy"
+    } > "$OUT/dirtylog/btrfs-dirty-log-replay.logdump.partial"
+    log_tree=$(python3 - "$OUT/dirtylog/btrfs-dirty-log-replay.logdump.partial" <<'PY'
+import re, sys
+dump = open(sys.argv[1]).read()
+keys = re.findall(r'item \d+ key \((\S+) (\S+) (\S+)\)', dump)
+assert keys == [('TREE_LOG', 'ROOT_ITEM', '5')], ('unexpected log roots', keys)
+roots = re.findall(r'\bbytenr (\d+)\b', dump.split('item 0 key (TREE_LOG', 1)[1])
+assert roots and int(roots[0]) > 0, ('missing log tree block', roots)
+print(roots[0])
+PY
+    )
+    btrfs inspect-internal dump-tree --follow -b "$log_tree" "$copy" \
+        >> "$OUT/dirtylog/btrfs-dirty-log-replay.logdump.partial"
+    mv -f "$OUT/dirtylog/btrfs-dirty-log-replay.logdump.partial" \
+        "$OUT/dirtylog/btrfs-dirty-log-replay.logdump"
+    cp --sparse=always "$copy" "$OUT/dirtylog/btrfs-dirty-log-replay.img.partial"
+    mv -f "$OUT/dirtylog/btrfs-dirty-log-replay.img.partial" \
+        "$OUT/dirtylog/btrfs-dirty-log-replay.img"
+    rm -f "$copy"
+    note "built btrfs-dirty-log-replay (log_root $log_root)"
 }
 
 # ---------------------------------------------------------------------

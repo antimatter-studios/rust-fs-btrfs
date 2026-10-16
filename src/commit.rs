@@ -121,7 +121,7 @@ impl Filesystem {
     /// copy exists to resolve, and a reader picks the newest copy that
     /// verifies.
     pub fn commit(&self, blocks: &[PlacedBlock], commit: &Commit) -> Result<()> {
-        self.commit_with(blocks, commit, 0, Membership::Unchanged)
+        self.commit_with(blocks, commit, 0, Membership::Unchanged, false)
     }
 
     /// [`Filesystem::commit`], also setting `incompat` in the superblock's
@@ -133,7 +133,7 @@ impl Filesystem {
         commit: &Commit,
         incompat: u64,
     ) -> Result<()> {
-        self.commit_with(blocks, commit, incompat, Membership::Unchanged)
+        self.commit_with(blocks, commit, incompat, Membership::Unchanged, false)
     }
 
     /// [`Filesystem::commit`], and when `total_bytes` is given, the
@@ -150,7 +150,7 @@ impl Filesystem {
             Some(size) => Membership::Resized(size),
             None => Membership::Unchanged,
         };
-        self.commit_with(blocks, commit, 0, membership)
+        self.commit_with(blocks, commit, 0, membership, false)
     }
 
     /// [`Filesystem::commit`], adding `device` to the filesystem (#303):
@@ -165,7 +165,13 @@ impl Filesystem {
         device: &Arc<dyn BlockDevice>,
         dev_item: &[u8],
     ) -> Result<()> {
-        self.commit_with(blocks, commit, 0, Membership::Added { device, dev_item })
+        self.commit_with(
+            blocks,
+            commit,
+            0,
+            Membership::Added { device, dev_item },
+            false,
+        )
     }
 
     /// [`Filesystem::commit`], removing device `devid`, of `size` bytes,
@@ -178,17 +184,37 @@ impl Filesystem {
         devid: u64,
         size: u64,
     ) -> Result<()> {
-        self.commit_with(blocks, commit, 0, Membership::Removed { devid, size })
+        self.commit_with(
+            blocks,
+            commit,
+            0,
+            Membership::Removed { devid, size },
+            false,
+        )
     }
 
-    /// The commit, with the incompat flags it sets and the device sizes and
-    /// membership it records.
+    /// [`Filesystem::commit`], also emptying the superblock's log: the
+    /// commit that folds a log tree into the trees it logs, which has to
+    /// stop naming the log in the same superblock that names the result
+    /// (#266). A crash before it leaves the log to be replayed again; one
+    /// after leaves nothing to replay.
+    pub(crate) fn commit_clearing_log(
+        &self,
+        blocks: &[PlacedBlock],
+        commit: &Commit,
+    ) -> Result<()> {
+        self.commit_with(blocks, commit, 0, Membership::Unchanged, true)
+    }
+
+    /// The commit, with the incompat flags it sets, the device sizes and
+    /// membership it records, and whether it empties the log.
     fn commit_with(
         &self,
         blocks: &[PlacedBlock],
         commit: &Commit,
         incompat: u64,
         membership: Membership<'_>,
+        clear_log: bool,
     ) -> Result<()> {
         if self.writable.is_none() {
             return Err(Error::ReadOnly);
@@ -199,7 +225,7 @@ impl Filesystem {
         //    a root tree that does not parse is refused while refusing is
         //    still free. One per device: each device's superblock carries
         //    its own `dev_item`, which the commit does not change (#298).
-        let images = self.superblock_images(blocks, commit, incompat, membership)?;
+        let images = self.superblock_images(blocks, commit, incompat, membership, clear_log)?;
 
         // 1. Every tree block, to every mirror. Nothing points at these
         //    yet, so their order among themselves does not matter --
@@ -281,6 +307,7 @@ impl Filesystem {
         commit: &Commit,
         incompat: u64,
         membership: Membership<'_>,
+        clear_log: bool,
     ) -> Result<Vec<SuperblockImage>> {
         use crate::superblock::{dev_item_offsets, offsets as so, DEV_ITEM_SIZE};
         // A device leaving gets no superblock from the commit that removes
@@ -379,6 +406,11 @@ impl Filesystem {
                 );
                 raw[INCOMPAT_FLAGS..INCOMPAT_FLAGS + 8]
                     .copy_from_slice(&(flags | incompat).to_le_bytes());
+            }
+            if clear_log {
+                raw[so::LOG_ROOT..so::LOG_ROOT + 8].fill(0);
+                raw[so::LOG_ROOT_TRANSID..so::LOG_ROOT_TRANSID + 8].fill(0);
+                raw[so::LOG_ROOT_LEVEL] = 0;
             }
             if let Some(size) = total_bytes {
                 for at in [

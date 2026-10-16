@@ -453,6 +453,17 @@ tasks:
       # a log tree the kernel has not replayed; its own directory, like
       # the snapshot, because every other reader refuses it on purpose
       - test-disks/dirtylog/btrfs-dirty-log.img
+      # and one whose log holds data and names for a replay to fold in
+      - test-disks/dirtylog/btrfs-dirty-log-replay.img
+      # chmod + fsync of an empty committed file: no data/name replay
+      - test-disks/dirtylog/btrfs-dirty-log-inode.img
+      # same-length overwrite of an existing inline file, fsynced
+      - test-disks/dirtylog/btrfs-dirty-log-inline.img
+      # four kernel-made logs replay refuses, each a distinct shape
+      - test-disks/dirtylog/btrfs-dirty-log-mixedlog.img
+      - test-disks/dirtylog/btrfs-dirty-log-compressedinline.img
+      - test-disks/dirtylog/btrfs-dirty-log-externalextent.img
+      - test-disks/dirtylog/btrfs-dirty-log-sizechange.img
       # the volume the command-line tools are tested against, labelled
       # CLITEST, with a manifest of what the kernel wrote into it
       - test-disks/cli/btrfs-cli.img
@@ -573,9 +584,14 @@ tasks:
     # branch, the largest of the open stack (run of 2026-10-09), so 660
     # lines and 54000 bytes, ~30% over it. A per-pull-request raise edits
     # this one line in every pull request, which conflicts inside a queue.
+    #
+    # Re-measured on the #361 + #363 + #364 stack's full run 38964715754
+    # (2026-10-16): every test passed, but the kernel log printed 1172
+    # lines and 89022 bytes against 1160 and 86000. About 30% over that
+    # is 1520 lines and 116000 bytes.
     cmds:
       - test-disks/build-fixtures.sh --check
-      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 1160 86000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 1520 116000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'

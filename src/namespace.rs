@@ -766,7 +766,20 @@ impl Filesystem {
     /// an edit lands in is dirty, and `bytes_used` gives back what each
     /// released extent held.
     pub(crate) fn commit_write(&mut self, write: DataWrite, generation: u64) -> Result<()> {
-        let dirty: Vec<u64> = {
+        self.commit_write_with(write, generation, false)
+    }
+
+    /// [`Filesystem::commit_write`], emptying the superblock's log in the
+    /// same commit when `clear_log` is set (#266). A change that edits no
+    /// item still commits, rewriting the root tree's root, so that a log
+    /// holding nothing to fold in is cleared all the same.
+    pub(crate) fn commit_write_with(
+        &mut self,
+        write: DataWrite,
+        generation: u64,
+        clear_log: bool,
+    ) -> Result<()> {
+        let mut dirty: Vec<u64> = {
             let reader = self.pool_reader();
             let tree = reader.tree();
             let mut leaves = std::collections::BTreeSet::new();
@@ -788,13 +801,18 @@ impl Filesystem {
             }
             leaves.into_iter().collect()
         };
+        if dirty.is_empty() && write.records.is_empty() {
+            dirty.push(self.sb.root);
+        }
         let plan = self.plan_transaction_closed_with(&dirty, &write, PLAN_ROUNDS)?;
         let blocks = self.render_plan_with(&plan, &write, generation)?;
         let root = self.planned_root(&plan).ok_or_else(|| {
             Error::UnsupportedFeature("the change's plan does not move the root tree".into())
         })?;
         let released: i128 = write.releases.iter().map(|r| i128::from(r.old_len)).sum();
-        let bytes_used = match plan.usage_delta(u64::from(self.sb.nodesize)) - released {
+        let delta =
+            plan.usage_delta(u64::from(self.sb.nodesize)) - released + write.records_usage_delta();
+        let bytes_used = match delta {
             0 => None,
             d => Some(
                 u64::try_from(i128::from(self.sb.bytes_used) + d).map_err(|_| {
@@ -805,16 +823,18 @@ impl Filesystem {
                 })?,
             ),
         };
-        self.commit(
-            &blocks,
-            &Commit {
-                generation,
-                root,
-                bytes_used,
-                invalidate_free_space_tree: false,
-                ..Default::default()
-            },
-        )?;
+        let commit = Commit {
+            generation,
+            root,
+            bytes_used,
+            invalidate_free_space_tree: false,
+            ..Default::default()
+        };
+        if clear_log {
+            self.commit_clearing_log(&blocks, &commit)?;
+        } else {
+            self.commit(&blocks, &commit)?;
+        }
         // Every member of a pool, as the copy-on-write write reopens it
         // (#298): `mount_rw` opens one device and refuses a pool (#336).
         *self = self.remount_rw()?;
