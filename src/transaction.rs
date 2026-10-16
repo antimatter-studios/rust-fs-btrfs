@@ -305,6 +305,43 @@ pub(crate) struct DataWrite {
     /// leaf a block, and the tree's `ROOT_ITEM` -- which `tree_edits` must
     /// put -- is pointed at it.
     pub new_trees: Vec<NewTree>,
+    /// Data extent records replaced outright, whoever's references they
+    /// carry (#266): a log replay changes the references of extents named
+    /// by many files at once. Each is checked against the record as it
+    /// stands before it is replaced.
+    pub records: Vec<RecordEdit>,
+}
+
+/// One data extent's `EXTENT_ITEM`, as a change finds it and as it leaves
+/// it (#266).
+///
+/// A record that appears is an allocation: the extent's free space is
+/// taken and its block group's `used` and the superblock's `bytes_used`
+/// count it. One that disappears is a release, and gives them back; its
+/// checksums are the caller's to remove. One that only changes keeps its
+/// space, and is a change of references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordEdit {
+    /// The extent's address.
+    pub bytenr: u64,
+    /// Its length on disk, the record key's offset.
+    pub len: u64,
+    /// The record's body now, or `None` when there is no record.
+    pub before: Option<Vec<u8>>,
+    /// The body it is left with, or `None` to release the extent.
+    pub after: Option<Vec<u8>>,
+}
+
+impl RecordEdit {
+    /// Whether the change records an extent nothing recorded.
+    pub(crate) fn allocates(&self) -> bool {
+        self.before.is_none() && self.after.is_some()
+    }
+
+    /// Whether the change removes the extent's record.
+    pub(crate) fn releases(&self) -> bool {
+        self.before.is_some() && self.after.is_none()
+    }
 }
 
 /// A tree a [`DataWrite`] makes (#267): its objectid, and the items of
@@ -383,6 +420,7 @@ impl DataWrite {
             .chain(self.adds.iter().map(|a| a.new))
             .chain(self.releases.iter().map(|r| r.old))
             .chain(self.unrefs.iter().map(|r| r.old))
+            .chain(self.records.iter().map(|r| r.bytenr))
             .collect()
     }
 
@@ -394,6 +432,36 @@ impl DataWrite {
             .iter()
             .map(|m| (m.new, m.disk_len, m.file_offset))
             .chain(self.adds.iter().map(|a| (a.new, a.disk_len, a.file_offset)))
+    }
+
+    /// Every data extent a [`RecordEdit`] allocates, by address and length.
+    fn recorded_allocations(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.records
+            .iter()
+            .filter(|r| r.allocates())
+            .map(|r| (r.bytenr, r.len))
+    }
+
+    /// Every data extent a [`RecordEdit`] releases, by address and length.
+    fn recorded_releases(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.records
+            .iter()
+            .filter(|r| r.releases())
+            .map(|r| (r.bytenr, r.len))
+    }
+
+    /// How far its [`RecordEdit`]s move `bytes_used`: what they allocate
+    /// less what they release.
+    pub(crate) fn records_usage_delta(&self) -> i128 {
+        let allocated: i128 = self
+            .recorded_allocations()
+            .map(|(_, len)| i128::from(len))
+            .sum();
+        let released: i128 = self
+            .recorded_releases()
+            .map(|(_, len)| i128::from(len))
+            .sum();
+        allocated - released
     }
 
     /// Every data extent released, once each, by address and length, with
@@ -563,7 +631,10 @@ impl Filesystem {
             for run in runs {
                 let mut at = run.start.next_multiple_of(nodesize);
                 while at + nodesize <= run.end() {
-                    if !taken.contains(&at) && !self.on_superblock_copy(at, nodesize)? {
+                    if !taken.contains(&at)
+                        && !self.is_pinned(at, nodesize)
+                        && !self.on_superblock_copy(at, nodesize)?
+                    {
                         return Ok(at);
                     }
                     at += nodesize;
@@ -574,6 +645,13 @@ impl Filesystem {
             "no metadata block group has room for another {nodesize}-byte block; \
              allocating a new block group is not implemented"
         )))
+    }
+
+    /// Whether `[at, at + len)` overlaps a range this mount has pinned.
+    fn is_pinned(&self, at: u64, len: u64) -> bool {
+        self.pinned
+            .iter()
+            .any(|&(start, n)| at < start.saturating_add(n) && start < at.saturating_add(len))
     }
 
     /// The root block a `ROOT_ITEM` names, or `None` if its body does
@@ -1304,6 +1382,14 @@ impl Filesystem {
                 applied.unreffed
             )));
         }
+        if applied.records != data.records.len() {
+            return Err(Error::UnsupportedFeature(format!(
+                "the change replaces the records of {} data extents, and the plan rewrote {} \
+                 of them",
+                data.records.len(),
+                applied.records
+            )));
+        }
         let recorded = data.allocations().count();
         if applied.released != released || applied.recorded != recorded {
             return Err(Error::UnsupportedFeature(format!(
@@ -1857,6 +1943,42 @@ impl Filesystem {
             applied.shared += 1;
         }
 
+        // Each data extent record replaced outright (#266), once it is
+        // shown to be what the change was computed from: a record that
+        // differs means the references it counts are not the ones the
+        // change adjusted.
+        for r in &data.records {
+            if !mine(r.bytenr)? {
+                continue;
+            }
+            let key = DiskKey {
+                objectid: r.bytenr,
+                key_type: key_type::EXTENT_ITEM,
+                offset: r.len,
+            };
+            let found = out.iter().find(|i| i.key == key).map(|i| i.data.clone());
+            if found != r.before {
+                return Err(Error::UnsupportedFeature(format!(
+                    "the data extent at {} is not recorded as the change found it, so the \
+                     references it counts are not the ones the change adjusted",
+                    r.bytenr
+                )));
+            }
+            if found.is_some() {
+                out = delete(&out, &key)?;
+            }
+            if let Some(body) = &r.after {
+                out = insert(
+                    &out,
+                    OwnedItem {
+                        key,
+                        data: body.clone(),
+                    },
+                )?;
+            }
+            applied.records += 1;
+        }
+
         // Each reference that names a moved full-backref block by its
         // old address becomes the keyed reference an ordinary block of
         // its tree gives its children (#287). Without this the data under
@@ -2281,6 +2403,8 @@ struct DataApplied {
     default_subvol: usize,
     /// `ROOT_ITEM`s pointed at a tree the change makes.
     created: usize,
+    /// Data extent records replaced outright (#266).
+    records: usize,
 }
 
 /// Offsets within a data extent's `EXTENT_ITEM` body carrying one inline
@@ -2534,6 +2658,12 @@ impl Filesystem {
         for (old, old_len, _) in data.released_extents() {
             *out.entry(group_of(old)?).or_default() -= i128::from(old_len);
         }
+        for (at, len) in data.recorded_allocations() {
+            *out.entry(group_of(at)?).or_default() += i128::from(len);
+        }
+        for (at, len) in data.recorded_releases() {
+            *out.entry(group_of(at)?).or_default() -= i128::from(len);
+        }
         out.retain(|_, delta| *delta != 0);
         Ok(out)
     }
@@ -2775,12 +2905,14 @@ impl Filesystem {
                     .into_iter()
                     .map(|(old, len, _)| (old, len)),
             )
+            .chain(data.recorded_releases())
             .collect();
         let allocated: Vec<(u64, u64)> = plan
             .allocated()
             .into_iter()
             .map(|at| (at, nodesize))
             .chain(data.allocations().map(|(new, disk_len, _)| (new, disk_len)))
+            .chain(data.recorded_allocations())
             .collect();
 
         let mut out: Vec<OwnedItem> = Vec::with_capacity(items.len());

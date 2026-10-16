@@ -188,6 +188,49 @@ case "$out" in
     *) fail "--check says a missing fixture is not a skip" ;;
 esac
 
+# Exercise the replay recipe's actual payload commands under its pipefail
+# policy, without mounting anything. An infinite producer stopped by head
+# exits on SIGPIPE even when the requested bytes were written successfully.
+mkdir -p "$sandbox/payload/d"
+python3 - "$RECIPES" "$sandbox/payload.sh" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+helper = re.search(r'^repeat_bytes\(\) \{\n.*?^\}', text, re.M | re.S)
+recipe = re.search(r'^build_dirtylog_replay\(\) \{\n.*?^\}', text, re.M | re.S).group()
+commands = re.findall(r'^    (?:yes |repeat_bytes ).*(?:\n        dd .*|)', recipe, re.M)
+assert len(commands) == 7, commands
+with open(sys.argv[2], 'w') as script:
+    script.write('set -euo pipefail\nMNT="$1"\n')
+    if helper:
+        script.write(helper.group() + '\n')
+    script.write('\n'.join(commands) + '\n')
+PY
+out="$(bash "$sandbox/payload.sh" "$sandbox/payload" 2>&1)"; rc=$?
+[ "$rc" = 0 ] && ok "all seven replay payload writes finish under pipefail" \
+    || fail "replay payload writes fail under pipefail (status $rc): $out"
+if [ "$rc" = 0 ]; then
+    python3 - "$sandbox/payload" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+def repeated(line, size):
+    pattern = (line + '\n').encode()
+    return (pattern * (size // len(pattern) + 1))[:size]
+big = bytearray(repeated('committed big', 262144))
+big[65536:69632] = repeated('FSYNCED BIG', 4096)
+expected = {
+    'big.bin': bytes(big),
+    'grow.bin': repeated('committed grow', 8192) + repeated('appended grow', 8192),
+    'shrink.bin': repeated('committed shrink', 65536),
+    'd/gone.bin': repeated('committed gone', 12288),
+    'new.bin': repeated('created new', 131072),
+}
+for name, payload in expected.items():
+    assert (root / name).read_bytes() == payload, name
+PY
+    [ "$?" = 0 ] && ok "replay payload sizes, patterns, append and overwrite stay exact" \
+        || fail "replay payload bytes differ"
+fi
+
 if [ "$fails" -gt 0 ]; then
     echo "FAIL  $fails fixture-builder violation(s)" >&2
     exit 1

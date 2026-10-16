@@ -29,8 +29,8 @@
 //! when it was written and has not been for some time.
 //!
 //! - **Encoded extents** — encrypted or otherwise transformed.
-//! - **A dirty log.** `log_root` being set means the tree on disk is not
-//!   the whole story.
+//! - **An unsupported dirty log.** Read-write recovery currently accepts
+//!   only metadata for existing empty regular files in tree 5.
 //!
 //! Holes read as zeros, which is what they are.
 
@@ -447,6 +447,13 @@ pub struct Filesystem {
     ///
     /// [`Compression::None`]: crate::compression::Compression::None
     compression: crate::compression::Compression,
+    /// Ranges no new tree block may be placed in, as `(start, length)`:
+    /// the blocks of a log tree being replayed, and the data it names that
+    /// the extent tree does not record yet (#266). Neither is in the
+    /// extent tree, so both read as free, and a block written over either
+    /// before the commit lands would leave a crash with a log that no
+    /// longer reads. The kernel pins them for the same reason.
+    pub(crate) pinned: Vec<(u64, u64)>,
 }
 
 /// Tree blocks a mount keeps: 1024, 16 MiB at the default 16 KiB node.
@@ -599,10 +606,10 @@ impl Filesystem {
     /// writable: a driver able to write should not do so merely because
     /// nothing stopped it.
     ///
-    /// The refusal of a non-empty log tree applies here as to a
-    /// read-only mount, and matters more — writing to a volume whose log
-    /// holds changes the trees have not seen would layer new data on top
-    /// of state that is about to be replayed over it.
+    /// A log holding only metadata for existing empty regular files in
+    /// tree 5 is replayed before this returns. Other logged records are
+    /// refused: writing over changes that still need replay would lose
+    /// the state an application was told its fsync made durable.
     ///
     /// A volume whose chosen superblock is not the primary copy -- the
     /// primary is damaged, or older than a mirror -- is refused: something
@@ -617,8 +624,33 @@ impl Filesystem {
         if !device.is_writable() {
             return Err(Error::ReadOnly);
         }
-        let fs = Self::open(device.clone(), Some(device))?;
+        let fs = match Self::open(device.clone(), Some(device.clone())) {
+            Err(Error::DirtyLog) => return Self::mount_replaying_inode_log(device),
+            other => other?,
+        };
         fs.refuse_unwritable()?;
+        Ok(fs)
+    }
+
+    /// Open the committed trees for a narrowly supported log recovery.
+    /// The primary-copy check uses the same selection as this handle.
+    fn mount_replaying_inode_log(device: Arc<dyn BlockDevice>) -> Result<Self> {
+        let (mut sb, copy) = crate::superblock::read_superblock(&*device)?;
+        if copy != 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "the primary superblock is damaged or older than copy {copy}; the volume can be \
+                 mounted read-only from that copy, and should be checked before it is written"
+            )));
+        }
+        let log_root = sb.log_root;
+        let log_root_level = sb.log_root_level;
+        sb.log_root = 0;
+        let mut fs = Self::open_known(device.clone(), sb, copy)?;
+        fs.sb.log_root = log_root;
+        fs.sb.log_root_level = log_root_level;
+        fs.refuse_unwritable()?;
+        fs.writable = Some(device);
+        fs.replay_inode_only_log()?;
         Ok(fs)
     }
 
@@ -1347,6 +1379,7 @@ impl Filesystem {
             csum_tree_root,
             nodes: std::sync::Mutex::new(NodeCache::new(NODE_CACHE_BLOCKS)),
             compression: crate::compression::Compression::None,
+            pinned: Vec::new(),
         };
         Ok(fs)
     }
@@ -1810,6 +1843,7 @@ impl Filesystem {
             csum_tree_root: self.csum_tree_root,
             nodes: std::sync::Mutex::new(NodeCache::new(NODE_CACHE_BLOCKS)),
             compression: self.compression,
+            pinned: Vec::new(),
         };
         Ok(fs)
     }

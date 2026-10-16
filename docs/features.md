@@ -95,8 +95,8 @@ Linux kernel in the guest.
 | Moving a full-backref tree leaf | Partial: data back references are left inconsistent | | #287 (PR #297) | |
 | A volume with a `compat_ro` feature the writer does not maintain | Refused for writing | 0.7.0 | | `compat_ro_write_refusal.rs` |
 | A read-write mount whose newest superblock is not the primary | Refused | 0.7.0 (#90) | | `superblock_mirrors.rs` |
-| A volume whose log tree holds entries | Partial: the log is read (`Filesystem::log`) and the volume opens read-only on its committed trees (`mount_ignoring_log`, like `ro,nologreplay`); every other mount refuses it, since the log is not replayed | Unreleased (#266) | #266 | `log_tree_kernel.rs` |
-| A volume whose log tree holds entries | Refused for writing | | #266 (PR #328) | |
+| A volume whose log tree holds entries | Partial: the log is read (`Filesystem::log`) and the volume opens read-only on its committed trees (`mount_ignoring_log`, like `ro,nologreplay`); inode-only recovery of existing empty regular files in tree 5 is implemented locally, pending kernel CI validation | Unreleased (#364) | #266 | `log_tree_kernel.rs` |
+| Log replay involving data, names, xattrs, new inodes or other subvolumes | Refused for writing | | #266: #375, #376, #377, #378, #379, #380 | `log_tree_kernel.rs` |
 | A pool of several devices, written (`mount_pool_rw`) | Supported, RAID5/6 included; a stale, read-only or missing member is refused | Unreleased (#298, #299) | | `pool_write_kernel.rs`, `raid56_write_kernel.rs` |
 | Create, mkdir, symlink, link, unlink, rmdir; unlinking a file's last name releases its data extents, their back references and checksums, and drops its reference of an extent a reflink shares | Supported; data a snapshot may share is refused | Unreleased (#262) | | `namespace_kernel.rs` |
 | Rename, replacing a name already there as POSIX does (`rename`, `fs_btrfs_rename`, `fs.btrfs mv`); a replaced file's last name releases its data | Supported; data a snapshot may share is refused | Unreleased (#262) | | `rename_kernel.rs` |
