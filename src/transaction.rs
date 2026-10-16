@@ -142,6 +142,11 @@ impl Plan {
 /// unit each (#357): the first takes the item's place, covering less of
 /// the file than the item did ([`DataMove::len`] is less than
 /// [`DataMove::item_len`]), and each of the rest is a [`DataAdd`].
+///
+/// A defragment (#305) moves the first item of a run of several into one
+/// copy of all of them: the item then covers more than it did
+/// ([`DataMove::item_len`] is less than [`DataMove::len`]), and the items
+/// after it are deleted by the change's edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DataMove {
     /// The extent the item referenced.
@@ -159,7 +164,8 @@ pub(crate) struct DataMove {
     pub len: u64,
     /// The item's `num_bytes` before the move, which the item must still
     /// hold: `len`, unless the copy was split into several extents and
-    /// this is the first (#357).
+    /// this is the first (#357), or a defragment joins several items
+    /// into one larger copy (#305).
     pub item_len: u64,
     /// The copy's length on disk: `len` for a copy stored as it is, the
     /// compressed length rounded up to a sector for one compressed
