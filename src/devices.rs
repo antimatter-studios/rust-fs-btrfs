@@ -1,4 +1,4 @@
-//! The devices a filesystem spans: adding one (#303).
+//! The devices a filesystem spans: adding one, and replacing one (#303).
 //!
 //! # Adding a device
 //!
@@ -47,6 +47,38 @@
 //! A device holding some other filesystem is not refused: it is the
 //! caller's to decide, as it is for [`crate::mkfs::format`], and
 //! [`crate::mkfs::existing_signature`] says what is there.
+//!
+//! # Replacing a device
+//!
+//! A replaced device's place is taken whole: the new device gets every
+//! byte of every `DEV_EXTENT` the old one holds, at the same physical
+//! offset, and then the old device's superblock, so it becomes the same
+//! devid with the same device UUID and the same recorded size. That is
+//! where the kernel's own `btrfs replace` leaves a pool, and it means
+//! nothing else in the filesystem changes: every chunk stripe names the
+//! device by devid and UUID, and every device extent by its offset, and
+//! all of those still hold. No tree is rewritten and the generation does
+//! not move. A larger new device keeps the old one's size until it is
+//! resized, as after the kernel's replace.
+//!
+//! The order is what makes it safe to cut anywhere:
+//!
+//! 1. every device extent copied, and the new device flushed: until its
+//!    superblock is written, nothing reads the new device as a member;
+//! 2. the new device's superblocks, and a flush: from here the new device
+//!    is the member;
+//! 3. the old device's superblocks wiped, and a flush, so the old device is
+//!    no longer found as one.
+//!
+//! Cut between 2 and 3, both devices claim the same devid and hold the same
+//! bytes in every device extent; either one completes the pool, and the old
+//! device should be wiped before both are attached together.
+//!
+//! A replace refuses a device smaller than the one it replaces, a device
+//! already carrying a superblock of this filesystem, a devid that is not a
+//! member, and a mount or a device that cannot write. The old device must
+//! be readable: rebuilding a missing or failed device from its mirrors is
+//! not implemented.
 
 use std::sync::Arc;
 
@@ -57,7 +89,8 @@ use crate::error::{Error, Result};
 use crate::fs::Filesystem;
 use crate::leaf_edit::OwnedItem;
 use crate::super_write::Commit;
-use crate::superblock::{dev_item_offsets as o, DEV_ITEM_SIZE};
+use crate::super_write::{self, SUPERBLOCK_SIZE};
+use crate::superblock::{dev_item_offsets as o, DEV_ITEM_SIZE, SUPER_OFFSETS};
 use crate::transaction::{DataWrite, ItemEdit};
 
 /// How many rounds the plan has to close over its own bookkeeping.
@@ -66,6 +99,15 @@ const PLAN_ROUNDS: usize = 64;
 /// The first MiB of every device, which Btrfs keeps for itself: the
 /// primary superblock is in it, and no device extent starts below it.
 pub const RESERVED_BYTES: u64 = 1 << 20;
+
+/// `BTRFS_DEV_EXTENT_KEY`, the device tree's item for one chunk stripe.
+const DEV_EXTENT_KEY: u8 = 204;
+
+/// Where a `DEV_EXTENT`'s `length` is.
+const DEV_EXTENT_LENGTH: usize = 24;
+
+/// How much of a device extent a replace copies at a time.
+const COPY_BYTES: usize = 1 << 20;
 
 /// What a new device's item says about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,15 +169,7 @@ impl Filesystem {
                  {RESERVED_BYTES} to itself: there is no room on it for a chunk"
             )));
         }
-        if let Ok((sb, _)) = crate::superblock::read_superblock(&*device) {
-            if sb.fsid == self.sb.fsid {
-                return Err(Error::UnsupportedFeature(format!(
-                    "the device already carries a superblock of this filesystem, as device \
-                     {}: it is a member, or was one, and must be wiped before it is added",
-                    sb.dev_item.devid
-                )));
-            }
-        }
+        self.refuse_member(&device, "added")?;
 
         let last = self.last_devid()?;
         let devid = last.checked_add(1).ok_or_else(|| {
@@ -208,6 +242,164 @@ impl Filesystem {
         members.push(device);
         *self = Filesystem::mount_pool_rw(members)?;
         Ok(devid)
+    }
+
+    /// Replace device `devid` with `target`, which takes its place whole:
+    /// its devid, its device UUID, its recorded size and every byte of
+    /// every device extent on it. The old device's superblocks are wiped,
+    /// and the mount becomes the pool's with `target` in the old device's
+    /// place.
+    ///
+    /// Nothing but the two devices is written, and nothing the pool reads
+    /// until every device extent is copied; the [module
+    /// documentation](crate::devices) gives the order and what a cut
+    /// leaves.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] unless the mount can write and so can `target`,
+    /// and [`Error::UnsupportedFeature`] for every refusal the module
+    /// documentation lists, each before anything is written.
+    pub fn replace_device(&mut self, devid: u64, target: Arc<dyn BlockDevice>) -> Result<()> {
+        if self.writable.is_none() || !target.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        let source = if self.writable_pool.is_empty() {
+            self.writable
+                .clone()
+                .filter(|_| devid == self.sb.dev_item.devid)
+        } else {
+            self.writable_pool.get(&devid).cloned()
+        }
+        .ok_or_else(|| {
+            Error::UnsupportedFeature(format!("device {devid} is not a member of this filesystem"))
+        })?;
+        self.refuse_member(&target, "the replacement")?;
+
+        // The old device's own superblock, which the new device is given
+        // as it stands: it names the devid, the device UUID and the size.
+        let (sb, copy) = crate::superblock::read_superblock(&*source)?;
+        if copy != 0 || sb.generation != self.sb.generation || sb.dev_item.devid != devid {
+            return Err(Error::UnsupportedFeature(format!(
+                "device {devid}'s primary superblock is not the pool's current one; the pool \
+                 should be checked before a device of it is replaced"
+            )));
+        }
+        let mut primary = vec![0u8; SUPERBLOCK_SIZE];
+        source.read_at(SUPER_OFFSETS[0], &mut primary)?;
+
+        let sectorsize = u64::from(self.sb.sectorsize);
+        let size = target.size_bytes() - target.size_bytes() % sectorsize;
+        let need = sb.dev_item.total_bytes;
+        if size < need {
+            return Err(Error::UnsupportedFeature(format!(
+                "the replacement holds {size} bytes, fewer than the {need} of device {devid}"
+            )));
+        }
+        let extents = self.device_extents(devid)?;
+        if let Some(&(start, len)) = extents
+            .iter()
+            .find(|&&(start, len)| start.checked_add(len).is_none_or(|end| end > need))
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "device {devid} has an extent of {len} bytes at {start}, past its {need} bytes"
+            )));
+        }
+
+        // 1. Every device extent, at the offset it has on the old device.
+        let mut buf = vec![0u8; COPY_BYTES];
+        for &(start, len) in &extents {
+            let mut done = 0u64;
+            while done < len {
+                let n = usize::try_from(len - done).map_or(COPY_BYTES, |n| n.min(COPY_BYTES));
+                source.read_at(start + done, &mut buf[..n])?;
+                target.write_at(start + done, &buf[..n])?;
+                done += n as u64;
+            }
+        }
+        target.flush()?;
+
+        // 2. The old device's superblock, at every copy the new one holds.
+        for &offset in &SUPER_OFFSETS {
+            if offset + SUPERBLOCK_SIZE as u64 > target.size_bytes() {
+                continue;
+            }
+            let mut image = primary.clone();
+            super_write::set_bytenr(&mut image, offset);
+            super_write::stamp_checksum(&mut image, self.sb.csum_type);
+            target.write_at(offset, &image)?;
+        }
+        target.flush()?;
+
+        // 3. The old device is no longer one.
+        let blank = vec![0u8; SUPERBLOCK_SIZE];
+        for &offset in &SUPER_OFFSETS {
+            if offset + SUPERBLOCK_SIZE as u64 > source.size_bytes() {
+                continue;
+            }
+            source.write_at(offset, &blank)?;
+        }
+        source.flush()?;
+
+        let members = if self.writable_pool.is_empty() {
+            vec![target]
+        } else {
+            self.writable_pool
+                .iter()
+                .map(|(id, d)| {
+                    if *id == devid {
+                        Arc::clone(&target)
+                    } else {
+                        Arc::clone(d)
+                    }
+                })
+                .collect()
+        };
+        *self = Filesystem::mount_pool_rw(members)?;
+        Ok(())
+    }
+
+    /// Refuse `device` when it already carries a superblock of this
+    /// filesystem: it is a member, or was one, and one disk must not hold
+    /// two places in the pool.
+    fn refuse_member(&self, device: &Arc<dyn BlockDevice>, what: &str) -> Result<()> {
+        if let Ok((sb, _)) = crate::superblock::read_superblock(&**device) {
+            if sb.fsid == self.sb.fsid {
+                return Err(Error::UnsupportedFeature(format!(
+                    "the device {what} already carries a superblock of this filesystem, as \
+                     device {}: it is a member, or was one, and must be wiped first",
+                    sb.dev_item.devid
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every `(physical, length)` the device tree records on device
+    /// `devid`, in offset order.
+    fn device_extents(&self, devid: u64) -> Result<Vec<(u64, u64)>> {
+        let root = self.tree_root(objectid::DEV_TREE)?;
+        let reader = self.pool_reader();
+        let tree = reader.tree();
+        let mut extents = Vec::new();
+        let mut bad = None;
+        tree.for_each(root, &mut |k: &DiskKey, data: &[u8]| {
+            if k.objectid == devid && k.key_type == DEV_EXTENT_KEY {
+                match data.get(DEV_EXTENT_LENGTH..DEV_EXTENT_LENGTH + 8) {
+                    Some(b) => {
+                        extents.push((k.offset, u64::from_le_bytes(b.try_into().expect("8 bytes"))))
+                    }
+                    None => bad = Some(k.offset),
+                }
+            }
+            Ok(true)
+        })?;
+        if let Some(at) = bad {
+            return Err(Error::UnsupportedFeature(format!(
+                "device {devid}'s extent at {at} is too short to say its length"
+            )));
+        }
+        Ok(extents)
     }
 
     /// The highest devid the chunk tree has a `DEV_ITEM` for.
