@@ -28,24 +28,32 @@
 //! - references whose counts do not add up to the extent's, or name file
 //!   items that are not there.
 //!
-//! # Relocating an empty group
+//! # Relocating a group
 //!
-//! [`Filesystem::relocate_block_group`] moves an empty data group (#397)
-//! in two committed transactions, each leaving a filesystem the kernel
-//! and `btrfs check` accept on its own:
+//! [`Filesystem::relocate_block_group`] moves a data group (#397, #493)
+//! in committed transactions, each leaving a filesystem the kernel and
+//! `btrfs check` accept on its own:
 //!
 //! 1. **A new chunk** of the group's profile: its `CHUNK_ITEM` in the
 //!    chunk tree, a `DEV_EXTENT` in the device tree for its stripe, an
 //!    empty `BLOCK_GROUP_ITEM`, a `FREE_SPACE_INFO` and one free run
 //!    covering it in the free-space tree, and the device's `bytes_used`
 //!    raised in the chunk tree's device item and the superblock's copy.
-//! 2. **The old group goes**: its chunk item, device extents, block group
+//! 2. **The extents move**, when the group holds any (#493): each one's
+//!    bytes are read verified against their digests and written into the
+//!    new chunk, then one commit re-points the file item naming it, moves
+//!    its `EXTENT_ITEM` and keyed back references unchanged, files its
+//!    checksums under the new sectors, and carries the free-space tree and
+//!    both groups' `used` with it.
+//! 3. **The old group goes**: its chunk item, device extents, block group
 //!    item and free-space records, and `bytes_used` lowered again.
 //!
 //! Besides everything above, it refuses a system group, a conversion to
 //! another profile, any profile but single, a volume of more than one
 //! device, one with no free-space tree or with a block group tree, and a
-//! group holding any extent, each before anything is written.
+//! group holding an extent more than one file item names, one with a
+//! sector that has no checksum, or more extents than one transaction
+//! moves, each before anything is written.
 
 use crate::block_group::BlockGroup;
 use crate::chunk::{
@@ -194,14 +202,15 @@ impl Filesystem {
             .collect())
     }
 
-    /// Relocate the empty data block group at `start` into a newly
-    /// allocated chunk of its own profile, and return where the new group
-    /// is (#397).
+    /// Relocate the data block group at `start` into a newly allocated
+    /// chunk of its own profile, and return where the new group is (#397,
+    /// #493).
     ///
-    /// Two committed transactions, each leaving a filesystem the kernel
-    /// accepts on its own: the new chunk is allocated, then the old group
-    /// is removed. A crash between them leaves both groups, the new one
-    /// empty.
+    /// Committed transactions, each leaving a filesystem the kernel
+    /// accepts on its own: the new chunk is allocated, the group's extents
+    /// are moved into it in one transaction, then the old group is
+    /// removed. A crash between them leaves both groups, every extent in
+    /// exactly one of them.
     ///
     /// # Errors
     ///
