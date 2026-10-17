@@ -155,6 +155,7 @@ space_cache_v1_kernel     2
 split_oracle              4
 subvol_create_kernel      1
 subvol_default_kernel     1
+subvol_namespace_kernel   1
 subvol_oracle             12
 subvol_readonly_kernel    1
 superblock_mirrors        4
