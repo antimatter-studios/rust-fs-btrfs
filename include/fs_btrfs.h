@@ -253,7 +253,8 @@ int64_t fs_btrfs_getxattr(fs_btrfs_fs_t *fs, const char *path,
  * it, when a reflink still reads it -- and commits a new generation, so
  * a crash leaves the old contents or the new and never a mixture.
  * fs_btrfs_write_file does that for an existing file's extents that are
- * really allocated and that no snapshot shares.
+ * really allocated and that no snapshot shares, for its holes, and past
+ * its end for a write that starts at or before it.
  *
  * A file marked NODATACOW -- `chattr +C` -- is the exception: its
  * blocks are overwritten where they lie, carry no checksums, and need
@@ -303,10 +304,12 @@ int fs_btrfs_can_write_in_place(fs_btrfs_fs_t *fs, const char *path);
  * Overwrite `length` bytes of an existing file at `offset`. Returns the
  * number written, or -1. The whole range is written or none of it is.
  *
- * A NODATACOW file is written in place; any other is written
- * copy-on-write and committed. Refused with ENOTSUP, the case named,
- * for an extent a snapshot shares, an inline or preallocated one, a
- * hole, or a write past the end (rust-fs-btrfs#261).
+ * A NODATACOW file is written in place, and never grown; any other is
+ * written copy-on-write and committed, filling holes and growing the
+ * file. Refused with ENOTSUP, the case named, for an extent a snapshot
+ * shares, an inline or preallocated one, a write that starts past the
+ * end, or one that grows a file on a volume without the no-holes
+ * feature (rust-fs-btrfs#261).
  */
 int64_t fs_btrfs_write_file(fs_btrfs_fs_t *fs, const char *path,
                             const void *buf, uint64_t offset, uint64_t length);

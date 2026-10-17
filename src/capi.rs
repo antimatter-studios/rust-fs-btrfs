@@ -1179,8 +1179,10 @@ pub unsafe extern "C" fn fs_btrfs_can_write_in_place(
 /// A NODATACOW file is overwritten in place. Any other file is written
 /// copy-on-write: the bytes land in newly allocated extents and the
 /// change is committed as one transaction, so a crash leaves the old
-/// contents or the new and never a mixture. What that path cannot write
-/// yet — a write that grows the file or fills a hole, an inline or
+/// contents or the new and never a mixture. A hole is filled, and a write
+/// that starts at or before the end of the file grows it. What that path
+/// cannot write yet — a write that starts past the end, one that grows a
+/// file on a volume without the no-holes feature, an inline or
 /// preallocated extent, or an extent a snapshot may share
 /// (rust-fs-btrfs#261) — is refused with ENOTSUP and the case named.
 ///

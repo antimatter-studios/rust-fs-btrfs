@@ -47,7 +47,9 @@
 //!    volume's checksum algorithm (#261). An extent kept for its other
 //!    references keeps its digests.
 //! 6. **The inode** is stamped with the transaction, a new change count
-//!    and new change and modification times.
+//!    and new change and modification times. A write into a hole, or past
+//!    the end of the file, adds the sectors it allocates to `nbytes`; one
+//!    past the end moves `size` to where it stops (#432).
 //!
 //! The data goes to every mirror first; then the tree blocks, a flush,
 //! the superblocks and a flush, in [`Filesystem::commit`]'s order. Until
@@ -62,8 +64,12 @@
 //!   root, or a full one that cannot be split (its parent node has no
 //!   room for another pointer): removing a leaf and splitting a node are
 //!   not written yet;
-//! - a write that **grows** the file: it allocates past the end, where
-//!   the size and the last item both move;
+//! - a write that starts **past the end** of the file, leaving a gap: the
+//!   kernel zeroes the rest of the old last sector first (#433). One that
+//!   starts at or before the end and grows the file is written;
+//! - a write that grows a file on a volume **without the no-holes
+//!   feature**, where the hole a file ends with is an item of its own
+//!   (#436);
 //! - an **inline** or **preallocated** extent: each changes the item's
 //!   kind, not only where it points;
 //! - an extent a **snapshot** may share — one from at or before the last
@@ -176,12 +182,26 @@ impl Filesystem {
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or_else(|| Error::UnsupportedFeature("write range overflows".into()))?;
+        // A write that grows the file starts at or before its end, so the
+        // sectors past its last extent are planned as a hole is (#432).
+        // One that starts past the end leaves a gap, and the kernel zeroes
+        // the rest of the old last sector before it makes one (#433). A
+        // volume without no-holes records the hole a file ends with as an
+        // item the hole fill does not maintain (#436).
         if end > inode.size {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino}: writing to {end} would grow the file past its {} bytes, which \
-                 adds an extent rather than replacing one",
-                inode.size
-            )));
+            if offset > inode.size {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino}: writing at {offset} starts past the file's end at {}, and \
+                     a write that leaves a gap is not implemented",
+                    inode.size
+                )));
+            }
+            if !self.sb.has_no_holes() {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino}: growing a file on a volume without the no-holes feature \
+                     means keeping its hole items, which is not implemented"
+                )));
+            }
         }
 
         // Every refusal before anything is allocated.
@@ -296,15 +316,20 @@ impl Filesystem {
             }
         }
         // A hole filled adds what it now covers to the inode's `nbytes`,
-        // and the inode item says so; the times move as for any write.
+        // a write past the end moves its `size` there (#432), and the
+        // inode item says so; the times move as for any write. A write
+        // inside the last sector past the end adds no sector, and still
+        // moves the size.
         let filled: u64 = targets.iter().filter(|t| t.hole).map(|t| t.len).sum();
-        if filled > 0 {
+        if filled > 0 || end > inode.size {
             use crate::inode::offsets as io;
             let mut raw = self.raw_inode(ino)?;
             let nbytes = inode.nbytes.checked_add(filled).ok_or_else(|| {
                 Error::UnsupportedFeature(format!("inode {ino}: nbytes overflows"))
             })?;
             raw[io::NBYTES..io::NBYTES + 8].copy_from_slice(&nbytes.to_le_bytes());
+            let size = end.max(inode.size);
+            raw[io::SIZE..io::SIZE + 8].copy_from_slice(&size.to_le_bytes());
             crate::namespace::touch(
                 &mut raw,
                 generation,
