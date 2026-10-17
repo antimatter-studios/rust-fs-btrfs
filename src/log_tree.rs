@@ -111,14 +111,30 @@ impl LoggedTree {
     }
 
     /// The inode the log names `name` in directory `parent`, from its
-    /// `INODE_REF` items: what a logged new name, or a logged inode's
-    /// name, resolves to.
+    /// `INODE_REF` and `INODE_EXTREF` items: what a logged new name, or a
+    /// logged inode's name, resolves to.
     pub fn inode_named(&self, parent: u64, name: &[u8]) -> Option<u64> {
         self.items
             .iter()
-            .filter(|i| i.key.key_type == INODE_REF_KEY && i.key.offset == parent)
-            .find(|i| ref_names(&i.data).any(|n| n == name))
+            .find(|i| match i.key.key_type {
+                INODE_REF_KEY => i.key.offset == parent && ref_names(&i.data).any(|n| n == name),
+                INODE_EXTREF_KEY => extref_records(&i.data)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|&(p, _, n)| p == parent && n == name),
+                _ => false,
+            })
             .map(|i| i.key.objectid)
+    }
+
+    /// Whether a logged `INODE_REF` or `INODE_EXTREF` item of `ino` names
+    /// it `name` at `index` in directory `parent`.
+    fn names_at(&self, ino: u64, parent: u64, index: u64, name: &[u8]) -> bool {
+        self.items
+            .iter()
+            .filter(|i| i.key.objectid == ino)
+            .filter_map(|i| name_records(&i.key, &i.data))
+            .any(|records| records.contains(&(parent, index, name)))
     }
 
     /// The logged `EXTENT_DATA` items of `ino`.
@@ -172,6 +188,61 @@ fn ref_records(data: &[u8]) -> Option<Vec<(u64, &[u8])>> {
         pos += 10 + len;
     }
     Some(out)
+}
+
+/// `BTRFS_INODE_EXTREF_KEY`: names of an inode kept outside its
+/// `INODE_REF` items, as the kernel stores them once the `INODE_REF` for
+/// a parent has grown to the largest item a leaf holds, filed under a
+/// hash of each name's parent and name (#407).
+pub const INODE_EXTREF_KEY: u8 = 13;
+
+/// The records of an `INODE_EXTREF` item: each name's parent, its index
+/// in the parent, and the name, after an 8-byte parent, an 8-byte index
+/// and a 2-byte length. `None` when a record runs past the end.
+fn extref_records(data: &[u8]) -> Option<Vec<(u64, u64, &[u8])>> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let parent = u64::from_le_bytes(data.get(pos..pos + 8)?.try_into().ok()?);
+        let index = u64::from_le_bytes(data.get(pos + 8..pos + 16)?.try_into().ok()?);
+        let len = usize::from(u16::from_le_bytes(
+            data.get(pos + 16..pos + 18)?.try_into().ok()?,
+        ));
+        out.push((parent, index, data.get(pos + 18..pos + 18 + len)?));
+        pos += 18 + len;
+    }
+    Some(out)
+}
+
+/// The key offset an extended reference to `name` in `parent` is filed
+/// under: the kernel's `btrfs_extref_hash`, a CRC-32C of the name seeded
+/// with the parent's low 32 bits, with no inversion at either end (see
+/// [`dir::name_hash`]).
+fn extref_hash(parent: u64, name: &[u8]) -> u64 {
+    u64::from(!crc32c::crc32c_append(!(parent as u32), name))
+}
+
+/// The names a reference item of either kind holds, as (parent, index,
+/// name): an `INODE_REF` names its parent in its key, an `INODE_EXTREF`
+/// in each record. `None` for a record that runs past the end, or an
+/// extended record not filed under the hash of its own parent and name.
+fn name_records<'a>(key: &DiskKey, data: &'a [u8]) -> Option<Vec<(u64, u64, &'a [u8])>> {
+    match key.key_type {
+        INODE_REF_KEY => Some(
+            ref_records(data)?
+                .into_iter()
+                .map(|(index, name)| (key.offset, index, name))
+                .collect(),
+        ),
+        INODE_EXTREF_KEY => {
+            let records = extref_records(data)?;
+            records
+                .iter()
+                .all(|&(parent, _, name)| extref_hash(parent, name) == key.offset)
+                .then_some(records)
+        }
+        _ => None,
+    }
 }
 
 fn le64(b: &[u8], at: usize) -> u64 {
@@ -410,10 +481,10 @@ impl Filesystem {
     ///   cover their ranges -- a committed item they cover in part keeps
     ///   its head and its tail -- and the file is cut at its logged size,
     ///   rounded up to a sector, as the logged inode item is the truth of
-    ///   it. Its `nbytes` is counted from what is left. Its references
-    ///   keep every committed name and may add hard links (#406), each in
-    ///   a directory the log speaks for, its link count raised by one for
-    ///   each.
+    ///   it. Its `nbytes` is counted from what is left. Its references,
+    ///   in `INODE_REF` and `INODE_EXTREF` items alike (#407), keep every
+    ///   committed name and may add hard links (#406), each in a directory
+    ///   the log speaks for, its link count raised by one for each.
     /// - **Extents**: every file item that names an extent is one
     ///   reference to it. The references replay adds and drops are applied
     ///   to each extent's record: an extent nothing recorded yet is
@@ -670,28 +741,27 @@ impl Filesystem {
                         {
                             return Err(Error::DirtyLog);
                         }
-                        // Its references keep every committed name, and may
+                        // Its references, `INODE_REF` and `INODE_EXTREF`
+                        // alike (#407), keep every committed name, and may
                         // add names (#406): each one in a committed directory
                         // the log speaks for, whose logged entry at that index
                         // is the name, which the directory pass adds. A renamed
                         // file is replayed through its directory.
                         let mut gained = 0u32;
-                        for r in top
-                            .items
-                            .iter()
-                            .filter(|i| i.key.objectid == ino && i.key.key_type == INODE_REF_KEY)
-                        {
+                        for r in top.items.iter().filter(|i| {
+                            i.key.objectid == ino
+                                && matches!(i.key.key_type, INODE_REF_KEY | INODE_EXTREF_KEY)
+                        }) {
                             let committed = tree.search(root, &r.key)?.map(|c| c.data);
                             let had = match &committed {
-                                Some(data) => ref_records(data).ok_or(Error::DirtyLog)?,
+                                Some(data) => name_records(&r.key, data).ok_or(Error::DirtyLog)?,
                                 None => Vec::new(),
                             };
-                            let has = ref_records(&r.data).ok_or(Error::DirtyLog)?;
+                            let has = name_records(&r.key, &r.data).ok_or(Error::DirtyLog)?;
                             if had.iter().any(|record| !has.contains(record)) {
                                 return Err(Error::DirtyLog);
                             }
-                            let parent = r.key.offset;
-                            for &(index, name) in has.iter().filter(|r| !had.contains(r)) {
+                            for &(parent, index, name) in has.iter().filter(|r| !had.contains(r)) {
                                 let entry = logged_entry(parent, index)?.ok_or(Error::DirtyLog)?;
                                 if !dirs.contains(&parent)
                                     || entry.ino != ino
@@ -707,14 +777,18 @@ impl Filesystem {
                             }
                         }
                         // Its link count is its committed names and the ones
-                        // it gains, each committed name in an `INODE_REF`.
+                        // it gains, each committed name in an `INODE_REF` or
+                        // an `INODE_EXTREF`.
                         let nlink = if gained == 0 {
                             before.nlink
                         } else {
                             let mut committed_names = 0u32;
-                            for c in tree.find_all(root, ino, INODE_REF_KEY)? {
-                                committed_names +=
-                                    ref_records(&c.data).ok_or(Error::DirtyLog)?.len() as u32;
+                            for kind in [INODE_REF_KEY, INODE_EXTREF_KEY] {
+                                for c in tree.find_all(root, ino, kind)? {
+                                    committed_names +=
+                                        name_records(&c.key, &c.data).ok_or(Error::DirtyLog)?.len()
+                                            as u32;
+                                }
                             }
                             if committed_names != before.nlink {
                                 return Err(Error::DirtyLog);
@@ -727,11 +801,20 @@ impl Filesystem {
                     }
                     raw[io::NBYTES..io::NBYTES + 8].copy_from_slice(&nbytes.to_le_bytes());
                     edits.push(put(key(ino, INODE_ITEM_KEY, 0), raw));
+                    // Extended references are replayed only for a file the
+                    // log holds in full; a created one is named from its
+                    // `INODE_REF` items alone.
                     for item in top.items.iter().filter(|i| i.key.objectid == ino) {
-                        if !matches!(
-                            item.key.key_type,
-                            INODE_ITEM_KEY | INODE_REF_KEY | EXTENT_DATA_KEY | dir::XATTR_ITEM_KEY
-                        ) {
+                        let extref = item.key.key_type == INODE_EXTREF_KEY && files.contains(&ino);
+                        if !extref
+                            && !matches!(
+                                item.key.key_type,
+                                INODE_ITEM_KEY
+                                    | INODE_REF_KEY
+                                    | EXTENT_DATA_KEY
+                                    | dir::XATTR_ITEM_KEY
+                            )
+                        {
                             return Err(Error::DirtyLog);
                         }
                     }
@@ -949,17 +1032,7 @@ impl Filesystem {
                         let child = entry.ino;
                         if logged_inodes.contains(&child) {
                             // A logged inode's names are its logged references.
-                            let logged_ref = top
-                                .items
-                                .iter()
-                                .find(|i| i.key == key(child, INODE_REF_KEY, d));
-                            let still = logged_ref
-                                .map(|r| {
-                                    ref_records(&r.data)
-                                        .unwrap_or_default()
-                                        .contains(&(c.key.offset, &entry.name[..]))
-                                })
-                                .unwrap_or(false);
+                            let still = top.names_at(child, d, c.key.offset, &entry.name);
                             if still || !exists_only.contains(&child) {
                                 return Err(Error::DirtyLog);
                             }
@@ -1000,7 +1073,7 @@ impl Filesystem {
                                 edits.push(ItemEdit::Delete(item.key));
                             }
                         }
-                        for kind in [13u8, 48] {
+                        for kind in [INODE_EXTREF_KEY, 48] {
                             // Extended references and orphan items are not
                             // deleted here.
                             if !tree.find_all(root, child, kind)?.is_empty() {
@@ -1023,17 +1096,9 @@ impl Filesystem {
                             continue;
                         }
                         let entry = logged_entry(d, item.key.offset)?.ok_or(Error::DirtyLog)?;
-                        // Its inode must be one the log holds and names here.
-                        let named = top
-                            .items
-                            .iter()
-                            .find(|i| i.key == key(entry.ino, INODE_REF_KEY, d))
-                            .map(|r| {
-                                ref_records(&r.data)
-                                    .unwrap_or_default()
-                                    .contains(&(item.key.offset, &entry.name[..]))
-                            })
-                            .unwrap_or(false);
+                        // Its inode must be one the log holds and names here,
+                        // in a reference or an extended reference (#407).
+                        let named = top.names_at(entry.ino, d, item.key.offset, &entry.name);
                         if !named || entry.location_type != INODE_ITEM_KEY {
                             return Err(Error::DirtyLog);
                         }
@@ -1504,6 +1569,47 @@ mod tests {
         assert_eq!(tree.inode_named(256, b"ab"), None);
         assert_eq!(tree.inode_named(257, b"abc"), None);
         assert!(tree.inode(258).unwrap().is_none());
+    }
+
+    /// The key offsets a Debian 12 (6.1) kernel and a 7.0 kernel both gave
+    /// the extended references of names 061 to 064 (each three digits
+    /// repeated to 255 bytes) under `/`, read with the native
+    /// `dump-tree` (#407).
+    #[test]
+    fn an_extended_reference_is_filed_under_the_kernels_hash() {
+        for (i, hash) in [
+            (61, 1_271_905_755),
+            (62, 992_780_333),
+            (63, 3_895_035_600),
+            (64, 3_672_808_385),
+        ] {
+            let name = format!("{i:03}").repeat(85);
+            assert_eq!(extref_hash(256, name.as_bytes()), hash, "name {i}");
+            let mut data = 256u64.to_le_bytes().to_vec();
+            data.extend((i as u64 + 3).to_le_bytes());
+            data.extend(255u16.to_le_bytes());
+            data.extend(name.as_bytes());
+            let at = |offset| DiskKey {
+                objectid: 257,
+                key_type: INODE_EXTREF_KEY,
+                offset,
+            };
+            assert_eq!(
+                name_records(&at(hash), &data),
+                Some(vec![(256, i as u64 + 3, name.as_bytes())]),
+                "name {i}"
+            );
+            assert_eq!(name_records(&at(hash + 1), &data), None, "name {i}");
+            assert_eq!(name_records(&at(hash), &data[..data.len() - 1]), None);
+            let tree = LoggedTree {
+                subvolume: 5,
+                root: 0,
+                items: vec![item(257, INODE_EXTREF_KEY, hash, data)],
+            };
+            assert_eq!(tree.inode_named(256, name.as_bytes()), Some(257));
+            assert!(tree.names_at(257, 256, i as u64 + 3, name.as_bytes()));
+            assert!(!tree.names_at(257, 257, i as u64 + 3, name.as_bytes()));
+        }
     }
 
     fn inline(data: &[u8]) -> Vec<u8> {
