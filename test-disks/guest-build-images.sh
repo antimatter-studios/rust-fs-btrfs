@@ -1220,6 +1220,7 @@ build_dirtylog() {
     build_dirtylog_refused dirlink 'compress=no,max_inline=2048' dirlink
     build_dirtylog_refused nbytes 'compress=no,max_inline=2048' nbytes
     build_dirtylog_refused extrefexists 'compress=no,max_inline=2048' extrefexists
+    build_dirtylog_refused extrefcreated 'compress=no,max_inline=2048' extrefcreated
 }
 
 # fsync_path <path> — fsync one file or directory, and nothing else.
@@ -1475,6 +1476,20 @@ if kind == "extrefexists":
     os.link(d + "/f", d + "/d/g")
     dfd = os.open(d + "/d", os.O_RDONLY); os.fsync(dfd); os.close(dfd)
     sys.exit(0)
+if kind == "extrefcreated":
+    # After the commit, n is created empty and given 64 more names in /,
+    # each 255 bytes: the first 61 fill its INODE_REF to the largest item
+    # a 16 KiB leaf holds, and the last three are INODE_EXTREF items. Only
+    # / is fsynced. The log holds the entries of / for all 65 names, and
+    # n only as an inode that exists, though nothing of it is committed:
+    # generation 0, size 0, 65 links, its INODE_REF and its three
+    # INODE_EXTREF items. An fsync of n itself would fall back to a full
+    # commit and leave no log.
+    open(d + "/n", "w").close()
+    for i in range(64):
+        os.link(d + "/n", d + "/" + ("%03d" % i) * 85)
+    dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    sys.exit(0)
 fd = os.open(d + "/f", os.O_WRONLY)
 if kind == "sizechange":
     os.pwrite(fd, b"replayed-and-longer-inline-bytes-0123456789", 0)
@@ -1556,6 +1571,7 @@ want = {
     'dirlink': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: f\n\s+index \d+ namelen 1 name: g\n',
     'nbytes': r'size 33 nbytes (?!0\n|33\n)\d+\n',
     'extrefexists': r'INODE_REF (?!256\))\d+\)[^\n]*\n\s+index \d+ namelen 1 name: g\n',
+    'extrefcreated': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: n\n',
 }[kind]
 assert re.search(want, dump), (kind, 'native dump does not show the unsupported shape')
 if kind == 'symlink':
@@ -1733,6 +1749,43 @@ if kind == 'extrefexists':
         (kind, 'no logged index range of d holds g', at_g, ranges)
     assert not re.search(r'key \(256 (DIR_ITEM|DIR_INDEX|DIR_LOG_ITEM|DIR_LOG_INDEX) ', dump), \
         (kind, 'the log holds an entry or index range of /')
+if kind == 'extrefcreated':
+    # n, which the log creates, is logged only to say it exists:
+    # generation 0, size 0, 65 links and no data, its INODE_REF to / and
+    # three INODE_EXTREF items, whose records are 65 names between them.
+    # Every one of them is an entry of / naming n, inside a logged index
+    # range of /, and the log holds no other entry of / and no other
+    # extended reference.
+    ref = re.search(r'key \((\d+) INODE_REF 256\) itemoff \d+ itemsize \d+\n'
+                    r'([ \t]+index \d+ namelen 1 name: n\n'
+                    r'(?:[ \t]+index \d+ namelen \d+ name: [^\n]*\n)*)', dump)
+    assert ref, (kind, 'native dump shows no logged reference of n to /')
+    n = ref.group(1)
+    item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation (\d+) transid \d+ size (\d+) nbytes \d+\n'
+                     r'\s+block group \d+ mode 100644 links (\d+) ' % n, dump)
+    assert item, (kind, 'native dump shows no logged inode item of n')
+    generation, size, links = map(int, item.groups())
+    assert (generation, size, links) == (0, 0, 65), \
+        (kind, 'n is not logged as an inode that exists with 65 links', generation, size, links)
+    assert not re.search(r'key \(%s EXTENT_DATA ' % n, dump), (kind, 'the log holds data of n')
+    extrefs = re.findall(r'key \(%s INODE_EXTREF \d+\) itemoff \d+ itemsize \d+\n'
+                         r'((?:[ \t]+index \d+ parent 256 namelen 255 name: [^\n]*\n)+)' % n, dump)
+    assert len(extrefs) == 3, (kind, 'n is not logged with three INODE_EXTREF items', len(extrefs))
+    assert len(re.findall(r'key \(\d+ INODE_EXTREF \d+\) itemoff ', dump)) == 3, \
+        (kind, 'the log holds an extended reference of another inode')
+    named = len(re.findall(r'index \d+ namelen', ref.group(2)))
+    extended = sum(len(re.findall(r'index \d+ parent', e)) for e in extrefs)
+    assert named + extended == 65, (kind, 'the references of n are not its 65 names', named, extended)
+    entries = [int(i) for i in re.findall(
+        r'key \(256 DIR_INDEX (\d+)\) itemoff \d+ itemsize \d+\n'
+        r'\s+location key \(%s INODE_ITEM 0\) type FILE\n' % n, dump)]
+    assert len(entries) == 65 == len(re.findall(r'key \(256 DIR_INDEX \d+\) itemoff ', dump)), \
+        (kind, 'the logged entries of / are not the 65 names of n', len(entries))
+    ranges = [(int(a), int(b)) for a, b in re.findall(
+        r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
+    assert all(any(a <= i <= b for a, b in ranges) for i in entries), \
+        (kind, 'an entry of / naming n is outside every logged index range', ranges)
 if kind == 'compressedinline':
     # The native tool must print a compressed inline extent: nonzero
     # compression on the inline line itself, stored smaller than its bytes.
