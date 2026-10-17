@@ -1217,6 +1217,7 @@ build_dirtylog() {
     build_dirtylog_refused special 'compress=no,max_inline=2048' special
     build_dirtylog_refused hardlink 'compress=no,max_inline=2048' hardlink
     build_dirtylog_refused extref 'compress=no,max_inline=2048' extref
+    build_dirtylog_refused dirlink 'compress=no,max_inline=2048' dirlink
 }
 
 # fsync_path <path> — fsync one file or directory, and nothing else.
@@ -1362,7 +1363,7 @@ build_dirtylog_refused() {
     mkfs.btrfs -f "$img" >/dev/null
     mount -o "loop,commit=300,$opts" "$img" "$MNT"
     case "$kind" in
-        mixedlog|sizechange|compressedinline|newdir|symlink|special|hardlink)
+        mixedlog|sizechange|compressedinline|newdir|symlink|special|hardlink|dirlink)
             printf 'committed-inline-bytes-0123456789' > "$MNT/f" ;;
         externalextent)
             head -c 8192 /dev/zero | tr '\0' 'c' > "$MNT/f" ;;
@@ -1446,6 +1447,15 @@ if kind == "extref":
     os.link(d + "/f", d + "/" + "064" * 85)
     dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
     sys.exit(0)
+if kind == "dirlink":
+    # The committed f is given a second name g after the commit, and only
+    # / is fsynced. The log holds the entry of / naming g, in a range
+    # that starts past the committed index of f, and f only as an inode
+    # that exists: generation 0, its link count raised, and its reference
+    # to / holding both names. The data of f is not logged.
+    os.link(d + "/f", d + "/g")
+    dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    sys.exit(0)
 fd = os.open(d + "/f", os.O_WRONLY)
 if kind == "sizechange":
     os.pwrite(fd, b"replayed-and-longer-inline-bytes-0123456789", 0)
@@ -1518,6 +1528,7 @@ want = {
     'special': r'location key \(\d+ INODE_ITEM 0\) type CHRDEV',
     'hardlink': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: f\n\s+index \d+ namelen 1 name: g\n',
     'extref': r'INODE_EXTREF \d+\) itemoff \d+ itemsize \d+\n\s+index \d+ parent 256 namelen 255 name: (064){85}\n',
+    'dirlink': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: f\n\s+index \d+ namelen 1 name: g\n',
 }[kind]
 assert re.search(want, dump), (kind, 'native dump does not show the unsupported shape')
 if kind == 'symlink':
@@ -1600,6 +1611,36 @@ if kind == 'extref':
         r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
     assert any(a <= index <= b for a, b in ranges), \
         (kind, 'no logged index range of / holds the new name', index, ranges)
+if kind == 'dirlink':
+    # f is logged only to say it exists: generation 0, two links, no data,
+    # and one reference to / holding f at its committed index and g at a
+    # later one. The entry of / naming g, f's inode, is inside a logged
+    # index range of /; f's committed index is outside every one, and the
+    # log holds no entry of / there.
+    ref = re.search(r'key \((\d+) INODE_REF 256\) itemoff \d+ itemsize \d+\n'
+                    r'\s+index (\d+) namelen 1 name: f\n\s+index (\d+) namelen 1 name: g\n', dump)
+    assert ref, (kind, 'native dump shows no logged reference of f to / naming f and g')
+    f, at_f, at_g = ref.group(1), int(ref.group(2)), int(ref.group(3))
+    item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation (\d+) transid \d+ size \d+ nbytes \d+\n'
+                     r'\s+block group \d+ mode 100644 links (\d+) ' % f, dump)
+    assert item, (kind, 'native dump shows no logged inode item of f')
+    generation, links = map(int, item.groups())
+    assert (generation, links) == (0, 2), \
+        (kind, 'f is not logged as an inode that exists with two links', generation, links)
+    assert not re.search(r'key \(%s EXTENT_DATA ' % f, dump), (kind, 'the log holds data of f')
+    assert re.search(r'key \(256 DIR_INDEX %d\) itemoff \d+ itemsize \d+\n'
+                     r'\s+location key \(%s INODE_ITEM 0\) type FILE\n[^\n]*\n\s+name: g\n'
+                     % (at_g, f), dump), \
+        (kind, 'native dump shows no logged entry of / naming g at its index', at_g)
+    assert not re.search(r'key \(256 DIR_INDEX %d\)' % at_f, dump), \
+        (kind, 'the log holds an entry of / at the committed index of f', at_f)
+    ranges = [(int(a), int(b)) for a, b in re.findall(
+        r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
+    assert any(a <= at_g <= b for a, b in ranges), \
+        (kind, 'no logged index range of / holds g', at_g, ranges)
+    assert not any(a <= at_f <= b for a, b in ranges), \
+        (kind, 'a logged index range of / holds the committed name f', at_f, ranges)
 if kind == 'compressedinline':
     # The native tool must print a compressed inline extent: nonzero
     # compression on the inline line itself, stored smaller than its bytes.
