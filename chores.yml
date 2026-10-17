@@ -479,6 +479,9 @@ tasks:
       # a committed file given a second name and a file created with two,
       # durable by an fsync of each
       - test-disks/dirtylog/btrfs-dirty-log-hardlink.img
+      # a committed file whose INODE_REF is full given another name, held
+      # in an INODE_EXTREF item, durable by an fsync of /
+      - test-disks/dirtylog/btrfs-dirty-log-extref.img
       # the volume the command-line tools are tested against, labelled
       # CLITEST, with a manifest of what the kernel wrote into it
       - test-disks/cli/btrfs-cli.img
