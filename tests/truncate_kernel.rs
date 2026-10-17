@@ -532,3 +532,111 @@ fn files_ending_partway_through_a_sector_grow_with_zeros_from_their_old_end() {
 
     guest_kernel_write_ok(&image, "scrub", "btrfs scrub start -B \"$MNT\" >/dev/null");
 }
+
+/// Files the kernel wrote small enough to hold inline are grown through
+/// the ABI, past their sector and inside it. Growing inline data moves it
+/// into a regular extent (#422): `btrfs check` and `--check-data-csum`
+/// call the volume clean, the fs tree holds no inline item, the kernel
+/// reports each file's size and SHA-256 with zeros from the old end, and
+/// after the kernel appends to them `btrfs check` still passes.
+#[test]
+fn files_holding_inline_data_grow_into_a_regular_extent() {
+    let (scratch, _) = Scratch::made(
+        "truncate-grow-inline",
+        "no-holes",
+        "cd \"$MNT\"\n\
+         head -c 100 /dev/urandom > far\n\
+         head -c 700 /dev/urandom > near\n\
+         sync",
+    );
+    let image = scratch.image();
+    assert!(
+        dump_tree(Path::new(&image), "5").contains("inline extent data size"),
+        "the kernel stored no inline data to grow"
+    );
+    let fs = unsafe { fs_btrfs_mount_rw(c(&image).as_ptr()) };
+    assert!(!fs.is_null(), "mount_rw: {}", last_error());
+
+    let far = read(fs, "/far", 1 << 20);
+    assert_eq!(far.len(), 100, "/far is not the size made");
+    let near = read(fs, "/near", 1 << 20);
+    assert_eq!(near.len(), 700, "/near is not the size made");
+
+    // Past the inline data's sector, and inside it.
+    let grown = [("far", 50_000usize, &far), ("near", 3000, &near)];
+    let want: Vec<(&str, Vec<u8>)> = grown
+        .iter()
+        .map(|(name, size, kept)| {
+            let mut bytes = kept.to_vec();
+            bytes.resize(*size, 0);
+            (*name, bytes)
+        })
+        .collect();
+    for (name, size, _) in &grown {
+        let at = format!("/{name}");
+        assert_eq!(
+            truncate(fs, &at, *size as u64),
+            0,
+            "{name}: {}",
+            last_error()
+        );
+    }
+    for (name, bytes) in &want {
+        assert!(
+            read(fs, &format!("/{name}"), 1 << 20) == *bytes,
+            "/{name} does not read as its old bytes and then zeros"
+        );
+    }
+    unsafe { fs_btrfs_umount(fs) };
+
+    assert_btrfs_check_clean(Path::new(&image), "after inline files were grown");
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum finds data that disagrees with its digests:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let fs_tree = dump_tree(Path::new(&image), "5");
+    assert!(
+        !fs_tree.contains("inline extent data size"),
+        "an inline item survived the growth:\n{fs_tree}"
+    );
+    assert!(
+        fs_tree.contains("extent data disk byte"),
+        "no regular extent took the inline data's place:\n{fs_tree}"
+    );
+
+    let seen = guest_kernel_read_ok(
+        &image,
+        "after growing inline files",
+        "cd \"$MNT\"\n\
+         for f in far near; do \
+           printf '%s %s %s\\n' \"$f\" \"$(stat -c %s \"$f\")\" \
+             \"$(sha256sum \"$f\" | cut -d' ' -f1)\"; done",
+    );
+    let expected: String = want
+        .iter()
+        .map(|(name, bytes)| format!("{name} {} {}\n", bytes.len(), sha256_hex(bytes)))
+        .collect();
+    let lines: Vec<&str> = seen.lines().collect();
+    assert_eq!(
+        lines.join("\n") + "\n",
+        expected,
+        "the kernel sees the grown files differently"
+    );
+
+    guest_kernel_write_ok(
+        &image,
+        "append to the grown files",
+        "cd \"$MNT\"\nprintf appended >> far\nprintf appended >> near\nsync",
+    );
+    assert_btrfs_check_clean(
+        Path::new(&image),
+        "after the kernel appended to the grown files",
+    );
+}
