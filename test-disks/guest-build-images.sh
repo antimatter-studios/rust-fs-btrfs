@@ -1223,6 +1223,7 @@ build_dirtylog() {
     build_dirtylog_refused extrefcreated 'compress=no,max_inline=2048' extrefcreated
     build_dirtylog_refused extrefremoved 'compress=no,max_inline=2048' extrefremoved
     build_dirtylog_refused compressedcut 'compress-force=zlib,max_inline=0' compressedcut
+    build_dirtylog_refused rmdir 'compress=no,max_inline=2048' rmdir
 }
 
 # fsync_path <path> — fsync one file or directory, and nothing else.
@@ -1401,6 +1402,10 @@ os.unlink(sys.argv[1] + "/f")
 for i in range(63):
     os.unlink(sys.argv[1] + "/" + ("%03d" % i) * 85)' "$MNT"
             printf 'kept' > "$MNT/k" ;;
+        rmdir)
+            # An empty directory e and a file k, committed in /.
+            mkdir "$MNT/e"
+            printf 'kept' > "$MNT/k" ;;
         compressedcut)
             # 128 KiB of one byte: compress-force stores it as one
             # compressed extent, the largest the kernel makes.
@@ -1517,6 +1522,14 @@ if kind == "extrefremoved":
     os.unlink(d + "/" + "063" * 85)
     dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
     sys.exit(0)
+if kind == "rmdir":
+    # The committed empty directory e is removed after the commit, and
+    # only / is fsynced. The log holds index ranges of / covering the
+    # index of e and no entry there, and does not hold e: its replay removes
+    # the directory with its items.
+    os.rmdir(d + "/e")
+    dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    sys.exit(0)
 fd = os.open(d + "/f", os.O_WRONLY)
 if kind == "sizechange":
     os.pwrite(fd, b"replayed-and-longer-inline-bytes-0123456789", 0)
@@ -1606,6 +1619,7 @@ want = {
     'extrefcreated': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: n\n',
     'extrefremoved': r'key \(256 DIR_LOG_INDEX \d+\) itemoff \d+ itemsize \d+\n\s+dir log end \d+\n',
     'compressedcut': r'EXTENT_DATA 32768\)',
+    'rmdir': r'key \(256 DIR_LOG_INDEX \d+\) itemoff \d+ itemsize \d+\n\s+dir log end \d+\n',
 }[kind]
 assert re.search(want, dump), (kind, 'native dump does not show the unsupported shape')
 if kind == 'symlink':
@@ -1848,6 +1862,29 @@ if kind == 'extrefremoved':
         (kind, 'no committed entry of / names f at the index of its extended reference', at)
     assert not re.search(r'\bkey \(%s ' % f, dump), (kind, 'the log holds f or an entry naming it')
     assert not re.search(r'key \(\d+ INODE_EXTREF ', dump), (kind, 'the log holds an extended reference')
+    assert not re.search(r'key \(256 DIR_INDEX %d\) ' % at, dump), \
+        (kind, 'the log holds an entry of / at the removed index', at)
+    ranges = [(int(a), int(b)) for a, b in re.findall(
+        r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
+    assert any(a <= at <= b for a, b in ranges), \
+        (kind, 'no logged index range of / holds the removed index', at, ranges)
+if kind == 'rmdir':
+    # Committed, / names one directory, e, empty with one link. The log
+    # does not hold e or any entry naming it, and holds an index range of
+    # / covering e's index with no entry there.
+    import subprocess
+    tree = subprocess.run(['btrfs', 'inspect-internal', 'dump-tree', '-t', '5', sys.argv[3]],
+                          check=True, capture_output=True, text=True).stdout
+    named = re.findall(r'key \(256 DIR_INDEX (\d+)\) itemoff \d+ itemsize \d+\n'
+                       r'\s+location key \((\d+) INODE_ITEM 0\) type DIR\n[^\n]*\n\s+name: e\n', tree)
+    assert len(named) == 1, (kind, 'the committed / does not name one directory e', named)
+    at, e = int(named[0][0]), named[0][1]
+    item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation \d+ transid \d+ size (\d+) nbytes \d+\n'
+                     r'\s+block group \d+ mode 40\d+ links (\d+) ' % e, tree)
+    assert item and item.groups() == ('0', '1'), \
+        (kind, 'e is not committed as an empty directory with one link', item and item.groups())
+    assert not re.search(r'\bkey \(%s ' % e, dump), (kind, 'the log holds e or an item of it')
     assert not re.search(r'key \(256 DIR_INDEX %d\) ' % at, dump), \
         (kind, 'the log holds an entry of / at the removed index', at)
     ranges = [(int(a), int(b)) for a, b in re.findall(

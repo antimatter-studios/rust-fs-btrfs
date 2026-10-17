@@ -520,8 +520,9 @@ impl Filesystem {
     ///   range the log's names are the directory's names. A committed name
     ///   the log lacks is removed; its inode, if the log does not hold it
     ///   and that was its last name, is deleted with its data, whether the
-    ///   name was in an `INODE_REF` or an `INODE_EXTREF` item (#478). A logged
-    ///   name the directory lacks is added.
+    ///   name was in an `INODE_REF` or an `INODE_EXTREF` item (#478). An
+    ///   empty directory losing its name is removed with its items (#410).
+    ///   A logged name the directory lacks is added.
     /// - **Inodes logged only to say they exist** (generation 0) keep
     ///   their committed item; their logged references are their names,
     ///   each new one named by a logged entry and a committed one kept
@@ -1125,10 +1126,16 @@ impl Filesystem {
                             .search(root, &key(child, INODE_ITEM_KEY, 0))?
                             .ok_or(Error::DirtyLog)?;
                         let inode = Inode::parse(&inode.data, child)?;
-                        if !only
-                            || !inode.is_regular_file()
-                            || inode.nlink != 1
-                            || !removed_inodes.insert(child)
+                        // A directory goes only empty, as `rmdir` left it:
+                        // no names of its own and no size counting any (#410).
+                        let removable = if inode.is_dir() {
+                            inode.size == 0
+                                && tree.find_all(root, child, dir::DIR_ITEM_KEY)?.is_empty()
+                                && tree.find_all(root, child, DIR_INDEX_KEY)?.is_empty()
+                        } else {
+                            inode.is_regular_file()
+                        };
+                        if !only || !removable || inode.nlink != 1 || !removed_inodes.insert(child)
                         {
                             return Err(Error::DirtyLog);
                         }
