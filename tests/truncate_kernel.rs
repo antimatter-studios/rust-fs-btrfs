@@ -17,11 +17,14 @@
 //! reports each file's size and SHA-256, and a kernel scrub verifies every
 //! sector. Last, the kernel writes to and truncates the same files and
 //! `btrfs check` looks again.
+//!
+//! A second volume is made without the `NO_HOLES` feature, where growing a
+//! file has to record its new range as hole items (#420).
 
 use fs_btrfs::capi::*;
 use fs_btrfs_test_support::{
-    assert_btrfs_check_clean, guest_kernel_read_ok, guest_kernel_write_ok, oracle, sha256_hex,
-    temp_path,
+    assert_btrfs_check_clean, dump_tree, guest_kernel_read_ok, guest_kernel_write_ok, oracle,
+    sha256_hex, temp_path,
 };
 use std::ffi::{c_void, CStr, CString};
 use std::path::{Path, PathBuf};
@@ -46,24 +49,9 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(name: &str) -> Self {
-        let dir = PathBuf::from(temp_path!("{name}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let image = dir.join("fs.img");
-        std::fs::File::create(&image)
-            .and_then(|f| f.set_len(256 << 20))
-            .unwrap();
-        let made = oracle("mkfs.btrfs")
-            .args(["-q", "-f", "-s", "4096", "-n", "16384", "-O", "no-holes"])
-            .arg(&image)
-            .output();
-        assert!(
-            made.status.success(),
-            "mkfs.btrfs: {}",
-            String::from_utf8_lossy(&made.stderr)
-        );
-        guest_kernel_write_ok(
-            &image.to_string_lossy(),
+        Self::made(
             name,
+            "no-holes",
             "cd \"$MNT\"\n\
              head -c 65536 /dev/urandom > multi\n\
              sync\n\
@@ -78,8 +66,30 @@ impl Scratch {
              cp --reflink=always shared shared2\n\
              mkdir dir\n\
              sync",
+        )
+        .0
+    }
+
+    /// A volume made with mkfs `features`, on which the guest kernel runs
+    /// `script`; and what the script printed.
+    fn made(name: &str, features: &str, script: &str) -> (Self, String) {
+        let dir = PathBuf::from(temp_path!("{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("fs.img");
+        std::fs::File::create(&image)
+            .and_then(|f| f.set_len(256 << 20))
+            .unwrap();
+        let made = oracle("mkfs.btrfs")
+            .args(["-q", "-f", "-s", "4096", "-n", "16384", "-O", features])
+            .arg(&image)
+            .output();
+        assert!(
+            made.status.success(),
+            "mkfs.btrfs: {}",
+            String::from_utf8_lossy(&made.stderr)
         );
-        Scratch(dir)
+        let said = guest_kernel_write_ok(&image.to_string_lossy(), name, script);
+        (Scratch(dir), said)
     }
 
     fn image(&self) -> String {
@@ -245,5 +255,177 @@ fn files_truncated_through_the_abi_are_clean_and_the_kernel_agrees() {
     assert_btrfs_check_clean(
         Path::new(&image),
         "after the kernel changed the truncated files",
+    );
+}
+
+/// The `EXTENT_DATA` items `dump-tree` lists for inode `ino` in the
+/// top-level subvolume, as `(file offset, disk bytenr, num_bytes)`.
+fn dumped_extents(image: &Path, ino: u64) -> Vec<(u64, u64, u64)> {
+    let fs_tree = dump_tree(image, "5");
+    let lines: Vec<&str> = fs_tree.lines().collect();
+    let needle = format!("key ({ino} EXTENT_DATA ");
+    let mut items = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        let Some(start) = line.find(&needle) else {
+            continue;
+        };
+        let offset = line[start + needle.len()..]
+            .split(')')
+            .next()
+            .and_then(|o| o.parse().ok())
+            .unwrap_or_else(|| panic!("no offset in {line:?}"));
+        let body: Vec<&str> = lines[at + 1..]
+            .iter()
+            .take_while(|l| !l.contains(" key ("))
+            .copied()
+            .collect();
+        let field = |phrase: &str, word: &str| -> u64 {
+            let found = body
+                .iter()
+                .find(|l| l.contains(phrase))
+                .unwrap_or_else(|| panic!("inode {ino}'s item at {offset} has no {phrase:?}"));
+            let mut words = found.split_whitespace();
+            words.find(|w| *w == word);
+            words
+                .next()
+                .and_then(|w| w.parse().ok())
+                .unwrap_or_else(|| panic!("inode {ino}'s item at {offset}: no {word} in {found:?}"))
+        };
+        items.push((
+            offset,
+            field("extent data disk byte", "byte"),
+            field("extent data offset", "nr"),
+        ));
+    }
+    items
+}
+
+/// Without the `NO_HOLES` feature, every range of a file up to its size,
+/// rounded to a sector, must be covered by an `EXTENT_DATA` item, a hole
+/// being one whose disk bytenr is 0 (#420). A kernel-made volume without
+/// the feature holds an empty file, a file of two sectors and one the
+/// kernel already grew past its data; each is grown through the ABI, one
+/// of them twice. `btrfs check` reports a range left without an item as a
+/// file extent discount; `dump-tree` must show the items tiling each file
+/// exactly, everything past the old end a hole; the kernel reports each
+/// file's size and SHA-256, writes into the new ranges, and `btrfs check`
+/// looks again.
+#[test]
+fn files_grown_without_no_holes_are_covered_by_hole_items_and_the_kernel_agrees() {
+    let (scratch, said) = Scratch::made(
+        "truncate-holes",
+        "^no-holes",
+        "cd \"$MNT\"\n\
+         touch empty\n\
+         head -c 8192 /dev/urandom > aligned\n\
+         head -c 8192 /dev/urandom > holey\n\
+         truncate -s 16384 holey\n\
+         sync\n\
+         stat -c '%n %i' empty aligned holey",
+    );
+    let image = scratch.image();
+    let ino = |name: &str| -> u64 {
+        said.lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.trim().parse().ok())
+            .unwrap_or_else(|| panic!("the guest printed no inode for {name}: {said:?}"))
+    };
+    let super_block = oracle("btrfs")
+        .args(["inspect-internal", "dump-super"])
+        .arg(&image)
+        .output();
+    assert!(super_block.status.success(), "dump-super failed");
+    assert!(
+        !String::from_utf8_lossy(&super_block.stdout).contains("NO_HOLES"),
+        "mkfs made the volume with the no-holes feature, so this test proves nothing"
+    );
+    assert_btrfs_check_clean(Path::new(&image), "the kernel-made volume");
+
+    let fs = unsafe { fs_btrfs_mount_rw(c(&image).as_ptr()) };
+    assert!(!fs.is_null(), "mount_rw: {}", last_error());
+    let aligned = read(fs, "/aligned", 1 << 20);
+    assert_eq!(aligned.len(), 8192, "/aligned is not the size made");
+    let holey = read(fs, "/holey", 1 << 20);
+    assert_eq!(holey.len(), 16384, "/holey is not the size made");
+
+    let grown = [
+        ("empty", 1 << 20, Vec::new()),
+        ("aligned", 65536, aligned),
+        ("holey", 40960, holey),
+    ];
+    assert_eq!(truncate(fs, "/empty", 1 << 20), 0, "{}", last_error());
+    assert_eq!(truncate(fs, "/aligned", 32768), 0, "{}", last_error());
+    assert_eq!(truncate(fs, "/aligned", 65536), 0, "{}", last_error());
+    assert_eq!(truncate(fs, "/holey", 40960), 0, "{}", last_error());
+    for (name, size, data) in &grown {
+        let mut want = data.clone();
+        want.resize(*size, 0);
+        assert!(
+            read(fs, &format!("/{name}"), 2 << 20) == want,
+            "/{name} does not read back as its data followed by zeros"
+        );
+    }
+    unsafe { fs_btrfs_umount(fs) };
+
+    assert_btrfs_check_clean(
+        Path::new(&image),
+        "after files were grown through the ABI without no-holes",
+    );
+    for (name, size, data) in &grown {
+        let items = dumped_extents(Path::new(&image), ino(name));
+        let mut end = 0;
+        for &(offset, bytenr, num) in &items {
+            assert_eq!(
+                offset, end,
+                "{name}'s items leave [{end}, {offset}) uncovered: {items:?}"
+            );
+            if offset >= data.len() as u64 {
+                assert_eq!(
+                    bytenr, 0,
+                    "{name}'s item at {offset} is not a hole: {items:?}"
+                );
+            }
+            end = offset + num;
+        }
+        assert_eq!(
+            end, *size as u64,
+            "{name}'s items do not end at its new size: {items:?}"
+        );
+    }
+
+    let seen = guest_kernel_read_ok(
+        &image,
+        "after the ABI grew files without no-holes",
+        "cd \"$MNT\"\n\
+         for f in empty aligned holey; do \
+           printf '%s %s %s\\n' \"$f\" \"$(stat -c %s \"$f\")\" \
+             \"$(sha256sum \"$f\" | cut -d' ' -f1)\"; done",
+    );
+    let want: String = grown
+        .iter()
+        .map(|(name, size, data)| {
+            let mut bytes = data.clone();
+            bytes.resize(*size, 0);
+            format!("{name} {size} {}\n", sha256_hex(&bytes))
+        })
+        .collect();
+    let lines: Vec<&str> = seen.lines().collect();
+    assert_eq!(
+        lines.join("\n") + "\n",
+        want,
+        "the kernel sees the grown files differently"
+    );
+
+    guest_kernel_write_ok(
+        &image,
+        "the kernel writes into the grown ranges",
+        "cd \"$MNT\"\n\
+         head -c 4096 /dev/urandom | dd of=empty bs=4096 seek=10 conv=notrunc status=none\n\
+         head -c 4096 /dev/urandom | dd of=aligned bs=4096 seek=9 conv=notrunc status=none\n\
+         head -c 5000 /dev/urandom >> holey\n\
+         sync",
+    );
+    assert_btrfs_check_clean(
+        Path::new(&image),
+        "after the kernel wrote into the grown ranges",
     );
 }
