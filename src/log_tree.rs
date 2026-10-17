@@ -421,7 +421,9 @@ impl Filesystem {
     /// - **Inodes the log creates** are inserted, named from their
     ///   references, or from the logged entries of a directory the log
     ///   speaks for. A directory the log creates (#403) is named only
-    ///   that way, and holds the names the log gives it.
+    ///   that way, and holds the names the log gives it. A symbolic link
+    ///   the log creates (#404) holds its target as logged, in one plain
+    ///   inline extent, and is named as a link.
     /// - **Directories the log speaks for** (#377): in each logged index
     ///   range the log's names are the directory's names. A committed name
     ///   the log lacks is removed; its inode, if the log does not hold it
@@ -498,6 +500,8 @@ impl Filesystem {
                 let mut dirs: BTreeSet<u64> = BTreeSet::new();
                 // Directories the log creates (#403).
                 let mut new_dirs: BTreeSet<u64> = BTreeSet::new();
+                // Symbolic links the log creates (#404), each also in `created`.
+                let mut links: BTreeSet<u64> = BTreeSet::new();
                 for &ino in &logged_inodes {
                     let logged = top.inode(ino)?.ok_or(Error::DirtyLog)?;
                     if ino < FIRST_FREE_OBJECTID {
@@ -506,6 +510,10 @@ impl Filesystem {
                     match tree.search(root, &key(ino, INODE_ITEM_KEY, 0))? {
                         None if logged.is_regular_file() && ino >= FIRST_FREE_OBJECTID => {
                             created.insert(ino);
+                        }
+                        None if logged.is_symlink() => {
+                            created.insert(ino);
+                            links.insert(ino);
                         }
                         None if logged.is_dir() => {
                             new_dirs.insert(ino);
@@ -563,6 +571,17 @@ impl Filesystem {
                             if !tree.find_all(root, ino, kind)?.is_empty() {
                                 return Err(Error::DirtyLog);
                             }
+                        }
+                    }
+                    if links.contains(&ino) {
+                        // A link's target is its only extent: plain, inline,
+                        // at 0 and exactly its size, as the kernel writes it.
+                        let target = logged_items.get(&0).filter(|d| plain_inline(d));
+                        if logged_items.len() != 1
+                            || logged.size == 0
+                            || target.map(|d| le64(d, fe::RAM_BYTES)) != Some(logged.size)
+                        {
+                            return Err(Error::DirtyLog);
                         }
                     }
                     let end = logged.size.div_ceil(sector) * sector;
@@ -697,7 +716,11 @@ impl Filesystem {
                             *names.entry(ino).or_default() += 1;
                             if spoken_for(parent) {
                                 let entry = logged_entry(parent, index)?.ok_or(Error::DirtyLog)?;
-                                if entry.ino != ino || entry.name != name {
+                                if entry.ino != ino
+                                    || entry.name != name
+                                    || (links.contains(&ino)
+                                        && entry.ftype != Some(crate::inode::FileType::Symlink))
+                                {
                                     return Err(Error::DirtyLog);
                                 }
                                 continue;
@@ -727,12 +750,12 @@ impl Filesystem {
                             {
                                 return Err(Error::DirtyLog);
                             }
-                            let entry = crate::namespace::dir_entry(
-                                ino,
-                                generation,
-                                dir::ftype::REG_FILE,
-                                name,
-                            );
+                            let ftype = if links.contains(&ino) {
+                                dir::ftype::SYMLINK
+                            } else {
+                                dir::ftype::REG_FILE
+                            };
+                            let entry = crate::namespace::dir_entry(ino, generation, ftype, name);
                             edits.push(put(by_hash, entry.clone()));
                             edits.push(put(by_index, entry));
                             *grown.entry(parent).or_default() += 2 * name.len() as i64;
