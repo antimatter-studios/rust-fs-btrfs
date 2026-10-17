@@ -61,7 +61,7 @@
 use crate::chunk::{objectid, DiskKey};
 use crate::dir::{self, ftype, DIR_INDEX_KEY, DIR_ITEM_KEY, MAX_NAME_LEN};
 use crate::error::{Error, Result};
-use crate::fs::{Filesystem, EXTENT_DATA_KEY};
+use crate::fs::{Filesystem, SubvolumeWrites, EXTENT_DATA_KEY};
 use crate::inode::{
     offsets as io, Inode, FIRST_FREE_OBJECTID, INODE_ITEM_KEY, INODE_ITEM_SIZE, INODE_NODATACOW,
     INODE_NODATASUM, INODE_REF_KEY,
@@ -71,6 +71,8 @@ use crate::log_tree::{extref_hash, INODE_EXTREF_KEY};
 use crate::super_write::Commit;
 use crate::superblock::incompat::EXTENDED_IREF;
 use crate::transaction::{DataRelease, DataWrite, ItemEdit};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// How many rounds a change's plan has to close over its own bookkeeping.
 const PLAN_ROUNDS: usize = 64;
@@ -648,7 +650,30 @@ impl Filesystem {
         uid: u32,
         gid: u32,
     ) -> Result<u64> {
-        self.require_writable_top_level()?;
+        match self.subvolume_writes.as_ref().map(|w| w.id) {
+            Some(id) => {
+                self.writing_subvolume(|fs| fs.add_inode_in(id, parent, name, kind, mode, uid, gid))
+            }
+            None => {
+                self.require_writable_top_level()?;
+                self.add_inode_in(objectid::FS_TREE, parent, name, kind, mode, uid, gid)
+            }
+        }
+    }
+
+    /// [`Filesystem::add_inode`] in the tree `root`, which this handle
+    /// reads.
+    #[allow(clippy::too_many_arguments)]
+    fn add_inode_in(
+        &mut self,
+        root: u64,
+        parent: u64,
+        name: &[u8],
+        kind: NewKind,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<u64> {
         let dir = self.writable_parent(parent, name)?;
         if let NewKind::Symlink(target) = kind {
             let limit = (self.sb.sectorsize as usize - 1).min(self.max_item_size() - INLINE_HEADER);
@@ -703,7 +728,7 @@ impl Filesystem {
             ));
         }
         self.entry_edits(&mut edits, &dir, name, ino, ft, index, generation, now)?;
-        self.commit_edits(ino, edits, generation, now)?;
+        self.commit_edits_in(root, ino, edits, generation, now)?;
         Ok(ino)
     }
 
@@ -756,8 +781,21 @@ impl Filesystem {
         generation: u64,
         now: (u64, u32),
     ) -> Result<()> {
+        self.commit_edits_in(objectid::FS_TREE, ino, edits, generation, now)
+    }
+
+    /// [`Filesystem::commit_edits`] to the tree `root`, which this handle
+    /// reads (#517).
+    pub(crate) fn commit_edits_in(
+        &mut self,
+        root: u64,
+        ino: u64,
+        edits: Vec<ItemEdit>,
+        generation: u64,
+        now: (u64, u32),
+    ) -> Result<()> {
         let write = DataWrite {
-            root: objectid::FS_TREE,
+            root,
             ino,
             moves: Vec::new(),
             adds: Vec::new(),
@@ -851,6 +889,51 @@ impl Filesystem {
         // (#298): `mount_rw` opens one device and refuses a pool (#336).
         *self = self.remount_rw()?;
         Ok(())
+    }
+
+    /// The devices this handle writes through, its own or those a
+    /// subvolume handle holds aside, held for the subvolume `id` (#517).
+    pub(crate) fn writes_for_subvolume(&self, id: u64) -> Option<SubvolumeWrites> {
+        let (writable, writable_pool) = match (&self.writable, &self.subvolume_writes) {
+            (Some(device), _) => (Arc::clone(device), self.writable_pool.clone()),
+            (None, Some(w)) => (Arc::clone(&w.writable), w.writable_pool.clone()),
+            (None, None) => return None,
+        };
+        Some(SubvolumeWrites {
+            id,
+            writable,
+            writable_pool,
+        })
+    }
+
+    /// Run `write`, a change committed against this subvolume handle's own
+    /// tree, with the handle's devices in place (#517).
+    ///
+    /// A commit reopens the mount, which opens the top level, so whatever
+    /// `write` leaves behind is turned back into this subvolume's handle
+    /// on the generation it reached, read-only to everything else again.
+    fn writing_subvolume<R>(&mut self, write: impl FnOnce(&mut Self) -> Result<R>) -> Result<R> {
+        let held = self.subvolume_writes.take().ok_or(Error::ReadOnly)?;
+        self.writable = Some(Arc::clone(&held.writable));
+        self.writable_pool = held.writable_pool.clone();
+        let out = write(self);
+        let reopened = self.tree_root(held.id).and_then(|root| self.reroot(root));
+        match reopened {
+            Ok(mut fs) => {
+                fs.subvolume_writes = Some(held);
+                *self = fs;
+            }
+            Err(e) => {
+                // Read-only again whatever happened: the handle must never
+                // be left writing the top level.
+                self.writable = None;
+                self.writable_pool = BTreeMap::new();
+                self.subvolume_writes = Some(held);
+                out?;
+                return Err(e);
+            }
+        }
+        out
     }
 
     /// Refuse a read-only mount, and one whose tree is not tree 5.
