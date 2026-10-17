@@ -1182,9 +1182,10 @@ pub unsafe extern "C" fn fs_btrfs_can_write_in_place(
 /// contents or the new and never a mixture. A hole is filled, and a write
 /// past the end of the file grows it, the gap reading as zeros and, without
 /// the no-holes feature, recorded as a hole item. What that path cannot
-/// write yet — an inline or preallocated extent, or an extent a snapshot
-/// may share (rust-fs-btrfs#261) — is refused with ENOTSUP and the case
-/// named.
+/// write yet — a preallocated extent, inline data the write does not lie
+/// within or that is compressed, or an extent a snapshot may share
+/// (rust-fs-btrfs#261) — is refused with ENOTSUP and the case named. A
+/// write within uncompressed inline data rewrites it in place.
 ///
 /// # Safety
 ///
