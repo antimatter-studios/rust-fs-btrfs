@@ -109,7 +109,7 @@ leaf_split                1
 leaf_split_oracle         1
 # The whole-suite counter includes the CLI inode flag unit case (#412).
 lib                       234
-log_tree_kernel           28
+log_tree_kernel           29
 lookup_by_name_key        1
 namespace_kernel          2
 node_write_oracle         4
