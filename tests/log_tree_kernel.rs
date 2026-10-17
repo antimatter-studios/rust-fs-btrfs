@@ -19,7 +19,7 @@ use fs_btrfs::log_tree::LoggedTree;
 use fs_btrfs::Error;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, fixture, guest_kernel_read_ok, guest_kernel_report,
-    guest_kernel_write_ok, temp_path,
+    guest_kernel_write_ok, oracle, temp_path,
 };
 use fs_core::{BlockDevice, BlockRead, FileDevice};
 use std::collections::BTreeMap;
@@ -694,9 +694,129 @@ fn a_compressed_inline_log_is_refused_without_writing() {
     an_unsupported_log_is_refused_without_writing("compressedinline");
 }
 
+const EXTERNAL_FIXTURE: &str = "dirtylog/btrfs-dirty-log-externalextent.img";
+const EXTERNAL_TRANSCRIPT: &str = "dirtylog/btrfs-dirty-log-externalextent.logdump";
+/// The fixture's file: 8 KiB of `c` in one regular, checksummed extent,
+/// committed, then overwritten whole with `r` and fsynced.
+const EXTERNAL_LEN: usize = 8192;
+
+/// `btrfs check --check-data-csum`: every data sector against its digest,
+/// which `btrfs check --readonly` alone does not read.
+fn assert_data_csums_clean(image: &Path, tag: &str) {
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "[{tag}] btrfs check --check-data-csum finds data that disagrees with its digests:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+}
+
+/// An existing file overwritten whole and made durable by fsync alone
+/// (#375): the log holds the file's new regular extent, which no
+/// committed extent record names yet, and that extent's checksums. This
+/// was refused until replay could take the extent into the extent tree
+/// and its digests into the checksum tree; the kernel's replay of the same
+/// crash image is the oracle for what the file and the trees end up as.
 #[test]
-fn an_external_extent_log_is_refused_without_writing() {
-    an_unsupported_log_is_refused_without_writing("externalextent");
+fn an_external_extent_overwrite_replays_as_the_kernel_does() {
+    use sha2::Digest;
+    let image = fixture(EXTERNAL_FIXTURE);
+    let transcript = std::fs::read_to_string(fixture(EXTERNAL_TRANSCRIPT))
+        .expect("the native transcript of the external extent log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    let committed = Filesystem::mount_ignoring_log(Arc::new(
+        FileDevice::open(&image).expect("open the external extent fixture"),
+    ) as Arc<dyn BlockRead>)
+    .expect("read the committed file without replay");
+    let before = committed.lookup_path("/f").unwrap();
+    assert_eq!(
+        committed.read_file(before.ino).unwrap(),
+        vec![b'c'; EXTERNAL_LEN],
+        "the committed file is the bytes written before the overwrite"
+    );
+    let log = committed
+        .log()
+        .unwrap()
+        .expect("a dirty external extent log");
+    assert_eq!(log.trees.len(), 1, "only the top-level subvolume changed");
+    let top = &log.trees[0];
+    assert!(
+        top.items
+            .iter()
+            .any(|item| (item.key.objectid, item.key.key_type)
+                == (before.ino, fs_btrfs::fs::EXTENT_DATA_KEY)),
+        "the overwrite's file extent is logged"
+    );
+    assert!(
+        top.items
+            .iter()
+            .any(|item| item.key.key_type == fs_btrfs::csum::EXTENT_CSUM_KEY),
+        "the new extent's checksums are logged"
+    );
+    drop(committed);
+
+    let theirs_guard = ScratchCopy::of(&image, temp_path!("external-kernel.img"));
+    let ours_guard = ScratchCopy::of(&image, temp_path!("external-crate.img"));
+    let (theirs, ours) = (theirs_guard.0.clone(), ours_guard.0.clone());
+    const VIEW: &str = "stat -c '%i %s %h' \"$MNT/f\"; sha256sum \"$MNT/f\" | cut -d' ' -f1";
+    let expected = format!(
+        "{} {EXTERNAL_LEN} 1\n{:x}",
+        before.ino,
+        sha2::Sha256::digest(vec![b'r'; EXTERNAL_LEN])
+    );
+    let kernel = guest_kernel_write_ok(
+        &theirs.to_string_lossy(),
+        "external extent kernel replay",
+        VIEW,
+    );
+    assert_eq!(
+        kernel.trim(),
+        expected,
+        "the real kernel recovered the overwrite"
+    );
+    assert_btrfs_check_clean(&theirs, "external extent kernel replay");
+    assert_data_csums_clean(&theirs, "external extent kernel replay");
+    {
+        let fs = Filesystem::mount_rw(
+            Arc::new(FileDevice::open_rw(&ours).unwrap()) as Arc<dyn BlockDevice>
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "an external extent overwrite log must replay: {error:?}; kernel recovered {}",
+                kernel.trim()
+            )
+        });
+        assert_eq!(fs.superblock().log_root, 0);
+        let replayed = fs.lookup_path("/f").unwrap();
+        assert_eq!(replayed.ino, before.ino);
+        assert_eq!(
+            fs.read_file(replayed.ino).unwrap(),
+            vec![b'r'; EXTERNAL_LEN]
+        );
+    }
+    assert_btrfs_check_clean(&ours, "external extent crate replay");
+    assert_data_csums_clean(&ours, "external extent crate replay");
+    let actual = guest_kernel_read_ok(
+        &ours.to_string_lossy(),
+        "external extent crate readback",
+        VIEW,
+    );
+    assert_eq!(
+        actual.trim(),
+        expected,
+        "the kernel reads the crate's replay"
+    );
+    assert!(differences(
+        &kernel_view(&ours, "external extent crate"),
+        &kernel_view(&theirs, "external extent kernel")
+    )
+    .is_empty());
 }
 
 #[test]
