@@ -498,6 +498,10 @@ tasks:
       # of them INODE_EXTREF items, durable by an fsync of / alone, which
       # logs the file only as an inode that exists
       - test-disks/dirtylog/btrfs-dirty-log-extrefcreated.img
+      # a committed file whose only name is in an INODE_EXTREF item,
+      # that name removed and / alone fsynced, which leaves the file
+      # unlogged for replay to delete
+      - test-disks/dirtylog/btrfs-dirty-log-extrefremoved.img
       # the volume the command-line tools are tested against, labelled
       # CLITEST, with a manifest of what the kernel wrote into it
       - test-disks/cli/btrfs-cli.img
