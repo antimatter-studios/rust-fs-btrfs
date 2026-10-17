@@ -2630,6 +2630,127 @@ fn a_directory_whose_name_the_log_removes_is_removed_as_the_kernel_does() {
     );
 }
 
+/// `f` and `g`, two committed names of one file in `/`, lose `g` after
+/// the commit, and only `/` is fsynced (#411). The log holds an index
+/// range of `/` covering the removed index and no entry there, and does
+/// not hold the file. A replay that removes only an inode's last name
+/// refuses the log; the kernel's replay of the same crash image drops the
+/// name `g` and its reference record and leaves the file with one link,
+/// and is the oracle.
+#[test]
+fn a_name_whose_inode_keeps_another_is_removed_as_the_kernel_does() {
+    const LINK_REMOVED_FIXTURE: &str = "dirtylog/btrfs-dirty-log-linkremoved.img";
+    let image = fixture(LINK_REMOVED_FIXTURE);
+    let transcript =
+        std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-linkremoved.logdump"))
+            .expect("the native transcript of the removed name log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    let f = {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the removed name fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        let committed_f = fs
+            .lookup_path("/f")
+            .expect("the committed trees hold the file f");
+        let committed_g = fs
+            .lookup_path("/g")
+            .expect("the committed trees hold the name g");
+        assert_eq!(committed_f.ino, committed_g.ino, "f and g are one inode");
+        assert_eq!(committed_f.nlink, 2, "f is committed with two links");
+        let f = committed_f.ino;
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        assert!(
+            !top.items.iter().any(|i| i.key.objectid == f),
+            "the log holds no item of f: {keys:?}"
+        );
+        for entry in top
+            .items
+            .iter()
+            .filter(|i| (i.key.objectid, i.key.key_type) == (256, DIR_INDEX_KEY))
+        {
+            assert!(
+                parse_dir_items(&entry.data)
+                    .unwrap()
+                    .iter()
+                    .all(|d| d.ino != f),
+                "the logged entry of / at index {} names f",
+                entry.key.offset
+            );
+        }
+        assert!(
+            top.items
+                .iter()
+                .any(|i| i.key.objectid == 256 && i.key.key_type == DIR_LOG_INDEX_KEY),
+            "the log holds no index range of /: {keys:?}"
+        );
+        f
+    };
+    // What the kernel's view does not show: the file's reference records,
+    // as the native tool prints each replayed copy.
+    let refs_of_f = |image: &Path| -> Vec<String> {
+        let dump = dump_tree(image, "5");
+        let mut lines = dump.lines().map(str::trim);
+        let mut refs = Vec::new();
+        while let Some(line) = lines.next() {
+            if line.contains(&format!("key ({f} INODE_REF ")) {
+                refs.push(line.split(" itemoff").next().unwrap_or(line).to_string());
+                refs.extend(
+                    lines
+                        .clone()
+                        .take_while(|l| l.starts_with("index "))
+                        .map(str::to_string),
+                );
+            }
+        }
+        refs
+    };
+    let theirs = replays_as_the_kernel_does_then(
+        LINK_REMOVED_FIXTURE,
+        "dirtylog-linkremoved",
+        |theirs, ours| {
+            let kernel = refs_of_f(theirs);
+            assert_eq!(
+                kernel.len(),
+                2,
+                "the kernel's replay keeps one INODE_REF with one record: {kernel:?}"
+            );
+            assert!(
+                kernel[1].ends_with("name: f"),
+                "the kernel's replay keeps the name f: {kernel:?}"
+            );
+            assert_eq!(
+                refs_of_f(ours),
+                kernel,
+                "this crate's replay keeps the reference records the kernel's does"
+            );
+        },
+    );
+    assert_eq!(
+        theirs.get(&("stat".to_string(), "g".to_string())),
+        None,
+        "the kernel's replay removes the name g"
+    );
+    assert_eq!(
+        theirs
+            .get(&("stat".to_string(), "f".to_string()))
+            .map(String::as_str),
+        Some("f 1 4"),
+        "the kernel's replay keeps f with one link"
+    );
+}
+
 /// The inline writer's encoding fields are checked against the native
 /// tools, not against our own parser. `dump-tree` prints an inline file
 /// extent's data size, `ram_bytes` and compression; the raw item must hold
