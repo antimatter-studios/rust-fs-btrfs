@@ -765,6 +765,8 @@ tasks:
     # tier was added, 176 with test-docs.sh; the floor is about 95% of that.
     # Stat adds 39 assertions and one generated man-page check (#412):
     # raise the existing floor by those 40 checks; CI verifies execution.
+    # xattr adds 24 installed assertions and one generated man-page check
+    # (#416); raise the floor by 25 and let CI verify execution.
     #
     # BUDGET: 26 lines and 1047 bytes measured with fsck.btrfs's checks in
     # the tier (#260, run 37378163675), so 26 lines and 1200 bytes.
@@ -773,9 +775,10 @@ tasks:
     # lines (95 bytes); add them to the existing floor and budget.
     # mkdir --parents adds 114 assertions to test-write.sh (#414) and no
     # file, so no line; the floor takes them and the budget stays.
+    # test-xattr.sh adds three fixed success lines, exactly 81 bytes.
     cmds:
-      - '../rust-fs-core/scripts/tier.sh test:cli cli 32 1295 -- scripts/test-cli.sh'
-      - 'bash ../rust-fs-core/scripts/test-floor.sh cli 383'
+      - '../rust-fs-core/scripts/tier.sh test:cli cli 35 1376 -- scripts/test-cli.sh'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh cli 408'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
