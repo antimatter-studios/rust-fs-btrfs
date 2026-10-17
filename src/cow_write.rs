@@ -54,7 +54,10 @@
 //!    the kernel does, the old last sector is copied with zeros past the
 //!    old end when the write does not cover it (#433). Without the
 //!    no-holes feature, explicit hole items keep the ranges before and
-//!    after each fill, trimmed or split in the same transaction (#434).
+//!    after each fill, trimmed or split in the same transaction (#434),
+//!    and the gap a write past the end leaves is a hole item of its own,
+//!    from the sector after the old end to the one the write starts in,
+//!    as the kernel inserts it (#436).
 //!
 //! The data goes to every mirror first; then the tree blocks, a flush,
 //! the superblocks and a flush, in [`Filesystem::commit`]'s order. Until
@@ -69,9 +72,9 @@
 //!   root, or a full one that cannot be split (its parent node has no
 //!   room for another pointer): removing a leaf and splitting a node are
 //!   not written yet;
-//! - a write that grows a file on a volume **without the no-holes
-//!   feature**, where the hole a file ends with is an item of its own
-//!   (#436);
+//! - a write past the end of a file, on a volume **without the no-holes
+//!   feature**, whose gap an extent item past the end (a preallocated one)
+//!   already reaches into;
 //! - an **inline** or **preallocated** extent: each changes the item's
 //!   kind, not only where it points;
 //! - an extent a **snapshot** may share — one from at or before the last
@@ -220,18 +223,25 @@ impl Filesystem {
         // extent as a hole is (#432). One that starts past the end leaves a
         // gap, and the kernel zeroes the rest of the old last sector before
         // it makes one: that sector is copied too, reading as zeros past
-        // the old end (#433). A volume without no-holes records the hole a
-        // file ends with as an item the hole fill does not maintain (#436).
+        // the old end (#433). A volume without no-holes records that gap
+        // as a hole item, from the sector after the old end to the one the
+        // write starts in, as the kernel's extend does (#436).
         let mut tail = None;
+        let mut gap = None;
         if end > inode.size {
-            if !self.sb.has_no_holes() {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino}: growing a file on a volume without the no-holes feature \
-                     means keeping its hole items, which is not implemented"
-                )));
-            }
-            if offset > inode.size && !inode.size.is_multiple_of(u64::from(self.sb.sectorsize)) {
+            let sector = u64::from(self.sb.sectorsize);
+            if offset > inode.size && !inode.size.is_multiple_of(sector) {
                 tail = Some(inode.size);
+            }
+            if !self.sb.has_no_holes() {
+                let from = inode.size.checked_next_multiple_of(sector).ok_or_else(|| {
+                    Error::UnsupportedFeature(format!("inode {ino}: size overflows"))
+                })?;
+                let to = offset - offset % sector;
+                if from < to {
+                    self.check_gap_is_empty(ino, from)?;
+                    gap = Some((from, to));
+                }
             }
         }
 
@@ -302,6 +312,16 @@ impl Filesystem {
         // Remove or trim explicit holes before inserting the new data
         // items: a fill at a hole's start replaces its original key.
         let mut edits = self.cow_hole_edits(ino, &targets, generation)?;
+        if let Some((from, to)) = gap {
+            edits.push(ItemEdit::Put(OwnedItem {
+                key: DiskKey {
+                    objectid: ino,
+                    key_type: EXTENT_DATA_KEY,
+                    offset: from,
+                },
+                data: regular_extent_item(generation, 0, 0, to - from, COMPRESS_NONE),
+            }));
+        }
         for (p, &new) in pieces.iter().zip(&news) {
             let t = &targets[p.target];
             let disk_len = p.bytes.len() as u64;
@@ -412,7 +432,8 @@ impl Filesystem {
             let mut leaves = BTreeSet::new();
             let keys = std::iter::once((INODE_ITEM_KEY, 0))
                 .chain(targets.iter().map(|t| (EXTENT_DATA_KEY, t.start)))
-                .chain(write.adds.iter().map(|a| (EXTENT_DATA_KEY, a.file_offset)));
+                .chain(write.adds.iter().map(|a| (EXTENT_DATA_KEY, a.file_offset)))
+                .chain(gap.map(|(from, _)| (EXTENT_DATA_KEY, from)));
             for (key_type, key_offset) in keys {
                 let key = DiskKey {
                     objectid: ino,
@@ -487,6 +508,30 @@ impl Filesystem {
         // The trees this mount holds are the previous generation's.
         *self = self.remount_rw()?;
         Ok(data.len())
+    }
+
+    /// Refuse a gap past the end of a file that an extent item already
+    /// reaches into — a preallocated extent kept past the end — as the
+    /// hole item recording the gap would overlap it (#436).
+    fn check_gap_is_empty(&self, ino: u64, from: u64) -> Result<()> {
+        use crate::fs::file_extent as fe;
+        use crate::superblock::le64;
+        for (key, data) in self.items_of(ino)? {
+            // Inline data (type 0) only ever lies within the file's size.
+            if key.key_type != EXTENT_DATA_KEY
+                || data.len() < fe::REGULAR_SIZE
+                || data[fe::TYPE] == 0
+            {
+                continue;
+            }
+            if key.offset.saturating_add(le64(&data, fe::NUM_BYTES)) > from {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino}: an extent item past the end reaches into the gap a write \
+                     past the end leaves, which a hole item cannot record without overlapping it"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Preserve what remains of explicit hole items around the sectors
