@@ -308,8 +308,10 @@ int fs_btrfs_can_write_in_place(fs_btrfs_fs_t *fs, const char *path);
  * written copy-on-write and committed, filling holes and growing the
  * file, including from past its end, where the gap reads as zeros.
  * Without the no-holes feature that gap is recorded as a hole item.
- * Refused with ENOTSUP, the case named, for an extent a snapshot shares,
- * or an inline or preallocated one (rust-fs-btrfs#261).
+ * A write within uncompressed inline data rewrites it in place. Refused
+ * with ENOTSUP, the case named, for an extent a snapshot shares, a
+ * preallocated one, or inline data the write does not lie within or that
+ * is compressed (rust-fs-btrfs#261).
  */
 int64_t fs_btrfs_write_file(fs_btrfs_fs_t *fs, const char *path,
                             const void *buf, uint64_t offset, uint64_t length);
