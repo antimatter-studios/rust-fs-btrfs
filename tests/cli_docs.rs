@@ -63,7 +63,11 @@ fn every_name_has_a_man_page_in_its_section_naming_its_subcommands() {
             "no fs.btrfs-{verb}.1"
         );
     }
-    let ls = std::fs::read_to_string(share.join("man/man1/fs.btrfs-ls.1")).unwrap();
+    // roff escapes every hyphen (`\-\-max\-depth`), so the page is read
+    // with those escapes turned back into the hyphens a reader sees.
+    let ls = std::fs::read_to_string(share.join("man/man1/fs.btrfs-ls.1"))
+        .unwrap()
+        .replace("\\-", "-");
     for option in ["recursive", "max-depth", "limit", "64", "100000"] {
         assert!(ls.contains(option), "ls man page omits {option}");
     }
