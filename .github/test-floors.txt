@@ -91,6 +91,8 @@ fuzz_decoders             5
 getxattr_byte_names       1
 guest_scripts_drain_pipes 2
 hard_link_extref          5
+# Three cases in the file (#447); the first full run's count confirms it.
+incompat_feature_refusals 3
 kernel_readback           2
 leaf_edit_oracle          3
 leaf_split                1
