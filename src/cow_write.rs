@@ -49,7 +49,9 @@
 //! 6. **The inode** is stamped with the transaction, a new change count
 //!    and new change and modification times. A write into a hole, or past
 //!    the end of the file, adds the sectors it allocates to `nbytes`; one
-//!    past the end moves `size` to where it stops (#432).
+//!    past the end moves `size` to where it stops (#432). Without the
+//!    no-holes feature, explicit hole items keep the ranges before and
+//!    after each fill, trimmed or split in the same transaction (#434).
 //!
 //! The data goes to every mirror first; then the tree blocks, a flush,
 //! the superblocks and a flush, in [`Filesystem::commit`]'s order. Until
@@ -116,9 +118,10 @@ struct Target {
     /// a reflink's, or another item of this file outside the range
     /// (#261). It then loses this item's reference and stays.
     shared: bool,
-    /// A span of a hole, whole sectors of it, which has no item or
-    /// extent to replace: its copy is a new extent with an item of its
-    /// own, and adds its length to the inode's `nbytes` (#261).
+    /// A span of a hole, whole sectors of it, with no allocated extent:
+    /// its copy is a new extent with an item of its own, and adds its
+    /// length to the inode's `nbytes` (#261). Explicit hole items are
+    /// trimmed or split around the copy on a volume without NO_HOLES.
     hole: bool,
 }
 
@@ -264,7 +267,9 @@ impl Filesystem {
         // piece after it is a new extent with an item of its own (#357).
         let mut moves: Vec<DataMove> = Vec::with_capacity(targets.len());
         let mut adds: Vec<DataAdd> = Vec::new();
-        let mut edits: Vec<ItemEdit> = Vec::new();
+        // Remove or trim explicit holes before inserting the new data
+        // items: a fill at a hole's start replaces its original key.
+        let mut edits = self.cow_hole_edits(ino, &targets, generation)?;
         for (p, &new) in pieces.iter().zip(&news) {
             let t = &targets[p.target];
             let disk_len = p.bytes.len() as u64;
@@ -445,6 +450,61 @@ impl Filesystem {
         // The trees this mount holds are the previous generation's.
         *self = self.remount_rw()?;
         Ok(data.len())
+    }
+
+    /// Preserve what remains of explicit hole items around the sectors
+    /// filled by this write (#434). The read-oriented extent list omits
+    /// holes, so their original keys and spans come from the raw items.
+    /// A hole has no extent record, checksum or allocation to release.
+    fn cow_hole_edits(
+        &self,
+        ino: u64,
+        targets: &[Target],
+        generation: u64,
+    ) -> Result<Vec<ItemEdit>> {
+        use crate::fs::{file_extent as fe, EXTENT_REGULAR};
+        use crate::superblock::le64;
+        let mut edits = Vec::new();
+        if self.sb.has_no_holes() || !targets.iter().any(|t| t.hole) {
+            return Ok(edits);
+        }
+        // plan_cow_targets has already decoded and validated these items.
+        for (key, data) in self.items_of(ino)? {
+            if key.key_type != EXTENT_DATA_KEY
+                || data.len() < fe::REGULAR_SIZE
+                || data[fe::TYPE] != EXTENT_REGULAR
+                || le64(&data, fe::DISK_BYTENR) != 0
+            {
+                continue;
+            }
+            let end = key
+                .offset
+                .checked_add(le64(&data, fe::NUM_BYTES))
+                .ok_or_else(|| Error::BadSuperblock(format!("inode {ino}: hole end overflows")))?;
+            // Each target covers a maximal gap between allocated items,
+            // so an explicit hole can intersect at most one target.
+            let Some(t) = targets
+                .iter()
+                .find(|t| t.hole && t.start < end && key.offset < t.start + t.len)
+            else {
+                continue;
+            };
+            let from = key.offset.max(t.start);
+            let to = end.min(t.start + t.len);
+            edits.push(ItemEdit::Delete(key));
+            for (start, stop) in [(key.offset, from), (to, end)] {
+                if start < stop {
+                    edits.push(ItemEdit::Put(OwnedItem {
+                        key: DiskKey {
+                            offset: start,
+                            ..key
+                        },
+                        data: regular_extent_item(generation, 0, 0, stop - start, COMPRESS_NONE),
+                    }));
+                }
+            }
+        }
+        Ok(edits)
     }
 
     /// The extent items `[offset, end)` touches, each checked writable.
