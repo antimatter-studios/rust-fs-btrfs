@@ -6,3 +6,9 @@
   says the volume uses extent-tree-v2, the second-generation extent tree,
   which this driver cannot read. A bit no feature is known by is still
   refused by its value.
+- **A read-only mount refuses an unreadable incompat feature too (#447).**
+  A primary superblock declaring one was passed over as damaged, so a
+  read-only mount fell back to a superblock mirror that did not declare it
+  and read the volume as though the feature were not there; a read-write
+  mount was refused, but as a damaged primary. Every mount now refuses
+  such a volume and names the feature.
