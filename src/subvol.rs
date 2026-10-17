@@ -1145,7 +1145,7 @@ impl Filesystem {
 const S_IFDIR: u32 = 0o040_000;
 
 /// `BTRFS_QUOTA_TREE_OBJECTID`: present while quotas are enabled.
-const QUOTA_TREE_OBJECTID: u64 = 8;
+pub(crate) const QUOTA_TREE_OBJECTID: u64 = 8;
 
 /// The id a new subvolume gets: one past the highest objectid in the root
 /// tree's free range, as `btrfs_find_highest_objectid` finds it, and never
