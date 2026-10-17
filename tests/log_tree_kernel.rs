@@ -20,7 +20,7 @@ use fs_btrfs::log_tree::{LoggedTree, DIR_LOG_INDEX_KEY};
 use fs_btrfs::Error;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, dump_tree, fixture, guest_kernel_read_ok, guest_kernel_report,
-    guest_kernel_write_ok, oracle, temp_path,
+    guest_kernel_write_ok, oracle, sha256_hex, temp_path,
 };
 use fs_core::{BlockDevice, BlockRead, FileDevice};
 use std::collections::BTreeMap;
@@ -1769,6 +1769,107 @@ fn a_hard_link_made_durable_by_its_directory_replays_as_the_kernel_does() {
         get("sha256", "g"),
         "f and g read back differently"
     );
+}
+
+/// The committed file `f`, with 64 more names in `/` of 255 bytes each,
+/// three of them in `INODE_EXTREF` items, rewritten in place with 33
+/// other bytes and made durable by an fsync of `f` alone (#462). The log
+/// holds `f` in full, at its committed generation with its 65 links and
+/// its new inline extent, but the kernel leaves the logged `nbytes`
+/// holding stale bytes of a long name rather than a count. The kernel's
+/// replay counts `nbytes` again from the data, so its replay of the same
+/// crash image is the oracle, with `btrfs check` judging the count.
+#[test]
+fn a_log_whose_inode_holds_a_stale_nbytes_replays_as_the_kernel_does() {
+    const NBYTES_FIXTURE: &str = "dirtylog/btrfs-dirty-log-nbytes.img";
+    const REWRITTEN: &[u8] = b"replayed-inline-bytes-ABCDEFGHIJK";
+    let long = |i: usize| format!("{i:03}").repeat(85);
+    let image = fixture(NBYTES_FIXTURE);
+    let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-nbytes.logdump"))
+        .expect("the native transcript of the stale-nbytes log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the stale-nbytes fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        let committed = fs.lookup_path("/f").expect("the committed trees hold /f");
+        assert_eq!(
+            (committed.nlink, committed.size, committed.nbytes),
+            (65, 33, 33),
+            "/f is committed with 65 names and 33 bytes"
+        );
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        let logged_f = top
+            .inode(committed.ino)
+            .unwrap()
+            .expect("f's logged inode item");
+        assert_eq!(
+            (logged_f.generation, logged_f.nlink, logged_f.size),
+            (committed.generation, 65, 33),
+            "the log holds the committed f in full: {logged_f:?}"
+        );
+        assert!(
+            logged_f.nbytes != 0 && logged_f.nbytes != committed.nbytes,
+            "the log holds f with a counted nbytes, not the stale one: {logged_f:?}"
+        );
+        let extent = top
+            .items
+            .iter()
+            .find(|i| {
+                (i.key.objectid, i.key.key_type, i.key.offset)
+                    == (committed.ino, fs_btrfs::fs::EXTENT_DATA_KEY, 0)
+            })
+            .unwrap_or_else(|| panic!("the log holds no extent of f at 0: {keys:?}"));
+        assert!(
+            extent.data.ends_with(REWRITTEN),
+            "the logged extent of f holds the rewritten bytes inline: {:?}",
+            extent.data
+        );
+        assert!(
+            !top.items
+                .iter()
+                .any(|i| i.key.key_type == DIR_INDEX_KEY || i.key.key_type == DIR_LOG_INDEX_KEY),
+            "only f was fsynced, so the log holds no entry of a directory: {keys:?}"
+        );
+    }
+    let theirs = replays_as_the_kernel_does(NBYTES_FIXTURE, "dirtylog-nbytes");
+    // The two replays agree; this is what they agree on, as the kernel
+    // reports it, so a rewrite both left out cannot pass.
+    let get = |kind: &str, name: &str| {
+        theirs
+            .get(&(kind.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("the kernel's replay reports no {kind} for {name}"))
+    };
+    for name in ["f".to_string(), long(0), long(63)] {
+        assert_eq!(
+            get("stat", &name),
+            "f 65 33",
+            "the kernel's replay of {name}"
+        );
+        assert_eq!(
+            get("ino", &name),
+            get("ino", "f"),
+            "the kernel's replay names {name} as f"
+        );
+        assert_eq!(
+            get("sha256", &name),
+            sha256_hex(REWRITTEN),
+            "{name} does not read back the rewritten bytes"
+        );
+    }
 }
 
 /// The inline writer's encoding fields are checked against the native
