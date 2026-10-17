@@ -347,6 +347,17 @@ fn differences(
 /// Returns the kernel's view of its own replay, for a test that also
 /// needs to know what that view holds.
 fn replays_as_the_kernel_does(fixture_name: &str, tag: &str) -> BTreeMap<(String, String), String> {
+    replays_as_the_kernel_does_then(fixture_name, tag, |_, _| {})
+}
+
+/// [`replays_as_the_kernel_does`], handing the kernel's replayed copy and
+/// this crate's to `inspect`, in that order, before they are removed, for
+/// a test that compares what the kernel's view does not show.
+fn replays_as_the_kernel_does_then(
+    fixture_name: &str,
+    tag: &str,
+    inspect: impl FnOnce(&Path, &Path),
+) -> BTreeMap<(String, String), String> {
     let image = fixture(fixture_name);
 
     let theirs = PathBuf::from(temp_path!("{tag}-kernel-replay.img"));
@@ -381,9 +392,13 @@ fn replays_as_the_kernel_does(fixture_name: &str, tag: &str) -> BTreeMap<(String
     assert_btrfs_check_clean(&ours, &format!("{tag}: this crate's replay"));
     let theirs_view = kernel_view(&theirs, &format!("{tag}: the kernel's replay"));
     let ours_view = kernel_view(&ours, &format!("{tag}: this crate's replay"));
+    let differ = differences(&ours_view, &theirs_view);
+    // What the views show differing is reported first.
+    if differ.is_empty() {
+        inspect(&theirs, &ours);
+    }
     let _ = std::fs::remove_file(&theirs);
     let _ = std::fs::remove_file(&ours);
-    let differ = differences(&ours_view, &theirs_view);
     assert!(
         differ.is_empty(),
         "[{tag}] the volume this crate replayed differs from the kernel's replay:\n{}",
@@ -2081,6 +2096,198 @@ fn a_hard_link_of_a_file_with_extended_references_replays_as_the_kernel_does() {
             get("sha256", &name),
             get("sha256", "f"),
             "{name} reads back differently from f"
+        );
+    }
+}
+
+/// `n`, created empty after the commit and given 64 more names in `/` of
+/// 255 bytes each, three of them in `INODE_EXTREF` items, made durable by
+/// an fsync of `/` alone (#477). The log holds the entries of `/` for all
+/// 65 names, and `n` only as an inode that exists, though nothing of it
+/// is committed: generation 0, size 0, 65 links, its `INODE_REF` to `/`
+/// and its three extended references. A replay that names `n` only from
+/// its `INODE_REF` counts 62 links; the kernel's replay of the same crash
+/// image creates it with all 65, its extended references kept and the
+/// generation of the transaction replaying it, and is the oracle.
+#[test]
+fn a_file_the_log_creates_with_extended_references_replays_as_the_kernel_does() {
+    const EXTREF_CREATED_FIXTURE: &str = "dirtylog/btrfs-dirty-log-extrefcreated.img";
+    /// `BTRFS_INODE_EXTREF_KEY`.
+    const INODE_EXTREF_KEY: u8 = 13;
+    let long = |i: usize| format!("{i:03}").repeat(85);
+    let image = fixture(EXTREF_CREATED_FIXTURE);
+    let transcript =
+        std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-extrefcreated.logdump"))
+            .expect("the native transcript of the created extended-reference log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    let (n, committed_generation) = {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the created extended-reference fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        assert!(
+            fs.lookup_path("/n").is_err(),
+            "n was made after the commit, so the committed trees should not hold it"
+        );
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        let n = top.inode_named(256, b"n").expect("the log names n in /");
+        assert!(
+            fs.read_inode(n).is_err(),
+            "the committed trees hold no inode {n}, so the log creates n"
+        );
+        let logged = top.inode(n).unwrap().expect("n's logged inode item");
+        assert_eq!(
+            (logged.generation, logged.size, logged.nlink),
+            (0, 0, 65),
+            "the log holds n only as an inode that exists, with 65 links: {logged:?}"
+        );
+        assert_eq!(
+            top.items
+                .iter()
+                .filter(|i| (i.key.objectid, i.key.key_type) == (n, INODE_EXTREF_KEY))
+                .count(),
+            3,
+            "the log holds three extended references of n: {keys:?}"
+        );
+        for i in [0, 60, 61, 62, 63] {
+            assert_eq!(
+                top.inode_named(256, long(i).as_bytes()),
+                Some(n),
+                "the log's references of n name {i} in /"
+            );
+        }
+        assert!(
+            !top.items
+                .iter()
+                .any(|i| (i.key.objectid, i.key.key_type) == (n, fs_btrfs::fs::EXTENT_DATA_KEY)),
+            "the log holds no data of n: {keys:?}"
+        );
+        let entries: Vec<u64> = top
+            .items
+            .iter()
+            .filter(|i| (i.key.objectid, i.key.key_type) == (256, DIR_INDEX_KEY))
+            .map(|i| {
+                let named = parse_dir_items(&i.data).unwrap();
+                assert_eq!(
+                    named.iter().map(|e| e.ino).collect::<Vec<_>>(),
+                    vec![n],
+                    "the logged entry of / at index {} names n",
+                    i.key.offset
+                );
+                i.key.offset
+            })
+            .collect();
+        assert_eq!(
+            entries.len(),
+            65,
+            "the log holds an entry of / for every name of n"
+        );
+        for at in entries {
+            assert!(
+                top.items
+                    .iter()
+                    .filter(|i| i.key.objectid == 256 && i.key.key_type == DIR_LOG_INDEX_KEY)
+                    .any(|i| i.key.offset <= at
+                        && at <= u64::from_le_bytes(i.data[..8].try_into().unwrap())),
+                "no logged index range of / holds index {at}: {keys:?}"
+            );
+        }
+        (n, fs.superblock().generation)
+    };
+    // What the kernel's view does not show: n's inode item and its
+    // extended references, as the native tool prints them from each
+    // replayed copy.
+    let inode_of_n = |image: &Path| {
+        let dump = dump_tree(image, "5");
+        let mut lines = dump
+            .lines()
+            .skip_while(|l| !l.contains(&format!("key ({n} INODE_ITEM 0) itemoff")));
+        lines
+            .next()
+            .unwrap_or_else(|| panic!("{} holds no inode item of n", image.display()));
+        let mut fields = BTreeMap::new();
+        for line in lines.take(2) {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            for name in ["generation", "size", "nbytes", "links"] {
+                if let Some(at) = words.iter().position(|w| *w == name) {
+                    fields.insert(name, words[at + 1].to_string());
+                }
+            }
+        }
+        let extrefs: Vec<String> = dump
+            .lines()
+            .filter_map(|l| {
+                let (_, rest) = l.split_once(&format!("key ({n} INODE_EXTREF "))?;
+                let (hash, rest) = rest.split_once(')')?;
+                rest.contains("itemoff").then(|| hash.to_string())
+            })
+            .collect();
+        (fields, extrefs)
+    };
+    let theirs = replays_as_the_kernel_does_then(
+        EXTREF_CREATED_FIXTURE,
+        "dirtylog-extrefcreated",
+        |theirs, ours| {
+            let (kernel, kernel_extrefs) = inode_of_n(theirs);
+            let (this, this_extrefs) = inode_of_n(ours);
+            let replayed_in = (committed_generation + 1).to_string();
+            assert_eq!(
+                [
+                    kernel.get("generation"),
+                    kernel.get("size"),
+                    kernel.get("nbytes"),
+                    kernel.get("links")
+                ],
+                [
+                    Some(&replayed_in),
+                    Some(&"0".to_string()),
+                    Some(&"0".to_string()),
+                    Some(&"65".to_string())
+                ],
+                "the kernel's replay creates n in its own transaction, empty, with 65 links"
+            );
+            assert_eq!(
+                this, kernel,
+                "n's inode item, this crate's replay and the kernel's"
+            );
+            assert_eq!(
+                kernel_extrefs.len(),
+                3,
+                "the kernel's replay keeps n's three extended references: {kernel_extrefs:?}"
+            );
+            assert_eq!(
+                this_extrefs, kernel_extrefs,
+                "n's extended references, this crate's replay and the kernel's"
+            );
+        },
+    );
+    let get = |kind: &str, name: &str| {
+        theirs
+            .get(&(kind.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("the kernel's replay reports no {kind} for {name}"))
+    };
+    for name in ["n".to_string(), long(0), long(60), long(61), long(63)] {
+        assert_eq!(
+            get("stat", &name),
+            "f 65 0",
+            "the kernel's replay of {name}"
+        );
+        assert_eq!(
+            get("ino", &name),
+            get("ino", "n"),
+            "the kernel's replay names {name} as n"
         );
     }
 }
