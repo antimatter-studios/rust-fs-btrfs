@@ -58,6 +58,9 @@ cli_label_kernel          2
 # One find comparison covers nested subvolumes and an ancestor snapshot (#466);
 # damaged copies add a revisit test and an unreadable-directory test (#467).
 cli_ls_recursive_kernel   3
+# Chains the kernel then sees, and every refusal the kernel's own mkdir -p
+# gives, put to mkdir --parents (#414).
+cli_mkdir_kernel          2
 cli_mkfs_kernel           5
 cli_oracle                3
 cli_resize_kernel         3
