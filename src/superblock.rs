@@ -286,7 +286,7 @@ pub mod incompat {
     ///
     /// - [`ZONED`], [`EXTENT_TREE_V2`], [`RAID_STRIPE_TREE`],
     ///   [`REMAP_TREE`] — each restructures something the read path
-    ///   depends on.
+    ///   depends on. [`super::refuse_unreadable_incompat`] refuses them.
     ///
     /// [`SIMPLE_QUOTA`] IS accepted (#270): it adds an owner reference to
     /// each data extent item and keeps usage in the quota tree, neither of
@@ -322,6 +322,39 @@ pub mod incompat {
         // parity chunk spans several.
         | RAID56
         | SIMPLE_QUOTA;
+}
+
+/// Refuse a volume carrying an incompatible feature this driver cannot
+/// read, naming each feature it knows (#447).
+///
+/// A bit outside [`incompat::SUPPORTED`] means the kernel that wrote the
+/// volume laid something out in a way this driver does not understand, so
+/// reading it at all would be guessing. The refusal used to give only the
+/// mask, which says nothing a user can act on; a known feature is named,
+/// and a bit no feature is known by is still given by its value.
+pub fn refuse_unreadable_incompat(incompat_flags: u64) -> Result<()> {
+    let mut unreadable = incompat_flags & !incompat::SUPPORTED;
+    if unreadable == 0 {
+        return Ok(());
+    }
+    let mut named = Vec::new();
+    for (bit, name) in [(
+        incompat::EXTENT_TREE_V2,
+        "extent-tree-v2 (the second-generation extent tree)",
+    )] {
+        if unreadable & bit != 0 {
+            named.push(name.to_string());
+            unreadable &= !bit;
+        }
+    }
+    if unreadable != 0 {
+        named.push(format!("incompatible feature bits {unreadable:#018x}"));
+    }
+    Err(Error::UnsupportedFeature(format!(
+        "this volume uses incompatible features this driver cannot read ({}), so it cannot \
+         be mounted",
+        named.join(", ")
+    )))
 }
 
 /// `compat_ro_flags` bits: features an implementation may ignore while
@@ -763,12 +796,7 @@ impl Superblock {
         }
 
         let incompat_flags = le64(buf, offsets::INCOMPAT_FLAGS);
-        let unknown = incompat_flags & !incompat::SUPPORTED;
-        if unknown != 0 {
-            return Err(Error::UnsupportedFeature(format!(
-                "incompatible feature bits {unknown:#018x} not implemented"
-            )));
-        }
+        refuse_unreadable_incompat(incompat_flags)?;
 
         let sys_len = le32(buf, offsets::SYS_CHUNK_ARRAY_SIZE) as usize;
         if sys_len > SYS_CHUNK_ARRAY_SIZE {
