@@ -65,6 +65,7 @@
 //! - [`devices`] — the devices a filesystem spans: a device added, replaced or removed
 //! - [`truncate`] — a regular file's length, shrunk or grown
 //! - [`clone`](mod@clone) — a range of one file cloned into another, sharing its extents
+//! - [`balance`] — block groups relocated: the extents a data group holds and the file items naming them
 //! - [`transaction`], [`extent_write`], [`block_group`] and [`commit`] — tree
 //!   rewrites and the commit of a new generation, separate from file writes
 //! - [`send`] — send streams: parsed, and written from a read-only subvolume
@@ -75,6 +76,7 @@
 
 pub mod attrs;
 mod backref;
+pub mod balance;
 pub mod block_group;
 pub mod btree;
 pub mod capi;
