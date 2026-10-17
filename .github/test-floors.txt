@@ -123,6 +123,9 @@ read_file_huge_size       1
 read_path_cost            1
 readlink_kernel_oracle    1
 release_attestation       2
+# One executed: a data group of the kernel's plain checksummed extents
+# relocated, judged by check --check-data-csum, a read and a scrub (#493).
+relocate_data_group_kernel 1
 # Two executed: the empty data group relocated and judged by the kernel,
 # and the refusals before anything is written (#397).
 relocate_empty_group_kernel 2
