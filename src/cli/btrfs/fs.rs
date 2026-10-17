@@ -1,7 +1,7 @@
 //! `fs.btrfs <target> <verb>`: an errand inside a Btrfs image or device,
 //! without mounting it.
 //!
-//! The verbs are the shared set: `ls`, `stat`, `read`, `write`, `mkdir`,
+//! The verbs are the shared set: `ls`, `stat`, `read`, `xattr`, `write`, `mkdir`,
 //! `get`/`info`, `set`, `resize`. Metadata is JSON (or `--text`); file
 //! content is raw bytes. A verb the library cannot do yet still exists and
 //! answers `not implemented` with exit status 3, so a script moved between
@@ -59,8 +59,8 @@ fn command() -> Cmd {
             "Work inside a Btrfs image or device directly: no mount, no kernel driver.\n\n\
              An escape hatch for an errand (get a file out, read the label, check whether \
              it is dirty), not a place to do real filesystem work: for that, mount it.\n\n\
-             Metadata is JSON on stdout (--text for people); `read` writes the file's raw \
-             bytes. A failure is {\"error\": \"...\", \"code\": N} on stderr, N being the \
+             Metadata is JSON on stdout (--text for people); `read` and a named `xattr` \
+             write raw bytes. A failure is {\"error\": \"...\", \"code\": N} on stderr, N being the \
              exit status: 1 failed, 2 wrong command line, 3 not implemented or refused.\n\n\
              Writing is limited to what this library can do safely: `write` overwrites \
              an existing file at the same length, a NODATACOW file in place and any other \
@@ -161,6 +161,41 @@ fn command() -> Cmd {
                     "Examples:\n  fs.btrfs disk.img read /etc/hostname\n  \
                      fs.btrfs disk.img read /snapshots/home/notes.txt | less\n  \
                      fs.btrfs disk.img read /backup.tar -o backup.tar",
+                ),
+        )
+        .subcommand(
+            Cmd::new("xattr")
+                .about("List a path's extended attributes, or read one value as raw bytes")
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .arg(
+                    Arg::new("name")
+                        .value_name("NAME")
+                        .help("The fully qualified attribute name, including its namespace")
+                        .value_parser(value_parser!(OsString)),
+                )
+                .arg(
+                    Arg::new("output")
+                        .short('o')
+                        .long("output")
+                        .value_name("FILE")
+                        .requires("name")
+                        .value_parser(value_parser!(OsString))
+                        .help("Write the named value here instead of stdout"),
+                )
+                .after_help(
+                    "Examples:\n  fs.btrfs disk.img xattr /notes.txt\n  \
+                     fs.btrfs disk.img xattr /notes.txt --text\n  \
+                     fs.btrfs disk.img xattr /notes.txt user.comment\n  \
+                     fs.btrfs disk.img xattr /bin/tool security.capability -o capability.bin\n\n\
+                     Listings are JSON names and byte lengths (--text for people). A \
+                     non-UTF-8 name is shown lossily with its exact bytes in name_hex. \
+                     A named value is always raw bytes, including with --text. Inspection \
+                     only: attributes are never set or removed.",
                 ),
         )
         .subcommand(
@@ -464,6 +499,12 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         "write" if sub.get_one::<u64>("at").is_some() => Err(CliError::not_implemented(
             "positioned write (--at) is not supported",
         )),
+        "xattr" => xattr(
+            &device::mount(target, offset)?,
+            path_arg(sub),
+            sub.get_one::<OsString>("name").map(os_bytes),
+            sub.get_one("output"),
+        ),
         "write" => write(target, offset, path_arg(sub)),
         "mkdir" if sub.get_flag("parents") => mkdir_parents(target, offset, sub),
         "mkdir" | "create" | "rm" | "rmdir" | "ln" | "mv" => names(target, offset, verb, sub),
@@ -1426,6 +1467,83 @@ fn stat(root: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
         ]),
     ));
     Ok(Outcome::report(Json::object(fields)))
+}
+
+/// Inspect attributes in the resolved path's own tree, including inside
+/// subvolumes and snapshots. A value is read completely before any output
+/// is opened, so lookup failures cannot truncate a destination file.
+fn xattr(
+    root: &Filesystem,
+    path: &[u8],
+    name: Option<&[u8]>,
+    output: Option<&OsString>,
+) -> Result<Outcome, CliError> {
+    let found = root
+        .resolve_path_bytes(path)
+        .map_err(|e| btrfs_error(path, e))?;
+    let fs = found.fs(root);
+    if let Some(name) = name {
+        let value = fs
+            .get_xattr(found.inode.ino, name)
+            .map_err(|e| btrfs_error(path, e))?
+            .ok_or_else(|| {
+                CliError::failed(format!(
+                    "{}: no such extended attribute {}",
+                    show(path),
+                    show(name)
+                ))
+            })?;
+        if let Some(file) = output {
+            let dest = std::path::Path::new(file);
+            let mut partial = dest.as_os_str().to_owned();
+            partial.push(".partial");
+            let partial = std::path::PathBuf::from(partial);
+            let written =
+                std::fs::write(&partial, &value).and_then(|()| std::fs::rename(&partial, dest));
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&partial);
+                return Err(CliError::failed(format!("write {}: {e}", dest.display())));
+            }
+        } else {
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(&value)
+                .and_then(|()| stdout.flush())
+                .map_err(|e| CliError::failed(format!("write: {e}")))?;
+        }
+        return Ok(Outcome::done());
+    }
+    let mut attrs = fs
+        .list_xattrs(found.inode.ino)
+        .map_err(|e| btrfs_error(path, e))?;
+    attrs.sort_by(|a, b| a.name.cmp(&b.name));
+    let text = attrs
+        .iter()
+        .map(|attr| format!("{}\t{}", show(&attr.name), attr.value.len()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let entries = attrs
+        .into_iter()
+        .map(|attr| {
+            let mut fields = vec![
+                ("name", Json::from(show(&attr.name))),
+                ("size", Json::from(attr.value.len() as u64)),
+            ];
+            if std::str::from_utf8(&attr.name).is_err() {
+                fields.push((
+                    "name_hex",
+                    Json::from(
+                        attr.name
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>(),
+                    ),
+                ));
+            }
+            Json::object(fields)
+        })
+        .collect();
+    Ok(Outcome::report(Json::Arr(entries)).with_text(text))
 }
 
 /// Stream a regular file's bytes. Each chunk is read before it is
