@@ -40,7 +40,7 @@ impl Scratch {
             .and_then(|f| f.set_len(256 << 20))
             .unwrap();
         let made = oracle("mkfs.btrfs")
-            .args(["-q", "-f", "-s", "4096", "-n", "16384", "-d", "single"])
+            .args(["-q", "-f", "-s", "4096", "-n", "16384"])
             .arg(&image)
             .output();
         assert!(
