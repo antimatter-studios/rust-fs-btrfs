@@ -97,7 +97,7 @@ kernel_readback           2
 leaf_edit_oracle          3
 leaf_split                1
 leaf_split_oracle         1
-lib                       232
+lib                       233
 log_tree_kernel           21
 lookup_by_name_key        1
 namespace_kernel          2
