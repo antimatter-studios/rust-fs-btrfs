@@ -326,10 +326,22 @@ fn item_span(d: &[u8]) -> Result<u64> {
 }
 
 /// A regular, preallocated or hole item cut to the `num` bytes that begin
-/// `skip` bytes into it. A compressed extent is decoded whole, so a window
-/// into part of one is refused.
+/// `skip` bytes into it. A compressed regular extent is cut the same way,
+/// without decoding it (#409): the window keeps its reference to the whole
+/// compressed extent, and its offset and length count decoded bytes,
+/// bounded by `ram_bytes`. An encrypted or otherwise encoded item, or one
+/// compressed by an algorithm the format does not define, is refused.
 fn cut_item(d: &[u8], skip: u64, num: u64) -> Result<Vec<u8>> {
-    if d.len() != fe::REGULAR_SIZE || !matches!(d[fe::TYPE], 1 | 2) || d[fe::COMPRESSION] != 0 {
+    if d.len() != fe::REGULAR_SIZE
+        || !matches!(d[fe::TYPE], 1 | 2)
+        || d[fe::ENCRYPTION] != 0
+        || d[fe::OTHER_ENCODING..fe::TYPE] != [0, 0]
+        || match d[fe::COMPRESSION] {
+            0 => false,
+            1..=3 => d[fe::TYPE] != 1 || le64(d, fe::DISK_BYTENR) == 0,
+            _ => true,
+        }
+    {
         return Err(Error::DirtyLog);
     }
     let offset = le64(d, fe::OFFSET)
@@ -1772,12 +1784,46 @@ mod tests {
         let after = reconcile(&committed, &truncate, 3 * k).unwrap();
         assert_eq!(after, truncate);
 
-        let mut compressed = regular(1 << 20, 64 * k, 0, 64 * k);
-        compressed[fe::COMPRESSION] = 1;
-        assert!(
-            reconcile(&BTreeMap::from([(0, compressed)]), &overwrite, 64 * k).is_err(),
-            "a window into part of a compressed extent"
+        // A compressed extent is cut into windows as a plain one is
+        // (#409): both keep the whole compressed extent, offsets in
+        // decoded bytes.
+        let zlib = |mut d: Vec<u8>, algorithm: u8| {
+            d[fe::COMPRESSION] = algorithm;
+            d
+        };
+        let compressed = zlib(regular(1 << 20, 64 * k, 0, 64 * k), 1);
+        let after = reconcile(
+            &BTreeMap::from([(0, compressed.clone())]),
+            &overwrite,
+            64 * k,
+        )
+        .unwrap();
+        assert_eq!(
+            after,
+            BTreeMap::from([
+                (0, zlib(regular(1 << 20, 64 * k, 0, 16 * k), 1)),
+                (16 * k, regular(2 << 20, k, 0, k)),
+                (17 * k, zlib(regular(1 << 20, 64 * k, 17 * k, 47 * k), 1)),
+            ])
         );
+        for refused in [
+            zlib(compressed.clone(), 4),
+            {
+                let mut d = compressed.clone();
+                d[fe::ENCRYPTION] = 1;
+                d
+            },
+            {
+                let mut d = compressed.clone();
+                d[fe::OTHER_ENCODING] = 1;
+                d
+            },
+        ] {
+            assert!(
+                reconcile(&BTreeMap::from([(0, refused)]), &overwrite, 64 * k).is_err(),
+                "a window into an extent of an unknown or unsupported encoding"
+            );
+        }
         let beside = BTreeMap::from([(8 * k, regular(2 << 20, k, 0, k))]);
         assert!(
             reconcile(&BTreeMap::from([(0, inline(b"inline"))]), &beside, 9 * k).is_err(),
