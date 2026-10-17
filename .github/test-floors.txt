@@ -160,7 +160,7 @@ super_write_oracle        3
 test_contract             7
 transaction_oracle        5
 transaction_plan          7
-truncate_kernel           2
+truncate_kernel           3
 tree_write_oracle         6
 trim_oracle               3
 # Six executed (2 passed, 4 failed) in full CI run 38624143978 at a2dc3b6;
