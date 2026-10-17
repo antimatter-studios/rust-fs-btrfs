@@ -986,7 +986,7 @@ fn check_name(name: &[u8]) -> Result<()> {
 }
 
 /// The directory-entry type of an existing inode.
-fn file_type(inode: &Inode) -> u8 {
+pub(crate) fn file_type(inode: &Inode) -> u8 {
     match inode.mode & S_IFMT {
         S_IFREG => ftype::REG_FILE,
         S_IFDIR => ftype::DIR,

@@ -41,7 +41,7 @@ use crate::chunk::DiskKey;
 use crate::dir::{self, DirEntry, DIR_INDEX_KEY};
 use crate::error::{Error, Result};
 use crate::fs::{root_item, Filesystem, EXTENT_DATA_KEY, ROOT_ITEM_KEY};
-use crate::inode::{Inode, INODE_ITEM_KEY, INODE_REF_KEY};
+use crate::inode::{FileType, Inode, INODE_ITEM_KEY, INODE_REF_KEY};
 
 /// `BTRFS_TREE_LOG_OBJECTID`: the objectid a log tree's `ROOT_ITEM` is
 /// filed under in the log root tree.
@@ -423,7 +423,9 @@ impl Filesystem {
     ///   speaks for. A directory the log creates (#403) is named only
     ///   that way, and holds the names the log gives it. A symbolic link
     ///   the log creates (#404) holds its target as logged, in one plain
-    ///   inline extent, and is named as a link.
+    ///   inline extent. A device, FIFO or socket node the log creates
+    ///   (#405) holds no data, and keeps its type and device number as
+    ///   logged. Each name of a created inode is typed as the inode is.
     /// - **Directories the log speaks for** (#377): in each logged index
     ///   range the log's names are the directory's names. A committed name
     ///   the log lacks is removed; its inode, if the log does not hold it
@@ -502,6 +504,9 @@ impl Filesystem {
                 let mut new_dirs: BTreeSet<u64> = BTreeSet::new();
                 // Symbolic links the log creates (#404), each also in `created`.
                 let mut links: BTreeSet<u64> = BTreeSet::new();
+                // Device, FIFO and socket nodes the log creates (#405), each
+                // also in `created`.
+                let mut nodes: BTreeSet<u64> = BTreeSet::new();
                 for &ino in &logged_inodes {
                     let logged = top.inode(ino)?.ok_or(Error::DirtyLog)?;
                     if ino < FIRST_FREE_OBJECTID {
@@ -514,6 +519,19 @@ impl Filesystem {
                         None if logged.is_symlink() => {
                             created.insert(ino);
                             links.insert(ino);
+                        }
+                        None if matches!(
+                            logged.file_type(),
+                            Some(
+                                FileType::CharDevice
+                                    | FileType::BlockDevice
+                                    | FileType::Fifo
+                                    | FileType::Socket
+                            )
+                        ) =>
+                        {
+                            created.insert(ino);
+                            nodes.insert(ino);
                         }
                         None if logged.is_dir() => {
                             new_dirs.insert(ino);
@@ -583,6 +601,11 @@ impl Filesystem {
                         {
                             return Err(Error::DirtyLog);
                         }
+                    }
+                    // A node holds no data: its device number, if it has
+                    // one, is in its inode item, which is put as logged.
+                    if nodes.contains(&ino) && (!logged_items.is_empty() || logged.size != 0) {
+                        return Err(Error::DirtyLog);
                     }
                     let end = logged.size.div_ceil(sector) * sector;
                     let after = reconcile(&committed_items, &logged_items, end)?;
@@ -698,6 +721,7 @@ impl Filesystem {
                 let mut names: BTreeMap<u64, u32> = BTreeMap::new();
                 let spoken_for = |d: u64| dirs.contains(&d) || new_dirs.contains(&d);
                 for &ino in created.iter().chain(&exists_only).chain(&new_dirs) {
+                    let inode = top.inode(ino)?.ok_or(Error::DirtyLog)?;
                     for r in top
                         .items
                         .iter()
@@ -718,8 +742,7 @@ impl Filesystem {
                                 let entry = logged_entry(parent, index)?.ok_or(Error::DirtyLog)?;
                                 if entry.ino != ino
                                     || entry.name != name
-                                    || (links.contains(&ino)
-                                        && entry.ftype != Some(crate::inode::FileType::Symlink))
+                                    || (created.contains(&ino) && entry.ftype != inode.file_type())
                                 {
                                     return Err(Error::DirtyLog);
                                 }
@@ -750,11 +773,7 @@ impl Filesystem {
                             {
                                 return Err(Error::DirtyLog);
                             }
-                            let ftype = if links.contains(&ino) {
-                                dir::ftype::SYMLINK
-                            } else {
-                                dir::ftype::REG_FILE
-                            };
+                            let ftype = crate::namespace::file_type(&inode);
                             let entry = crate::namespace::dir_entry(ino, generation, ftype, name);
                             edits.push(put(by_hash, entry.clone()));
                             edits.push(put(by_index, entry));
