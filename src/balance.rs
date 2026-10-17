@@ -27,15 +27,69 @@
 //!   is recorded by no reference, so the items it names would be missed;
 //! - references whose counts do not add up to the extent's, or name file
 //!   items that are not there.
+//!
+//! # Relocating an empty group
+//!
+//! [`Filesystem::relocate_block_group`] moves an empty data group (#397)
+//! in two committed transactions, each leaving a filesystem the kernel
+//! and `btrfs check` accept on its own:
+//!
+//! 1. **A new chunk** of the group's profile: its `CHUNK_ITEM` in the
+//!    chunk tree, a `DEV_EXTENT` in the device tree for its stripe, an
+//!    empty `BLOCK_GROUP_ITEM`, a `FREE_SPACE_INFO` and one free run
+//!    covering it in the free-space tree, and the device's `bytes_used`
+//!    raised in the chunk tree's device item and the superblock's copy.
+//! 2. **The old group goes**: its chunk item, device extents, block group
+//!    item and free-space records, and `bytes_used` lowered again.
+//!
+//! Besides everything above, it refuses a system group, a conversion to
+//! another profile, any profile but single, a volume of more than one
+//! device, one with no free-space tree or with a block group tree, and a
+//! group holding any extent, each before anything is written.
 
 use crate::block_group::BlockGroup;
-use crate::chunk::{key_type, objectid, DiskKey};
+use crate::chunk::{
+    block_group as bg, key_type, objectid, ChunkProfile, DiskKey, DEFAULT_STRIPE_LEN,
+};
 use crate::error::{Error, Result};
 use crate::fs::{
     file_extent as fe, root_item, Filesystem, EXTENT_DATA_KEY, EXTENT_PREALLOC, EXTENT_REGULAR,
     ROOT_ITEM_KEY,
 };
 use crate::leaf_edit::OwnedItem;
+use crate::super_write::Commit;
+use crate::transaction::{DataWrite, ItemEdit};
+
+/// How many rounds a chunk change's plan has to close over its own
+/// bookkeeping.
+const PLAN_ROUNDS: usize = 64;
+
+/// Where a new chunk's stripes start and how they are aligned: the
+/// kernel leaves the first MiB of every device alone, and places device
+/// extents on MiB boundaries.
+const MIB: u64 = 1 << 20;
+
+/// `BTRFS_DEV_EXTENT_KEY`.
+const DEV_EXTENT_KEY: u8 = 204;
+
+/// Byte offsets within `struct btrfs_dev_extent`.
+mod dev_extent {
+    /// The chunk's logical address.
+    pub const CHUNK_OFFSET: usize = 16;
+    /// The stripe's length on the device.
+    pub const LENGTH: usize = 24;
+    /// The chunk tree's UUID.
+    pub const CHUNK_TREE_UUID: usize = 32;
+    /// The whole item.
+    pub const SIZE: usize = 48;
+}
+
+/// Where a device item's size is, in the chunk tree's copy.
+const DEV_ITEM_TOTAL_BYTES: usize = 8;
+/// Where a device item's `bytes_used` is, in the chunk tree's copy.
+const DEV_ITEM_BYTES_USED: usize = 16;
+/// A `BLOCK_GROUP_ITEM`: used, chunk objectid, flags.
+const BLOCK_GROUP_ITEM_SIZE: usize = 24;
 
 /// `BTRFS_EXTENT_DATA_REF_KEY`, keyed or inline.
 const EXTENT_DATA_REF: u8 = crate::backref::EXTENT_DATA_REF;
@@ -131,6 +185,459 @@ impl Filesystem {
             .iter()
             .map(DataExtent::public)
             .collect())
+    }
+
+    /// Relocate the empty data block group at `start` into a newly
+    /// allocated chunk of its own profile, and return where the new group
+    /// is (#397).
+    ///
+    /// Two committed transactions, each leaving a filesystem the kernel
+    /// accepts on its own: the new chunk is allocated, then the old group
+    /// is removed. A crash between them leaves both groups, the new one
+    /// empty.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] unless mounted with [`Filesystem::mount_rw`],
+    /// [`Error::NotFound`] when no block group starts at `start`, and
+    /// [`Error::UnsupportedFeature`] for every refusal the [module
+    /// documentation](crate::balance) lists, each before anything is
+    /// written.
+    pub fn relocate_block_group(
+        &mut self,
+        start: u64,
+        profile: Option<ChunkProfile>,
+    ) -> Result<u64> {
+        if self.writable.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        let group = self.block_group_at(start)?;
+        self.refuse_unrelocatable(&group, profile)?;
+        let new = self.allocate_chunk(group.flags, group.length)?;
+        self.remove_block_group(start)?;
+        Ok(new)
+    }
+
+    /// Refuse a group this does not relocate, before anything is written.
+    fn refuse_unrelocatable(
+        &self,
+        group: &BlockGroup,
+        profile: Option<ChunkProfile>,
+    ) -> Result<()> {
+        if group.flags & bg::SYSTEM != 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "the block group at {} holds the chunk tree, which the superblock's chunk \
+                 array also names, and relocating it is not implemented",
+                group.start
+            )));
+        }
+        self.refuse_unenumerable(group)?;
+        let own = ChunkProfile::from_type(group.flags)?;
+        if let Some(p) = profile.filter(|&p| p != own) {
+            return Err(Error::UnsupportedFeature(format!(
+                "converting a {} block group to {} is not implemented",
+                own.name(),
+                p.name()
+            )));
+        }
+        if own != ChunkProfile::Single {
+            return Err(Error::UnsupportedFeature(format!(
+                "allocating a {} chunk is not implemented; only single is",
+                own.name()
+            )));
+        }
+        if self.sb.num_devices != 1 {
+            return Err(Error::UnsupportedFeature(format!(
+                "this filesystem spans {} devices, and placing a chunk's stripes on a pool \
+                 is not implemented",
+                self.sb.num_devices
+            )));
+        }
+        if self.tree_root(objectid::FREE_SPACE_TREE).is_err() {
+            return Err(Error::UnsupportedFeature(
+                "this volume has no free-space tree, and the free-space cache that stands in \
+                 for it is not maintained here"
+                    .into(),
+            ));
+        }
+        if self.sb.has_block_group_tree() {
+            return Err(Error::UnsupportedFeature(
+                "this volume keeps its block group items in a block group tree, and \
+                 allocating a chunk there is not implemented"
+                    .into(),
+            ));
+        }
+        if group.used != 0 || !self.data_extents_in(group)?.is_empty() {
+            return Err(Error::UnsupportedFeature(format!(
+                "the block group at {} holds {} bytes of extents, and moving them is not \
+                 implemented; only an empty group is relocated",
+                group.start, group.used
+            )));
+        }
+        Ok(())
+    }
+
+    /// Allocate a single chunk of `length` logical bytes and `flags`, with
+    /// its empty block group, in one committed transaction, and return its
+    /// logical address.
+    fn allocate_chunk(&mut self, flags: u64, length: u64) -> Result<u64> {
+        let devid = self.sb.dev_item.devid;
+        // After every chunk there is, as the kernel places a new one.
+        let logical = self
+            .map
+            .chunks()
+            .iter()
+            .map(|c| c.logical_end())
+            .max()
+            .unwrap_or(0);
+
+        let extents = self.dev_extents()?;
+        let taken: Vec<(u64, u64)> = extents
+            .iter()
+            .filter(|e| e.devid == devid)
+            .map(|e| (e.physical, e.length))
+            .collect();
+        let (dev_item_key, mut dev_item) = self.dev_item(devid)?;
+        let total = le64(&dev_item, DEV_ITEM_TOTAL_BYTES);
+        let stripes = place_stripes(&taken, total, length, 1).ok_or_else(|| {
+            Error::UnsupportedFeature(format!(
+                "device {devid} has no room for a stripe of {length} bytes"
+            ))
+        })?;
+        let chunk_tree_uuid = extents
+            .first()
+            .map(|e| e.chunk_tree_uuid)
+            .ok_or_else(|| Error::UnsupportedFeature("the device tree has no extents".into()))?;
+        let used = le64(&dev_item, DEV_ITEM_BYTES_USED)
+            .checked_add(length)
+            .ok_or_else(|| {
+                Error::UnsupportedFeature(format!("device {devid}'s bytes used overflow"))
+            })?;
+        dev_item[DEV_ITEM_BYTES_USED..DEV_ITEM_BYTES_USED + 8].copy_from_slice(&used.to_le_bytes());
+
+        let dev_uuid = self.sb.dev_item.uuid;
+        let stripe_list: Vec<(u64, u64, [u8; 16])> =
+            stripes.iter().map(|&p| (devid, p, dev_uuid)).collect();
+        let mut tree_edits = vec![
+            (
+                objectid::CHUNK_TREE,
+                ItemEdit::Put(OwnedItem {
+                    key: dev_item_key,
+                    data: dev_item,
+                }),
+            ),
+            (
+                objectid::CHUNK_TREE,
+                ItemEdit::Put(OwnedItem {
+                    key: DiskKey {
+                        objectid: objectid::FIRST_CHUNK_TREE,
+                        key_type: key_type::CHUNK_ITEM,
+                        offset: logical,
+                    },
+                    data: chunk_item(length, flags, self.sb.sectorsize, &stripe_list),
+                }),
+            ),
+        ];
+        for &physical in &stripes {
+            tree_edits.push((
+                objectid::DEV_TREE,
+                ItemEdit::Put(OwnedItem {
+                    key: DiskKey {
+                        objectid: devid,
+                        key_type: DEV_EXTENT_KEY,
+                        offset: physical,
+                    },
+                    data: dev_extent_item(logical, length, chunk_tree_uuid),
+                }),
+            ));
+        }
+        // An empty group: nothing used, in the chunk tree's first chunk
+        // objectid, of the chunk's type.
+        let mut group = Vec::with_capacity(BLOCK_GROUP_ITEM_SIZE);
+        group.extend_from_slice(&0u64.to_le_bytes());
+        group.extend_from_slice(&objectid::FIRST_CHUNK_TREE.to_le_bytes());
+        group.extend_from_slice(&flags.to_le_bytes());
+        tree_edits.push((
+            objectid::EXTENT_TREE,
+            ItemEdit::Put(OwnedItem {
+                key: DiskKey {
+                    objectid: logical,
+                    key_type: key_type::BLOCK_GROUP_ITEM,
+                    offset: length,
+                },
+                data: group,
+            }),
+        ));
+        // Free, all of it: one run, recorded as an extent.
+        let mut info = 1u32.to_le_bytes().to_vec();
+        info.extend_from_slice(&0u32.to_le_bytes());
+        for (key_type, data) in [
+            (key_type::FREE_SPACE_INFO, info),
+            (key_type::FREE_SPACE_EXTENT, Vec::new()),
+        ] {
+            tree_edits.push((
+                objectid::FREE_SPACE_TREE,
+                ItemEdit::Put(OwnedItem {
+                    key: DiskKey {
+                        objectid: logical,
+                        key_type,
+                        offset: length,
+                    },
+                    data,
+                }),
+            ));
+        }
+        self.commit_chunk_change(tree_edits, devid, used)?;
+        Ok(logical)
+    }
+
+    /// Remove the empty block group at `start` and its chunk, in one
+    /// committed transaction.
+    fn remove_block_group(&mut self, start: u64) -> Result<()> {
+        let group = self.block_group_at(start)?;
+        if group.used != 0 || !self.data_extents_in(&group)?.is_empty() {
+            return Err(Error::UnsupportedFeature(format!(
+                "the block group at {start} still holds {} bytes",
+                group.used
+            )));
+        }
+        let chunk = self
+            .map
+            .chunk_for(start)
+            .filter(|c| c.logical == start && c.length == group.length)
+            .ok_or_else(|| {
+                Error::UnsupportedFeature(format!(
+                    "no chunk maps the block group at {start} exactly"
+                ))
+            })?
+            .clone();
+        let devid = self.sb.dev_item.devid;
+        let stripes: Vec<DevExtent> = self
+            .dev_extents()?
+            .into_iter()
+            .filter(|e| e.chunk_offset == start)
+            .collect();
+        if stripes.len() != usize::from(chunk.num_stripes)
+            || stripes.iter().any(|s| s.devid != devid)
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "the chunk at {start} has {} stripes, and the device tree has {} extents for \
+                 it on device {devid}",
+                chunk.num_stripes,
+                stripes.len()
+            )));
+        }
+
+        let mut tree_edits = vec![(
+            objectid::CHUNK_TREE,
+            ItemEdit::Delete(DiskKey {
+                objectid: objectid::FIRST_CHUNK_TREE,
+                key_type: key_type::CHUNK_ITEM,
+                offset: start,
+            }),
+        )];
+        let mut freed = 0u64;
+        for s in &stripes {
+            freed += s.length;
+            tree_edits.push((
+                objectid::DEV_TREE,
+                ItemEdit::Delete(DiskKey {
+                    objectid: s.devid,
+                    key_type: DEV_EXTENT_KEY,
+                    offset: s.physical,
+                }),
+            ));
+        }
+        let (key, mut item) = self.dev_item(devid)?;
+        let used = le64(&item, DEV_ITEM_BYTES_USED)
+            .checked_sub(freed)
+            .ok_or_else(|| {
+                Error::UnsupportedFeature(format!(
+                    "device {devid} records fewer bytes used than the chunk at {start} takes \
+                     on it"
+                ))
+            })?;
+        item[DEV_ITEM_BYTES_USED..DEV_ITEM_BYTES_USED + 8].copy_from_slice(&used.to_le_bytes());
+        tree_edits.push((
+            objectid::CHUNK_TREE,
+            ItemEdit::Put(OwnedItem { key, data: item }),
+        ));
+        tree_edits.push((
+            objectid::EXTENT_TREE,
+            ItemEdit::Delete(DiskKey {
+                objectid: start,
+                key_type: key_type::BLOCK_GROUP_ITEM,
+                offset: group.length,
+            }),
+        ));
+        // And everything the free-space tree says about the group.
+        for key in self.free_space_keys(&group)? {
+            tree_edits.push((objectid::FREE_SPACE_TREE, ItemEdit::Delete(key)));
+        }
+        self.commit_chunk_change(tree_edits, devid, used)
+    }
+
+    /// Plan, render and commit `tree_edits`, with device `devid`'s chunks
+    /// taking `bytes_used` in its superblock's device item as in the chunk
+    /// tree's, then remount.
+    fn commit_chunk_change(
+        &mut self,
+        tree_edits: Vec<(u64, ItemEdit)>,
+        devid: u64,
+        bytes_used: u64,
+    ) -> Result<()> {
+        let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
+            Error::UnsupportedFeature("the generation counter is exhausted".into())
+        })?;
+        let write = DataWrite {
+            root: objectid::CHUNK_TREE,
+            tree_edits,
+            ..Default::default()
+        };
+        let dirty: Vec<u64> = {
+            let reader = self.pool_reader();
+            let tree = reader.tree();
+            let mut leaves = std::collections::BTreeSet::new();
+            for (t, edit) in &write.tree_edits {
+                leaves.insert(
+                    tree.descend(self.edit_root(*t)?, &edit.key())?
+                        .header
+                        .bytenr,
+                );
+            }
+            leaves.into_iter().collect()
+        };
+        let plan = self.plan_transaction_closed_with(&dirty, &write, PLAN_ROUNDS)?;
+        let blocks = self.render_plan_with(&plan, &write, generation)?;
+        let root = self.planned_root(&plan).ok_or_else(|| {
+            Error::UnsupportedFeature("the relocation's plan does not move the root tree".into())
+        })?;
+        let chunk_root = self.planned_chunk_root(&plan).ok_or_else(|| {
+            Error::UnsupportedFeature("the relocation's plan does not move the chunk tree".into())
+        })?;
+        let sb_bytes_used = match plan.usage_delta(u64::from(self.sb.nodesize)) {
+            0 => None,
+            d => Some(
+                u64::try_from(i128::from(self.sb.bytes_used) + d).map_err(|_| {
+                    Error::UnsupportedFeature(format!(
+                        "the superblock's {} bytes used cannot move by {d}",
+                        self.sb.bytes_used
+                    ))
+                })?,
+            ),
+        };
+        self.commit_bytes_used(
+            &blocks,
+            &Commit {
+                generation,
+                root,
+                bytes_used: sb_bytes_used,
+                chunk_root: Some(chunk_root),
+                chunk_root_generation: Some(generation),
+                invalidate_free_space_tree: false,
+                ..Default::default()
+            },
+            devid,
+            bytes_used,
+        )?;
+        *self = self.remount_rw()?;
+        Ok(())
+    }
+
+    /// The chunk tree's item for device `devid`, and its key.
+    fn dev_item(&self, devid: u64) -> Result<(DiskKey, Vec<u8>)> {
+        let key = DiskKey {
+            objectid: objectid::DEV_ITEMS,
+            key_type: key_type::DEV_ITEM,
+            offset: devid,
+        };
+        let item = self
+            .pool_reader()
+            .tree()
+            .search(self.sb.chunk_root, &key)?
+            .ok_or_else(|| {
+                Error::UnsupportedFeature(format!("the chunk tree has no item for device {devid}"))
+            })?
+            .data;
+        if item.len() < DEV_ITEM_BYTES_USED + 8 {
+            return Err(Error::UnsupportedFeature(format!(
+                "device {devid}'s item is {} bytes, shorter than a device item",
+                item.len()
+            )));
+        }
+        Ok((key, item))
+    }
+
+    /// Every device extent the device tree records.
+    fn dev_extents(&self) -> Result<Vec<DevExtent>> {
+        let root = self.tree_root(objectid::DEV_TREE)?;
+        let reader = self.pool_reader();
+        let tree = reader.tree();
+        let mut out = Vec::new();
+        let mut bad = None;
+        tree.for_each(root, &mut |k: &DiskKey, d: &[u8]| {
+            if k.key_type != DEV_EXTENT_KEY {
+                return Ok(true);
+            }
+            if d.len() < dev_extent::SIZE {
+                bad = Some(k.offset);
+                return Ok(false);
+            }
+            let mut chunk_tree_uuid = [0u8; 16];
+            chunk_tree_uuid
+                .copy_from_slice(&d[dev_extent::CHUNK_TREE_UUID..dev_extent::CHUNK_TREE_UUID + 16]);
+            out.push(DevExtent {
+                devid: k.objectid,
+                physical: k.offset,
+                chunk_offset: le64(d, dev_extent::CHUNK_OFFSET),
+                length: le64(d, dev_extent::LENGTH),
+                chunk_tree_uuid,
+            });
+            Ok(true)
+        })?;
+        if let Some(at) = bad {
+            return Err(Error::UnsupportedFeature(format!(
+                "the device extent at {at} is shorter than a device extent"
+            )));
+        }
+        Ok(out)
+    }
+
+    /// The key of every free-space tree item describing `group`.
+    fn free_space_keys(&self, group: &BlockGroup) -> Result<Vec<DiskKey>> {
+        let root = self.tree_root(objectid::FREE_SPACE_TREE)?;
+        let reader = self.pool_reader();
+        let tree = reader.tree();
+        let mut out = Vec::new();
+        let from = DiskKey {
+            objectid: group.start,
+            key_type: 0,
+            offset: 0,
+        };
+        tree.for_each_from(root, &from, &mut |k: &DiskKey, _| {
+            if k.objectid >= group.end() {
+                return Ok(false);
+            }
+            if matches!(
+                k.key_type,
+                key_type::FREE_SPACE_INFO
+                    | key_type::FREE_SPACE_EXTENT
+                    | key_type::FREE_SPACE_BITMAP
+            ) {
+                out.push(*k);
+            }
+            Ok(true)
+        })?;
+        if !out
+            .iter()
+            .any(|k| k.key_type == key_type::FREE_SPACE_INFO && k.objectid == group.start)
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "the free-space tree has no information item for the block group at {}",
+                group.start
+            )));
+        }
+        Ok(out)
     }
 
     /// The block group starting at `start`.
@@ -394,4 +901,175 @@ fn data_ref(b: &[u8]) -> (u64, u64, u64, u32) {
 
 fn le64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes"))
+}
+
+/// One `DEV_EXTENT`: a stripe of a chunk, on a device.
+#[derive(Debug, Clone, Copy)]
+struct DevExtent {
+    devid: u64,
+    physical: u64,
+    chunk_offset: u64,
+    length: u64,
+    chunk_tree_uuid: [u8; 16],
+}
+
+/// A `CHUNK_ITEM`'s body: `length` logical bytes of `flags`, over
+/// `stripes`, each `(devid, physical offset, device UUID)`.
+fn chunk_item(
+    length: u64,
+    flags: u64,
+    sectorsize: u32,
+    stripes: &[(u64, u64, [u8; 16])],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(48 + 32 * stripes.len());
+    out.extend_from_slice(&length.to_le_bytes());
+    out.extend_from_slice(&objectid::EXTENT_TREE.to_le_bytes()); // owner
+    out.extend_from_slice(&DEFAULT_STRIPE_LEN.to_le_bytes());
+    out.extend_from_slice(&flags.to_le_bytes());
+    out.extend_from_slice(&(DEFAULT_STRIPE_LEN as u32).to_le_bytes()); // io_align
+    out.extend_from_slice(&(DEFAULT_STRIPE_LEN as u32).to_le_bytes()); // io_width
+    out.extend_from_slice(&sectorsize.to_le_bytes());
+    out.extend_from_slice(&(stripes.len() as u16).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // sub_stripes
+    for (devid, physical, uuid) in stripes {
+        out.extend_from_slice(&devid.to_le_bytes());
+        out.extend_from_slice(&physical.to_le_bytes());
+        out.extend_from_slice(uuid);
+    }
+    out
+}
+
+/// A `DEV_EXTENT`'s body: a stripe of `length` bytes of the chunk at
+/// `chunk_offset`, in the chunk tree.
+fn dev_extent_item(chunk_offset: u64, length: u64, chunk_tree_uuid: [u8; 16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(dev_extent::SIZE);
+    out.extend_from_slice(&objectid::CHUNK_TREE.to_le_bytes());
+    out.extend_from_slice(&objectid::FIRST_CHUNK_TREE.to_le_bytes());
+    out.extend_from_slice(&chunk_offset.to_le_bytes());
+    out.extend_from_slice(&length.to_le_bytes());
+    out.extend_from_slice(&chunk_tree_uuid);
+    debug_assert_eq!(out.len(), dev_extent::SIZE);
+    out
+}
+
+/// Where `count` stripes of `len` bytes go on a device of `device_bytes`
+/// whose extents `taken` already holds, each `(physical, length)`: the
+/// first holes that fit, on MiB boundaries, past the first MiB, and
+/// clear of every superblock copy -- so no allocation inside the chunk
+/// has to step around one, and the free-space tree's one run covering
+/// the group is true.
+fn place_stripes(
+    taken: &[(u64, u64)],
+    device_bytes: u64,
+    len: u64,
+    count: usize,
+) -> Option<Vec<u64>> {
+    use crate::superblock::SUPER_OFFSETS;
+    if len == 0 {
+        return None;
+    }
+    let mut busy: Vec<(u64, u64)> = taken
+        .iter()
+        .map(|&(at, n)| (at, at.saturating_add(n)))
+        .chain(std::iter::once((0, MIB)))
+        .chain(SUPER_OFFSETS.iter().map(|&at| {
+            let end = (at + crate::super_write::SUPERBLOCK_SIZE as u64).next_multiple_of(MIB);
+            (at - at % MIB, end)
+        }))
+        .collect();
+    busy.sort();
+    let mut out = Vec::with_capacity(count);
+    let mut at = 0u64;
+    let mut i = 0usize;
+    while out.len() < count {
+        at = at.next_multiple_of(MIB);
+        let end = at.checked_add(len)?;
+        if end > device_bytes {
+            return None;
+        }
+        // The first busy range ending after `at`: if it starts before the
+        // stripe would end, the stripe goes after it.
+        while i < busy.len() && busy[i].1 <= at {
+            i += 1;
+        }
+        match busy.get(i) {
+            Some(&(start, stop)) if start < end => at = stop,
+            _ => {
+                out.push(at);
+                busy.insert(i, (at, end));
+            }
+        }
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chunk::Chunk;
+
+    #[test]
+    fn a_chunk_item_this_writes_parses_as_the_chunk_it_describes() {
+        let uuid = [7u8; 16];
+        let item = chunk_item(8 * MIB, bg::DATA, 4096, &[(1, 300 * MIB, uuid)]);
+        let chunk = Chunk::parse(1 << 30, &item).expect("the item parses");
+        assert_eq!(chunk.length, 8 * MIB);
+        assert_eq!(chunk.profile().unwrap(), ChunkProfile::Single);
+        assert!(chunk.is_data());
+        assert_eq!(chunk.encoded_len(), item.len());
+        assert_eq!(
+            chunk
+                .stripes
+                .iter()
+                .map(|s| (s.devid, s.offset, s.dev_uuid))
+                .collect::<Vec<_>>(),
+            vec![(1, 300 * MIB, uuid)]
+        );
+        let at = (1 << 30) + 5000;
+        assert_eq!(chunk.map_mirror(at, 0).unwrap().physical, 300 * MIB + 5000);
+    }
+
+    #[test]
+    fn stripes_go_in_the_first_holes_past_the_first_mib() {
+        // An extent at 1 MiB of 8 MiB, and one at 20 MiB of 4 MiB.
+        let taken = [(MIB, 8 * MIB), (20 * MIB, 4 * MIB)];
+        assert_eq!(
+            place_stripes(&taken, 256 * MIB, 8 * MIB, 1),
+            Some(vec![9 * MIB])
+        );
+        // Two: the hole before 20 MiB holds one, the next goes after it.
+        assert_eq!(
+            place_stripes(&taken, 256 * MIB, 8 * MIB, 2),
+            Some(vec![9 * MIB, 24 * MIB])
+        );
+        // Nothing fits past the device.
+        assert_eq!(
+            place_stripes(&taken, 30 * MIB, 8 * MIB, 1),
+            Some(vec![9 * MIB])
+        );
+        assert_eq!(place_stripes(&taken, 30 * MIB, 8 * MIB, 2), None);
+    }
+
+    #[test]
+    fn a_stripe_never_covers_a_superblock_copy() {
+        // Everything taken up to 60 MiB: an 8 MiB stripe would cross the
+        // copy at 64 MiB, so it starts past it.
+        let taken = [(MIB, 59 * MIB)];
+        let at = place_stripes(&taken, 512 * MIB, 8 * MIB, 1).unwrap()[0];
+        assert!(at >= 65 * MIB, "a stripe at {at} covers the copy at 64 MiB");
+        // And one that fits before it stays there.
+        assert_eq!(
+            place_stripes(&taken, 512 * MIB, 4 * MIB, 1),
+            Some(vec![60 * MIB])
+        );
+    }
+
+    #[test]
+    fn a_misaligned_extent_end_moves_the_stripe_to_the_next_mib() {
+        let taken = [(MIB, 8 * MIB + 4096)];
+        assert_eq!(
+            place_stripes(&taken, 256 * MIB, MIB, 1),
+            Some(vec![10 * MIB])
+        );
+    }
 }
