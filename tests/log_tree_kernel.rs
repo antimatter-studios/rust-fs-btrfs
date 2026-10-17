@@ -278,9 +278,10 @@ fn the_log_holds_what_the_kernels_replay_produces() {
 }
 
 /// Every path's type, link count and size, every regular file's
-/// modification time, and every device's major and minor numbers (in
-/// hex, as `stat` prints them), as the kernel reports them for the
-/// mounted image.
+/// modification time, every device's major and minor numbers (in hex, as
+/// `stat` prints them), and the inode of every name whose inode has more
+/// than one, so that two names are the same inode only if the kernel says
+/// so, as the kernel reports them for the mounted image.
 ///
 /// A directory's times are left out: a name the replay removes moves its
 /// directory's times to the moment of the replay, in the kernel's replay
@@ -292,6 +293,7 @@ find . -mindepth 1 -type f -printf 'mtime\t%P\t%T@\n' | sort
 find . -mindepth 1 \( -type b -o -type c \) -printf '%P\n' | sort | while read -r p; do
     printf 'rdev\t%s\t%s\n' "$p" "$(stat -c '%t:%T' "$p")"
 done
+find . -mindepth 1 ! -type d -links +1 -printf 'ino\t%P\t%i\n' | sort
 "#;
 
 /// `kind<TAB>path<TAB>value` lines, keyed by `(kind, path)`.
@@ -1367,6 +1369,119 @@ fn a_log_creating_device_fifo_and_socket_nodes_replays_as_the_kernel_does() {
         };
         assert_eq!(get("type"), Some(kind), "the kernel's replay of {name}");
         assert_eq!(get("rdev"), rdev, "the kernel's replay of {name}");
+    }
+}
+
+/// The committed file `f` given a second name `g`, and a file `n`
+/// created with data and given a second name `m`, after the last commit
+/// and made durable by an fsync of `f` and then one of `n` (#406). The
+/// committed trees hold `f` alone, with one link. The log holds `f` in
+/// full, its link count raised to 2 and its reference to `/` holding both
+/// names; `n` with its data and both its names; and the entries of `/`
+/// that name `g`, `n` and `m`. The kernel's replay of the same crash
+/// image is the oracle, down to each name's link count and inode.
+#[test]
+fn a_log_adding_hard_links_replays_as_the_kernel_does() {
+    const HARDLINK_FIXTURE: &str = "dirtylog/btrfs-dirty-log-hardlink.img";
+    let image = fixture(HARDLINK_FIXTURE);
+    let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-hardlink.logdump"))
+        .expect("the native transcript of the hard-link log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the hard-link fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        let committed = fs.lookup_path("/f").expect("the committed trees hold /f");
+        assert_eq!(committed.nlink, 1, "/f is committed with one name");
+        for path in ["/g", "/n", "/m"] {
+            assert!(
+                fs.lookup_path(path).is_err(),
+                "{path} was made after the commit, so the committed trees should not hold it"
+            );
+        }
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        let named = |name: &str| {
+            top.inode_named(256, name.as_bytes())
+                .unwrap_or_else(|| panic!("the log names no {name} in /: {keys:?}"))
+        };
+        assert_eq!(
+            (named("f"), named("g")),
+            (committed.ino, committed.ino),
+            "the log names f and g as the committed f: {keys:?}"
+        );
+        let n = named("n");
+        assert_eq!(
+            named("m"),
+            n,
+            "the log names n and m as one inode: {keys:?}"
+        );
+        let logged_f = top
+            .inode(committed.ino)
+            .unwrap()
+            .expect("f's logged inode item");
+        assert_eq!(
+            (logged_f.generation, logged_f.nlink),
+            (committed.generation, 2),
+            "the log holds the committed f in full, with two links: {logged_f:?}"
+        );
+        let logged_n = top.inode(n).unwrap().expect("n's logged inode item");
+        assert_eq!(
+            (logged_n.nlink, logged_n.size),
+            (2, 19),
+            "the log holds n with two links and its data: {logged_n:?}"
+        );
+        let entries: Vec<(Vec<u8>, u64)> = top
+            .names(256)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, e.ino))
+            .collect();
+        for (name, ino) in [("g", committed.ino), ("n", n), ("m", n)] {
+            assert!(
+                entries.contains(&(name.as_bytes().to_vec(), ino)),
+                "the log holds no entry of / naming {name}: {entries:?}"
+            );
+        }
+    }
+    let theirs = replays_as_the_kernel_does(HARDLINK_FIXTURE, "dirtylog-hardlink");
+    // The two replays agree; this is what they agree on, as the kernel
+    // reports it, so a name both left out cannot pass.
+    let get = |kind: &str, name: &str| {
+        theirs
+            .get(&(kind.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("the kernel's replay reports no {kind} for {name}"))
+    };
+    for (first, second, size) in [("f", "g", 33), ("n", "m", 19)] {
+        for name in [first, second] {
+            assert_eq!(
+                get("stat", name),
+                format!("f 2 {size}"),
+                "the kernel's replay of {name}"
+            );
+        }
+        assert_eq!(
+            get("ino", first),
+            get("ino", second),
+            "the kernel's replay names {first} and {second} as one inode"
+        );
+        assert_eq!(
+            get("sha256", first),
+            get("sha256", second),
+            "{first} and {second} read back differently"
+        );
     }
 }
 
