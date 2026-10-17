@@ -17,7 +17,10 @@
 //!   bytenr is 0, as the kernel records it (#420). A file that ends
 //!   partway through a sector first has the rest of that sector rewritten
 //!   copy-on-write with zeros (#421), through [`Filesystem::write`], so
-//!   stale bytes past the old end never read back.
+//!   stale bytes past the old end never read back. A file that holds
+//!   inline data first has that data moved into a regular extent at
+//!   offset 0, the rest of its sector zeros (#422), as the kernel does:
+//!   an inline extent never stays shorter than its file.
 //!
 //! Either way the inode's `nbytes` is recounted from the items left (inline
 //! data at its length, every other item with an extent at its `num_bytes`,
@@ -29,9 +32,9 @@
 //!   snapshot; an extent a reflink shares has this file's reference
 //!   dropped and stays for the others (#262), unless that reference is held
 //!   anywhere but inline in the extent's record, or is its last;
-//! - growing a file that holds inline data, which means moving that data
-//!   into an extent; and, on a volume without `NO_HOLES`, growing a file
-//!   whose last sector is partly past its end.
+//! - on a volume without `NO_HOLES`, growing a file whose last sector is
+//!   partly past its end, inline data included; and growing a `nodatacow`
+//!   file that holds inline data.
 //! - a compressed inline extent cut short, and any subvolume other than the
 //!   top level.
 
@@ -59,9 +62,10 @@ impl Filesystem {
     /// [`Error::NotAFile`] for anything but a regular file, and
     /// [`Error::UnsupportedFeature`] for every refusal the [module
     /// documentation](crate::truncate) lists. Nothing is written unless
-    /// everything is, except that a file ending partway through a sector
-    /// and grown past it commits the zeroed sector first: if the growth
-    /// after it then fails, the file ends at that sector's boundary.
+    /// everything is, except that a file ending partway through a sector,
+    /// or holding inline data, and grown past it commits the zeroed sector
+    /// first: if the growth after it then fails, the file ends at that
+    /// sector's boundary.
     pub fn truncate(&mut self, ino: u64, size: u64) -> Result<()> {
         self.require_writable_top_level()?;
         let inode = self.read_inode(ino)?;
@@ -85,6 +89,16 @@ impl Filesystem {
         let mut released = Vec::new();
         if size > inode.size {
             self.refuse_growth(ino, inode.size, &items)?;
+            if items.iter().any(|(_, d)| d.get(fe::TYPE) == Some(&INLINE)) {
+                // Inline data cannot stay shorter than its file, so it moves
+                // into a regular extent at offset 0 (#422) that the write
+                // fills to the next sector boundary with zeros; any growth
+                // past that boundary is then sector-aligned.
+                let boundary = (inode.size / sector + 1) * sector;
+                let zeros = vec![0u8; (size.min(boundary) - inode.size) as usize];
+                self.write_moving_inline(ino, inode.size, &zeros)?;
+                return self.truncate(ino, size);
+            }
             if !inode.size.is_multiple_of(sector) && !items.is_empty() {
                 // The rest of the old last sector may hold stale bytes, so
                 // it is rewritten copy-on-write with zeros past the old end,
@@ -163,12 +177,6 @@ impl Filesystem {
     /// Refuse growing a file whose new bytes could not be read as zeros
     /// without writing data.
     fn refuse_growth(&self, ino: u64, old: u64, items: &[(DiskKey, Vec<u8>)]) -> Result<()> {
-        if items.iter().any(|(_, d)| d.get(fe::TYPE) == Some(&INLINE)) {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino} holds inline data, and growing it means moving that data into \
-                 an extent, which is not written yet"
-            )));
-        }
         if !old.is_multiple_of(u64::from(self.sb.sectorsize))
             && !items.is_empty()
             && !self.sb.has_no_holes()
