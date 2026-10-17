@@ -44,7 +44,8 @@ check "a missing path has no stdout" test ! -s "$SANDBOX/out"
 jq_check "a missing path is named" '.code==1 and (.error|contains("no-such-path"))' "$SANDBOX/err"
 check "inspection and refusals leave the image unchanged" cmp -s "$img" "$SANDBOX/before.img"
 
-dd if="$img" of="$SANDBOX/whole.img" bs=1048576 seek=1 conv=sparse,notrunc 2>"$SANDBOX/dd.err"
+dd if="$img" of="$SANDBOX/whole.img" bs=1048576 seek=1 conv=sparse,notrunc 2>"$SANDBOX/dd.err" ||
+    dd if="$img" of="$SANDBOX/whole.img" bs=1048576 seek=1 conv=notrunc 2>"$SANDBOX/dd.err"
 fs.btrfs --offset 1048576 "$SANDBOX/whole.img" xattr /plain.txt user.binary >"$SANDBOX/offset" 2>"$SANDBOX/err"
 check "--offset remains the filesystem's device offset" test $? -eq 0
 check "--offset reads the same raw value" cmp -s "$SANDBOX/offset" "$SANDBOX/want"
