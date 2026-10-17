@@ -385,14 +385,15 @@ impl Filesystem {
     /// the rest against that subvolume, and paths inside it are absolute
     /// within it rather than carrying its own path as a prefix.
     ///
-    /// # Read-only, deliberately
+    /// # Read-only, except for what commits against its own tree
     ///
-    /// The handle never carries the write capability, even when this one
-    /// does. Writing into a subvolume is not the same operation as
-    /// writing into the default tree — a snapshot shares its blocks with
-    /// its parent until something writes, so a write has to unshare
-    /// before it can proceed, and none of that is implemented. A handle
-    /// that could not write is better than one that could write wrongly.
+    /// The handle is read-only to every operation that only knows how
+    /// to write the top level: [`Filesystem::is_writable`] is false, and
+    /// those refuse it as [`crate::error::Error::ReadOnly`]. On a writable
+    /// mount it holds the devices aside for the operations that name the
+    /// subvolume's tree in their transaction (#517) — [`Filesystem::create`],
+    /// [`Filesystem::mkdir`] and [`Filesystem::symlink`] — and after each
+    /// commit it is this subvolume's handle on the new generation.
     ///
     /// # Errors
     ///
@@ -404,7 +405,9 @@ impl Filesystem {
             .into_iter()
             .find(|s| s.id == id)
             .ok_or(crate::error::Error::NotFound)?;
-        self.open_subvolume_at(subvol.bytenr)
+        let mut fs = self.open_subvolume_at(subvol.bytenr)?;
+        fs.subvolume_writes = self.writes_for_subvolume(id);
+        Ok(fs)
     }
 
     /// Open the subvolume whose tree root is `bytenr`.

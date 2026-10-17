@@ -398,6 +398,16 @@ pub(crate) struct FileExtent {
 /// the `[from, from + length)` of the caller's buffer that goes there.
 pub(crate) type WriteSpan = (Arc<dyn BlockDevice>, u64, usize, usize);
 
+/// The devices a subvolume handle writes through, and the subvolume
+/// (#517). See [`Filesystem::subvolume_writes`].
+#[derive(Clone)]
+pub(crate) struct SubvolumeWrites {
+    /// The subvolume's id: the objectid its `ROOT_ITEM` is filed under.
+    pub(crate) id: u64,
+    pub(crate) writable: Arc<dyn BlockDevice>,
+    pub(crate) writable_pool: BTreeMap<u64, Arc<dyn BlockDevice>>,
+}
+
 /// A mounted Btrfs filesystem.
 pub struct Filesystem {
     pub(crate) device: Arc<dyn BlockRead>,
@@ -426,6 +436,14 @@ pub struct Filesystem {
     pub(crate) sb: Superblock,
     pub(crate) map: ChunkMap,
     pub(crate) fs_tree_root: u64,
+    /// A subvolume handle's write capability, held aside (#517).
+    ///
+    /// `None` for a mount, which writes through `writable`. A handle from
+    /// [`Filesystem::open_subvolume`] on a writable mount keeps `writable`
+    /// empty, so every write that only knows the top level still refuses
+    /// it as read-only, and holds the devices here for the operations
+    /// that commit against the subvolume's own tree.
+    pub(crate) subvolume_writes: Option<SubvolumeWrites>,
     /// The csum tree's root, when the filesystem has one.
     ///
     /// `None` only for a filesystem whose root tree holds no ROOT_ITEM
@@ -1390,6 +1408,7 @@ impl Filesystem {
             sb,
             map,
             fs_tree_root,
+            subvolume_writes: None,
             csum_tree_root,
             nodes: std::sync::Mutex::new(NodeCache::new(NODE_CACHE_BLOCKS)),
             compression: crate::compression::Compression::None,
@@ -1852,6 +1871,7 @@ impl Filesystem {
             sb: self.sb.clone(),
             map: self.map.clone(),
             fs_tree_root,
+            subvolume_writes: None,
             // A subvolume is another tree on the same volume, so its
             // data is checksummed by the same csum tree.
             csum_tree_root: self.csum_tree_root,
