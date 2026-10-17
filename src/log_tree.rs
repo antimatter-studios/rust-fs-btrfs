@@ -348,26 +348,60 @@ struct Ledger {
 
 #[derive(Default)]
 struct LedgerExtent {
-    refs: BTreeMap<(u64, u64), i64>,
+    /// By (subvolume, inode, offset).
+    refs: BTreeMap<(u64, u64, u64), i64>,
     summed: bool,
+    /// The latest snapshot of any subvolume naming it: an extent from at
+    /// or before it may be shared through a snapshot's tree blocks.
+    last_snapshot: u64,
 }
 
 impl Ledger {
-    fn change(&mut self, r: (u64, u64, u64), ino: u64, delta: i64, summed: bool) -> Result<()> {
+    fn change(
+        &mut self,
+        r: (u64, u64, u64),
+        subvol: u64,
+        ino: u64,
+        delta: i64,
+        summed: bool,
+        last_snapshot: u64,
+    ) -> Result<()> {
         let (bytenr, len, offset) = r;
         if self.extents.keys().any(|&(b, l)| b == bytenr && l != len) {
             return Err(Error::DirtyLog);
         }
         let e = self.extents.entry((bytenr, len)).or_default();
-        *e.refs.entry((ino, offset)).or_default() += delta;
+        *e.refs.entry((subvol, ino, offset)).or_default() += delta;
         e.summed |= summed;
+        e.last_snapshot = e.last_snapshot.max(last_snapshot);
         Ok(())
     }
 }
 
 impl Filesystem {
-    /// Replay the log of the top-level subvolume, as the kernel does for
-    /// the shapes below. Everything is validated before the first write,
+    /// The `last_snapshot` of subvolume `objectid`'s `ROOT_ITEM` (#380).
+    fn root_last_snapshot(&self, objectid: u64) -> Result<u64> {
+        if objectid == crate::chunk::objectid::FS_TREE {
+            return self.fs_tree_last_snapshot();
+        }
+        let reader = self.pool_reader();
+        let mut found = None;
+        reader
+            .tree()
+            .for_each(self.sb.root, &mut |key: &DiskKey, data: &[u8]| {
+                if key.objectid == objectid && key.key_type == ROOT_ITEM_KEY {
+                    found = data
+                        .get(root_item::LAST_SNAPSHOT..root_item::LAST_SNAPSHOT + 8)
+                        .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")));
+                    return Ok(false);
+                }
+                Ok(true)
+            })?;
+        found.ok_or(Error::DirtyLog)
+    }
+
+    /// Replay the log of every subvolume the log root tree names (#380),
+    /// as the kernel does for the shapes below, in one transaction. Everything is validated before the first write,
     /// and anything else is refused with [`Error::DirtyLog`] until its
     /// replay has independent oracle proof (#266).
     ///
@@ -405,17 +439,21 @@ impl Filesystem {
         use std::collections::{BTreeMap, BTreeSet};
 
         let log = self.log()?.ok_or(Error::DirtyLog)?;
-        if log.trees.len() != 1 || log.trees[0].subvolume != objectid::FS_TREE {
+        // The log of every subvolume the log root tree names, the top
+        // level's or another's (#380), replayed in one transaction.
+        if log.trees.is_empty()
+            || log
+                .trees
+                .iter()
+                .any(|t| t.subvolume != objectid::FS_TREE && t.subvolume < FIRST_FREE_OBJECTID)
+        {
             return Err(Error::DirtyLog);
         }
         self.require_writable_top_level()?;
-        let top = &log.trees[0];
         let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
             Error::UnsupportedFeature("the log replay generation overflows".into())
         })?;
-        let last_snapshot = self.fs_tree_last_snapshot()?;
         let sector = u64::from(self.sb.sectorsize);
-        let root = self.fs_tree_root;
         let key = |objectid: u64, key_type: u8, offset: u64| DiskKey {
             objectid,
             key_type,
@@ -423,7 +461,8 @@ impl Filesystem {
         };
         let put = |key: DiskKey, data: Vec<u8>| ItemEdit::Put(OwnedItem { key, data });
 
-        let mut edits: Vec<ItemEdit> = Vec::new();
+        let mut fs_edits: Vec<ItemEdit> = Vec::new();
+        let mut tree_edits: Vec<(u64, ItemEdit)> = Vec::new();
         let mut pins = Vec::new();
         let mut ledger = Ledger::default();
         let mut logged_csums: Vec<&LogItem> = Vec::new();
@@ -434,516 +473,532 @@ impl Filesystem {
             tree.for_each(log.log_root, &mut |key, _| {
                 if key.objectid != TREE_LOG_OBJECTID
                     || key.key_type != ROOT_ITEM_KEY
-                    || key.offset != objectid::FS_TREE
+                    || !log.trees.iter().any(|t| t.subvolume == key.offset)
                 {
                     return Err(Error::DirtyLog);
                 }
                 roots += 1;
                 Ok(true)
             })?;
-            if roots != 1 {
+            if roots != log.trees.len() {
                 return Err(Error::DirtyLog);
             }
 
-            // What each logged inode is to replay.
-            let logged_inodes = top.inodes();
-            let mut created: BTreeSet<u64> = BTreeSet::new();
-            let mut files: BTreeSet<u64> = BTreeSet::new();
-            let mut exists_only: BTreeSet<u64> = BTreeSet::new();
-            let mut dirs: BTreeSet<u64> = BTreeSet::new();
-            for &ino in &logged_inodes {
-                let logged = top.inode(ino)?.ok_or(Error::DirtyLog)?;
-                if ino < FIRST_FREE_OBJECTID {
-                    return Err(Error::DirtyLog);
-                }
-                match tree.search(root, &key(ino, INODE_ITEM_KEY, 0))? {
-                    None if logged.is_regular_file() && ino >= FIRST_FREE_OBJECTID => {
-                        created.insert(ino);
-                    }
-                    Some(c) => {
-                        let committed = Inode::parse(&c.data, ino)?;
-                        if committed.is_dir() && logged.is_dir() {
-                            dirs.insert(ino);
-                        } else if committed.is_regular_file() && logged.is_regular_file() {
-                            if logged.generation == 0 {
-                                exists_only.insert(ino);
-                            } else {
-                                files.insert(ino);
-                            }
-                        } else {
-                            return Err(Error::DirtyLog);
-                        }
-                    }
-                    None => return Err(Error::DirtyLog),
-                }
-            }
-            for item in &top.items {
-                if (item.key.objectid, item.key.key_type) == (EXTENT_CSUM_OBJECTID, EXTENT_CSUM_KEY)
-                {
-                    logged_csums.push(item);
-                } else if !logged_inodes.contains(&item.key.objectid) {
-                    return Err(Error::DirtyLog);
-                }
-            }
-
-            // Each file's data, whether the log creates the file or holds
-            // an existing one in full.
-            for &ino in files.iter().chain(created.iter()) {
-                let logged_item = top
-                    .items
-                    .iter()
-                    .find(|i| i.key == key(ino, INODE_ITEM_KEY, 0))
-                    .ok_or(Error::DirtyLog)?;
-                let logged = Inode::parse(&logged_item.data, ino)?;
-                if logged_item.data.len() != INODE_ITEM_SIZE {
-                    return Err(Error::DirtyLog);
-                }
-                let committed_items: BTreeMap<u64, Vec<u8>> = tree
-                    .find_all(root, ino, EXTENT_DATA_KEY)?
-                    .into_iter()
-                    .map(|i| (i.key.offset, i.data))
-                    .collect();
-                let logged_items: BTreeMap<u64, Vec<u8>> = top
-                    .extents(ino)
-                    .map(|i| (i.key.offset, i.data.clone()))
-                    .collect();
-                if created.contains(&ino) {
-                    for kind in [INODE_REF_KEY, EXTENT_DATA_KEY, dir::XATTR_ITEM_KEY] {
-                        if !tree.find_all(root, ino, kind)?.is_empty() {
-                            return Err(Error::DirtyLog);
-                        }
-                    }
-                }
-                let end = logged.size.div_ceil(sector) * sector;
-                let after = reconcile(&committed_items, &logged_items, end)?;
-                let summed = logged.flags & INODE_NODATASUM == 0;
-                for (&at, data) in &committed_items {
-                    if !after.contains_key(&at) {
-                        edits.push(ItemEdit::Delete(key(ino, EXTENT_DATA_KEY, at)));
-                    }
-                    if let Some(r) = file_ref(at, data) {
-                        ledger.change(r, ino, -1, summed)?;
-                    }
-                }
-                for (&at, data) in &after {
-                    if committed_items.get(&at) != Some(data) {
-                        edits.push(put(key(ino, EXTENT_DATA_KEY, at), data.clone()));
-                    }
-                    if let Some(r) = file_ref(at, data) {
-                        ledger.change(r, ino, 1, summed)?;
-                    }
-                }
-                let nbytes = after.values().map(|d| counted_bytes(d)).sum::<u64>();
-                let mut raw = logged_item.data.clone();
-                if files.contains(&ino) {
-                    let c = tree
-                        .search(root, &key(ino, INODE_ITEM_KEY, 0))?
-                        .ok_or(Error::DirtyLog)?;
-                    let before = Inode::parse(&c.data, ino)?;
-                    // The kernel logs `nbytes` as 0 and counts it again from
-                    // the data; a committed count that disagrees with the
-                    // committed items is not a volume this understands.
-                    let committed_nbytes = committed_items
-                        .values()
-                        .map(|d| counted_bytes(d))
-                        .sum::<u64>();
-                    if before.nbytes != committed_nbytes
-                        || (logged.nbytes != 0 && logged.nbytes != before.nbytes)
-                        || before.generation != logged.generation
-                        || before.nlink == 0
-                        || before.nlink != logged.nlink
-                        || before.flags != logged.flags
-                        || before.rdev != logged.rdev
-                        || before.block_group != logged.block_group
-                    {
+            for top in &log.trees {
+                let subvol = top.subvolume;
+                let root = self.tree_root(subvol)?;
+                let last_snapshot = self.root_last_snapshot(subvol)?;
+                let mut edits: Vec<ItemEdit> = Vec::new();
+                // What each logged inode is to replay.
+                let logged_inodes = top.inodes();
+                let mut created: BTreeSet<u64> = BTreeSet::new();
+                let mut files: BTreeSet<u64> = BTreeSet::new();
+                let mut exists_only: BTreeSet<u64> = BTreeSet::new();
+                let mut dirs: BTreeSet<u64> = BTreeSet::new();
+                for &ino in &logged_inodes {
+                    let logged = top.inode(ino)?.ok_or(Error::DirtyLog)?;
+                    if ino < FIRST_FREE_OBJECTID {
                         return Err(Error::DirtyLog);
                     }
-                    // Its names do not change here: a renamed or relinked
-                    // file is replayed through its directory.
+                    match tree.search(root, &key(ino, INODE_ITEM_KEY, 0))? {
+                        None if logged.is_regular_file() && ino >= FIRST_FREE_OBJECTID => {
+                            created.insert(ino);
+                        }
+                        Some(c) => {
+                            let committed = Inode::parse(&c.data, ino)?;
+                            if committed.is_dir() && logged.is_dir() {
+                                dirs.insert(ino);
+                            } else if committed.is_regular_file() && logged.is_regular_file() {
+                                if logged.generation == 0 {
+                                    exists_only.insert(ino);
+                                } else {
+                                    files.insert(ino);
+                                }
+                            } else {
+                                return Err(Error::DirtyLog);
+                            }
+                        }
+                        None => return Err(Error::DirtyLog),
+                    }
+                }
+                for item in &top.items {
+                    if (item.key.objectid, item.key.key_type)
+                        == (EXTENT_CSUM_OBJECTID, EXTENT_CSUM_KEY)
+                    {
+                        logged_csums.push(item);
+                    } else if !logged_inodes.contains(&item.key.objectid) {
+                        return Err(Error::DirtyLog);
+                    }
+                }
+
+                // Each file's data, whether the log creates the file or holds
+                // an existing one in full.
+                for &ino in files.iter().chain(created.iter()) {
+                    let logged_item = top
+                        .items
+                        .iter()
+                        .find(|i| i.key == key(ino, INODE_ITEM_KEY, 0))
+                        .ok_or(Error::DirtyLog)?;
+                    let logged = Inode::parse(&logged_item.data, ino)?;
+                    if logged_item.data.len() != INODE_ITEM_SIZE {
+                        return Err(Error::DirtyLog);
+                    }
+                    let committed_items: BTreeMap<u64, Vec<u8>> = tree
+                        .find_all(root, ino, EXTENT_DATA_KEY)?
+                        .into_iter()
+                        .map(|i| (i.key.offset, i.data))
+                        .collect();
+                    let logged_items: BTreeMap<u64, Vec<u8>> = top
+                        .extents(ino)
+                        .map(|i| (i.key.offset, i.data.clone()))
+                        .collect();
+                    if created.contains(&ino) {
+                        for kind in [INODE_REF_KEY, EXTENT_DATA_KEY, dir::XATTR_ITEM_KEY] {
+                            if !tree.find_all(root, ino, kind)?.is_empty() {
+                                return Err(Error::DirtyLog);
+                            }
+                        }
+                    }
+                    let end = logged.size.div_ceil(sector) * sector;
+                    let after = reconcile(&committed_items, &logged_items, end)?;
+                    let summed = logged.flags & INODE_NODATASUM == 0;
+                    for (&at, data) in &committed_items {
+                        if !after.contains_key(&at) {
+                            edits.push(ItemEdit::Delete(key(ino, EXTENT_DATA_KEY, at)));
+                        }
+                        if let Some(r) = file_ref(at, data) {
+                            ledger.change(r, subvol, ino, -1, summed, last_snapshot)?;
+                        }
+                    }
+                    for (&at, data) in &after {
+                        if committed_items.get(&at) != Some(data) {
+                            edits.push(put(key(ino, EXTENT_DATA_KEY, at), data.clone()));
+                        }
+                        if let Some(r) = file_ref(at, data) {
+                            ledger.change(r, subvol, ino, 1, summed, last_snapshot)?;
+                        }
+                    }
+                    let nbytes = after.values().map(|d| counted_bytes(d)).sum::<u64>();
+                    let mut raw = logged_item.data.clone();
+                    if files.contains(&ino) {
+                        let c = tree
+                            .search(root, &key(ino, INODE_ITEM_KEY, 0))?
+                            .ok_or(Error::DirtyLog)?;
+                        let before = Inode::parse(&c.data, ino)?;
+                        // The kernel logs `nbytes` as 0 and counts it again from
+                        // the data; a committed count that disagrees with the
+                        // committed items is not a volume this understands.
+                        let committed_nbytes = committed_items
+                            .values()
+                            .map(|d| counted_bytes(d))
+                            .sum::<u64>();
+                        if before.nbytes != committed_nbytes
+                            || (logged.nbytes != 0 && logged.nbytes != before.nbytes)
+                            || before.generation != logged.generation
+                            || before.nlink == 0
+                            || before.nlink != logged.nlink
+                            || before.flags != logged.flags
+                            || before.rdev != logged.rdev
+                            || before.block_group != logged.block_group
+                        {
+                            return Err(Error::DirtyLog);
+                        }
+                        // Its names do not change here: a renamed or relinked
+                        // file is replayed through its directory.
+                        for r in top
+                            .items
+                            .iter()
+                            .filter(|i| i.key.objectid == ino && i.key.key_type == INODE_REF_KEY)
+                        {
+                            if tree.search(root, &r.key)?.map(|c| c.data) != Some(r.data.clone()) {
+                                return Err(Error::DirtyLog);
+                            }
+                        }
+                    }
+                    raw[io::NBYTES..io::NBYTES + 8].copy_from_slice(&nbytes.to_le_bytes());
+                    edits.push(put(key(ino, INODE_ITEM_KEY, 0), raw));
+                    for item in top.items.iter().filter(|i| i.key.objectid == ino) {
+                        if !matches!(
+                            item.key.key_type,
+                            INODE_ITEM_KEY | INODE_REF_KEY | EXTENT_DATA_KEY | dir::XATTR_ITEM_KEY
+                        ) {
+                            return Err(Error::DirtyLog);
+                        }
+                    }
+                    // Its extended attributes are the logged set (#379): each
+                    // logged item is put as logged, and a committed one the log
+                    // does not hold is deleted, as `replay_xattr_deletes` does.
+                    let committed_xattrs: BTreeMap<u64, Vec<u8>> = tree
+                        .find_all(root, ino, dir::XATTR_ITEM_KEY)?
+                        .into_iter()
+                        .map(|i| (i.key.offset, i.data))
+                        .collect();
+                    let logged_xattrs: BTreeMap<u64, &[u8]> = top
+                        .items
+                        .iter()
+                        .filter(|i| i.key.objectid == ino && i.key.key_type == dir::XATTR_ITEM_KEY)
+                        .map(|i| (i.key.offset, &i.data[..]))
+                        .collect();
+                    for &hash in committed_xattrs.keys() {
+                        if !logged_xattrs.contains_key(&hash) {
+                            edits.push(ItemEdit::Delete(key(ino, dir::XATTR_ITEM_KEY, hash)));
+                        }
+                    }
+                    for (&hash, &data) in &logged_xattrs {
+                        if committed_xattrs.get(&hash).map(|c| &c[..]) != Some(data) {
+                            edits.push(put(key(ino, dir::XATTR_ITEM_KEY, hash), data.to_vec()));
+                        }
+                    }
+                }
+
+                // Names. A created inode named in a directory the log does not
+                // speak for gets its entries from its reference; any other
+                // logged reference must match a logged directory entry, or be
+                // the committed one.
+                let logged_entry = |dir: u64, index: u64| -> Result<Option<DirEntry>> {
+                    let Some(item) = top
+                        .items
+                        .iter()
+                        .find(|i| i.key == key(dir, DIR_INDEX_KEY, index))
+                    else {
+                        return Ok(None);
+                    };
+                    let mut entries = dir::parse_dir_items(&item.data)?;
+                    if entries.len() != 1 {
+                        return Err(Error::DirtyLog);
+                    }
+                    Ok(entries.pop())
+                };
+                let mut grown: BTreeMap<u64, i64> = BTreeMap::new();
+                let mut names: BTreeMap<u64, u32> = BTreeMap::new();
+                for &ino in created.iter().chain(exists_only.iter()) {
                     for r in top
                         .items
                         .iter()
                         .filter(|i| i.key.objectid == ino && i.key.key_type == INODE_REF_KEY)
                     {
+                        let parent = r.key.offset;
+                        let p = tree
+                            .search(root, &key(parent, INODE_ITEM_KEY, 0))?
+                            .ok_or(Error::DirtyLog)?;
+                        if !Inode::parse(&p.data, parent)?.is_dir() {
+                            return Err(Error::DirtyLog);
+                        }
+                        for (index, name) in ref_records(&r.data).ok_or(Error::DirtyLog)? {
+                            *names.entry(ino).or_default() += 1;
+                            if dirs.contains(&parent) {
+                                let entry = logged_entry(parent, index)?.ok_or(Error::DirtyLog)?;
+                                if entry.ino != ino || entry.name != name {
+                                    return Err(Error::DirtyLog);
+                                }
+                                continue;
+                            }
+                            if exists_only.contains(&ino) {
+                                // Named where the log does not speak for the
+                                // directory: the name must be the committed one.
+                                let committed =
+                                    tree.search(root, &r.key)?.ok_or(Error::DirtyLog)?;
+                                if !ref_records(&committed.data)
+                                    .ok_or(Error::DirtyLog)?
+                                    .contains(&(index, name))
+                                {
+                                    return Err(Error::DirtyLog);
+                                }
+                                continue;
+                            }
+                            let by_hash = key(parent, dir::DIR_ITEM_KEY, dir::name_hash(name));
+                            let by_index = key(parent, DIR_INDEX_KEY, index);
+                            if tree.search(root, &by_hash)?.is_some()
+                                || tree.search(root, &by_index)?.is_some()
+                            {
+                                return Err(Error::DirtyLog);
+                            }
+                            let entry = crate::namespace::dir_entry(
+                                ino,
+                                generation,
+                                dir::ftype::REG_FILE,
+                                name,
+                            );
+                            edits.push(put(by_hash, entry.clone()));
+                            edits.push(put(by_index, entry));
+                            *grown.entry(parent).or_default() += 2 * name.len() as i64;
+                        }
+                        edits.push(put(r.key, r.data.clone()));
+                    }
+                }
+                for &ino in &created {
+                    let logged = top.inode(ino)?.ok_or(Error::DirtyLog)?;
+                    if names.get(&ino).copied().unwrap_or(0) != logged.nlink || logged.nlink == 0 {
+                        return Err(Error::DirtyLog);
+                    }
+                }
+
+                // An inode logged only to say it exists keeps its committed
+                // item; its committed references the log replaces are dropped,
+                // and its link count is what its names now are.
+                for &ino in &exists_only {
+                    if top.extents(ino).next().is_some() {
+                        return Err(Error::DirtyLog);
+                    }
+                    let logged_parents: BTreeSet<u64> = top
+                        .items
+                        .iter()
+                        .filter(|i| i.key.objectid == ino && i.key.key_type == INODE_REF_KEY)
+                        .map(|i| i.key.offset)
+                        .collect();
+                    for c in tree.find_all(root, ino, INODE_REF_KEY)? {
+                        if !logged_parents.contains(&c.key.offset) {
+                            // A name in a directory the log does not mention.
+                            *names.entry(ino).or_default() +=
+                                ref_records(&c.data).ok_or(Error::DirtyLog)?.len() as u32;
+                        }
+                    }
+                    for item in top.items.iter().filter(|i| i.key.objectid == ino) {
+                        if !matches!(item.key.key_type, INODE_ITEM_KEY | INODE_REF_KEY) {
+                            return Err(Error::DirtyLog);
+                        }
+                    }
+                    let c = tree
+                        .search(root, &key(ino, INODE_ITEM_KEY, 0))?
+                        .ok_or(Error::DirtyLog)?;
+                    let nlink = names.get(&ino).copied().unwrap_or(0);
+                    if nlink == 0 || c.data.len() != INODE_ITEM_SIZE {
+                        return Err(Error::DirtyLog);
+                    }
+                    let mut raw = c.data.clone();
+                    raw[io::NLINK..io::NLINK + 4].copy_from_slice(&nlink.to_le_bytes());
+                    edits.push(put(key(ino, INODE_ITEM_KEY, 0), raw));
+                }
+
+                // Each directory the log speaks for.
+                let mut removed_inodes: BTreeSet<u64> = BTreeSet::new();
+                for &d in &dirs {
+                    let mut ranges = Vec::new();
+                    for item in top.items.iter().filter(|i| i.key.objectid == d) {
+                        match item.key.key_type {
+                            INODE_ITEM_KEY | INODE_REF_KEY | DIR_INDEX_KEY => {}
+                            DIR_LOG_INDEX_KEY if item.data.len() == 8 => {
+                                ranges.push((item.key.offset, le64(&item.data, 0)));
+                            }
+                            _ => return Err(Error::DirtyLog),
+                        }
+                    }
+                    for r in top
+                        .items
+                        .iter()
+                        .filter(|i| i.key.objectid == d && i.key.key_type == INODE_REF_KEY)
+                    {
                         if tree.search(root, &r.key)?.map(|c| c.data) != Some(r.data.clone()) {
                             return Err(Error::DirtyLog);
                         }
                     }
-                }
-                raw[io::NBYTES..io::NBYTES + 8].copy_from_slice(&nbytes.to_le_bytes());
-                edits.push(put(key(ino, INODE_ITEM_KEY, 0), raw));
-                for item in top.items.iter().filter(|i| i.key.objectid == ino) {
-                    if !matches!(
-                        item.key.key_type,
-                        INODE_ITEM_KEY | INODE_REF_KEY | EXTENT_DATA_KEY | dir::XATTR_ITEM_KEY
-                    ) {
-                        return Err(Error::DirtyLog);
-                    }
-                }
-                // Its extended attributes are the logged set (#379): each
-                // logged item is put as logged, and a committed one the log
-                // does not hold is deleted, as `replay_xattr_deletes` does.
-                let committed_xattrs: BTreeMap<u64, Vec<u8>> = tree
-                    .find_all(root, ino, dir::XATTR_ITEM_KEY)?
-                    .into_iter()
-                    .map(|i| (i.key.offset, i.data))
-                    .collect();
-                let logged_xattrs: BTreeMap<u64, &[u8]> = top
-                    .items
-                    .iter()
-                    .filter(|i| i.key.objectid == ino && i.key.key_type == dir::XATTR_ITEM_KEY)
-                    .map(|i| (i.key.offset, &i.data[..]))
-                    .collect();
-                for &hash in committed_xattrs.keys() {
-                    if !logged_xattrs.contains_key(&hash) {
-                        edits.push(ItemEdit::Delete(key(ino, dir::XATTR_ITEM_KEY, hash)));
-                    }
-                }
-                for (&hash, &data) in &logged_xattrs {
-                    if committed_xattrs.get(&hash).map(|c| &c[..]) != Some(data) {
-                        edits.push(put(key(ino, dir::XATTR_ITEM_KEY, hash), data.to_vec()));
-                    }
-                }
-            }
-
-            // Names. A created inode named in a directory the log does not
-            // speak for gets its entries from its reference; any other
-            // logged reference must match a logged directory entry, or be
-            // the committed one.
-            let logged_entry = |dir: u64, index: u64| -> Result<Option<DirEntry>> {
-                let Some(item) = top
-                    .items
-                    .iter()
-                    .find(|i| i.key == key(dir, DIR_INDEX_KEY, index))
-                else {
-                    return Ok(None);
-                };
-                let mut entries = dir::parse_dir_items(&item.data)?;
-                if entries.len() != 1 {
-                    return Err(Error::DirtyLog);
-                }
-                Ok(entries.pop())
-            };
-            let mut grown: BTreeMap<u64, i64> = BTreeMap::new();
-            let mut names: BTreeMap<u64, u32> = BTreeMap::new();
-            for &ino in created.iter().chain(exists_only.iter()) {
-                for r in top
-                    .items
-                    .iter()
-                    .filter(|i| i.key.objectid == ino && i.key.key_type == INODE_REF_KEY)
-                {
-                    let parent = r.key.offset;
-                    let p = tree
-                        .search(root, &key(parent, INODE_ITEM_KEY, 0))?
-                        .ok_or(Error::DirtyLog)?;
-                    if !Inode::parse(&p.data, parent)?.is_dir() {
-                        return Err(Error::DirtyLog);
-                    }
-                    for (index, name) in ref_records(&r.data).ok_or(Error::DirtyLog)? {
-                        *names.entry(ino).or_default() += 1;
-                        if dirs.contains(&parent) {
-                            let entry = logged_entry(parent, index)?.ok_or(Error::DirtyLog)?;
-                            if entry.ino != ino || entry.name != name {
+                    let in_range =
+                        |index: u64| ranges.iter().any(|&(a, b)| a <= index && index <= b);
+                    let mut delta: i64 = 0;
+                    // Committed names in a logged range that the log lacks.
+                    for c in tree.find_all(root, d, DIR_INDEX_KEY)? {
+                        if !in_range(c.key.offset) {
+                            continue;
+                        }
+                        if let Some(l) = top.items.iter().find(|i| i.key == c.key) {
+                            if l.data != c.data {
                                 return Err(Error::DirtyLog);
                             }
                             continue;
                         }
-                        if exists_only.contains(&ino) {
-                            // Named where the log does not speak for the
-                            // directory: the name must be the committed one.
-                            let committed = tree.search(root, &r.key)?.ok_or(Error::DirtyLog)?;
-                            if !ref_records(&committed.data)
-                                .ok_or(Error::DirtyLog)?
-                                .contains(&(index, name))
-                            {
+                        let mut entries = dir::parse_dir_items(&c.data)?;
+                        let (Some(entry), true) = (entries.pop(), entries.is_empty()) else {
+                            return Err(Error::DirtyLog);
+                        };
+                        if entry.location_type != INODE_ITEM_KEY {
+                            return Err(Error::DirtyLog);
+                        }
+                        let by_hash = key(d, dir::DIR_ITEM_KEY, dir::name_hash(&entry.name));
+                        let hashed = tree.search(root, &by_hash)?.ok_or(Error::DirtyLog)?;
+                        if hashed.data != c.data {
+                            return Err(Error::DirtyLog);
+                        }
+                        edits.push(ItemEdit::Delete(c.key));
+                        edits.push(ItemEdit::Delete(by_hash));
+                        delta -= 2 * entry.name.len() as i64;
+                        let child = entry.ino;
+                        if logged_inodes.contains(&child) {
+                            // A logged inode's names are its logged references.
+                            let logged_ref = top
+                                .items
+                                .iter()
+                                .find(|i| i.key == key(child, INODE_REF_KEY, d));
+                            let still = logged_ref
+                                .map(|r| {
+                                    ref_records(&r.data)
+                                        .unwrap_or_default()
+                                        .contains(&(c.key.offset, &entry.name[..]))
+                                })
+                                .unwrap_or(false);
+                            if still || !exists_only.contains(&child) {
                                 return Err(Error::DirtyLog);
                             }
                             continue;
                         }
-                        let by_hash = key(parent, dir::DIR_ITEM_KEY, dir::name_hash(name));
-                        let by_index = key(parent, DIR_INDEX_KEY, index);
-                        if tree.search(root, &by_hash)?.is_some()
-                            || tree.search(root, &by_index)?.is_some()
+                        // An inode the log does not hold, losing this name: only
+                        // its last, which deletes it with its data.
+                        let refs = tree.find_all(root, child, INODE_REF_KEY)?;
+                        let only = refs.len() == 1
+                            && refs[0].key.offset == d
+                            && ref_records(&refs[0].data).ok_or(Error::DirtyLog)?
+                                == vec![(c.key.offset, &entry.name[..])];
+                        let inode = tree
+                            .search(root, &key(child, INODE_ITEM_KEY, 0))?
+                            .ok_or(Error::DirtyLog)?;
+                        let inode = Inode::parse(&inode.data, child)?;
+                        if !only
+                            || !inode.is_regular_file()
+                            || inode.nlink != 1
+                            || !removed_inodes.insert(child)
                         {
                             return Err(Error::DirtyLog);
                         }
-                        let entry = crate::namespace::dir_entry(
-                            ino,
-                            generation,
-                            dir::ftype::REG_FILE,
-                            name,
-                        );
-                        edits.push(put(by_hash, entry.clone()));
-                        edits.push(put(by_index, entry));
-                        *grown.entry(parent).or_default() += 2 * name.len() as i64;
-                    }
-                    edits.push(put(r.key, r.data.clone()));
-                }
-            }
-            for &ino in &created {
-                let logged = top.inode(ino)?.ok_or(Error::DirtyLog)?;
-                if names.get(&ino).copied().unwrap_or(0) != logged.nlink || logged.nlink == 0 {
-                    return Err(Error::DirtyLog);
-                }
-            }
-
-            // An inode logged only to say it exists keeps its committed
-            // item; its committed references the log replaces are dropped,
-            // and its link count is what its names now are.
-            for &ino in &exists_only {
-                if top.extents(ino).next().is_some() {
-                    return Err(Error::DirtyLog);
-                }
-                let logged_parents: BTreeSet<u64> = top
-                    .items
-                    .iter()
-                    .filter(|i| i.key.objectid == ino && i.key.key_type == INODE_REF_KEY)
-                    .map(|i| i.key.offset)
-                    .collect();
-                for c in tree.find_all(root, ino, INODE_REF_KEY)? {
-                    if !logged_parents.contains(&c.key.offset) {
-                        // A name in a directory the log does not mention.
-                        *names.entry(ino).or_default() +=
-                            ref_records(&c.data).ok_or(Error::DirtyLog)?.len() as u32;
-                    }
-                }
-                for item in top.items.iter().filter(|i| i.key.objectid == ino) {
-                    if !matches!(item.key.key_type, INODE_ITEM_KEY | INODE_REF_KEY) {
-                        return Err(Error::DirtyLog);
-                    }
-                }
-                let c = tree
-                    .search(root, &key(ino, INODE_ITEM_KEY, 0))?
-                    .ok_or(Error::DirtyLog)?;
-                let nlink = names.get(&ino).copied().unwrap_or(0);
-                if nlink == 0 || c.data.len() != INODE_ITEM_SIZE {
-                    return Err(Error::DirtyLog);
-                }
-                let mut raw = c.data.clone();
-                raw[io::NLINK..io::NLINK + 4].copy_from_slice(&nlink.to_le_bytes());
-                edits.push(put(key(ino, INODE_ITEM_KEY, 0), raw));
-            }
-
-            // Each directory the log speaks for.
-            let mut removed_inodes: BTreeSet<u64> = BTreeSet::new();
-            for &d in &dirs {
-                let mut ranges = Vec::new();
-                for item in top.items.iter().filter(|i| i.key.objectid == d) {
-                    match item.key.key_type {
-                        INODE_ITEM_KEY | INODE_REF_KEY | DIR_INDEX_KEY => {}
-                        DIR_LOG_INDEX_KEY if item.data.len() == 8 => {
-                            ranges.push((item.key.offset, le64(&item.data, 0)));
+                        let summed = inode.flags & INODE_NODATASUM == 0;
+                        for kind in [
+                            INODE_ITEM_KEY,
+                            INODE_REF_KEY,
+                            dir::XATTR_ITEM_KEY,
+                            EXTENT_DATA_KEY,
+                        ] {
+                            for item in tree.find_all(root, child, kind)? {
+                                if let Some(r) = (kind == EXTENT_DATA_KEY)
+                                    .then(|| file_ref(item.key.offset, &item.data))
+                                    .flatten()
+                                {
+                                    ledger.change(r, subvol, child, -1, summed, last_snapshot)?;
+                                }
+                                edits.push(ItemEdit::Delete(item.key));
+                            }
                         }
-                        _ => return Err(Error::DirtyLog),
+                        for kind in [13u8, 48] {
+                            // Extended references and orphan items are not
+                            // deleted here.
+                            if !tree.find_all(root, child, kind)?.is_empty() {
+                                return Err(Error::DirtyLog);
+                            }
+                        }
                     }
-                }
-                for r in top
-                    .items
-                    .iter()
-                    .filter(|i| i.key.objectid == d && i.key.key_type == INODE_REF_KEY)
-                {
-                    if tree.search(root, &r.key)?.map(|c| c.data) != Some(r.data.clone()) {
-                        return Err(Error::DirtyLog);
-                    }
-                }
-                let in_range = |index: u64| ranges.iter().any(|&(a, b)| a <= index && index <= b);
-                let mut delta: i64 = 0;
-                // Committed names in a logged range that the log lacks.
-                for c in tree.find_all(root, d, DIR_INDEX_KEY)? {
-                    if !in_range(c.key.offset) {
-                        continue;
-                    }
-                    if let Some(l) = top.items.iter().find(|i| i.key == c.key) {
-                        if l.data != c.data {
+                    // Logged names the directory lacks.
+                    for item in top
+                        .items
+                        .iter()
+                        .filter(|i| i.key.objectid == d && i.key.key_type == DIR_INDEX_KEY)
+                    {
+                        if !in_range(item.key.offset) {
                             return Err(Error::DirtyLog);
                         }
-                        continue;
-                    }
-                    let mut entries = dir::parse_dir_items(&c.data)?;
-                    let (Some(entry), true) = (entries.pop(), entries.is_empty()) else {
-                        return Err(Error::DirtyLog);
-                    };
-                    if entry.location_type != INODE_ITEM_KEY {
-                        return Err(Error::DirtyLog);
-                    }
-                    let by_hash = key(d, dir::DIR_ITEM_KEY, dir::name_hash(&entry.name));
-                    let hashed = tree.search(root, &by_hash)?.ok_or(Error::DirtyLog)?;
-                    if hashed.data != c.data {
-                        return Err(Error::DirtyLog);
-                    }
-                    edits.push(ItemEdit::Delete(c.key));
-                    edits.push(ItemEdit::Delete(by_hash));
-                    delta -= 2 * entry.name.len() as i64;
-                    let child = entry.ino;
-                    if logged_inodes.contains(&child) {
-                        // A logged inode's names are its logged references.
-                        let logged_ref = top
+                        if tree.search(root, &item.key)?.is_some() {
+                            continue;
+                        }
+                        let entry = logged_entry(d, item.key.offset)?.ok_or(Error::DirtyLog)?;
+                        // Its inode must be one the log holds and names here.
+                        let named = top
                             .items
                             .iter()
-                            .find(|i| i.key == key(child, INODE_REF_KEY, d));
-                        let still = logged_ref
+                            .find(|i| i.key == key(entry.ino, INODE_REF_KEY, d))
                             .map(|r| {
                                 ref_records(&r.data)
                                     .unwrap_or_default()
-                                    .contains(&(c.key.offset, &entry.name[..]))
+                                    .contains(&(item.key.offset, &entry.name[..]))
                             })
                             .unwrap_or(false);
-                        if still || !exists_only.contains(&child) {
+                        if !named || entry.location_type != INODE_ITEM_KEY {
                             return Err(Error::DirtyLog);
                         }
-                        continue;
+                        let by_hash = key(d, dir::DIR_ITEM_KEY, dir::name_hash(&entry.name));
+                        if tree.search(root, &by_hash)?.is_some() {
+                            return Err(Error::DirtyLog);
+                        }
+                        edits.push(put(by_hash, item.data.clone()));
+                        edits.push(put(item.key, item.data.clone()));
+                        delta += 2 * entry.name.len() as i64;
                     }
-                    // An inode the log does not hold, losing this name: only
-                    // its last, which deletes it with its data.
-                    let refs = tree.find_all(root, child, INODE_REF_KEY)?;
-                    let only = refs.len() == 1
-                        && refs[0].key.offset == d
-                        && ref_records(&refs[0].data).ok_or(Error::DirtyLog)?
-                            == vec![(c.key.offset, &entry.name[..])];
-                    let inode = tree
-                        .search(root, &key(child, INODE_ITEM_KEY, 0))?
+                    let at = key(d, INODE_ITEM_KEY, 0);
+                    let c = tree.search(root, &at)?.ok_or(Error::DirtyLog)?;
+                    let before = Inode::parse(&c.data, d)?;
+                    let logged = top
+                        .items
+                        .iter()
+                        .find(|i| i.key == at)
                         .ok_or(Error::DirtyLog)?;
-                    let inode = Inode::parse(&inode.data, child)?;
-                    if !only
-                        || !inode.is_regular_file()
-                        || inode.nlink != 1
-                        || !removed_inodes.insert(child)
+                    let after = Inode::parse(&logged.data, d)?;
+                    if logged.data.len() != INODE_ITEM_SIZE
+                        || before.size.checked_add_signed(delta) != Some(after.size)
+                        || before.nlink != after.nlink
+                        || before.generation != after.generation
+                        || before.flags != after.flags
+                        || grown.contains_key(&d)
                     {
                         return Err(Error::DirtyLog);
                     }
-                    let summed = inode.flags & INODE_NODATASUM == 0;
-                    for kind in [
-                        INODE_ITEM_KEY,
-                        INODE_REF_KEY,
-                        dir::XATTR_ITEM_KEY,
-                        EXTENT_DATA_KEY,
-                    ] {
-                        for item in tree.find_all(root, child, kind)? {
-                            if let Some(r) = (kind == EXTENT_DATA_KEY)
-                                .then(|| file_ref(item.key.offset, &item.data))
-                                .flatten()
-                            {
-                                ledger.change(r, child, -1, summed)?;
+                    let mut data = logged.data.clone();
+                    data[io::NBYTES..io::NBYTES + 8].copy_from_slice(&before.nbytes.to_le_bytes());
+                    edits.push(put(at, data));
+                }
+                // A renamed inode must have lost every name its logged
+                // references no longer hold.
+                for &ino in &exists_only {
+                    for c in tree.find_all(root, ino, INODE_REF_KEY)? {
+                        let Some(l) = top.items.iter().find(|i| i.key == c.key) else {
+                            continue;
+                        };
+                        let kept = ref_records(&l.data).ok_or(Error::DirtyLog)?;
+                        for (index, name) in ref_records(&c.data).ok_or(Error::DirtyLog)? {
+                            if kept.contains(&(index, name)) {
+                                continue;
                             }
-                            edits.push(ItemEdit::Delete(item.key));
-                        }
-                    }
-                    for kind in [13u8, 48] {
-                        // Extended references and orphan items are not
-                        // deleted here.
-                        if !tree.find_all(root, child, kind)?.is_empty() {
-                            return Err(Error::DirtyLog);
+                            let gone = dirs.contains(&c.key.offset)
+                                && top
+                                    .items
+                                    .iter()
+                                    .filter(|i| {
+                                        i.key.objectid == c.key.offset
+                                            && i.key.key_type == DIR_LOG_INDEX_KEY
+                                    })
+                                    .any(|i| i.key.offset <= index && index <= le64(&i.data, 0))
+                                && logged_entry(c.key.offset, index)?.is_none();
+                            if !gone {
+                                return Err(Error::DirtyLog);
+                            }
                         }
                     }
                 }
-                // Logged names the directory lacks.
-                for item in top
-                    .items
-                    .iter()
-                    .filter(|i| i.key.objectid == d && i.key.key_type == DIR_INDEX_KEY)
-                {
-                    if !in_range(item.key.offset) {
-                        return Err(Error::DirtyLog);
-                    }
-                    if tree.search(root, &item.key)?.is_some() {
-                        continue;
-                    }
-                    let entry = logged_entry(d, item.key.offset)?.ok_or(Error::DirtyLog)?;
-                    // Its inode must be one the log holds and names here.
-                    let named = top
-                        .items
-                        .iter()
-                        .find(|i| i.key == key(entry.ino, INODE_REF_KEY, d))
-                        .map(|r| {
-                            ref_records(&r.data)
-                                .unwrap_or_default()
-                                .contains(&(item.key.offset, &entry.name[..]))
-                        })
-                        .unwrap_or(false);
-                    if !named || entry.location_type != INODE_ITEM_KEY {
-                        return Err(Error::DirtyLog);
-                    }
-                    let by_hash = key(d, dir::DIR_ITEM_KEY, dir::name_hash(&entry.name));
-                    if tree.search(root, &by_hash)?.is_some() {
-                        return Err(Error::DirtyLog);
-                    }
-                    edits.push(put(by_hash, item.data.clone()));
-                    edits.push(put(item.key, item.data.clone()));
-                    delta += 2 * entry.name.len() as i64;
+                // Each parent the log does not speak for, by its new names.
+                for (parent, added) in grown {
+                    let at = key(parent, INODE_ITEM_KEY, 0);
+                    let mut raw = tree.search(root, &at)?.ok_or(Error::DirtyLog)?.data;
+                    let size = le64(&raw, io::SIZE)
+                        .checked_add_signed(added)
+                        .ok_or(Error::DirtyLog)?;
+                    raw[io::SIZE..io::SIZE + 8].copy_from_slice(&size.to_le_bytes());
+                    edits.push(put(at, raw));
                 }
-                let at = key(d, INODE_ITEM_KEY, 0);
-                let c = tree.search(root, &at)?.ok_or(Error::DirtyLog)?;
-                let before = Inode::parse(&c.data, d)?;
-                let logged = top
-                    .items
-                    .iter()
-                    .find(|i| i.key == at)
-                    .ok_or(Error::DirtyLog)?;
-                let after = Inode::parse(&logged.data, d)?;
-                if logged.data.len() != INODE_ITEM_SIZE
-                    || before.size.checked_add_signed(delta) != Some(after.size)
-                    || before.nlink != after.nlink
-                    || before.generation != after.generation
-                    || before.flags != after.flags
-                    || grown.contains_key(&d)
+                let mut seen = BTreeSet::new();
+                if !edits.iter().all(|e| {
+                    let k = e.key();
+                    seen.insert((k.objectid, k.key_type, k.offset))
+                }) || edits.is_empty()
                 {
                     return Err(Error::DirtyLog);
                 }
-                let mut data = logged.data.clone();
-                data[io::NBYTES..io::NBYTES + 8].copy_from_slice(&before.nbytes.to_le_bytes());
-                edits.push(put(at, data));
-            }
-            // A renamed inode must have lost every name its logged
-            // references no longer hold.
-            for &ino in &exists_only {
-                for c in tree.find_all(root, ino, INODE_REF_KEY)? {
-                    let Some(l) = top.items.iter().find(|i| i.key == c.key) else {
-                        continue;
-                    };
-                    let kept = ref_records(&l.data).ok_or(Error::DirtyLog)?;
-                    for (index, name) in ref_records(&c.data).ok_or(Error::DirtyLog)? {
-                        if kept.contains(&(index, name)) {
-                            continue;
-                        }
-                        let gone = dirs.contains(&c.key.offset)
-                            && top
-                                .items
-                                .iter()
-                                .filter(|i| {
-                                    i.key.objectid == c.key.offset
-                                        && i.key.key_type == DIR_LOG_INDEX_KEY
-                                })
-                                .any(|i| i.key.offset <= index && index <= le64(&i.data, 0))
-                            && logged_entry(c.key.offset, index)?.is_none();
-                        if !gone {
-                            return Err(Error::DirtyLog);
-                        }
-                    }
+
+                if subvol == objectid::FS_TREE {
+                    fs_edits.extend(edits);
+                } else {
+                    tree_edits.extend(edits.into_iter().map(|e| (subvol, e)));
                 }
-            }
-            // Each parent the log does not speak for, by its new names.
-            for (parent, added) in grown {
-                let at = key(parent, INODE_ITEM_KEY, 0);
-                let mut raw = tree.search(root, &at)?.ok_or(Error::DirtyLog)?.data;
-                let size = le64(&raw, io::SIZE)
-                    .checked_add_signed(added)
-                    .ok_or(Error::DirtyLog)?;
-                raw[io::SIZE..io::SIZE + 8].copy_from_slice(&size.to_le_bytes());
-                edits.push(put(at, raw));
-            }
-            let mut seen = BTreeSet::new();
-            if !edits.iter().all(|e| {
-                let k = e.key();
-                seen.insert((k.objectid, k.key_type, k.offset))
-            }) || edits.is_empty()
-            {
-                return Err(Error::DirtyLog);
             }
 
             // Log blocks have no extent-tree allocation. Pin all of
             // them until the same commit both installs the replay and
             // clears the log, preserving recovery after a crash.
-            let mut stack = vec![log.log_root, top.root];
+            let mut stack = vec![log.log_root];
+            stack.extend(log.trees.iter().map(|t| t.root));
             let mut seen = BTreeSet::new();
             while let Some(at) = stack.pop() {
                 if !seen.insert(at) {
@@ -980,7 +1035,7 @@ impl Filesystem {
                     .map(|i| i.data);
                 let mut body = match &before {
                     Some(b) => {
-                        if b.len() < 24 || le64(b, 8) <= last_snapshot {
+                        if b.len() < 24 || le64(b, 8) <= ext.last_snapshot {
                             return Err(Error::DirtyLog);
                         }
                         b.clone()
@@ -1003,8 +1058,11 @@ impl Filesystem {
                     for r in &refs {
                         let fields = |at: usize| le64(&r.payload, at);
                         let ours = r.kind == EXTENT_DATA_REF
-                            && fields(0) == objectid::FS_TREE
-                            && ext.refs.get(&(fields(8), fields(16))).copied().unwrap_or(0)
+                            && ext
+                                .refs
+                                .get(&(fields(0), fields(8), fields(16)))
+                                .copied()
+                                .unwrap_or(0)
                                 == -i64::from(u32::from_le_bytes(
                                     r.payload[24..28].try_into().expect("28-byte payload"),
                                 ));
@@ -1017,23 +1075,23 @@ impl Filesystem {
                 } else {
                     // Every reference added before any is dropped, so a drop
                     // never meets an extent's last reference.
-                    for (&(ino, offset), &d) in &ext.refs {
+                    for (&(tree_id, ino, offset), &d) in &ext.refs {
                         for _ in 0..d.max(0) {
                             body = backref::add_inline_data_ref(
                                 EXTENT_ITEM,
                                 &body,
-                                objectid::FS_TREE,
+                                tree_id,
                                 ino,
                                 offset,
                             )?;
                         }
                     }
-                    for (&(ino, offset), &d) in &ext.refs {
+                    for (&(tree_id, ino, offset), &d) in &ext.refs {
                         for _ in 0..(-d).max(0) {
                             body = backref::drop_inline_data_ref(
                                 EXTENT_ITEM,
                                 &body,
-                                objectid::FS_TREE,
+                                tree_id,
                                 ino,
                                 offset,
                             )?
@@ -1106,7 +1164,8 @@ impl Filesystem {
         self.commit_write_with(
             DataWrite {
                 root: objectid::FS_TREE,
-                edits,
+                edits: fs_edits,
+                tree_edits,
                 csum_edits,
                 records,
                 ..Default::default()

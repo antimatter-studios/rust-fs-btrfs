@@ -139,6 +139,8 @@ artefacts_for() {
             echo dirtylog/btrfs-dirty-log-sizechange.logdump
             echo dirtylog/btrfs-dirty-log-xattr.img
             echo dirtylog/btrfs-dirty-log-xattr.logdump
+            echo dirtylog/btrfs-dirty-log-subvol.img
+            echo dirtylog/btrfs-dirty-log-subvol.logdump
             ;;
         cli)
             echo cli/btrfs-cli.img; echo cli/btrfs-cli.superdump; echo cli/btrfs-cli.manifest

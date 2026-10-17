@@ -1211,6 +1211,7 @@ build_dirtylog() {
     build_dirtylog_refused externalextent 'compress=no,max_inline=0' externalextent
     build_dirtylog_refused sizechange 'compress=no,max_inline=2048' sizechange
     build_dirtylog_refused xattr 'compress=no,max_inline=2048' xattr
+    build_dirtylog_refused subvol 'compress=no,max_inline=2048' subvol
 }
 
 # fsync_path <path> — fsync one file or directory, and nothing else.
@@ -1360,6 +1361,11 @@ build_dirtylog_refused() {
             printf 'committed-inline-bytes-0123456789' > "$MNT/f" ;;
         externalextent)
             head -c 8192 /dev/zero | tr '\0' 'c' > "$MNT/f" ;;
+        subvol)
+            # A file in the top level and one in a subvolume, committed.
+            btrfs subvolume create "$MNT/sv" >/dev/null
+            printf 'committed-inline-bytes-0123456789' > "$MNT/f"
+            printf 'committed-inline-bytes-0123456789' > "$MNT/sv/g" ;;
         xattr)
             # Two attributes committed: one the log changes, one it removes.
             printf 'committed-inline-bytes-0123456789' > "$MNT/f"
@@ -1375,6 +1381,19 @@ if kind == "sizechange":
     os.pwrite(fd, b"replayed-and-longer-inline-bytes-0123456789", 0)
 elif kind == "externalextent":
     os.pwrite(fd, b"r" * 8192, 0)
+elif kind == "subvol":
+    # Both subvolumes change after the commit, so the log root tree names
+    # a log tree for each: f in the top level and g in the subvolume are
+    # rewritten in place, and a file is created in the subvolume.
+    os.pwrite(fd, b"replayed-inline-bytes-ABCDEFGHIJK", 0)
+    g = os.open(d + "/sv/g", os.O_WRONLY)
+    os.pwrite(g, b"replayed-inline-bytes-ABCDEFGHIJK", 0)
+    os.fsync(g)
+    os.close(g)
+    n = os.open(d + "/sv/new", os.O_WRONLY | os.O_CREAT, 0o644)
+    os.write(n, b"created in the subvolume\n")
+    os.fsync(n)
+    os.close(n)
 elif kind == "xattr":
     # Changed, removed and added after the commit; the data is untouched.
     os.setxattr(d + "/f", "user.keep", b"changed after the commit")
@@ -1423,6 +1442,7 @@ want = {
     'externalextent': r'type 1 \(regular\)|extent data disk byte [1-9]',
     'sizechange': r'inline extent data size 4[0-9]',
     'xattr': r'XATTR_ITEM',
+    'subvol': r'TREE_LOG ROOT_ITEM 25[6-9]',
 }[kind]
 assert re.search(want, dump), (kind, 'native dump does not show the unsupported shape')
 if kind == 'compressedinline':
