@@ -58,6 +58,8 @@ cli_label_kernel          2
 cli_mkfs_kernel           5
 cli_oracle                3
 cli_resize_kernel         3
+# One kernel stat case compares 17 paths, including nested subvolumes (#412).
+cli_stat_kernel           1
 cli_write_kernel          1
 clone_kernel              1
 commit_order              3
@@ -97,7 +99,8 @@ kernel_readback           2
 leaf_edit_oracle          3
 leaf_split                1
 leaf_split_oracle         1
-lib                       233
+# The whole-suite counter includes the CLI inode flag unit case (#412).
+lib                       234
 log_tree_kernel           21
 lookup_by_name_key        1
 namespace_kernel          2

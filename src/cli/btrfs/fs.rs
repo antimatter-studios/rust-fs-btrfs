@@ -1,7 +1,7 @@
 //! `fs.btrfs <target> <verb>`: an errand inside a Btrfs image or device,
 //! without mounting it.
 //!
-//! The verbs are the shared set: `ls`, `read`, `write`, `mkdir`,
+//! The verbs are the shared set: `ls`, `stat`, `read`, `write`, `mkdir`,
 //! `get`/`info`, `set`, `resize`. Metadata is JSON (or `--text`); file
 //! content is raw bytes. A verb the library cannot do yet still exists and
 //! answers `not implemented` with exit status 3, so a script moved between
@@ -100,6 +100,24 @@ fn command() -> Cmd {
                     "Examples:\n  fs.btrfs disk.img ls /home\n  \
                      fs.btrfs disk.img ls / | jq -r '.[] | select(.subvolume) | .name'\n  \
                      fs.btrfs disk.img ls --text /",
+                ),
+        )
+        .subcommand(
+            Cmd::new("stat")
+                .about("Report one path: identity, type, mode, owner, links, sizes and every time")
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .after_help(
+                    "Examples:\n  fs.btrfs disk.img stat /etc/hostname\n  \
+                     fs.btrfs disk.img stat /sub/notes.txt | jq .btrfs.subvolume\n  \
+                     fs.btrfs disk.img stat --text /bin/sh\n\n\
+                     A symlink is reported, not followed. Times are signed seconds since \
+                     the epoch plus nanoseconds. The compression property is null when \
+                     absent; it does not describe the compression of each data extent.",
                 ),
         )
         .subcommand(
@@ -376,6 +394,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         .unwrap_or(0);
     match verb {
         "ls" => ls(&device::mount(target, offset)?, path_arg(sub)),
+        "stat" => stat(&device::mount(target, offset)?, path_arg(sub)),
         "read" => read(
             &device::mount(target, offset)?,
             path_arg(sub),
@@ -797,6 +816,116 @@ fn ls(root: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
     Ok(Outcome::report(Json::Arr(entries)).with_text(text))
 }
 
+/// The on-disk inode flags, with unknown bits preserved by `flag_names`.
+const INODE_FLAGS: &[(u64, &str)] = &[
+    (fs_btrfs::inode::INODE_NODATASUM, "NODATASUM"),
+    (fs_btrfs::inode::INODE_NODATACOW, "NODATACOW"),
+    (1 << 2, "READONLY"),
+    (1 << 3, "NOCOMPRESS"),
+    (1 << 4, "PREALLOC"),
+    (1 << 5, "SYNC"),
+    (1 << 6, "IMMUTABLE"),
+    (1 << 7, "APPEND"),
+    (1 << 8, "NODUMP"),
+    (1 << 9, "NOATIME"),
+    (1 << 10, "DIRSYNC"),
+    (1 << 11, "COMPRESS"),
+    (1 << 31, "ROOT_ITEM_INIT"),
+    (fs_btrfs::verity::INODE_RO_VERITY, "RO_VERITY"),
+];
+
+#[cfg(test)]
+#[test]
+fn inode_flags_keep_names_and_unknown_bits() {
+    assert_eq!(flag_names(0, INODE_FLAGS), Json::Arr(Vec::new()));
+    assert_eq!(
+        flag_names((1 << 0) | (1 << 1) | (1 << 11) | (1 << 60), INODE_FLAGS),
+        Json::Arr(vec![
+            Json::from("NODATASUM"),
+            Json::from("NODATACOW"),
+            Json::from("COMPRESS"),
+            Json::from("0x1000000000000000"),
+        ])
+    );
+}
+
+/// One path's metadata, with the shared keys first and Btrfs's own last.
+/// Resolve through subvolumes before reading attributes or a symlink's target.
+fn stat(root: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
+    let found = root
+        .resolve_path_bytes(path)
+        .map_err(|e| btrfs_error(path, e))?;
+    let fs = found.fs(root);
+    let inode = &found.inode;
+    let subvolume = fs.subvolume_at(b"/").map_err(|e| btrfs_error(path, e))?;
+    let compression = fs
+        .get_xattr(inode.ino, b"btrfs.compression")
+        .map_err(|e| btrfs_error(path, e))?;
+    // The kernel's stat accounts in whole filesystem sectors, including
+    // inline data; nbytes itself can hold a partial sector.
+    let sector = u64::from(fs.superblock().sectorsize);
+    let allocated = inode
+        .nbytes
+        .checked_add(sector - 1)
+        .ok_or_else(|| CliError::failed(format!("{}: allocated size overflows", show(path))))?
+        & !(sector - 1);
+    let mut fields = vec![("path", Json::from(show(path)))];
+    if std::str::from_utf8(path).is_err() {
+        fields.push((
+            "path_hex",
+            Json::from(path.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        ));
+    }
+    fields.extend([
+        ("inode", Json::from(inode.ino)),
+        ("type", Json::from(type_name(inode.file_type()))),
+        ("mode", Json::from(format!("{:04o}", inode.permissions()))),
+        ("uid", Json::from(inode.uid)),
+        ("gid", Json::from(inode.gid)),
+        ("nlink", Json::from(inode.nlink)),
+        ("size", Json::from(inode.size)),
+        ("allocated_bytes", Json::from(allocated)),
+        ("atime", Json::from(inode.atime.sec)),
+        ("atime_nsec", Json::from(inode.atime.nsec)),
+        ("mtime", Json::from(inode.mtime.sec)),
+        ("mtime_nsec", Json::from(inode.mtime.nsec)),
+        ("ctime", Json::from(inode.ctime.sec)),
+        ("ctime_nsec", Json::from(inode.ctime.nsec)),
+        ("btime", Json::from(inode.otime.sec)),
+        ("btime_nsec", Json::from(inode.otime.nsec)),
+    ]);
+    match inode.file_type() {
+        Some(FileType::Symlink) => fields.push((
+            "target",
+            Json::from(
+                fs.read_link(inode.ino)
+                    .map(|t| show(&t))
+                    .map_err(|e| btrfs_error(path, e))?,
+            ),
+        )),
+        Some(FileType::CharDevice | FileType::BlockDevice) => {
+            fields.push(("major", Json::from((inode.rdev >> 8) & 0xfff)));
+            fields.push((
+                "minor",
+                Json::from((inode.rdev & 0xff) | ((inode.rdev >> 12) & 0xf_ff00)),
+            ));
+        }
+        _ => {}
+    }
+    fields.push((
+        "btrfs",
+        Json::object([
+            ("subvolume", Json::from(subvolume)),
+            ("flags", flag_names(inode.flags, INODE_FLAGS)),
+            ("generation", Json::from(inode.generation)),
+            ("transid", Json::from(inode.transid)),
+            ("sequence", Json::from(inode.sequence)),
+            ("compression", Json::from(compression.map(|v| show(&v)))),
+        ]),
+    ));
+    Ok(Outcome::report(Json::object(fields)))
+}
+
 /// Stream a regular file's bytes. Each chunk is read before it is
 /// written, so a file whose blocks turn out unreadable part-way stops with
 /// status 1 and what came before stays on stdout; everything that can be
@@ -895,8 +1024,8 @@ pub fn csum_name(t: ChecksumType) -> &'static str {
     }
 }
 
-/// The names of the bits set in `bits`, lowercase, as btrfs-progs spells
-/// them; a bit this table does not know is given in hex.
+/// The names of the bits set in `bits`, spelled as the table says;
+/// a bit this table does not know is given in hex.
 fn flag_names(bits: u64, table: &[(u64, &str)]) -> Json {
     let mut names = Vec::new();
     let mut known = 0u64;
