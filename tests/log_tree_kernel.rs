@@ -1222,6 +1222,61 @@ fn a_log_creating_directories_replays_as_the_kernel_does() {
     replays_as_the_kernel_does(NEWDIR_FIXTURE, "dirtylog-newdir");
 }
 
+/// A symbolic link `l` made after the last commit, durable by an fsync of
+/// `/` alone (#404). The committed trees do not hold it; the log holds
+/// `/`'s new entry, the link's inode item, its reference and the inline
+/// extent that holds its target. The kernel's replay of the same crash
+/// image is the oracle, down to the target each copy reads back.
+#[test]
+fn a_log_creating_a_symlink_replays_as_the_kernel_does() {
+    const SYMLINK_FIXTURE: &str = "dirtylog/btrfs-dirty-log-symlink.img";
+    let image = fixture(SYMLINK_FIXTURE);
+    let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-symlink.logdump"))
+        .expect("the native transcript of the symlink log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the symlink fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        assert!(
+            fs.lookup_path("/l").is_err(),
+            "/l was made after the commit, so the committed trees should not hold it"
+        );
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        let ino = top
+            .inode_named(256, b"l")
+            .unwrap_or_else(|| panic!("the log names no l in /: {keys:?}"));
+        let logged = top
+            .inode(ino)
+            .unwrap()
+            .unwrap_or_else(|| panic!("the log holds no inode item for l: {keys:?}"));
+        assert!(
+            logged.is_symlink(),
+            "the log's l is not a symbolic link: {logged:?}"
+        );
+        assert!(
+            top.items
+                .iter()
+                .any(|i| (i.key.objectid, i.key.key_type, i.key.offset)
+                    == (ino, fs_btrfs::fs::EXTENT_DATA_KEY, 0)),
+            "the log holds no extent for the target of l: {keys:?}"
+        );
+    }
+    replays_as_the_kernel_does(SYMLINK_FIXTURE, "dirtylog-symlink");
+}
+
 /// The inline writer's encoding fields are checked against the native
 /// tools, not against our own parser. `dump-tree` prints an inline file
 /// extent's data size, `ram_bytes` and compression; the raw item must hold
