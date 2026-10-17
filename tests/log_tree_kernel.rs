@@ -18,7 +18,7 @@ use fs_btrfs::inode::{INODE_ITEM_KEY, INODE_REF_KEY};
 use fs_btrfs::log_tree::{LoggedTree, DIR_LOG_INDEX_KEY};
 use fs_btrfs::Error;
 use fs_btrfs_test_support::{
-    assert_btrfs_check_clean, fixture, guest_kernel_read_ok, guest_kernel_report,
+    assert_btrfs_check_clean, dump_tree, fixture, guest_kernel_read_ok, guest_kernel_report,
     guest_kernel_write_ok, oracle, temp_path,
 };
 use fs_core::{BlockDevice, BlockRead, FileDevice};
@@ -820,18 +820,39 @@ fn a_log_whose_data_disagrees_with_its_checksums_is_refused_without_writing() {
             .expect("the log holds new.bin's extent");
         let logical = u64::from_le_bytes(extent.data[21..29].try_into().unwrap());
         drop(fs);
-        // Where the extent is on the device, from the native tool.
-        let out = oracle("btrfs-map-logical")
-            .args(["-l", &logical.to_string()])
-            .arg(copy)
-            .output();
-        let text = String::from_utf8_lossy(&out.stdout);
-        let physical: u64 = text
-            .split_whitespace()
-            .skip_while(|w| *w != "physical")
-            .nth(1)
-            .and_then(|w| w.parse().ok())
-            .unwrap_or_else(|| panic!("btrfs-map-logical names no physical offset: {text}"));
+        // Where the extent is on the device, from the native tool's dump
+        // of the chunk tree: the chunk holding it, and that chunk's one
+        // stripe on this single-device volume.
+        let chunks = dump_tree(copy, "chunk");
+        let (mut start, mut length) = (None, None);
+        let mut physical = None;
+        for line in chunks.lines() {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let after = |name: &str| {
+                words
+                    .iter()
+                    .position(|w| *w == name)
+                    .and_then(|at| words.get(at + 1))
+                    .and_then(|w| w.trim_end_matches(')').parse::<u64>().ok())
+            };
+            if line.contains("CHUNK_ITEM") {
+                start = after("CHUNK_ITEM");
+                length = None;
+            } else if let Some(n) = after("length") {
+                length = Some(n);
+            } else if let (Some(true), Some(offset), Some(s), Some(len)) = (
+                line.trim_start().starts_with("stripe 0").then_some(true),
+                after("offset"),
+                start,
+                length,
+            ) {
+                if (s..s + len).contains(&logical) {
+                    physical = Some(offset + (logical - s));
+                }
+            }
+        }
+        let physical = physical
+            .unwrap_or_else(|| panic!("no chunk in the dump holds logical {logical}:\n{chunks}"));
         let mut bytes = std::fs::read(copy).unwrap();
         bytes[physical as usize] ^= 0xff;
         std::fs::write(copy, bytes).unwrap();
