@@ -500,6 +500,8 @@ tasks:
       # that name removed and / alone fsynced, which leaves the file
       # unlogged for replay to delete
       - test-disks/dirtylog/btrfs-dirty-log-extrefremoved.img
+      # a sector written inside a committed compressed extent, fsynced
+      - test-disks/dirtylog/btrfs-dirty-log-compressedcut.img
       # the volume the command-line tools are tested against, labelled
       # CLITEST, with a manifest of what the kernel wrote into it
       - test-disks/cli/btrfs-cli.img
