@@ -123,6 +123,10 @@ struct Target {
     /// length to the inode's `nbytes` (#261). Explicit hole items are
     /// trimmed or split around the copy on a volume without NO_HOLES.
     hole: bool,
+    /// The length of the inline data this target's copy replaces, which
+    /// leaves the inode's `nbytes` as the copy's length is added (#422);
+    /// zero for every other target.
+    inline: u64,
 }
 
 /// One extent of a write's copies: a whole item's copy, or one unit of a
@@ -176,10 +180,37 @@ impl Filesystem {
         if inode.flags & INODE_NODATACOW != 0 {
             return self.write_at(ino, offset, data);
         }
-        self.write_cow(&inode, offset, data)
+        self.write_cow(&inode, offset, data, false)
     }
 
-    fn write_cow(&mut self, inode: &Inode, offset: u64, data: &[u8]) -> Result<usize> {
+    /// Write `data` at `offset` in a copy-on-write file whose data is
+    /// inline, moving that data into a regular extent at offset 0 that
+    /// holds it, the write, and zeros to the end of the sector the write
+    /// ends in, as the kernel does when inline data outgrows its item
+    /// (#422). The write must reach past the inline data.
+    pub(crate) fn write_moving_inline(
+        &mut self,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize> {
+        let inode = self.read_inode(ino)?;
+        if inode.flags & INODE_NODATACOW != 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino} is nodatacow and holds inline data, and moving that data into \
+                 an extent is only implemented for a copy-on-write file"
+            )));
+        }
+        self.write_cow(&inode, offset, data, true)
+    }
+
+    fn write_cow(
+        &mut self,
+        inode: &Inode,
+        offset: u64,
+        data: &[u8],
+        move_inline: bool,
+    ) -> Result<usize> {
         let ino = inode.ino;
         let summed = inode.flags & INODE_NODATASUM == 0;
         let end = offset
@@ -208,7 +239,7 @@ impl Filesystem {
         }
 
         // Every refusal before anything is allocated.
-        let targets = self.plan_cow_targets(ino, offset, end)?;
+        let targets = self.plan_cow_targets(ino, offset, end, move_inline)?;
 
         // Each copy: the item's bytes as they read now, with the write
         // laid over them. Past the end of the file the last sector reads
@@ -329,9 +360,14 @@ impl Filesystem {
         if filled > 0 || end > inode.size {
             use crate::inode::offsets as io;
             let mut raw = self.raw_inode(ino)?;
-            let nbytes = inode.nbytes.checked_add(filled).ok_or_else(|| {
-                Error::UnsupportedFeature(format!("inode {ino}: nbytes overflows"))
-            })?;
+            let moved: u64 = targets.iter().map(|t| t.inline).sum();
+            let nbytes = inode
+                .nbytes
+                .checked_add(filled)
+                .and_then(|n| n.checked_sub(moved))
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(format!("inode {ino}: nbytes overflows"))
+                })?;
             raw[io::NBYTES..io::NBYTES + 8].copy_from_slice(&nbytes.to_le_bytes());
             let size = end.max(inode.size);
             raw[io::SIZE..io::SIZE + 8].copy_from_slice(&size.to_le_bytes());
@@ -519,7 +555,13 @@ impl Filesystem {
     /// items this write replaces is released; one with references beyond
     /// them — a reflink's, or another item of this file outside the range
     /// — is marked shared, and keeps them (#261).
-    fn plan_cow_targets(&self, ino: u64, offset: u64, end: u64) -> Result<Vec<Target>> {
+    fn plan_cow_targets(
+        &self,
+        ino: u64,
+        offset: u64,
+        end: u64,
+        move_inline: bool,
+    ) -> Result<Vec<Target>> {
         let pieces = self.file_extents(ino)?;
         let last_snapshot = self.fs_tree_last_snapshot()?;
         let mut out = Vec::new();
@@ -527,6 +569,36 @@ impl Filesystem {
         let mut refs_of: BTreeMap<u64, u64> = BTreeMap::new();
         let sector = u64::from(self.sb.sectorsize);
         let mut pos = offset;
+        // Inline data moved into an extent (#422): the copy starts at the
+        // inline item's offset, takes its key, and covers whole sectors to
+        // the one the write ends in, as a hole's copy does. Inline data is
+        // only ever the file's one item, at offset 0, so nothing follows it.
+        if move_inline {
+            let Some(inline) = pieces.iter().find(|p| p.inline) else {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino} holds no inline data to move"
+                )));
+            };
+            if inline.start != 0 || pieces.len() != 1 || end <= inline.start + inline.len {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino}: its inline data at {} is not the file's one item, or the \
+                     write does not reach past it",
+                    inline.start
+                )));
+            }
+            let stop = end.div_ceil(sector).saturating_mul(sector);
+            out.push(Target {
+                start: 0,
+                len: stop,
+                extent_start: 0,
+                extent_len: 0,
+                extent_offset: 0,
+                shared: false,
+                hole: true,
+                inline: inline.len,
+            });
+            pos = stop;
+        }
         while pos < end {
             let Some(piece) = pieces
                 .iter()
@@ -558,6 +630,7 @@ impl Filesystem {
                     extent_offset: 0,
                     shared: false,
                     hole: true,
+                    inline: 0,
                 });
                 pos = stop;
                 continue;
@@ -601,6 +674,7 @@ impl Filesystem {
                 extent_offset: piece.ref_offset,
                 shared: false,
                 hole: false,
+                inline: 0,
             });
             refs_of.insert(piece.extent_start, refs);
             pos = piece.start + piece.len;
