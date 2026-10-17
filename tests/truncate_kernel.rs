@@ -23,6 +23,8 @@
 //! files that end partway through a sector with stale bytes past the end,
 //! grown so the rest of that sector reads as zeros (#421). A fourth holds
 //! inline files, grown so their data moves into a regular extent (#422).
+//! A fifth holds files the kernel stored as compressed inline extents,
+//! cut short (#423).
 
 use fs_btrfs::capi::*;
 use fs_btrfs_test_support::{
@@ -636,5 +638,90 @@ fn files_holding_inline_data_grow_into_a_regular_extent() {
     assert_btrfs_check_clean(
         Path::new(&image),
         "after the kernel appended to the grown files",
+    );
+}
+
+/// A small compressible file written through a `compress=zlib` mount, and
+/// another through `compress=zstd`, are each stored as a compressed inline
+/// extent; cut short through the ABI, each reads back its first bytes, and
+/// the volume stays clean for `btrfs check` and the kernel (#423).
+#[test]
+fn compressed_inline_files_are_cut_short_and_the_kernel_agrees() {
+    let (scratch, _) = Scratch::made(
+        "truncate-compressed-inline",
+        "no-holes",
+        "cd \"$MNT\"\n\
+         mount -o remount,compress=zlib \"$MNT\"\n\
+         awk -v size=3000 'BEGIN { s = \"a compressible line of text\\n\"; \
+           while (length(s) < size) s = s s; printf \"%s\", substr(s, 1, size) }' > zl\n\
+         sync\n\
+         mount -o remount,compress=zstd \"$MNT\"\n\
+         awk -v size=3000 'BEGIN { s = \"another compressible line\\n\"; \
+           while (length(s) < size) s = s s; printf \"%s\", substr(s, 1, size) }' > zs\n\
+         sync",
+    );
+    let image = scratch.image();
+    let before = dump_tree(Path::new(&image), "5");
+    assert!(
+        before.contains("compression 1") && before.contains("compression 3"),
+        "the kernel stored no zlib and zstd compressed extents to cut:\n{before}"
+    );
+    assert!(
+        before.contains("inline extent data size"),
+        "the kernel stored no inline data to cut:\n{before}"
+    );
+    let fs = unsafe { fs_btrfs_mount_rw(c(&image).as_ptr()) };
+    assert!(!fs.is_null(), "mount_rw: {}", last_error());
+
+    let cuts = [("zl", 1000usize), ("zs", 2500)];
+    let mut want = Vec::new();
+    for (name, size) in cuts {
+        let at = format!("/{name}");
+        let whole = read(fs, &at, 1 << 20);
+        assert_eq!(whole.len(), 3000, "{at} is not the size made");
+        assert_eq!(
+            truncate(fs, &at, size as u64),
+            0,
+            "{name}: {}",
+            last_error()
+        );
+        let kept = whole[..size].to_vec();
+        assert!(
+            read(fs, &at, 1 << 20) == kept,
+            "{at} does not read back as its first {size} bytes"
+        );
+        want.push((name, kept));
+    }
+    unsafe { fs_btrfs_umount(fs) };
+
+    assert_btrfs_check_clean(Path::new(&image), "after compressed inline files were cut");
+
+    let seen = guest_kernel_read_ok(
+        &image,
+        "after cutting compressed inline files",
+        "cd \"$MNT\"\n\
+         for f in zl zs; do \
+           printf '%s %s %s\\n' \"$f\" \"$(stat -c %s \"$f\")\" \
+             \"$(sha256sum \"$f\" | cut -d' ' -f1)\"; done",
+    );
+    let expected: String = want
+        .iter()
+        .map(|(name, bytes)| format!("{name} {} {}\n", bytes.len(), sha256_hex(bytes)))
+        .collect();
+    let lines: Vec<&str> = seen.lines().collect();
+    assert_eq!(
+        lines.join("\n") + "\n",
+        expected,
+        "the kernel sees the cut files differently"
+    );
+
+    guest_kernel_write_ok(
+        &image,
+        "append to the cut files",
+        "cd \"$MNT\"\nprintf appended >> zl\nprintf appended >> zs\nsync",
+    );
+    assert_btrfs_check_clean(
+        Path::new(&image),
+        "after the kernel appended to the cut files",
     );
 }
