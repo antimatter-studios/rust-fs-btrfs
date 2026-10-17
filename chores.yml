@@ -759,9 +759,11 @@ tasks:
     # test-stat.sh adds exactly three success lines, so 29 lines now.
     # Recursive ls adds 62 installed assertions (#466) and three success
     # lines (95 bytes); add them to the existing floor and budget.
+    # mkdir --parents adds 114 assertions to test-write.sh (#414) and no
+    # file, so no line; the floor takes them and the budget stays.
     cmds:
       - '../rust-fs-core/scripts/tier.sh test:cli cli 32 1295 -- scripts/test-cli.sh'
-      - 'bash ../rust-fs-core/scripts/test-floor.sh cli 269'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh cli 383'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
