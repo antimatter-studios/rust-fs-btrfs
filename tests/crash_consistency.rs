@@ -639,8 +639,9 @@ fn dumped_log_root(image: &Path) -> u64 {
         })
 }
 
-/// A volume with a log tree the kernel has not replayed is refused, by
-/// every way in — never read around.
+/// A volume with a log tree the kernel has not replayed is never read
+/// around: a read-only mount refuses it, and a read-write mount replays
+/// the log first (#376), so it reads what was fsynced.
 #[test]
 fn an_unreplayed_log_tree_is_refused_rather_than_read_around() {
     let image = fixture(DIRTY_LOG_FIXTURE);
@@ -669,10 +670,16 @@ fn an_unreplayed_log_tree_is_refused_rather_than_read_around() {
         "mount_with_cache",
         Filesystem::mount_with_cache(dev.clone() as Arc<dyn BlockRead>, 64),
     );
-    refused(
-        "mount_rw",
-        Filesystem::mount_rw(dev as Arc<dyn BlockDevice>),
+    // The overlay keeps the replay's writes off the fixture.
+    let fs = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>)
+        .unwrap_or_else(|error| panic!("mount_rw: the log must be replayed, not {error:?}"));
+    assert_eq!(fs.superblock().log_root, 0, "mount_rw replayed the log");
+    assert_eq!(
+        fs.read_path("/durable.txt").unwrap(),
+        FSYNCED,
+        "mount_rw reads the fsynced bytes, never the committed ones"
     );
+    assert_eq!(fs.read_path("/fsynced.txt").unwrap(), CREATED);
 }
 
 /// Why the refusal matters: the committed trees hold the file as it was

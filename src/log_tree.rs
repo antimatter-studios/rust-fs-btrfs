@@ -157,6 +157,22 @@ fn ref_names(data: &[u8]) -> impl Iterator<Item = &[u8]> {
     })
 }
 
+/// The records of an `INODE_REF` item: each name's index in the parent,
+/// and the name. `None` when a record runs past the end.
+fn ref_records(data: &[u8]) -> Option<Vec<(u64, &[u8])>> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let index = u64::from_le_bytes(data.get(pos..pos + 8)?.try_into().ok()?);
+        let len = usize::from(u16::from_le_bytes(
+            data.get(pos + 8..pos + 10)?.try_into().ok()?,
+        ));
+        out.push((index, data.get(pos + 10..pos + 10 + len)?));
+        pos += 10 + len;
+    }
+    Some(out)
+}
+
 fn le64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes"))
 }
@@ -166,15 +182,19 @@ fn le64(b: &[u8], at: usize) -> u64 {
 /// compressed, encrypted or otherwise encoded, and each one's
 /// `ram_bytes` naming exactly the data it carries.
 fn same_length_inline(committed: &[u8], logged: &[u8]) -> bool {
-    let plain = |d: &[u8]| {
-        d.len() > fe::INLINE_DATA
-            && d[fe::TYPE] == 0
-            && d[fe::COMPRESSION] == 0
-            && d[fe::ENCRYPTION] == 0
-            && d[fe::OTHER_ENCODING..fe::TYPE] == [0, 0]
-            && le64(d, fe::RAM_BYTES) == (d.len() - fe::INLINE_DATA) as u64
-    };
-    plain(committed) && plain(logged) && committed.len() == logged.len()
+    plain_inline(committed) && plain_inline(logged) && committed.len() == logged.len()
+}
+
+/// Whether a file extent item is inline and neither compressed, encrypted
+/// nor otherwise encoded, its `ram_bytes` naming exactly the data it
+/// carries.
+fn plain_inline(d: &[u8]) -> bool {
+    d.len() > fe::INLINE_DATA
+        && d[fe::TYPE] == 0
+        && d[fe::COMPRESSION] == 0
+        && d[fe::ENCRYPTION] == 0
+        && d[fe::OTHER_ENCODING..fe::TYPE] == [0, 0]
+        && le64(d, fe::RAM_BYTES) == (d.len() - fe::INLINE_DATA) as u64
 }
 
 /// A file extent item that references the whole of one uncompressed,
@@ -202,9 +222,11 @@ impl Filesystem {
     /// files whose only logged data is a same-length rewrite of their one
     /// uncompressed inline extent, and existing regular files whose logged
     /// data is a regular extent replacing a committed one over the same
-    /// range (#375). Everything is validated before the first write; other
-    /// data, names and other trees remain refused until their replay has
-    /// independent oracle proof.
+    /// range (#375), and regular files the log creates with inline data or
+    /// none, named in directories the log does not change (#376).
+    /// Everything is validated before the first write; other data, names
+    /// and other trees remain refused until their replay has independent
+    /// oracle proof.
     pub(crate) fn replay_inode_only_log(&mut self) -> Result<()> {
         use crate::backref::{self, EXTENT_DATA_REF, SHARED_DATA_REF};
         use crate::chunk::{key_type::EXTENT_ITEM, objectid};
@@ -251,7 +273,146 @@ impl Filesystem {
             if roots != 1 {
                 return Err(Error::DirtyLog);
             }
+            // Inodes the log creates (#376): a logged inode item the
+            // subvolume does not hold. Each is inserted as logged, and each
+            // of its names is entered in its parent from its reference,
+            // which is all the log says of the name: an fsync of a new file
+            // logs no directory item for it.
+            let mut created: BTreeSet<u64> = BTreeSet::new();
+            for ino in top.inodes() {
+                let at = DiskKey {
+                    objectid: ino,
+                    key_type: INODE_ITEM_KEY,
+                    offset: 0,
+                };
+                if tree.search(self.fs_tree_root, &at)?.is_none() {
+                    created.insert(ino);
+                }
+            }
+            let mut grown: BTreeMap<u64, u64> = BTreeMap::new();
+            for &ino in &created {
+                let inode = top.inode(ino)?.ok_or(Error::DirtyLog)?;
+                if !inode.is_regular_file() || ino < crate::inode::FIRST_FREE_OBJECTID {
+                    return Err(Error::DirtyLog);
+                }
+                for kind in [INODE_REF_KEY, EXTENT_DATA_KEY, dir::XATTR_ITEM_KEY] {
+                    if !tree.find_all(self.fs_tree_root, ino, kind)?.is_empty() {
+                        return Err(Error::DirtyLog);
+                    }
+                }
+                let mut names = 0u64;
+                let mut nbytes = 0u64;
+                let mut raw = None;
+                for item in top.items.iter().filter(|i| i.key.objectid == ino) {
+                    match item.key.key_type {
+                        INODE_ITEM_KEY if item.key.offset == 0 => raw = Some(item.data.clone()),
+                        INODE_REF_KEY => {
+                            let parent = item.key.offset;
+                            let at = DiskKey {
+                                objectid: parent,
+                                key_type: INODE_ITEM_KEY,
+                                offset: 0,
+                            };
+                            let dir_item = tree
+                                .search(self.fs_tree_root, &at)?
+                                .ok_or(Error::DirtyLog)?;
+                            // A directory the log also speaks for is #377's.
+                            if !Inode::parse(&dir_item.data, parent)?.is_dir()
+                                || top.inode(parent)?.is_some()
+                            {
+                                return Err(Error::DirtyLog);
+                            }
+                            for (index, name) in ref_records(&item.data).ok_or(Error::DirtyLog)? {
+                                let by_hash = DiskKey {
+                                    objectid: parent,
+                                    key_type: dir::DIR_ITEM_KEY,
+                                    offset: dir::name_hash(name),
+                                };
+                                let by_index = DiskKey {
+                                    objectid: parent,
+                                    key_type: DIR_INDEX_KEY,
+                                    offset: index,
+                                };
+                                if tree.search(self.fs_tree_root, &by_hash)?.is_some()
+                                    || tree.search(self.fs_tree_root, &by_index)?.is_some()
+                                {
+                                    return Err(Error::DirtyLog);
+                                }
+                                let entry = crate::namespace::dir_entry(
+                                    ino,
+                                    generation,
+                                    dir::ftype::REG_FILE,
+                                    name,
+                                );
+                                edits.push(ItemEdit::Put(OwnedItem {
+                                    key: by_hash,
+                                    data: entry.clone(),
+                                }));
+                                edits.push(ItemEdit::Put(OwnedItem {
+                                    key: by_index,
+                                    data: entry,
+                                }));
+                                *grown.entry(parent).or_default() += 2 * name.len() as u64;
+                                names += 1;
+                            }
+                            edits.push(ItemEdit::Put(OwnedItem {
+                                key: item.key,
+                                data: item.data.clone(),
+                            }));
+                        }
+                        // Only inline data, whole and plain, from offset 0.
+                        EXTENT_DATA_KEY if item.key.offset == 0 && plain_inline(&item.data) => {
+                            nbytes += le64(&item.data, fe::RAM_BYTES);
+                            edits.push(ItemEdit::Put(OwnedItem {
+                                key: item.key,
+                                data: item.data.clone(),
+                            }));
+                        }
+                        _ => return Err(Error::DirtyLog),
+                    }
+                }
+                // The kernel logs a new inode's `nbytes` as 0 and counts
+                // the data replay adds; here, its inline extent.
+                let mut raw = raw.ok_or(Error::DirtyLog)?;
+                if names == 0
+                    || names != u64::from(inode.nlink)
+                    || nbytes != inode.size
+                    || raw.len() != INODE_ITEM_SIZE
+                {
+                    return Err(Error::DirtyLog);
+                }
+                raw[crate::inode::offsets::NBYTES..crate::inode::offsets::NBYTES + 8]
+                    .copy_from_slice(&nbytes.to_le_bytes());
+                edits.push(ItemEdit::Put(OwnedItem {
+                    key: DiskKey {
+                        objectid: ino,
+                        key_type: INODE_ITEM_KEY,
+                        offset: 0,
+                    },
+                    data: raw,
+                }));
+            }
+            // Each parent's size counts its new names twice, once for each
+            // of its two indexes, as a directory's size does.
+            for (parent, added) in grown {
+                let at = DiskKey {
+                    objectid: parent,
+                    key_type: INODE_ITEM_KEY,
+                    offset: 0,
+                };
+                let mut raw = tree
+                    .search(self.fs_tree_root, &at)?
+                    .ok_or(Error::DirtyLog)?
+                    .data;
+                use crate::inode::offsets::SIZE;
+                let size = le64(&raw, SIZE).checked_add(added).ok_or(Error::DirtyLog)?;
+                raw[SIZE..SIZE + 8].copy_from_slice(&size.to_le_bytes());
+                edits.push(ItemEdit::Put(OwnedItem { key: at, data: raw }));
+            }
             for item in &top.items {
+                if created.contains(&item.key.objectid) {
+                    continue;
+                }
                 // The digests of logged data, checked below against the
                 // bytes they cover.
                 if (item.key.objectid, item.key.key_type) == (EXTENT_CSUM_OBJECTID, EXTENT_CSUM_KEY)

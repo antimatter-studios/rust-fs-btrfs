@@ -334,6 +334,62 @@ fn differences(
         .collect()
 }
 
+/// Replay a copy of `fixture_name` with the kernel and another with this
+/// crate, and require the two to be the same volume to the kernel.
+fn replays_as_the_kernel_does(fixture_name: &str, tag: &str) {
+    let image = fixture(fixture_name);
+
+    let theirs = PathBuf::from(temp_path!("{tag}-kernel-replay.img"));
+    std::fs::copy(&image, &theirs).expect("copying the fixture for the kernel to replay");
+    guest_kernel_write_ok(
+        &theirs.to_string_lossy(),
+        &format!("{tag}: kernel replay"),
+        "true",
+    );
+
+    let ours = PathBuf::from(temp_path!("{tag}-our-replay.img"));
+    std::fs::copy(&image, &ours).expect("copying the fixture for this crate to replay");
+    {
+        let dev = Arc::new(FileDevice::open_rw(&ours).expect("open the copy read-write"));
+        let fs = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>)
+            .unwrap_or_else(|e| panic!("[{tag}] a read-write mount should replay the log: {e}"));
+        assert_eq!(
+            fs.superblock().log_root,
+            0,
+            "[{tag}] the mount replayed the log and still names one"
+        );
+    }
+    let reopened = Filesystem::mount(Arc::new(
+        FileDevice::open(&ours).expect("open the replayed copy"),
+    ) as Arc<dyn BlockRead>);
+    assert!(
+        !matches!(reopened, Err(Error::DirtyLog)),
+        "[{tag}] the replay was not committed: the copy still holds a log"
+    );
+
+    assert_btrfs_check_clean(&theirs, &format!("{tag}: the kernel's replay"));
+    assert_btrfs_check_clean(&ours, &format!("{tag}: this crate's replay"));
+    let theirs_view = kernel_view(&theirs, &format!("{tag}: the kernel's replay"));
+    let ours_view = kernel_view(&ours, &format!("{tag}: this crate's replay"));
+    let _ = std::fs::remove_file(&theirs);
+    let _ = std::fs::remove_file(&ours);
+    let differ = differences(&ours_view, &theirs_view);
+    assert!(
+        differ.is_empty(),
+        "[{tag}] the volume this crate replayed differs from the kernel's replay:\n{}",
+        differ.join("\n")
+    );
+}
+
+/// `durable.txt` rewritten in place and `fsynced.txt` created, both made
+/// durable by fsync alone (#376): the new file exists only in the log, as
+/// its inode item, its reference to `/` and its inline extent, with no
+/// directory item for it. The kernel's replay is the oracle.
+#[test]
+fn a_read_write_mount_replays_the_log_as_the_kernel_does() {
+    replays_as_the_kernel_does(DIRTY_LOG_FIXTURE, "dirtylog");
+}
+
 /// Prove this is a metadata-only recovery before asking mount_rw to
 /// replay it. Unchanged inode refs may be logged, but no data, checksum,
 /// xattr, directory entry or directory deletion range is permitted.
