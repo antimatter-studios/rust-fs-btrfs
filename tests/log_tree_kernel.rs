@@ -2292,6 +2292,164 @@ fn a_file_the_log_creates_with_extended_references_replays_as_the_kernel_does() 
     }
 }
 
+/// `f`, committed with one link, its only name the last of 64 long names
+/// in `/`, held in an `INODE_EXTREF` item once its `INODE_REF` was
+/// emptied, loses that name after the commit, and only `/` is fsynced
+/// (#478). The log holds an index range of `/` covering the removed index
+/// and no entry there, and does not hold `f`. A replay that looks for the
+/// name only in `INODE_REF` items refuses the log; the kernel's replay of
+/// the same crash image deletes `f` with its extended reference and its
+/// data, and is the oracle.
+#[test]
+fn an_inode_whose_last_name_is_an_extended_reference_is_deleted_as_the_kernel_does() {
+    const EXTREF_REMOVED_FIXTURE: &str = "dirtylog/btrfs-dirty-log-extrefremoved.img";
+    let last = "063".repeat(85);
+    let image = fixture(EXTREF_REMOVED_FIXTURE);
+    let transcript =
+        std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-extrefremoved.logdump"))
+            .expect("the native transcript of the removed extended-reference log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    // f and the index of its last name, as the native tool prints the
+    // committed trees: one INODE_EXTREF item, whose record reads
+    // `index N parent P namelen L name: X`.
+    let committed = dump_tree(&image, "5");
+    let mut extrefs: Vec<(u64, u64, u64, String)> = Vec::new();
+    let mut lines = committed.lines();
+    while let Some(line) = lines.next() {
+        let Some((_, key)) = line.split_once("key (") else {
+            continue;
+        };
+        let words: Vec<&str> = key.split_whitespace().collect();
+        if words.get(1) != Some(&"INODE_EXTREF") {
+            continue;
+        }
+        let record: Vec<&str> = lines
+            .next()
+            .expect("an extended reference holds a record")
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            [record[0], record[2], record[6]],
+            ["index", "parent", "name:"],
+            "a record of an extended reference, as the native tool prints it: {record:?}"
+        );
+        extrefs.push((
+            words[0].parse().unwrap(),
+            record[1].parse().unwrap(),
+            record[3].parse().unwrap(),
+            record[7].to_string(),
+        ));
+    }
+    assert_eq!(
+        extrefs.len(),
+        1,
+        "the committed trees hold one extended reference: {extrefs:?}"
+    );
+    let (f, at, parent, name) = extrefs.pop().unwrap();
+    assert_eq!(
+        (parent, name.as_str()),
+        (256, last.as_str()),
+        "f's extended reference names its last long name in /"
+    );
+    {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the removed extended-reference fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        assert!(
+            fs.lookup_path("/f").is_err(),
+            "the name f was removed before the commit"
+        );
+        let committed_f = fs
+            .lookup_path(&format!("/{last}"))
+            .expect("the committed trees hold the last long name");
+        assert_eq!(
+            (committed_f.ino, committed_f.nlink),
+            (f, 1),
+            "the last long name is f, committed with one link"
+        );
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        assert!(
+            !top.items.iter().any(|i| i.key.objectid == f),
+            "the log holds no item of f: {keys:?}"
+        );
+        for entry in top
+            .items
+            .iter()
+            .filter(|i| (i.key.objectid, i.key.key_type) == (256, DIR_INDEX_KEY))
+        {
+            assert_ne!(
+                entry.key.offset, at,
+                "the log holds an entry of / at the removed index: {keys:?}"
+            );
+            assert!(
+                parse_dir_items(&entry.data)
+                    .unwrap()
+                    .iter()
+                    .all(|e| e.ino != f),
+                "the logged entry of / at index {} names f",
+                entry.key.offset
+            );
+        }
+        assert!(
+            top.items
+                .iter()
+                .filter(|i| i.key.objectid == 256 && i.key.key_type == DIR_LOG_INDEX_KEY)
+                .any(|i| i.key.offset <= at
+                    && at <= u64::from_le_bytes(i.data[..8].try_into().unwrap())),
+            "no logged index range of / holds the removed index {at}: {keys:?}"
+        );
+    }
+    // What the kernel's view does not show: every item of f, and every
+    // entry naming it, as the native tool prints each replayed copy.
+    let items_of_f = |image: &Path| -> Vec<String> {
+        dump_tree(image, "5")
+            .lines()
+            .filter(|l| l.contains(&format!("key ({f} ")))
+            .map(|l| l.trim().to_string())
+            .collect()
+    };
+    let theirs = replays_as_the_kernel_does_then(
+        EXTREF_REMOVED_FIXTURE,
+        "dirtylog-extrefremoved",
+        |theirs, ours| {
+            assert_eq!(
+                items_of_f(theirs),
+                Vec::<String>::new(),
+                "the kernel's replay deletes f with its extended reference and its data"
+            );
+            assert_eq!(
+                items_of_f(ours),
+                Vec::<String>::new(),
+                "this crate's replay deletes f with its extended reference and its data"
+            );
+        },
+    );
+    assert_eq!(
+        theirs.get(&("stat".to_string(), last.clone())),
+        None,
+        "the kernel's replay removes the last name of f"
+    );
+    assert_eq!(
+        theirs
+            .get(&("stat".to_string(), "k".to_string()))
+            .map(String::as_str),
+        Some("f 1 4"),
+        "the kernel's replay keeps k"
+    );
+}
+
 /// The inline writer's encoding fields are checked against the native
 /// tools, not against our own parser. `dump-tree` prints an inline file
 /// extent's data size, `ram_bytes` and compression; the raw item must hold
