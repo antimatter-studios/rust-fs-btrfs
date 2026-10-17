@@ -39,9 +39,10 @@
 //!    empty `BLOCK_GROUP_ITEM`, a `FREE_SPACE_INFO` and one free run
 //!    covering it in the free-space tree, and the device's `bytes_used`
 //!    raised in the chunk tree's device item and the superblock's copy.
-//! 2. **The extents move**, when the group holds any (#493): each one's
-//!    bytes are read verified against their digests and written into the
-//!    new chunk, then one commit re-points the file item naming it, moves
+//! 2. **The extents move**, when the group holds any (#493), at most 64
+//!    per committed transaction (#494): each one's bytes are read verified
+//!    against their digests and written into the new chunk, then the
+//!    batch's commit re-points the file item naming it, moves
 //!    its `EXTENT_ITEM` and keyed back references unchanged, files its
 //!    checksums under the new sectors, and carries the free-space tree and
 //!    both groups' `used` with it.
@@ -51,9 +52,10 @@
 //! Besides everything above, it refuses a system group, a conversion to
 //! another profile, any profile but single, a volume of more than one
 //! device, one with no free-space tree or with a block group tree, and a
-//! group holding an extent more than one file item names, one with a
-//! sector that has no checksum, or more extents than one transaction
-//! moves, each before anything is written.
+//! group holding an extent more than one file item names, or one with a
+//! sector that has no checksum, each before anything is written. A batch
+//! that fails after an earlier one committed leaves both groups, every
+//! extent in exactly one of them.
 
 use crate::block_group::BlockGroup;
 use crate::chunk::{
@@ -77,8 +79,9 @@ const PLAN_ROUNDS: usize = 64;
 /// extents on MiB boundaries.
 const MIB: u64 = 1 << 20;
 
-/// The most data extents one relocation moves, all in one transaction
-/// (#493): a group holding more is refused before anything is written.
+/// The most data extents one relocation transaction moves (#493): a
+/// group holding more is moved a batch of this many at a time, each batch
+/// committed before the next is copied (#494).
 const EXTENTS_PER_TRANSACTION: usize = 64;
 
 /// How much of an extent is read and written at a time while it is copied.
@@ -208,9 +211,9 @@ impl Filesystem {
     ///
     /// Committed transactions, each leaving a filesystem the kernel
     /// accepts on its own: the new chunk is allocated, the group's extents
-    /// are moved into it in one transaction, then the old group is
-    /// removed. A crash between them leaves both groups, every extent in
-    /// exactly one of them.
+    /// are moved into it a batch per transaction (#494), then the old
+    /// group is removed. A crash between them leaves both groups, every
+    /// extent in exactly one of them.
     ///
     /// # Errors
     ///
@@ -218,7 +221,8 @@ impl Filesystem {
     /// [`Error::NotFound`] when no block group starts at `start`, and
     /// [`Error::UnsupportedFeature`] for every refusal the [module
     /// documentation](crate::balance) lists, each before anything is
-    /// written.
+    /// written. An error from a later batch leaves the batches before it
+    /// committed and both groups in place.
     pub fn relocate_block_group(
         &mut self,
         start: u64,
@@ -230,11 +234,15 @@ impl Filesystem {
         let group = self.block_group_at(start)?;
         let extents = self.refuse_unrelocatable(&group, profile)?;
         let new = self.allocate_chunk(group.flags, group.length)?;
-        if !extents.is_empty() {
-            if let Err(e) = self.move_data_extents(&extents, new) {
-                // Nothing has moved: the new chunk is empty, and taking it
-                // away again leaves the filesystem as it was.
-                self.remove_block_group(new)?;
+        for (i, batch) in extents.chunks(EXTENTS_PER_TRANSACTION).enumerate() {
+            if let Err(e) = self.move_data_extents(batch, new) {
+                if i == 0 {
+                    // Nothing has moved: the new chunk is empty, and taking
+                    // it away again leaves the filesystem as it was.
+                    self.remove_block_group(new)?;
+                }
+                // Otherwise the committed batches stay where they are,
+                // each extent in exactly one of the two groups.
                 return Err(e);
             }
         }
@@ -242,8 +250,8 @@ impl Filesystem {
         Ok(new)
     }
 
-    /// Move `extents`, every data extent of one group, into the empty
-    /// group at `to` in one committed transaction (#493).
+    /// Move `extents`, one batch of a group's data extents, into the group
+    /// at `to` in one committed transaction (#493, #494).
     ///
     /// Each extent's bytes are read as the file read path reads them,
     /// verified against their digests from whichever copy verifies, and
@@ -387,15 +395,6 @@ impl Filesystem {
             ));
         }
         let extents = self.data_extents_in(group)?;
-        if extents.len() > EXTENTS_PER_TRANSACTION {
-            return Err(Error::UnsupportedFeature(format!(
-                "the block group at {} holds {} data extents, and moving more than {} in one \
-                 transaction is not implemented",
-                group.start,
-                extents.len(),
-                EXTENTS_PER_TRANSACTION
-            )));
-        }
         let sector = u64::from(self.sb.sectorsize).max(1);
         for e in &extents {
             if e.items.len() != 1 {
