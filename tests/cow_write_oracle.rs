@@ -14,7 +14,8 @@
 //! the digests of the extents it replaced are removed (#261). An extent a
 //! reflink or another item of the file also references is copied and
 //! keeps those references (#261); an extent a snapshot shares is still
-//! refused.
+//! refused. A write into a hole adds an extent, and so does one that
+//! starts at or before the end of a file and grows it (#432).
 //!
 //! # The oracles
 //!
@@ -788,6 +789,201 @@ fn a_write_into_a_hole_adds_an_extent_the_checker_and_kernel_accept() {
         assert_eq!(
             old.physical, new.physical,
             "an extent the write did not touch moved"
+        );
+    }
+}
+
+/// `mid.bin` ends partway through a sector, `edge.bin` on a sector
+/// boundary, both checksummed. Each `*-control.bin` is written by the same
+/// `tee`, so it holds the same bytes in extents of its own (a `cp` could
+/// reflink them), and then the kernel itself makes the writes
+/// [`a_write_past_the_end_grows_the_file_the_checker_and_kernel_accept`]
+/// makes through this driver, at the same offsets, in transactions of its
+/// own: the `size`, `nbytes` and bytes the driver's appends are held to.
+const GROW_FILL: &str =
+    "head -c 40000 /dev/urandom | tee \"$MNT/mid.bin\" > \"$MNT/mid-control.bin\"\n\
+     head -c 65536 /dev/urandom | tee \"$MNT/edge.bin\" > \"$MNT/edge-control.bin\"\n\
+     sync\n\
+     head -c 9000 /dev/zero | tr '\\000' '\\303' \
+     | dd of=\"$MNT/mid-control.bin\" bs=1 seek=40000 conv=notrunc status=none\n\
+     sync\n\
+     head -c 100 /dev/zero | tr '\\000' '\\151' \
+     | dd of=\"$MNT/mid-control.bin\" bs=1 seek=49000 conv=notrunc status=none\n\
+     sync\n\
+     head -c 9000 /dev/zero | tr '\\000' '\\074' \
+     | dd of=\"$MNT/edge-control.bin\" bs=1 seek=64536 conv=notrunc status=none\n\
+     sync\n\
+     head -c 5000 /dev/zero | tr '\\000' '\\226' \
+     | dd of=\"$MNT/edge-control.bin\" bs=1 seek=73536 conv=notrunc status=none\n\
+     sync";
+
+/// A write that starts at or before the end of a file and ends past it
+/// grows the file (#432): the sectors past the old last extent become a
+/// new extent with an item of its own, `size` moves to the write's end and
+/// `nbytes` by the sectors added, in one committed transaction.
+///
+/// The writes cover an append exactly at an end partway through a sector,
+/// one that stays inside that last sector and so adds none, one straddling
+/// an end on a sector boundary, and an append to what an earlier append
+/// committed. The kernel made the same writes into the controls, so the
+/// expected `size` and `nbytes` are its own, not this test's arithmetic.
+/// `btrfs check --check-data-csum` sees a digest missing for a new sector,
+/// a record with no item or a wrong `nbytes`; a scrub makes the kernel
+/// verify every sector, and it reads every byte back.
+///
+/// A write that starts past the end is still refused (#433), before
+/// anything is written.
+#[test]
+fn a_write_past_the_end_grows_the_file_the_checker_and_kernel_accept() {
+    const MID: &str = "mid.bin";
+    const EDGE: &str = "edge.bin";
+    let control = |name: &str| name.replace(".bin", "-control.bin");
+    let scratch = Scratch::new("cow-write-grow", GROW_FILL);
+    let image = scratch.image();
+
+    let mut fs = mount_rw(&image);
+    let mut expected: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
+    for (name, size) in [(MID, 40_000u64), (EDGE, 65_536)] {
+        let ino = ino_of(&fs, name);
+        let inode = fs.read_inode(ino).unwrap();
+        assert_eq!(inode.size, size, "{name} is not the size made");
+        assert_eq!(
+            inode.flags & fs_btrfs::write::INODE_NODATASUM,
+            0,
+            "{name} must be checksummed for this to test anything"
+        );
+        expected.insert(name, fs.read_file(ino).unwrap());
+    }
+
+    // Past the end, leaving a gap: refused, and nothing written.
+    let untouched = sha256_hex(&std::fs::read(&image).unwrap());
+    let err = fs
+        .write(ino_of(&fs, MID), 40_000 + 8192, b"past the end")
+        .expect_err("a write that starts past the end must still be refused");
+    assert!(
+        matches!(err, fs_btrfs::Error::UnsupportedFeature(_)),
+        "the refusal should be a named unsupported case: {err}"
+    );
+    assert_eq!(
+        sha256_hex(&std::fs::read(&image).unwrap()),
+        untouched,
+        "a refused write changed the image"
+    );
+
+    // (file, offset, bytes), the controls' writes in the same order.
+    let writes: Vec<(&str, u64, Vec<u8>)> = vec![
+        (MID, 40_000, vec![0xc3; 9000]),
+        (MID, 49_000, vec![0x69; 100]),
+        (EDGE, 64_536, vec![0x3c; 9000]),
+        (EDGE, 73_536, vec![0x96; 5000]),
+    ];
+    let generation = fs.superblock().generation;
+    for (name, offset, bytes) in &writes {
+        let ino = ino_of(&fs, name);
+        let n = fs.write(ino, *offset, bytes).unwrap_or_else(|e| {
+            panic!(
+                "writing {} bytes at {offset} of {name}, past its end: {e}",
+                bytes.len()
+            )
+        });
+        assert_eq!(n, bytes.len(), "a short write");
+        let file = expected.get_mut(name).unwrap();
+        let end = *offset as usize + bytes.len();
+        if file.len() < end {
+            file.resize(end, 0);
+        }
+        file[*offset as usize..end].copy_from_slice(bytes);
+        assert_eq!(
+            fs.read_inode(ino).unwrap().size,
+            end as u64,
+            "{name}'s size is not the end of the write"
+        );
+        // Our own reading of what we committed, before the oracles'.
+        assert_eq!(
+            &fs.read_file(ino).unwrap(),
+            file,
+            "{name} reads back differently through this driver after the write"
+        );
+    }
+    assert_eq!(
+        fs.superblock().generation,
+        generation + writes.len() as u64,
+        "each write is one committed transaction"
+    );
+    for name in [MID, EDGE] {
+        let ours = fs.read_inode(ino_of(&fs, name)).unwrap();
+        let theirs = fs.read_inode(ino_of(&fs, &control(name))).unwrap();
+        assert_eq!(
+            (ours.size, ours.nbytes),
+            (theirs.size, theirs.nbytes),
+            "{name}'s size and nbytes are not what the kernel's own writes gave its control"
+        );
+    }
+    drop(fs);
+
+    assert_btrfs_check_clean(&image, "after writes past the end");
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum finds data that disagrees with its digests:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after writes past the end",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+
+    let names = [MID, EDGE, "mid-control.bin", "edge-control.bin"];
+    let mut script = String::new();
+    for name in names {
+        script.push_str(&format!("stat -c '{name} %s %b %B' \"$MNT/{name}\"\n"));
+    }
+    let stats: BTreeMap<String, (u64, u64)> = guest_kernel_read_ok(
+        &image.to_string_lossy(),
+        "the kernel's stat after writes past the end",
+        &script,
+    )
+    .lines()
+    .map(|line| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(words.len(), 4, "stat printed {line:?}");
+        let n = |w: &str| -> u64 {
+            w.parse()
+                .unwrap_or_else(|e| panic!("stat printed {line:?}: {e}"))
+        };
+        (
+            words[0].to_string(),
+            (n(words[1]), n(words[2]) * n(words[3])),
+        )
+    })
+    .collect();
+    let after = kernel_view(&image, "after writes past the end", &names);
+    for name in [MID, EDGE] {
+        assert_eq!(
+            stats[name],
+            stats[&control(name)],
+            "the kernel's size and allocation of {name} differ from its control's"
+        );
+        assert_eq!(
+            stats[name].0,
+            expected[name].len() as u64,
+            "the kernel's size of {name} is not the end of the last write"
+        );
+        assert_eq!(
+            after[name].0,
+            sha256_hex(&expected[name]),
+            "the kernel reads back different bytes from {name} than were written"
+        );
+        assert_eq!(
+            after[name].0,
+            after[&control(name)].0,
+            "{name} does not read as the kernel's own writes left its control"
         );
     }
 }
