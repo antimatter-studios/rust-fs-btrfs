@@ -23,8 +23,10 @@
 //! # Limited replay
 //!
 //! A writable mount can recover logged inode metadata for existing empty
-//! regular files in tree 5. References must be unchanged; other records,
-//! new inodes and data or namespace changes remain refused (#266).
+//! regular files in tree 5, a same-length rewrite of an inline extent,
+//! and a regular extent that replaces an existing file's extent over the
+//! same range (#375). References must be unchanged; other records, new
+//! inodes and namespace changes remain refused (#266).
 //! [`Filesystem::mount_ignoring_log`] opens such a volume **read-only**,
 //! reading the committed trees as the kernel's `-o ro,nologreplay`
 //! does: an explicit opt-in, because what was `fsync`ed is invisible
@@ -135,6 +137,7 @@ mod fe {
     pub const TYPE: usize = 20;
     pub const INLINE_DATA: usize = 21;
     pub const DISK_BYTENR: usize = 21;
+    pub const DISK_NUM_BYTES: usize = 29;
     pub const OFFSET: usize = 37;
     pub const NUM_BYTES: usize = 45;
     pub const REGULAR_SIZE: usize = 53;
@@ -174,18 +177,43 @@ fn same_length_inline(committed: &[u8], logged: &[u8]) -> bool {
     plain(committed) && plain(logged) && committed.len() == logged.len()
 }
 
+/// A file extent item that references the whole of one uncompressed,
+/// unencrypted regular extent from its first byte: its address and
+/// length. `None` for anything else -- inline, prealloc, a hole, a
+/// compressed extent, or a window into part of one.
+fn whole_regular_extent(d: &[u8]) -> Option<(u64, u64)> {
+    if d.len() != fe::REGULAR_SIZE
+        || d[fe::TYPE] != 1
+        || d[fe::COMPRESSION] != 0
+        || d[fe::ENCRYPTION] != 0
+        || d[fe::OTHER_ENCODING..fe::TYPE] != [0, 0]
+    {
+        return None;
+    }
+    let (bytenr, disk_len) = (le64(d, fe::DISK_BYTENR), le64(d, fe::DISK_NUM_BYTES));
+    let whole = le64(d, fe::OFFSET) == 0
+        && le64(d, fe::NUM_BYTES) == disk_len
+        && le64(d, fe::RAM_BYTES) == disk_len;
+    (bytenr != 0 && disk_len != 0 && whole).then_some((bytenr, disk_len))
+}
+
 impl Filesystem {
-    /// Recover existing empty regular files in tree 5, and existing
-    /// regular files whose only logged data is a same-length rewrite of
-    /// their one uncompressed inline extent. Everything is validated
-    /// before the first write; other data, names and other trees remain
-    /// refused until their replay has independent oracle proof.
+    /// Recover existing empty regular files in tree 5, existing regular
+    /// files whose only logged data is a same-length rewrite of their one
+    /// uncompressed inline extent, and existing regular files whose logged
+    /// data is a regular extent replacing a committed one over the same
+    /// range (#375). Everything is validated before the first write; other
+    /// data, names and other trees remain refused until their replay has
+    /// independent oracle proof.
     pub(crate) fn replay_inode_only_log(&mut self) -> Result<()> {
-        use crate::chunk::objectid;
-        use crate::inode::INODE_ITEM_SIZE;
+        use crate::backref::{self, EXTENT_DATA_REF, SHARED_DATA_REF};
+        use crate::chunk::{key_type::EXTENT_ITEM, objectid};
+        use crate::csum::{EXTENT_CSUM_KEY, EXTENT_CSUM_OBJECTID};
+        use crate::extent_write::EXTENT_FLAG_DATA;
+        use crate::inode::{INODE_ITEM_SIZE, INODE_NODATASUM};
         use crate::leaf_edit::OwnedItem;
-        use crate::transaction::{DataWrite, ItemEdit};
-        use std::collections::BTreeSet;
+        use crate::transaction::{DataWrite, ItemEdit, RecordEdit};
+        use std::collections::{BTreeMap, BTreeSet};
 
         let log = self.log()?.ok_or(Error::DirtyLog)?;
         if log.trees.len() != 1 || log.trees[0].subvolume != objectid::FS_TREE {
@@ -193,8 +221,19 @@ impl Filesystem {
         }
         self.require_writable_top_level()?;
         let top = &log.trees[0];
+        let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
+            Error::UnsupportedFeature("the log replay generation overflows".into())
+        })?;
+        let last_snapshot = self.fs_tree_last_snapshot()?;
         let mut edits = Vec::new();
         let mut pins = Vec::new();
+        // Each extent replacement (#375): the extent records it changes,
+        // the extents it gives up whole, and each new extent with whether
+        // its file is checksummed.
+        let mut records: Vec<RecordEdit> = Vec::new();
+        let mut released: Vec<(u64, u64)> = Vec::new();
+        let mut news: Vec<(u64, u64, bool)> = Vec::new();
+        let mut logged_csums: Vec<&LogItem> = Vec::new();
         {
             let reader = self.pool_reader();
             let tree = reader.tree();
@@ -213,6 +252,13 @@ impl Filesystem {
                 return Err(Error::DirtyLog);
             }
             for item in &top.items {
+                // The digests of logged data, checked below against the
+                // bytes they cover.
+                if (item.key.objectid, item.key.key_type) == (EXTENT_CSUM_OBJECTID, EXTENT_CSUM_KEY)
+                {
+                    logged_csums.push(item);
+                    continue;
+                }
                 let committed = tree
                     .search(self.fs_tree_root, &item.key)?
                     .ok_or(Error::DirtyLog)?;
@@ -267,9 +313,9 @@ impl Filesystem {
                             data,
                         }));
                     }
-                    // Only a same-length rewrite of the committed inline
-                    // extent, of an inode whose metadata is in this log
-                    // and whose size is that extent's length.
+                    // A same-length rewrite of the committed inline extent,
+                    // of an inode whose metadata is in this log and whose
+                    // size is that extent's length.
                     EXTENT_DATA_KEY
                         if item.key.offset == 0
                             && same_length_inline(&committed.data, &item.data)
@@ -277,6 +323,113 @@ impl Filesystem {
                                 i.size == (item.data.len() - fe::INLINE_DATA) as u64
                             }) =>
                     {
+                        edits.push(ItemEdit::Put(OwnedItem {
+                            key: item.key,
+                            data: item.data.clone(),
+                        }));
+                    }
+                    // A regular extent in place of the committed one over
+                    // the same range, of an inode whose metadata is in this
+                    // log (#375): the kernel's `replay_one_extent` for a
+                    // whole-extent overwrite. The new extent is one no
+                    // record names yet, as `btrfs_alloc_logged_file_extent`
+                    // finds it; the committed one loses this item's
+                    // reference, and is released when that was its last.
+                    EXTENT_DATA_KEY => {
+                        let ino = item.key.objectid;
+                        let (Some((old, old_len)), Some((new, new_len))) = (
+                            whole_regular_extent(&committed.data),
+                            whole_regular_extent(&item.data),
+                        ) else {
+                            return Err(Error::DirtyLog);
+                        };
+                        if old == new || old_len != new_len || top.inode(ino)?.is_none() {
+                            return Err(Error::DirtyLog);
+                        }
+                        let inode_key = DiskKey {
+                            objectid: ino,
+                            key_type: INODE_ITEM_KEY,
+                            offset: 0,
+                        };
+                        let inode = tree
+                            .search(self.fs_tree_root, &inode_key)?
+                            .ok_or(Error::DirtyLog)?;
+                        let summed = Inode::parse(&inode.data, ino)?.flags & INODE_NODATASUM == 0;
+                        let extent_root = self.tree_root(objectid::EXTENT_TREE)?;
+                        let record = |bytenr: u64, len: u64| DiskKey {
+                            objectid: bytenr,
+                            key_type: EXTENT_ITEM,
+                            offset: len,
+                        };
+                        if tree.search(extent_root, &record(new, new_len))?.is_some() {
+                            return Err(Error::DirtyLog);
+                        }
+                        let before = tree
+                            .search(extent_root, &record(old, old_len))?
+                            .ok_or(Error::DirtyLog)?
+                            .data;
+                        // References kept as items of their own, and an
+                        // extent a snapshot may still read through a tree
+                        // block it shares, are not counted in the inline
+                        // references this edits.
+                        for kind in [EXTENT_DATA_REF, SHARED_DATA_REF] {
+                            if !tree.find_all(extent_root, old, kind)?.is_empty() {
+                                return Err(Error::DirtyLog);
+                            }
+                        }
+                        if before.len() < 24 || le64(&before, 8) <= last_snapshot {
+                            return Err(Error::DirtyLog);
+                        }
+                        // The item's extent offset is 0, so its reference
+                        // names its own key offset.
+                        let ref_offset = item.key.offset;
+                        let mut fields = Vec::with_capacity(24);
+                        for v in [objectid::FS_TREE, ino, ref_offset] {
+                            fields.extend_from_slice(&v.to_le_bytes());
+                        }
+                        let after = if le64(&before, 0) == 1 {
+                            let refs = backref::inline_refs(EXTENT_ITEM, &before)?;
+                            let ours = refs.len() == 1
+                                && refs[0].kind == EXTENT_DATA_REF
+                                && refs[0].payload[..24] == fields[..]
+                                && refs[0].payload[24..28] == 1u32.to_le_bytes();
+                            if !ours {
+                                return Err(Error::DirtyLog);
+                            }
+                            released.push((old, old + old_len));
+                            None
+                        } else {
+                            Some(
+                                backref::drop_inline_data_ref(
+                                    EXTENT_ITEM,
+                                    &before,
+                                    objectid::FS_TREE,
+                                    ino,
+                                    ref_offset,
+                                )?
+                                .ok_or(Error::DirtyLog)?,
+                            )
+                        };
+                        records.push(RecordEdit {
+                            bytenr: old,
+                            len: old_len,
+                            before: Some(before),
+                            after,
+                        });
+                        let mut body = Vec::with_capacity(53);
+                        for v in [1, generation, EXTENT_FLAG_DATA] {
+                            body.extend_from_slice(&v.to_le_bytes());
+                        }
+                        body.push(EXTENT_DATA_REF);
+                        body.extend_from_slice(&fields);
+                        body.extend_from_slice(&1u32.to_le_bytes());
+                        records.push(RecordEdit {
+                            bytenr: new,
+                            len: new_len,
+                            before: None,
+                            after: Some(body),
+                        });
+                        news.push((new, new_len, summed));
                         edits.push(ItemEdit::Put(OwnedItem {
                             key: item.key,
                             data: item.data.clone(),
@@ -309,14 +462,60 @@ impl Filesystem {
                 }
             }
         }
-        let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
-            Error::UnsupportedFeature("the log replay generation overflows".into())
-        })?;
+        // The new extents' digests, from the bytes already on disk, and
+        // the released extents' removed. The log carries the digests the
+        // kernel computed; they must be exactly these, sector for sector,
+        // or the data did not reach the disk as logged.
+        let mut contents = Vec::new();
+        for &(new, len, summed) in &news {
+            let mut buf = vec![0u8; usize::try_from(len).map_err(|_| Error::DirtyLog)?];
+            Self::read_logical_pool(&self.device, &self.devices, &self.map, new, &mut buf)?;
+            if summed {
+                contents.push((new, buf));
+            }
+        }
+        let csum_edits = if records.is_empty() {
+            Vec::new()
+        } else {
+            self.csum_edits(&released, &contents, true)?
+        };
+        let size = self.sb.csum_type.digest_len();
+        let sector = u64::from(self.sb.sectorsize);
+        let sectors =
+            |items: &mut dyn Iterator<Item = (u64, &[u8])>| -> Result<BTreeMap<u64, Vec<u8>>> {
+                let mut out = BTreeMap::new();
+                for (start, data) in items {
+                    if data.len() % size != 0 {
+                        return Err(Error::DirtyLog);
+                    }
+                    for (i, digest) in data.chunks(size).enumerate() {
+                        out.insert(start + i as u64 * sector, digest.to_vec());
+                    }
+                }
+                Ok(out)
+            };
+        let in_new = |at: u64| {
+            contents
+                .iter()
+                .any(|(n, b)| (*n..*n + b.len() as u64).contains(&at))
+        };
+        let logged = sectors(&mut logged_csums.iter().map(|i| (i.key.offset, &i.data[..])))?;
+        let computed = sectors(&mut csum_edits.iter().filter_map(|e| match e {
+            ItemEdit::Put(item) if in_new(item.key.offset) => {
+                Some((item.key.offset, &item.data[..]))
+            }
+            _ => None,
+        }))?;
+        if logged != computed {
+            return Err(Error::DirtyLog);
+        }
         self.pinned.extend(pins);
         self.commit_write_with(
             DataWrite {
                 root: objectid::FS_TREE,
                 edits,
+                csum_edits,
+                records,
                 ..Default::default()
             },
             generation,
