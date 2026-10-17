@@ -743,12 +743,15 @@ tasks:
     # FLOOR: each file prints a `test result: ok. N passed` line, which
     # test-floor.sh sums as it does cargo's. 34 checks executed when the
     # tier was added, 176 with test-docs.sh; the floor is about 95% of that.
+    # Stat adds 39 assertions and one generated man-page check (#412):
+    # raise the existing floor by those 40 checks; CI verifies execution.
     #
     # BUDGET: 26 lines and 1047 bytes measured with fsck.btrfs's checks in
     # the tier (#260, run 37378163675), so 26 lines and 1200 bytes.
+    # test-stat.sh adds exactly three success lines, so 29 lines now.
     cmds:
-      - '../rust-fs-core/scripts/tier.sh test:cli cli 26 1200 -- scripts/test-cli.sh'
-      - 'bash ../rust-fs-core/scripts/test-floor.sh cli 167'
+      - '../rust-fs-core/scripts/tier.sh test:cli cli 29 1200 -- scripts/test-cli.sh'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh cli 207'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
