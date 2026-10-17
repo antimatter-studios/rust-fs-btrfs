@@ -30,8 +30,8 @@
 
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs_test_support::{
-    assert_btrfs_check_clean, guest_kernel_read_ok, guest_kernel_write_ok, oracle, sha256_hex,
-    temp_path,
+    assert_btrfs_check_clean, dump_tree, guest_kernel_read_ok, guest_kernel_write_ok, oracle,
+    sha256_hex, temp_path,
 };
 use fs_core::{BlockDevice, FileDevice};
 use std::collections::BTreeMap;
@@ -59,6 +59,10 @@ impl Scratch {
     /// As [`Scratch::new`], on a volume whose checksum algorithm is
     /// `algorithm` (`mkfs.btrfs --csum`; crc32c is its default).
     fn with_csum(name: &str, algorithm: &str, script: &str) -> Self {
+        Self::made(name, algorithm, "no-holes", script)
+    }
+
+    fn made(name: &str, algorithm: &str, features: &str, script: &str) -> Self {
         let dir = PathBuf::from(temp_path!("{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         let image = dir.join("fs.img");
@@ -66,12 +70,14 @@ impl Scratch {
             .and_then(|f| f.set_len(256 << 20))
             .unwrap();
         let made = oracle("mkfs.btrfs")
-            .args(["-q", "-f", "-s", "4096", "-n", "16384", "--csum", algorithm])
+            .args([
+                "-q", "-f", "-s", "4096", "-n", "16384", "--csum", algorithm, "-O", features,
+            ])
             .arg(&image)
             .output();
         assert!(
             made.status.success(),
-            "mkfs.btrfs --csum {algorithm}: {}",
+            "mkfs.btrfs --csum {algorithm} -O {features}: {}",
             String::from_utf8_lossy(&made.stderr)
         );
         guest_kernel_write_ok(&image.to_string_lossy(), name, script);
@@ -790,6 +796,162 @@ fn a_write_into_a_hole_adds_an_extent_the_checker_and_kernel_accept() {
             old.physical, new.physical,
             "an extent the write did not touch moved"
         );
+    }
+}
+
+/// The explicit holes reported by btrfs-progs, after checking that all
+/// items tile the file without a gap or overlap. Data addresses differ
+/// between the driver's file and the independently written control.
+fn explicit_holes(image: &Path, ino: u64) -> Vec<(u64, u64)> {
+    let tree = dump_tree(image, "5");
+    let lines: Vec<&str> = tree.lines().collect();
+    let needle = format!("key ({ino} EXTENT_DATA ");
+    let mut end = 0;
+    let mut holes = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        let Some((_, key)) = line.split_once(&needle) else {
+            continue;
+        };
+        let offset: u64 = key.split(')').next().unwrap().parse().unwrap();
+        let body: Vec<&str> = lines[at + 1..]
+            .iter()
+            .copied()
+            .take_while(|l| !l.contains(" key ("))
+            .collect();
+        let field = |phrase: &str, word: &str| -> u64 {
+            let line = body.iter().find(|l| l.contains(phrase)).unwrap();
+            let mut words = line.split_whitespace();
+            assert!(words.any(|w| w == word), "no {word} in {line}");
+            words.next().unwrap().parse().unwrap()
+        };
+        let len = field("extent data offset", "nr");
+        assert_eq!(
+            offset, end,
+            "inode {ino}: gap or overlap at {offset}\n{tree}"
+        );
+        assert!(len > 0, "inode {ino}: empty extent at {offset}");
+        end = offset + len;
+        if field("extent data disk byte", "byte") == 0 {
+            holes.push((offset, len));
+        }
+    }
+    assert_eq!(
+        end, 196_608,
+        "inode {ino}: incomplete extent coverage\n{tree}"
+    );
+    holes
+}
+
+/// Without NO_HOLES, a hole is an item that must be trimmed, split or
+/// replaced (#434). Cover each shape, unaligned writes, a write across
+/// either data boundary, and a second fill into a previously split hole.
+/// The kernel performs identical writes to independent control files;
+/// btrfs-progs compares the remaining holes and validates every checksum.
+#[test]
+fn explicit_hole_fills_keep_items_the_checker_and_kernel_accept() {
+    let names = ["start", "middle", "end", "whole", "left", "right", "again"];
+    let writes = [
+        ("start", 65_536u64, 9000usize),
+        ("middle", 70_000, 9000),
+        ("end", 122_000, 9072),
+        ("whole", 65_536, 65_536),
+        ("left", 64_536, 18_000),
+        ("right", 122_000, 18_000),
+        ("again", 70_000, 9000),
+        ("again", 100_000, 9000),
+    ];
+    let mut script = String::new();
+    for name in names {
+        script.push_str(&format!(
+            "for f in {name} {name}-control; do\n\
+             head -c 65536 /dev/zero | tr '\\000' '\\151' > \"$MNT/$f\"\n\
+             head -c 65536 /dev/zero | tr '\\000' '\\226' \
+             | dd of=\"$MNT/$f\" bs=65536 seek=2 conv=notrunc status=none\n\
+             done\n"
+        ));
+    }
+    script.push_str("sync\n");
+    for (name, offset, len) in writes {
+        script.push_str(&format!(
+            "head -c {len} /dev/zero | tr '\\000' '\\303' \
+             | dd of=\"$MNT/{name}-control\" bs=1 seek={offset} conv=notrunc status=none\n\
+             sync\n"
+        ));
+    }
+    let scratch = Scratch::made("cow-write-explicit-holes", "crc32c", "^no-holes", &script);
+    let image = scratch.image();
+    let mut fs = mount_rw(&image);
+    assert!(!fs.superblock().has_no_holes(), "mkfs enabled NO_HOLES");
+    let mut expected = BTreeMap::new();
+    let mut inodes = BTreeMap::new();
+    for name in names {
+        let ino = ino_of(&fs, name);
+        inodes.insert(name, (ino, ino_of(&fs, &format!("{name}-control"))));
+        assert_eq!(
+            explicit_holes(&image, ino),
+            vec![(65_536, 65_536)],
+            "{name}: the kernel must have recorded an explicit hole"
+        );
+        let mut bytes = vec![0x69; 196_608];
+        bytes[65_536..131_072].fill(0);
+        bytes[131_072..].fill(0x96);
+        assert_eq!(fs.read_file(ino).unwrap(), bytes);
+        assert_eq!(fs.read_inode(ino).unwrap().nbytes, 131_072);
+        expected.insert(name, bytes);
+    }
+    assert_btrfs_check_clean(&image, "before explicit hole fills");
+    for (name, offset, len) in writes {
+        let ino = inodes[name].0;
+        let bytes = vec![0xc3; len];
+        assert_eq!(
+            fs.write(ino, offset, &bytes)
+                .unwrap_or_else(|e| panic!("filling {name}'s hole at {offset}: {e}")),
+            len
+        );
+        expected.get_mut(name).unwrap()[offset as usize..offset as usize + len]
+            .copy_from_slice(&bytes);
+    }
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert!(
+        checked.status.success(),
+        "btrfs check after explicit hole fills:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    for name in names {
+        let (ino, control) = inodes[name];
+        let ours = fs.read_inode(ino).unwrap();
+        let theirs = fs.read_inode(control).unwrap();
+        assert_eq!((ours.size, ours.nbytes), (theirs.size, theirs.nbytes));
+        assert_eq!(fs.read_file(ino).unwrap(), expected[name]);
+        assert_eq!(
+            explicit_holes(&image, ino),
+            explicit_holes(&image, control),
+            "{name}: remaining holes differ from the kernel's control"
+        );
+    }
+    drop(fs);
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after explicit hole fills",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+    let all_names: Vec<String> = names
+        .iter()
+        .flat_map(|n| [n.to_string(), format!("{n}-control")])
+        .collect();
+    let refs: Vec<&str> = all_names.iter().map(String::as_str).collect();
+    let seen = kernel_view(&image, "read back explicit hole fills", &refs);
+    for name in names {
+        assert_eq!(
+            seen[name].0,
+            sha256_hex(&expected[name]),
+            "{name}: wrong bytes"
+        );
+        assert_eq!(seen[name].0, seen[&format!("{name}-control")].0);
     }
 }
 
