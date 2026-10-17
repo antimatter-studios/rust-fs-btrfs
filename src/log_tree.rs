@@ -509,7 +509,9 @@ impl Filesystem {
     /// - **Inodes logged only to say they exist** (generation 0) keep
     ///   their committed item; their logged references are their names,
     ///   each new one named by a logged entry and a committed one kept
-    ///   where the log does not speak for its index (#461).
+    ///   where the log does not speak for its index (#461). Their
+    ///   committed extended references, which the kernel does not log for
+    ///   them, are kept and counted among their names (#476).
     pub(crate) fn replay_inode_only_log(&mut self) -> Result<()> {
         use crate::backref::{self, EXTENT_DATA_REF, SHARED_DATA_REF};
         use crate::chunk::{key_type::EXTENT_ITEM, objectid};
@@ -962,6 +964,20 @@ impl Filesystem {
                             // A name in a directory the log does not mention.
                             *names.entry(ino).or_default() +=
                                 ref_records(&c.data).ok_or(Error::DirtyLog)?.len() as u32;
+                        }
+                    }
+                    // Its committed extended references are not logged, and
+                    // stay (#476): each is one more name, outside every index
+                    // range the log speaks for, since one the log removed
+                    // would need its record deleted.
+                    for c in tree.find_all(root, ino, INODE_EXTREF_KEY)? {
+                        for (parent, index, _) in
+                            name_records(&c.key, &c.data).ok_or(Error::DirtyLog)?
+                        {
+                            if dirs.contains(&parent) && in_logged_range(parent, index) {
+                                return Err(Error::DirtyLog);
+                            }
+                            *names.entry(ino).or_default() += 1;
                         }
                     }
                     for item in top.items.iter().filter(|i| i.key.objectid == ino) {
