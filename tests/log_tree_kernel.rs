@@ -870,6 +870,66 @@ fn a_log_whose_data_disagrees_with_its_checksums_is_refused_without_writing() {
     });
 }
 
+/// A logged directory whose names the log speaks for by hashed ranges
+/// (`DIR_LOG_ITEM`, over `DIR_ITEM` name hashes) rather than by index
+/// ranges (#408). The CI guest's kernel (Debian 12, 6.1) never writes
+/// one: in sixteen fsync shapes, adding, removing and renaming names in
+/// committed and new directories, every log it left held `DIR_INDEX`
+/// items and `DIR_LOG_INDEX` ranges and no `DIR_ITEM` or `DIR_LOG_ITEM`
+/// at all. With no kernel replay of one to judge this crate's against,
+/// replay keeps refusing the shape before anything is written. The
+/// kernel-made directory-fsync log has each index range of `/` retyped as
+/// a hashed range, in place on a copy, its leaf still in key order and
+/// given a fresh checksum.
+#[test]
+fn a_log_with_a_hashed_directory_range_is_refused_without_writing() {
+    an_unsupported_log_is_refused_without_writing("dirlink", |copy| {
+        use fs_btrfs::btree::{Body, HEADER_SIZE, ITEM_SIZE};
+        use fs_btrfs::log_tree::DIR_LOG_ITEM_KEY;
+        use std::os::unix::fs::FileExt;
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(copy).expect("open the copy"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the copy without replay");
+        let log = fs.log().unwrap().expect("the copy holds a log");
+        let top = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .expect("the copy holds a log of the top-level subvolume");
+        let block = fs.read_tree_block(top.root).unwrap();
+        let Body::Leaf(items) = &block.body else {
+            panic!("the directory-fsync log is expected to be one leaf");
+        };
+        let mut bytes = block.bytes().to_vec();
+        let mut keys = Vec::with_capacity(items.len());
+        for (n, item) in items.iter().enumerate() {
+            let mut key_type = item.key.key_type;
+            if (item.key.objectid, key_type) == (256, DIR_LOG_INDEX_KEY) {
+                // An item's key type is the byte after its 8-byte objectid.
+                key_type = DIR_LOG_ITEM_KEY;
+                bytes[HEADER_SIZE + n * ITEM_SIZE + 8] = key_type;
+            }
+            keys.push((item.key.objectid, key_type, item.key.offset));
+        }
+        assert!(
+            keys.iter()
+                .any(|&(o, t, _)| (o, t) == (256, DIR_LOG_ITEM_KEY)),
+            "the directory-fsync log holds no index range of /"
+        );
+        assert!(
+            keys.windows(2).all(|w| w[0] < w[1]),
+            "retyping the ranges left the leaf out of key order: {keys:?}"
+        );
+        fs_btrfs::tree_write::stamp_checksum(&mut bytes, fs.superblock());
+        let file = std::fs::OpenOptions::new().write(true).open(copy).unwrap();
+        for mirror in 0..fs.chunk_map().mirrors_at(top.root).unwrap() {
+            let m = fs.chunk_map().map_mirror(top.root, mirror).unwrap();
+            file.write_all_at(&bytes, m.physical).unwrap();
+        }
+    });
+}
+
 /// An inline rewrite of `/f`, made durable by fsync alone, that #364's
 /// same-length replay does not cover (#378): the kernel replays one copy
 /// of the crash image and `mount_rw` the other. Both must pass `btrfs
