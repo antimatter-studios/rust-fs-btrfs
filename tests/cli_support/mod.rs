@@ -7,9 +7,13 @@
 
 #![allow(dead_code)]
 
+use fs_btrfs::chunk::DiskKey;
+use fs_btrfs::Filesystem;
+use fs_core::FileDevice;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// The repository-named entry point, as cargo built it.
 ///
@@ -156,4 +160,60 @@ pub fn json_field(json: &str, key: &str) -> String {
             .trim()
             .to_string()
     }
+}
+
+/// The size of a tree block's header: item offsets count from its end.
+const TREE_BLOCK_HEADER: usize = 101;
+
+/// The root of tree `tree` in `fs`.
+pub fn root_of(fs: &Filesystem, tree: u64) -> u64 {
+    match tree {
+        1 => fs.superblock().root,
+        3 => fs.superblock().chunk_root,
+        _ => fs
+            .root_tree_items()
+            .unwrap()
+            .into_iter()
+            .find(|(objectid, key_type, _, _)| *objectid == tree && *key_type == 132)
+            .map(|(_, _, _, data)| u64::from_le_bytes(data[176..184].try_into().unwrap()))
+            .unwrap_or_else(|| panic!("no root item for tree {tree}")),
+    }
+}
+
+/// Change the first item of `tree` that `pick` chooses, with `edit`, and
+/// write its block back with a fresh checksum to every mirror.
+pub fn edit_item(
+    image: &Path,
+    tree: u64,
+    pick: impl Fn(&DiskKey, &[u8]) -> bool,
+    edit: impl Fn(&mut [u8]),
+) {
+    let fs =
+        Filesystem::mount(Arc::new(FileDevice::open(image.to_str().unwrap()).unwrap())).unwrap();
+    let mut stack = vec![root_of(&fs, tree)];
+    while let Some(logical) = stack.pop() {
+        let block = fs.read_tree_block(logical).unwrap();
+        match &block.body {
+            fs_btrfs::btree::Body::Node(ptrs) => stack.extend(ptrs.iter().map(|p| p.blockptr)),
+            fs_btrfs::btree::Body::Leaf(items) => {
+                for item in items {
+                    let data = block.item_data(item).unwrap();
+                    if !pick(&item.key, data) {
+                        continue;
+                    }
+                    let mut bytes = block.bytes().to_vec();
+                    let at = TREE_BLOCK_HEADER + item.offset as usize;
+                    edit(&mut bytes[at..at + item.size as usize]);
+                    fs_btrfs::tree_write::stamp_checksum(&mut bytes, fs.superblock());
+                    let file = std::fs::OpenOptions::new().write(true).open(image).unwrap();
+                    for mirror in 0..fs.chunk_map().mirrors_at(logical).unwrap() {
+                        let m = fs.chunk_map().map_mirror(logical, mirror).unwrap();
+                        file.write_all_at(&bytes, m.physical).unwrap();
+                    }
+                    return;
+                }
+            }
+        }
+    }
+    panic!("no item in tree {tree} matched");
 }
