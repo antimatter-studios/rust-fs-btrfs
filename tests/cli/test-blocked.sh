@@ -1,7 +1,8 @@
 # What fs.btrfs refuses before it opens the image answers by name: status
 # 3 for a key that cannot be set, status 2 for an unknown key or a size
 # `resize` cannot read, a structured error naming why, and nothing on
-# stdout. None of them opens the image, so none needs one.
+# stdout. A missing target proves these refusals happen before opening it;
+# positioned writes also leave a copy of a kernel-made image byte-identical.
 #
 # `resize` was this file's verb that answered `not implemented` until it
 # could resize (#264); what it does to a volume is checked in
@@ -34,6 +35,35 @@ refused 2 set colour blue -- "colour"
 refused 2 resize 20Q -- "not a size"
 refused 2 resize 0 --force -- "not a size"
 refused 2 resize -x -- "not a size"
+
+# Positioned writes are a missing capability, including position zero.
+# A missing image proves refusal happens before opening the target.
+refused 3 write --at 0 /f -- "not implemented: positioned write"
+refused 3 write --at 18446744073709551615 /f -- "positioned write"
+check "write --at does not create the missing image" test ! -e "$img"
+refused 2 write --at nope /f -- "nope"
+refused 2 write --at 18446744073709551616 /f -- "18446744073709551616"
+
+# Refusal also leaves a real kernel-made volume byte-identical.
+src="$REPO/test-disks/cli/btrfs-cli.img"
+if [ ! -s "$src" ]; then
+    fail "test-disks/cli/btrfs-cli.img is missing: run chore fixtures in the harness VM. Nothing skips."
+    finish
+fi
+img="$SANDBOX/positioned-write.img"
+dd if="$src" of="$img" bs=1048576 conv=sparse status=none 2>/dev/null ||
+    dd if="$src" of="$img" bs=1048576 conv=sparse 2>/dev/null
+refused 3 write --at 0 /f -- "not implemented: positioned write"
+check "write --at 0 leaves the image byte-identical" cmp -s "$src" "$img"
+refused 3 --offset 1048576 write --at 17 /nocow/data.bin -- "positioned write"
+check "--offset and --at leave the image byte-identical" cmp -s "$src" "$img"
+
+# --text uses the same refusal and never reports success on stdout.
+fs.btrfs --text "$img" write --at 0 /f >"$SANDBOX/t.out" 2>"$SANDBOX/t.err"
+check "write --at --text exits 3" test $? -eq 3
+check "write --at --text prints nothing on stdout" test ! -s "$SANDBOX/t.out"
+check "write --at --text names the missing capability" grep -q '^fs.btrfs: not implemented: positioned write' "$SANDBOX/t.err"
+check "write --at --text leaves the image byte-identical" cmp -s "$src" "$img"
 
 # --text: `fs.btrfs: <message>`, for a person.
 fs.btrfs --text "$img" set total_bytes 1 >/dev/null 2>"$SANDBOX/t.err"
