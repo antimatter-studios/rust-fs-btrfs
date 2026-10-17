@@ -481,7 +481,8 @@ impl Filesystem {
     ///   cover their ranges -- a committed item they cover in part keeps
     ///   its head and its tail -- and the file is cut at its logged size,
     ///   rounded up to a sector, as the logged inode item is the truth of
-    ///   it. Its `nbytes` is counted from what is left. Its references,
+    ///   it. Its `nbytes` is counted from what is left, whatever the log
+    ///   holds there, which may be stale bytes (#462). Its references,
     ///   in `INODE_REF` and `INODE_EXTREF` items alike (#407), keep every
     ///   committed name and may add hard links (#406), each in a directory
     ///   the log speaks for, its link count raised by one for each.
@@ -736,15 +737,16 @@ impl Filesystem {
                             .search(root, &key(ino, INODE_ITEM_KEY, 0))?
                             .ok_or(Error::DirtyLog)?;
                         let before = Inode::parse(&c.data, ino)?;
-                        // The kernel logs `nbytes` as 0 and counts it again from
-                        // the data; a committed count that disagrees with the
+                        // The logged `nbytes` is not read: the kernel may log
+                        // 0, the committed count or stale bytes (#462), and
+                        // its replay counts it again from the data, as this
+                        // one does. A committed count that disagrees with the
                         // committed items is not a volume this understands.
                         let committed_nbytes = committed_items
                             .values()
                             .map(|d| counted_bytes(d))
                             .sum::<u64>();
                         if before.nbytes != committed_nbytes
-                            || (logged.nbytes != 0 && logged.nbytes != before.nbytes)
                             || before.generation != logged.generation
                             || before.nlink == 0
                             || before.flags != logged.flags
