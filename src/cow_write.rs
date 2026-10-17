@@ -222,9 +222,11 @@ impl Filesystem {
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or_else(|| Error::UnsupportedFeature("write range overflows".into()))?;
-        // Inline data the write lies within is rewritten in its item, and
-        // the file stays inline, as the kernel leaves it (#437).
-        if !move_inline && end <= inode.size {
+        // Inline data the write lies within, or grows while it still fits
+        // inline, is rewritten in its item, and the file stays inline, as
+        // the kernel leaves it (#437, #530).
+        let grows_inline = offset <= inode.size && inode.size < u64::from(self.sb.sectorsize);
+        if !move_inline && (end <= inode.size || grows_inline) {
             if let Some(written) = self.write_inline(inode, offset, data)? {
                 return Ok(written);
             }
@@ -528,6 +530,10 @@ impl Filesystem {
     /// or checksum, so nothing else changes. `None` when the file holds no
     /// inline item at offset 0.
     ///
+    /// A write that starts within inline data holding the whole file and
+    /// ends past it grows the item, as long as the grown data still fits
+    /// inline, and moves the inode's `size` and `nbytes` with it (#530).
+    ///
     /// A compressed inline extent (#438) is decoded, written and stored
     /// inline again: compressed when the file asks for compression and
     /// the encoding is smaller, as the kernel decides, otherwise as it is.
@@ -573,10 +579,12 @@ impl Filesystem {
             item[fe::INLINE_DATA..].to_vec()
         };
         let held = plain.len() as u64;
-        if end > held {
+        // A write past the inline data grows the file inline only when that
+        // data is the whole file and the write starts within it (#530).
+        if end > held && (held != inode.size || offset > held) {
             return Err(Error::UnsupportedFeature(format!(
                 "inode {ino}: the write to [{offset}, {end}) reaches past the {held} bytes of \
-                 inline data at 0"
+                 inline data at 0, which are not the whole file or the write starts past them"
             )));
         }
         let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
@@ -587,35 +595,49 @@ impl Filesystem {
             .unwrap_or_default();
         let now = (now.as_secs(), now.subsec_nanos());
 
+        let length = held.max(end);
+        plain.resize(length as usize, 0);
+        plain[offset as usize..end as usize].copy_from_slice(data);
+        let (bytes, compression) = if compressed {
+            self.encode_inline(plain, self.compression_for(inode)?)
+        } else {
+            (plain, COMPRESS_NONE)
+        };
+        // The kernel keeps compressed inline data no larger than its
+        // default `max_inline`, and plain inline data short of a sector,
+        // which `btrfs check` requires; data grown inline stays short of
+        // a sector however it is stored (#530).
+        let fits = if compression == COMPRESS_NONE {
+            bytes.len() < sector && bytes.len() <= MAX_INLINE
+        } else {
+            bytes.len() <= MAX_INLINE
+        } && (end <= held || length < sector as u64);
+        if !fits {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}: the write to [{offset}, {end}) leaves {} bytes of inline \
+                 data, more than an inline extent holds, and moving it out of line is \
+                 not implemented",
+                bytes.len()
+            )));
+        }
         let mut rewritten = item;
         rewritten[fe::GENERATION..fe::GENERATION + 8].copy_from_slice(&generation.to_le_bytes());
-        if compressed {
-            plain[offset as usize..end as usize].copy_from_slice(data);
-            let (bytes, compression) = self.encode_inline(plain, self.compression_for(inode)?);
-            // The kernel keeps compressed inline data no larger than its
-            // default `max_inline`, and plain inline data short of a
-            // sector, which `btrfs check` requires.
-            let fits = if compression == COMPRESS_NONE {
-                bytes.len() < sector && bytes.len() <= MAX_INLINE
-            } else {
-                bytes.len() <= MAX_INLINE
-            };
-            if !fits {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino}: the write to [{offset}, {end}) leaves {} bytes of inline \
-                     data, more than an inline extent holds, and moving it out of line is \
-                     not implemented",
-                    bytes.len()
-                )));
-            }
-            rewritten.truncate(fe::INLINE_DATA);
-            rewritten[fe::COMPRESSION] = compression;
-            rewritten.extend_from_slice(&bytes);
-        } else {
-            let at = fe::INLINE_DATA + offset as usize;
-            rewritten[at..at + data.len()].copy_from_slice(data);
-        }
+        rewritten[fe::RAM_BYTES..fe::RAM_BYTES + 8].copy_from_slice(&length.to_le_bytes());
+        rewritten.truncate(fe::INLINE_DATA);
+        rewritten[fe::COMPRESSION] = compression;
+        rewritten.extend_from_slice(&bytes);
         let mut raw = self.raw_inode(ino)?;
+        // A grown inline file's `size` moves to the write's end, and its
+        // `nbytes`, which counts inline data, by as much as the data grew.
+        if length > held {
+            let nbytes = (inode.nbytes - held.min(inode.nbytes))
+                .checked_add(length)
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(format!("inode {ino}: nbytes overflows"))
+                })?;
+            raw[io::SIZE..io::SIZE + 8].copy_from_slice(&length.to_le_bytes());
+            raw[io::NBYTES..io::NBYTES + 8].copy_from_slice(&nbytes.to_le_bytes());
+        }
         crate::namespace::touch(&mut raw, generation, now, &[io::CTIME, io::MTIME]);
         let edits = vec![
             ItemEdit::Put(OwnedItem {
