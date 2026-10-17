@@ -745,9 +745,91 @@ fn a_mixed_names_and_inline_log_is_refused_without_writing() {
     an_unsupported_log_is_refused_without_writing("mixedlog");
 }
 
+/// An inline rewrite of `/f`, made durable by fsync alone, that #364's
+/// same-length replay does not cover (#378): the kernel replays one copy
+/// of the crash image and `mount_rw` the other. Both must pass `btrfs
+/// check`, hold the logged bytes, and be the same volume to the kernel.
+fn an_inline_rewrite_replays_as_the_kernel_does(shape: &str, logged: &[u8]) {
+    use sha2::Digest;
+    let image = fixture(&format!("dirtylog/btrfs-dirty-log-{shape}.img"));
+    let transcript = std::fs::read_to_string(fixture(&format!(
+        "dirtylog/btrfs-dirty-log-{shape}.logdump"
+    )))
+    .expect("the native transcript of the inline rewrite log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    let committed = Filesystem::mount_ignoring_log(Arc::new(
+        FileDevice::open(&image).expect("open the inline rewrite fixture"),
+    ) as Arc<dyn BlockRead>)
+    .expect("read the committed file without replay");
+    let before = committed.lookup_path("/f").unwrap();
+    assert_eq!(
+        committed.read_file(before.ino).unwrap(),
+        b"committed-inline-bytes-0123456789",
+        "[{shape}] the committed file is the bytes written before the rewrite"
+    );
+    drop(committed);
+
+    let theirs_guard = ScratchCopy::of(&image, temp_path!("{shape}-kernel.img"));
+    let ours_guard = ScratchCopy::of(&image, temp_path!("{shape}-crate.img"));
+    let (theirs, ours) = (theirs_guard.0.clone(), ours_guard.0.clone());
+    const VIEW: &str = "stat -c '%i %s %h' \"$MNT/f\"; sha256sum \"$MNT/f\" | cut -d' ' -f1";
+    let expected = format!(
+        "{} {} 1\n{:x}",
+        before.ino,
+        logged.len(),
+        sha2::Sha256::digest(logged)
+    );
+    let kernel = guest_kernel_write_ok(
+        &theirs.to_string_lossy(),
+        &format!("{shape} kernel replay"),
+        VIEW,
+    );
+    assert_eq!(
+        kernel.trim(),
+        expected,
+        "[{shape}] the real kernel recovered the rewrite"
+    );
+    assert_btrfs_check_clean(&theirs, &format!("{shape} kernel replay"));
+    {
+        let fs = Filesystem::mount_rw(
+            Arc::new(FileDevice::open_rw(&ours).unwrap()) as Arc<dyn BlockDevice>
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "[{shape}] an inline rewrite log must replay: {error:?}; kernel recovered {}",
+                kernel.trim()
+            )
+        });
+        assert_eq!(fs.superblock().log_root, 0);
+        let replayed = fs.lookup_path("/f").unwrap();
+        assert_eq!(replayed.ino, before.ino);
+        assert_eq!(fs.read_file(replayed.ino).unwrap(), logged);
+    }
+    assert_btrfs_check_clean(&ours, &format!("{shape} crate replay"));
+    let actual = guest_kernel_read_ok(
+        &ours.to_string_lossy(),
+        &format!("{shape} crate readback"),
+        VIEW,
+    );
+    assert_eq!(
+        actual.trim(),
+        expected,
+        "[{shape}] the kernel reads the crate's replay"
+    );
+    assert!(differences(
+        &kernel_view(&ours, &format!("{shape} crate")),
+        &kernel_view(&theirs, &format!("{shape} kernel"))
+    )
+    .is_empty());
+}
+
+/// A compressed inline extent in place of an uncompressed one (#378):
+/// `compress-force=zlib` stores 33 bytes of `z` compressed, and replay
+/// must copy the encoded bytes and their compression type as logged.
 #[test]
-fn a_compressed_inline_log_is_refused_without_writing() {
-    an_unsupported_log_is_refused_without_writing("compressedinline");
+fn a_compressed_inline_rewrite_replays_as_the_kernel_does() {
+    an_inline_rewrite_replays_as_the_kernel_does("compressedinline", &[b'z'; 33]);
 }
 
 const EXTERNAL_FIXTURE: &str = "dirtylog/btrfs-dirty-log-externalextent.img";
@@ -875,9 +957,14 @@ fn an_external_extent_overwrite_replays_as_the_kernel_does() {
     .is_empty());
 }
 
+/// An inline extent that grows from 33 bytes to 43 (#378): the file's
+/// size and `nbytes` move with it.
 #[test]
-fn a_size_changing_inline_log_is_refused_without_writing() {
-    an_unsupported_log_is_refused_without_writing("sizechange");
+fn a_size_changing_inline_rewrite_replays_as_the_kernel_does() {
+    an_inline_rewrite_replays_as_the_kernel_does(
+        "sizechange",
+        b"replayed-and-longer-inline-bytes-0123456789",
+    );
 }
 
 /// The inline writer's encoding fields are checked against the native

@@ -185,6 +185,19 @@ fn same_length_inline(committed: &[u8], logged: &[u8]) -> bool {
     plain_inline(committed) && plain_inline(logged) && committed.len() == logged.len()
 }
 
+/// Whether a file extent item is inline, unencrypted and not otherwise
+/// encoded, and either compressed by an algorithm the format defines or
+/// plain (#378). A plain one's `ram_bytes` must name exactly the data it
+/// carries; a compressed one's names the decoded length.
+fn inline_extent(d: &[u8]) -> bool {
+    d.len() > fe::INLINE_DATA
+        && d[fe::TYPE] == 0
+        && d[fe::COMPRESSION] <= 3
+        && d[fe::ENCRYPTION] == 0
+        && d[fe::OTHER_ENCODING..fe::TYPE] == [0, 0]
+        && (d[fe::COMPRESSION] != 0 || plain_inline(d))
+}
+
 /// Whether a file extent item is inline and neither compressed, encrypted
 /// nor otherwise encoded, its `ram_bytes` naming exactly the data it
 /// carries.
@@ -446,14 +459,45 @@ impl Filesystem {
                                 && logged_extents.len() == 1
                                 && logged_extents[0].key.offset == 0
                         };
+                        // One inline extent in place of another (#378):
+                        // whatever its length or compression, the file is
+                        // that extent's decoded bytes, so its size is the
+                        // logged extent's `ram_bytes`.
+                        let inline_change = (extents_match && before.size != 0)
+                            .then(|| {
+                                let (old, new) =
+                                    (&committed_extents[0].data, &logged_extents[0].data);
+                                // A same-length plain rewrite (#364) moves
+                                // neither the size nor `nbytes`.
+                                (committed_extents[0].key.offset == 0
+                                    && inline_extent(old)
+                                    && inline_extent(new)
+                                    && !same_length_inline(old, new))
+                                .then(|| (le64(old, fe::RAM_BYTES), le64(new, fe::RAM_BYTES)))
+                            })
+                            .flatten();
+                        let size_follows = match inline_change {
+                            Some((_, ram)) => after.size == ram,
+                            None => before.size == after.size,
+                        };
                         // The kernel logs an inode's `nbytes` as 0 and
                         // replay keeps the committed count, adjusting it
-                        // only for extents the log changes; a same-length
+                        // only for extents the log changes: a same-length
                         // rewrite changes none (fixture
-                        // btrfs-dirty-log-inline: committed 33, logged 0).
+                        // btrfs-dirty-log-inline: committed 33, logged 0),
+                        // and an inline extent of another length gives back
+                        // the old extent's bytes and counts the new one's.
+                        let nbytes = match inline_change {
+                            Some((old, new)) => before
+                                .nbytes
+                                .checked_sub(old)
+                                .and_then(|n| n.checked_add(new))
+                                .ok_or(Error::DirtyLog)?,
+                            None => before.nbytes,
+                        };
                         if !before.is_regular_file()
                             || !after.is_regular_file()
-                            || before.size != after.size
+                            || !size_follows
                             || (after.nbytes != before.nbytes && after.nbytes != 0)
                             || !extents_match
                             || before.generation != after.generation
@@ -468,21 +512,24 @@ impl Filesystem {
                         }
                         let mut data = item.data.clone();
                         data[crate::inode::offsets::NBYTES..crate::inode::offsets::NBYTES + 8]
-                            .copy_from_slice(&before.nbytes.to_le_bytes());
+                            .copy_from_slice(&nbytes.to_le_bytes());
                         edits.push(ItemEdit::Put(OwnedItem {
                             key: item.key,
                             data,
                         }));
                     }
-                    // A same-length rewrite of the committed inline extent,
-                    // of an inode whose metadata is in this log and whose
-                    // size is that extent's length.
+                    // An inline extent in place of the committed inline
+                    // extent, of an inode whose metadata is in this log and
+                    // whose size is the new extent's decoded length: a
+                    // same-length rewrite (#364), or one of another length
+                    // or compressed (#378), copied as logged.
                     EXTENT_DATA_KEY
                         if item.key.offset == 0
-                            && same_length_inline(&committed.data, &item.data)
-                            && top.inode(item.key.objectid)?.is_some_and(|i| {
-                                i.size == (item.data.len() - fe::INLINE_DATA) as u64
-                            }) =>
+                            && inline_extent(&committed.data)
+                            && inline_extent(&item.data)
+                            && top
+                                .inode(item.key.objectid)?
+                                .is_some_and(|i| i.size == le64(&item.data, fe::RAM_BYTES)) =>
                     {
                         edits.push(ItemEdit::Put(OwnedItem {
                             key: item.key,
@@ -926,5 +973,36 @@ mod tests {
             !same_length_inline(&inline(b""), &inline(b"")),
             "no inline data"
         );
+    }
+
+    /// Replay takes an inline extent of any length, and a compressed one
+    /// as logged (#378); encryption, other encodings, an unknown
+    /// compression, a regular extent and a plain one whose `ram_bytes`
+    /// disagrees with its data stay refused.
+    #[test]
+    fn an_inline_extent_of_any_length_or_compression_is_replayable() {
+        assert!(inline_extent(&inline(b"committed")));
+        assert!(inline_extent(&inline(b"a longer rewrite of it")));
+        for algo in 1..=3 {
+            let mut compressed = inline(b"zzzz");
+            compressed[fe::COMPRESSION] = algo;
+            compressed[fe::RAM_BYTES] = 33;
+            assert!(inline_extent(&compressed), "compression {algo}");
+        }
+        let mut unknown = inline(b"zzzz");
+        unknown[fe::COMPRESSION] = 4;
+        assert!(!inline_extent(&unknown), "unknown compression");
+        for at in [fe::ENCRYPTION, fe::OTHER_ENCODING, fe::OTHER_ENCODING + 1] {
+            let mut encoded = inline(b"rewritten");
+            encoded[at] = 1;
+            assert!(!inline_extent(&encoded), "encoding byte {at}");
+        }
+        let mut external = inline(b"rewritten");
+        external[fe::TYPE] = 1;
+        assert!(!inline_extent(&external), "external extent");
+        let mut ram = inline(b"rewritten");
+        ram[fe::RAM_BYTES] = 3;
+        assert!(!inline_extent(&ram), "plain ram_bytes disagrees with data");
+        assert!(!inline_extent(&inline(b"")), "no inline data");
     }
 }
