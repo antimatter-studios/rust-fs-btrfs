@@ -13,7 +13,7 @@
 //! link count and file modification time, the contents of every file as
 //! the kernel reads them back, and `btrfs check` clean on both.
 
-use fs_btrfs::dir::XATTR_ITEM_KEY;
+use fs_btrfs::dir::{parse_dir_items, DIR_INDEX_KEY, XATTR_ITEM_KEY};
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::inode::{INODE_ITEM_KEY, INODE_REF_KEY};
 use fs_btrfs::log_tree::{LoggedTree, DIR_LOG_INDEX_KEY};
@@ -1481,6 +1481,144 @@ fn a_log_adding_hard_links_replays_as_the_kernel_does() {
             get("sha256", first),
             get("sha256", second),
             "{first} and {second} read back differently"
+        );
+    }
+}
+
+/// The committed file `f`, with 64 more names in `/` of 255 bytes each,
+/// given a 66th after the last commit and made durable by an fsync of `/`
+/// (#407). Its `INODE_REF` to `/` holds `f` and the first 61 long names,
+/// as many as the largest item a 16 KiB leaf holds, so the kernel commits
+/// the other three as `INODE_EXTREF` items and stores the new name in one
+/// more. The committed trees hold `f` with 65 links. The log holds `f`
+/// at its committed generation with 66 links, its `INODE_REF` and all
+/// four extended references, and the entry of `/` naming the new one.
+/// The kernel's replay of the same crash image is the oracle.
+#[test]
+fn a_log_adding_an_extended_reference_replays_as_the_kernel_does() {
+    const EXTREF_FIXTURE: &str = "dirtylog/btrfs-dirty-log-extref.img";
+    /// `BTRFS_INODE_EXTREF_KEY`.
+    const INODE_EXTREF_KEY: u8 = 13;
+    let long = |i: usize| format!("{i:03}").repeat(85);
+    let image = fixture(EXTREF_FIXTURE);
+    let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-extref.logdump"))
+        .expect("the native transcript of the extended-reference log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the extended-reference fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        let committed = fs.lookup_path("/f").expect("the committed trees hold /f");
+        assert_eq!(committed.nlink, 65, "/f is committed with 65 names");
+        for i in [0, 60, 61, 63] {
+            let path = format!("/{}", long(i));
+            let ino = fs
+                .lookup_path(&path)
+                .unwrap_or_else(|e| panic!("the committed trees should hold name {i}: {e}"))
+                .ino;
+            assert_eq!(ino, committed.ino, "committed name {i} is f");
+        }
+        assert!(
+            fs.lookup_path(&format!("/{}", long(64))).is_err(),
+            "the 66th name was made after the commit, so the committed trees should not hold it"
+        );
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        // Every record of f's logged extended references, read from the
+        // raw items: a parent, an index in it, and a name.
+        let mut records: Vec<(u64, u64, Vec<u8>)> = Vec::new();
+        for item in top
+            .items
+            .iter()
+            .filter(|i| i.key.objectid == committed.ino && i.key.key_type == INODE_EXTREF_KEY)
+        {
+            let d = &item.data;
+            let mut at = 0;
+            while at < d.len() {
+                let le64 = |p: usize| u64::from_le_bytes(d[p..p + 8].try_into().unwrap());
+                let len = usize::from(u16::from_le_bytes(d[at + 16..at + 18].try_into().unwrap()));
+                records.push((le64(at), le64(at + 8), d[at + 18..at + 18 + len].to_vec()));
+                at += 18 + len;
+            }
+        }
+        let mut names: Vec<String> = records
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.2).into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            (61..65).map(long).collect::<Vec<_>>(),
+            "the log holds f's extended references to names 61 to 64: {keys:?}"
+        );
+        assert!(
+            records.iter().all(|r| r.0 == 256),
+            "every extended reference of f names / as its parent: {records:?}"
+        );
+        let index = records
+            .iter()
+            .find(|r| r.2 == long(64).as_bytes())
+            .map(|r| r.1)
+            .unwrap();
+        let entry = top
+            .items
+            .iter()
+            .find(|i| (i.key.objectid, i.key.key_type, i.key.offset) == (256, DIR_INDEX_KEY, index))
+            .unwrap_or_else(|| panic!("the log holds no entry of / at index {index}: {keys:?}"));
+        let entry = parse_dir_items(&entry.data).unwrap();
+        assert_eq!(
+            entry
+                .iter()
+                .map(|e| (e.ino, e.name.clone()))
+                .collect::<Vec<_>>(),
+            vec![(committed.ino, long(64).into_bytes())],
+            "the logged entry of / at index {index} names f by the new name"
+        );
+        let logged_f = top
+            .inode(committed.ino)
+            .unwrap()
+            .expect("f's logged inode item");
+        assert_eq!(
+            (logged_f.generation, logged_f.nlink),
+            (committed.generation, 66),
+            "the log holds the committed f with 66 links: {logged_f:?}"
+        );
+    }
+    let theirs = replays_as_the_kernel_does(EXTREF_FIXTURE, "dirtylog-extref");
+    // The two replays agree; this is what they agree on, as the kernel
+    // reports it, so a name both left out cannot pass.
+    let get = |kind: &str, name: &str| {
+        theirs
+            .get(&(kind.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("the kernel's replay reports no {kind} for {name}"))
+    };
+    for name in ["f".to_string(), long(0), long(61), long(64)] {
+        assert_eq!(
+            get("stat", &name),
+            "f 66 33",
+            "the kernel's replay of {name}"
+        );
+        assert_eq!(
+            get("ino", &name),
+            get("ino", "f"),
+            "the kernel's replay names {name} as f"
+        );
+        assert_eq!(
+            get("sha256", &name),
+            get("sha256", "f"),
+            "{name} reads back differently from f"
         );
     }
 }
