@@ -123,6 +123,10 @@ read_file_huge_size       1
 read_path_cost            1
 readlink_kernel_oracle    1
 release_attestation       2
+# Two executed: a data group of more extents than one batch relocated a
+# batch per transaction and judged by the kernel, and a refused relocation
+# that leaves the device byte-identical (#494).
+relocate_data_batches_kernel 2
 # One executed: a data group of the kernel's plain checksummed extents
 # relocated, judged by check --check-data-csum, a read and a scrub (#493).
 relocate_data_group_kernel 1
