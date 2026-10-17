@@ -15,10 +15,10 @@
 
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::inode::{INODE_ITEM_KEY, INODE_REF_KEY};
-use fs_btrfs::log_tree::LoggedTree;
+use fs_btrfs::log_tree::{LoggedTree, DIR_LOG_INDEX_KEY};
 use fs_btrfs::Error;
 use fs_btrfs_test_support::{
-    assert_btrfs_check_clean, fixture, guest_kernel_read_ok, guest_kernel_report,
+    assert_btrfs_check_clean, dump_tree, fixture, guest_kernel_read_ok, guest_kernel_report,
     guest_kernel_write_ok, oracle, temp_path,
 };
 use fs_core::{BlockDevice, BlockRead, FileDevice};
@@ -390,6 +390,52 @@ fn a_read_write_mount_replays_the_log_as_the_kernel_does() {
     replays_as_the_kernel_does(DIRTY_LOG_FIXTURE, "dirtylog");
 }
 
+/// The second fixture's log, checked to hold each change its recipe made
+/// before the replay is judged: a fixture whose fsyncs fell back to a
+/// commit would hold nothing to replay, and pass for the wrong reason.
+#[test]
+fn a_log_of_data_and_names_replays_as_the_kernel_does() {
+    let image = fixture(REPLAY_FIXTURE);
+    {
+        let dev = Arc::new(FileDevice::open(&image).expect("open the fixture"));
+        let fs = Filesystem::mount_ignoring_log(dev as Arc<dyn BlockRead>)
+            .expect("a mount that ignores the log opens a volume with one");
+        let log = fs
+            .log()
+            .expect("read the log")
+            .expect("the log is not empty");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        for path in ["/big.bin", "/grow.bin", "/shrink.bin"] {
+            let ino = fs.lookup_path(path).unwrap().ino;
+            assert!(
+                top.inodes().contains(&ino),
+                "the log holds no inode item for {path} (inode {ino}): {keys:?}"
+            );
+        }
+        assert!(
+            top.inode_named(256, b"new.bin").is_some(),
+            "the log names no new.bin: {keys:?}"
+        );
+        let d = fs.lookup_path("/d").unwrap().ino;
+        assert!(
+            top.items
+                .iter()
+                .any(|i| i.key.objectid == d && i.key.key_type == DIR_LOG_INDEX_KEY),
+            "the log holds no index range for directory d (inode {d}): {keys:?}"
+        );
+    }
+    replays_as_the_kernel_does(REPLAY_FIXTURE, "dirtylog-replay");
+}
+
 /// Prove this is a metadata-only recovery before asking mount_rw to
 /// replay it. Unchanged inode refs may be logged, but no data, checksum,
 /// xattr, directory entry or directory deletion range is permitted.
@@ -717,7 +763,7 @@ fn a_same_length_inline_overwrite_replays_as_the_kernel_does() {
 /// by `mount_rw` with `DirtyLog`, and the refusal must write nothing: the
 /// whole image hashes the same before and after. The transcript is the
 /// native `dump-tree` of that exact image, bound by sha256 and superblock.
-fn an_unsupported_log_is_refused_without_writing(shape: &str) {
+fn an_unsupported_log_is_refused_without_writing(shape: &str, damage: impl FnOnce(&Path)) {
     use sha2::Digest;
     let image = fixture(&format!("dirtylog/btrfs-dirty-log-{shape}.img"));
     let transcript = std::fs::read_to_string(fixture(&format!(
@@ -728,6 +774,7 @@ fn an_unsupported_log_is_refused_without_writing(shape: &str) {
     transcript_binding(&transcript, &bytes).expect("transcript bound to this image");
     let guard = ScratchCopy::of(&image, temp_path!("refused-{shape}.img"));
     let copy = guard.0.clone();
+    damage(&copy);
     let before = format!("{:x}", sha2::Sha256::digest(std::fs::read(&copy).unwrap()));
     let result =
         Filesystem::mount_rw(Arc::new(FileDevice::open_rw(&copy).unwrap()) as Arc<dyn BlockDevice>);
@@ -749,12 +796,67 @@ fn a_mixed_names_and_inline_log_replays_as_the_kernel_does() {
     an_inline_rewrite_replays_as_the_kernel_does("mixedlog", b"replayed-inline-bytes-ABCDEFGHIJK");
 }
 
-/// A log of shapes replay does not take yet -- data appended, truncated
-/// and partly overwritten, names removed and renamed (#374) -- is refused
-/// before anything is written.
+/// A log whose data did not reach the disk as logged (#375): one byte of
+/// the extent the log gives `new.bin` is changed on a copy of the crash
+/// image, so the extent's bytes no longer match the digests the log
+/// carries for them. Replay must refuse to record data the log does not
+/// vouch for, before anything is written.
 #[test]
-fn a_log_replay_cannot_take_yet_is_refused_without_writing() {
-    an_unsupported_log_is_refused_without_writing("replay");
+fn a_log_whose_data_disagrees_with_its_checksums_is_refused_without_writing() {
+    an_unsupported_log_is_refused_without_writing("replay", |copy| {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(copy).expect("open the copy"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the copy without replay");
+        let log = fs.log().unwrap().expect("the copy holds a log");
+        let top = &log.trees[0];
+        let ino = top
+            .inode_named(256, b"new.bin")
+            .expect("the log creates new.bin");
+        let extent = top
+            .items
+            .iter()
+            .find(|i| i.key.objectid == ino && i.key.key_type == fs_btrfs::fs::EXTENT_DATA_KEY)
+            .expect("the log holds new.bin's extent");
+        let logical = u64::from_le_bytes(extent.data[21..29].try_into().unwrap());
+        drop(fs);
+        // Where the extent is on the device, from the native tool's dump
+        // of the chunk tree: the chunk holding it, and that chunk's one
+        // stripe on this single-device volume.
+        let chunks = dump_tree(copy, "chunk");
+        let (mut start, mut length) = (None, None);
+        let mut physical = None;
+        for line in chunks.lines() {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let after = |name: &str| {
+                words
+                    .iter()
+                    .position(|w| *w == name)
+                    .and_then(|at| words.get(at + 1))
+                    .and_then(|w| w.trim_end_matches(')').parse::<u64>().ok())
+            };
+            if line.contains("CHUNK_ITEM") {
+                start = after("CHUNK_ITEM");
+                length = None;
+            } else if let Some(n) = after("length") {
+                length = Some(n);
+            } else if let (Some(true), Some(offset), Some(s), Some(len)) = (
+                line.trim_start().starts_with("stripe 0").then_some(true),
+                after("offset"),
+                start,
+                length,
+            ) {
+                if (s..s + len).contains(&logical) {
+                    physical = Some(offset + (logical - s));
+                }
+            }
+        }
+        let physical = physical
+            .unwrap_or_else(|| panic!("no chunk in the dump holds logical {logical}:\n{chunks}"));
+        let mut bytes = std::fs::read(copy).unwrap();
+        bytes[physical as usize] ^= 0xff;
+        std::fs::write(copy, bytes).unwrap();
+    });
 }
 
 /// An inline rewrite of `/f`, made durable by fsync alone, that #364's
