@@ -9,7 +9,8 @@
 //!   tree and the block group's `used` give the space back, and its digests
 //!   leave the checksum tree. An item that straddles the new end keeps its
 //!   extent whole and references less of it (`num_bytes` shrinks), as the
-//!   kernel does; an inline item is cut to the new length.
+//!   kernel does; an inline item is cut to the new length, a compressed
+//!   one decoded and the bytes kept written back uncompressed (#423).
 //! - **Growing** moves the inode's size. With the `NO_HOLES` feature the
 //!   new range is an implicit hole; without it every range up to the size,
 //!   rounded up to a sector, must have an item, so each part of the new
@@ -35,8 +36,9 @@
 //! - on a volume without `NO_HOLES`, growing a file whose last sector is
 //!   partly past its end, inline data included; and growing a `nodatacow`
 //!   file that holds inline data.
-//! - a compressed inline extent cut short, and any subvolume other than the
-//!   top level.
+//! - an encrypted or otherwise encoded inline extent cut short, a
+//!   compressed one cut to a sector or more, and any subvolume other than
+//!   the top level.
 
 use crate::chunk::DiskKey;
 use crate::error::{Error, Result};
@@ -221,13 +223,46 @@ impl Filesystem {
                 if size >= start + ram {
                     return Ok(None);
                 }
+                let keep = (size - start) as usize;
+                let sector = self.sb.sectorsize as usize;
+                if d[fe::COMPRESSION] != 0
+                    && d[fe::ENCRYPTION] == 0
+                    && d[fe::OTHER_ENCODING..fe::OTHER_ENCODING + 2] == [0, 0]
+                {
+                    // A compressed inline extent is decoded and the bytes
+                    // kept are written back plain (#423): the kernel reads
+                    // either shape, and a plain one cannot hold stale
+                    // decoded bytes past the file's end. Kept short of a
+                    // sector, which `btrfs check` requires of plain inline
+                    // data.
+                    if keep >= sector {
+                        return Err(Error::UnsupportedFeature(format!(
+                            "inode {ino}: the compressed inline extent at {start} would \
+                             keep {keep} bytes, a sector or more, which inline data \
+                             cannot hold uncompressed"
+                        )));
+                    }
+                    let decoded = crate::compression::decompress(
+                        crate::compression::Compression::from_byte(d[fe::COMPRESSION])?,
+                        &d[fe::INLINE_DATA..],
+                        ram as usize,
+                        sector,
+                        crate::compression::ShortDecode::Pad,
+                    )?;
+                    let mut data = d[..fe::INLINE_DATA].to_vec();
+                    data[fe::COMPRESSION] = 0;
+                    data[fe::RAM_BYTES..fe::RAM_BYTES + 8]
+                        .copy_from_slice(&(keep as u64).to_le_bytes());
+                    data.extend_from_slice(&decoded[..keep]);
+                    return Ok(Some(ItemEdit::Put(OwnedItem { key: *k, data })));
+                }
                 if !unencoded(d) || d.len() != fe::INLINE_DATA + ram as usize {
                     return Err(Error::UnsupportedFeature(format!(
-                        "inode {ino}: the inline extent at {start} is compressed or encoded, \
-                         and cutting one short is not implemented"
+                        "inode {ino}: the inline extent at {start} is encrypted or encoded, \
+                         or its length disagrees with its ram_bytes, and cutting one short \
+                         is not implemented"
                     )));
                 }
-                let keep = (size - start) as usize;
                 let mut data = d[..fe::INLINE_DATA + keep].to_vec();
                 data[fe::RAM_BYTES..fe::RAM_BYTES + 8]
                     .copy_from_slice(&(keep as u64).to_le_bytes());
