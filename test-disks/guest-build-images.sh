@@ -1222,6 +1222,7 @@ build_dirtylog() {
     build_dirtylog_refused extrefexists 'compress=no,max_inline=2048' extrefexists
     build_dirtylog_refused extrefcreated 'compress=no,max_inline=2048' extrefcreated
     build_dirtylog_refused extrefremoved 'compress=no,max_inline=2048' extrefremoved
+    build_dirtylog_refused compressedcut 'compress-force=zlib,max_inline=0' compressedcut
 }
 
 # fsync_path <path> — fsync one file or directory, and nothing else.
@@ -1400,6 +1401,10 @@ os.unlink(sys.argv[1] + "/f")
 for i in range(63):
     os.unlink(sys.argv[1] + "/" + ("%03d" % i) * 85)' "$MNT"
             printf 'kept' > "$MNT/k" ;;
+        compressedcut)
+            # 128 KiB of one byte: compress-force stores it as one
+            # compressed extent, the largest the kernel makes.
+            head -c 131072 /dev/zero | tr '\0' 'c' > "$MNT/f" ;;
         subvol)
             # A file in the top level and one in a subvolume, committed.
             btrfs subvolume create "$MNT/sv" >/dev/null
@@ -1517,6 +1522,11 @@ if kind == "sizechange":
     os.pwrite(fd, b"replayed-and-longer-inline-bytes-0123456789", 0)
 elif kind == "externalextent":
     os.pwrite(fd, b"r" * 8192, 0)
+elif kind == "compressedcut":
+    # One sector inside the committed compressed extent: the kernel
+    # writes it uncompressed, and the committed extent keeps its head
+    # and its tail as windows into the whole compressed extent.
+    os.pwrite(fd, b"r" * 4096, 32768)
 elif kind == "subvol":
     # Both subvolumes change after the commit, so the log root tree names
     # a log tree for each: f in the top level and g in the subvolume are
@@ -1595,6 +1605,7 @@ want = {
     'extrefexists': r'INODE_REF (?!256\))\d+\)[^\n]*\n\s+index \d+ namelen 1 name: g\n',
     'extrefcreated': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: n\n',
     'extrefremoved': r'key \(256 DIR_LOG_INDEX \d+\) itemoff \d+ itemsize \d+\n\s+dir log end \d+\n',
+    'compressedcut': r'EXTENT_DATA 32768\)',
 }[kind]
 assert re.search(want, dump), (kind, 'native dump does not show the unsupported shape')
 if kind == 'symlink':
@@ -1849,7 +1860,19 @@ if kind == 'compressedinline':
     inline = [(int(n), int(r)) for n, r in re.findall(
         r'inline extent data size (\d+) ram_bytes (\d+) compression [1-3]\b', dump)]
     assert any(n < r for n, r in inline), (kind, 'native dump shows no compressed inline extent', inline)
+if kind == 'compressedcut':
+    # The logged write is its own uncompressed sector at 32768.
+    logged = re.search(r'EXTENT_DATA 32768\)[\s\S]*?extent compression (\d+)', dump)
+    assert logged and logged.group(1) == '0', (kind, 'native dump shows no plain logged sector at 32768')
 PY2
+    if [ "$kind" = compressedcut ]; then
+        # The committed file is one compressed extent, read from the
+        # native dump of the committed subvolume tree, not ours.
+        btrfs inspect-internal dump-tree -t 5 "$copy" | grep -Ec 'extent compression [1-3] ' >/dev/null || {
+            echo "guest-build-images: compressedcut committed no compressed extent" >&2
+            exit 1
+        }
+    fi
     mv -f "$out.logdump.partial" "$out.logdump"
     cp --sparse=always "$copy" "$out.img.partial"
     mv -f "$out.img.partial" "$out.img"

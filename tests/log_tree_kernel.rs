@@ -1157,6 +1157,82 @@ fn an_external_extent_overwrite_replays_as_the_kernel_does() {
     .is_empty());
 }
 
+const COMPRESSED_CUT_FIXTURE: &str = "dirtylog/btrfs-dirty-log-compressedcut.img";
+const COMPRESSED_CUT_TRANSCRIPT: &str = "dirtylog/btrfs-dirty-log-compressedcut.logdump";
+/// The fixture's file: 128 KiB of `c` in one compressed extent, committed,
+/// then one sector of `r` written at [`COMPRESSED_CUT_AT`] and fsynced.
+const COMPRESSED_CUT_LEN: usize = 131072;
+const COMPRESSED_CUT_AT: usize = 32768;
+
+/// A sector written inside a committed compressed extent and made durable
+/// by fsync alone (#409): the log holds only the new sector's extent, so
+/// replay must leave the committed extent's head and tail as windows into
+/// the whole compressed extent, without decoding it. The kernel's replay
+/// of the same crash image is the oracle for the volume, its data
+/// checksums and the file's bytes.
+#[test]
+fn a_write_inside_a_compressed_extent_replays_as_the_kernel_does() {
+    use sha2::Digest;
+    let image = fixture(COMPRESSED_CUT_FIXTURE);
+    let transcript = std::fs::read_to_string(fixture(COMPRESSED_CUT_TRANSCRIPT))
+        .expect("the native transcript of the compressed cut log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    let committed = Filesystem::mount_ignoring_log(Arc::new(
+        FileDevice::open(&image).expect("open the compressed cut fixture"),
+    ) as Arc<dyn BlockRead>)
+    .expect("read the committed file without replay");
+    let ino = committed.lookup_path("/f").unwrap().ino;
+    assert_eq!(
+        committed.read_file(ino).unwrap(),
+        vec![b'c'; COMPRESSED_CUT_LEN],
+        "the committed file is the bytes written before the logged sector"
+    );
+    drop(committed);
+
+    replays_as_the_kernel_does(COMPRESSED_CUT_FIXTURE, "dirtylog-compressedcut");
+
+    let theirs_guard = ScratchCopy::of(&image, temp_path!("compressedcut-kernel.img"));
+    let ours_guard = ScratchCopy::of(&image, temp_path!("compressedcut-crate.img"));
+    let (theirs, ours) = (theirs_guard.0.clone(), ours_guard.0.clone());
+    let mut bytes = vec![b'c'; COMPRESSED_CUT_LEN];
+    bytes[COMPRESSED_CUT_AT..COMPRESSED_CUT_AT + 4096].fill(b'r');
+    const VIEW: &str = "stat -c '%i %s %h' \"$MNT/f\"; sha256sum \"$MNT/f\" | cut -d' ' -f1";
+    let expected = format!(
+        "{ino} {COMPRESSED_CUT_LEN} 1\n{:x}",
+        sha2::Sha256::digest(&bytes)
+    );
+    let kernel = guest_kernel_write_ok(
+        &theirs.to_string_lossy(),
+        "compressed cut kernel replay",
+        VIEW,
+    );
+    assert_eq!(
+        kernel.trim(),
+        expected,
+        "the real kernel recovered the sector"
+    );
+    assert_data_csums_clean(&theirs, "compressed cut kernel replay");
+    {
+        let fs = Filesystem::mount_rw(
+            Arc::new(FileDevice::open_rw(&ours).unwrap()) as Arc<dyn BlockDevice>
+        )
+        .unwrap_or_else(|error| panic!("a compressed cut log must replay: {error:?}"));
+        assert_eq!(fs.read_file(ino).unwrap(), bytes);
+    }
+    assert_data_csums_clean(&ours, "compressed cut crate replay");
+    let actual = guest_kernel_read_ok(
+        &ours.to_string_lossy(),
+        "compressed cut crate readback",
+        VIEW,
+    );
+    assert_eq!(
+        actual.trim(),
+        expected,
+        "the kernel reads the crate's replay"
+    );
+}
+
 /// An inline extent that grows from 33 bytes to 43 (#378): the file's
 /// size and `nbytes` move with it.
 #[test]
