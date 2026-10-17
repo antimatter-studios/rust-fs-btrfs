@@ -575,9 +575,33 @@ impl Filesystem {
                 for item in top.items.iter().filter(|i| i.key.objectid == ino) {
                     if !matches!(
                         item.key.key_type,
-                        INODE_ITEM_KEY | INODE_REF_KEY | EXTENT_DATA_KEY
+                        INODE_ITEM_KEY | INODE_REF_KEY | EXTENT_DATA_KEY | dir::XATTR_ITEM_KEY
                     ) {
                         return Err(Error::DirtyLog);
+                    }
+                }
+                // Its extended attributes are the logged set (#379): each
+                // logged item is put as logged, and a committed one the log
+                // does not hold is deleted, as `replay_xattr_deletes` does.
+                let committed_xattrs: BTreeMap<u64, Vec<u8>> = tree
+                    .find_all(root, ino, dir::XATTR_ITEM_KEY)?
+                    .into_iter()
+                    .map(|i| (i.key.offset, i.data))
+                    .collect();
+                let logged_xattrs: BTreeMap<u64, &[u8]> = top
+                    .items
+                    .iter()
+                    .filter(|i| i.key.objectid == ino && i.key.key_type == dir::XATTR_ITEM_KEY)
+                    .map(|i| (i.key.offset, &i.data[..]))
+                    .collect();
+                for &hash in committed_xattrs.keys() {
+                    if !logged_xattrs.contains_key(&hash) {
+                        edits.push(ItemEdit::Delete(key(ino, dir::XATTR_ITEM_KEY, hash)));
+                    }
+                }
+                for (&hash, &data) in &logged_xattrs {
+                    if committed_xattrs.get(&hash).map(|c| &c[..]) != Some(data) {
+                        edits.push(put(key(ino, dir::XATTR_ITEM_KEY, hash), data.to_vec()));
                     }
                 }
             }

@@ -13,6 +13,7 @@
 //! link count and file modification time, the contents of every file as
 //! the kernel reads them back, and `btrfs check` clean on both.
 
+use fs_btrfs::dir::XATTR_ITEM_KEY;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::inode::{INODE_ITEM_KEY, INODE_REF_KEY};
 use fs_btrfs::log_tree::{LoggedTree, DIR_LOG_INDEX_KEY};
@@ -1079,6 +1080,72 @@ fn a_size_changing_inline_rewrite_replays_as_the_kernel_does() {
         "sizechange",
         b"replayed-and-longer-inline-bytes-0123456789",
     );
+}
+
+/// Extended attributes changed, removed and added on a committed file,
+/// made durable by fsync alone (#379): the log holds the file's
+/// attributes as they stand. The kernel's replay is the oracle for the
+/// names and values the file is left with.
+#[test]
+fn logged_xattr_changes_replay_as_the_kernel_does() {
+    let image = fixture("dirtylog/btrfs-dirty-log-xattr.img");
+    let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-xattr.logdump"))
+        .expect("the native transcript of the xattr log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    let committed = Filesystem::mount_ignoring_log(Arc::new(
+        FileDevice::open(&image).expect("open the xattr fixture"),
+    ) as Arc<dyn BlockRead>)
+    .expect("read the committed file without replay");
+    let before = committed.lookup_path("/f").unwrap();
+    let log = committed.log().unwrap().expect("a dirty xattr log");
+    assert!(
+        log.trees[0]
+            .items
+            .iter()
+            .any(|i| i.key.objectid == before.ino && i.key.key_type == XATTR_ITEM_KEY),
+        "the log holds the file's attributes"
+    );
+    drop(committed);
+
+    let theirs_guard = ScratchCopy::of(&image, temp_path!("xattr-kernel.img"));
+    let ours_guard = ScratchCopy::of(&image, temp_path!("xattr-crate.img"));
+    let (theirs, ours) = (theirs_guard.0.clone(), ours_guard.0.clone());
+    const VIEW: &str = "python3 -c 'import os, sys; p = sys.argv[1]; \
+        print(sorted((k, os.getxattr(p, k).decode()) for k in os.listxattr(p)))' \"$MNT/f\"";
+    let expected =
+        "[('user.keep', 'changed after the commit'), ('user.new', 'added after the commit')]";
+    let kernel = guest_kernel_write_ok(&theirs.to_string_lossy(), "xattr kernel replay", VIEW);
+    assert_eq!(
+        kernel.trim(),
+        expected,
+        "the real kernel recovered the attributes"
+    );
+    assert_btrfs_check_clean(&theirs, "xattr kernel replay");
+    {
+        let fs = Filesystem::mount_rw(
+            Arc::new(FileDevice::open_rw(&ours).unwrap()) as Arc<dyn BlockDevice>
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "an xattr log must replay: {error:?}; kernel recovered {}",
+                kernel.trim()
+            )
+        });
+        assert_eq!(fs.superblock().log_root, 0);
+    }
+    assert_btrfs_check_clean(&ours, "xattr crate replay");
+    let actual = guest_kernel_read_ok(&ours.to_string_lossy(), "xattr crate readback", VIEW);
+    assert_eq!(
+        actual.trim(),
+        expected,
+        "the kernel reads the crate's replay"
+    );
+    assert!(differences(
+        &kernel_view(&ours, "xattr crate"),
+        &kernel_view(&theirs, "xattr kernel")
+    )
+    .is_empty());
 }
 
 /// The inline writer's encoding fields are checked against the native

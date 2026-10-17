@@ -1210,6 +1210,7 @@ build_dirtylog() {
     build_dirtylog_refused compressedinline 'compress-force=zlib,max_inline=2048' compressedinline
     build_dirtylog_refused externalextent 'compress=no,max_inline=0' externalextent
     build_dirtylog_refused sizechange 'compress=no,max_inline=2048' sizechange
+    build_dirtylog_refused xattr 'compress=no,max_inline=2048' xattr
 }
 
 # fsync_path <path> — fsync one file or directory, and nothing else.
@@ -1359,6 +1360,12 @@ build_dirtylog_refused() {
             printf 'committed-inline-bytes-0123456789' > "$MNT/f" ;;
         externalextent)
             head -c 8192 /dev/zero | tr '\0' 'c' > "$MNT/f" ;;
+        xattr)
+            # Two attributes committed: one the log changes, one it removes.
+            printf 'committed-inline-bytes-0123456789' > "$MNT/f"
+            python3 -c 'import os, sys
+os.setxattr(sys.argv[1], "user.keep", b"committed")
+os.setxattr(sys.argv[1], "user.gone", b"committed")' "$MNT/f" ;;
     esac
     sync
     python3 -c 'import os, sys
@@ -1368,6 +1375,11 @@ if kind == "sizechange":
     os.pwrite(fd, b"replayed-and-longer-inline-bytes-0123456789", 0)
 elif kind == "externalextent":
     os.pwrite(fd, b"r" * 8192, 0)
+elif kind == "xattr":
+    # Changed, removed and added after the commit; the data is untouched.
+    os.setxattr(d + "/f", "user.keep", b"changed after the commit")
+    os.removexattr(d + "/f", "user.gone")
+    os.setxattr(d + "/f", "user.new", b"added after the commit")
 elif kind == "compressedinline":
     # Same 33-byte length, but one repeated byte: zlib shrinks it, so
     # compress-force stores it as a compressed inline extent. The earlier
@@ -1410,6 +1422,7 @@ want = {
     'compressedinline': r'type 0 \(inline\)[\s\S]*compression [1-3]|compression [1-3]',
     'externalextent': r'type 1 \(regular\)|extent data disk byte [1-9]',
     'sizechange': r'inline extent data size 4[0-9]',
+    'xattr': r'XATTR_ITEM',
 }[kind]
 assert re.search(want, dump), (kind, 'native dump does not show the unsupported shape')
 if kind == 'compressedinline':
