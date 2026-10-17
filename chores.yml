@@ -459,11 +459,14 @@ tasks:
       - test-disks/dirtylog/btrfs-dirty-log-inode.img
       # same-length overwrite of an existing inline file, fsynced
       - test-disks/dirtylog/btrfs-dirty-log-inline.img
-      # four kernel-made logs replay refuses, each a distinct shape
+      # kernel-made logs of distinct shapes, each replayed against the
+      # kernel's own replay of the same image
       - test-disks/dirtylog/btrfs-dirty-log-mixedlog.img
       - test-disks/dirtylog/btrfs-dirty-log-compressedinline.img
       - test-disks/dirtylog/btrfs-dirty-log-externalextent.img
       - test-disks/dirtylog/btrfs-dirty-log-sizechange.img
+      # xattrs changed, removed and added on a committed file, fsynced
+      - test-disks/dirtylog/btrfs-dirty-log-xattr.img
       # the volume the command-line tools are tested against, labelled
       # CLITEST, with a manifest of what the kernel wrote into it
       - test-disks/cli/btrfs-cli.img
