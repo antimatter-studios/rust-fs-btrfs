@@ -64,6 +64,7 @@ use crate::inode::{
     INODE_NODATASUM, INODE_REF_KEY,
 };
 use crate::leaf_edit::OwnedItem;
+use crate::log_tree::{extref_hash, INODE_EXTREF_KEY};
 use crate::super_write::Commit;
 use crate::transaction::{DataRelease, DataWrite, ItemEdit};
 
@@ -91,6 +92,9 @@ const INODE_COMPRESS: u64 = 1 << 11;
 
 /// The fixed part of an `INODE_REF`: the index and the name's length.
 const INODE_REF_HEADER: usize = 8 + 2;
+/// `sizeof(struct btrfs_inode_extref)` before the name: parent, index,
+/// name length.
+const INODE_EXTREF_HEADER: usize = 8 + 8 + 2;
 
 /// What a new inode is.
 #[derive(Debug, Clone, Copy)]
@@ -468,20 +472,31 @@ impl Filesystem {
         // The child's reference to this parent loses the name, and gives
         // up the index the parent filed it under.
         let ref_key = key(ino, INODE_REF_KEY, parent);
-        let refs = p.get(self, ref_key)?.ok_or_else(|| {
-            Error::UnsupportedFeature(format!(
-                "inode {ino} has no reference item from directory {parent}; a name held in \
-                 an extended reference is not removed"
-            ))
-        })?;
-        let (index, rest) = without_ref(&refs, name).ok_or_else(|| {
-            Error::UnsupportedFeature(format!(
-                "inode {ino}'s reference from directory {parent} does not hold {:?}; a name \
-                 held in an extended reference is not removed",
-                String::from_utf8_lossy(name)
-            ))
-        })?;
-        p.set(ref_key, non_empty(rest));
+        let held = p.get(self, ref_key)?;
+        let index = match held.as_deref().and_then(|refs| without_ref(refs, name)) {
+            Some((index, rest)) => {
+                p.set(ref_key, non_empty(rest));
+                index
+            }
+            // A name past what the `INODE_REF` item holds lives in an
+            // extended reference, filed under a hash of the parent and
+            // the name (#424).
+            None => {
+                let ext_key = key(ino, INODE_EXTREF_KEY, extref_hash(parent, name));
+                let (index, rest) = p
+                    .get(self, ext_key)?
+                    .and_then(|refs| without_extref(&refs, parent, name))
+                    .ok_or_else(|| {
+                        Error::UnsupportedFeature(format!(
+                            "inode {ino} holds no reference to {:?} from directory {parent}, \
+                             in a reference item or an extended reference",
+                            String::from_utf8_lossy(name)
+                        ))
+                    })?;
+                p.set(ext_key, non_empty(rest));
+                index
+            }
+        };
 
         // The parent's two entries.
         let hash_key = key(parent, DIR_ITEM_KEY, dir::name_hash(name));
@@ -1220,6 +1235,28 @@ fn without_ref(data: &[u8], name: &[u8]) -> Option<(u64, Vec<u8>)> {
         }
         if &data[pos + INODE_REF_HEADER..end] == name {
             let index = le64(data, pos);
+            let mut rest = data[..pos].to_vec();
+            rest.extend_from_slice(&data[end..]);
+            return Some((index, rest));
+        }
+        pos = end;
+    }
+    None
+}
+
+/// An `INODE_EXTREF` item without the record naming `name` in `parent`:
+/// that record's index, and the bytes left. `None` when no record holds
+/// the name or the records do not parse.
+fn without_extref(data: &[u8], parent: u64, name: &[u8]) -> Option<(u64, Vec<u8>)> {
+    let mut pos = 0;
+    while pos + INODE_EXTREF_HEADER <= data.len() {
+        let len = usize::from(u16::from_le_bytes([data[pos + 16], data[pos + 17]]));
+        let end = pos + INODE_EXTREF_HEADER + len;
+        if end > data.len() {
+            return None;
+        }
+        if le64(data, pos) == parent && &data[pos + INODE_EXTREF_HEADER..end] == name {
+            let index = le64(data, pos + 8);
             let mut rest = data[..pos].to_vec();
             rest.extend_from_slice(&data[end..]);
             return Some((index, rest));
