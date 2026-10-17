@@ -19,7 +19,9 @@
 //! `btrfs check` looks again.
 //!
 //! A second volume is made without the `NO_HOLES` feature, where growing a
-//! file has to record its new range as hole items (#420).
+//! file has to record its new range as hole items (#420). A third holds
+//! files that end partway through a sector with stale bytes past the end,
+//! grown so the rest of that sector reads as zeros (#421).
 
 use fs_btrfs::capi::*;
 use fs_btrfs_test_support::{
@@ -176,7 +178,8 @@ fn files_truncated_through_the_abi_are_clean_and_the_kernel_agrees() {
 
     // Each refusal names its errno and writes nothing.
     let before = std::fs::read(&image).unwrap();
-    refused(fs, "/multi", 100_000, ENOTSUP);
+    // Growing inline data means moving it into an extent (#262).
+    refused(fs, "/small", 100, ENOTSUP);
     refused(fs, "/dir", 0, EISDIR);
     refused(fs, "/missing", 0, ENOENT);
     assert!(
@@ -428,4 +431,104 @@ fn files_grown_without_no_holes_are_covered_by_hole_items_and_the_kernel_agrees(
         Path::new(&image),
         "after the kernel wrote into the grown ranges",
     );
+}
+
+/// Files that end partway through a sector whose last sector still holds
+/// bytes past the end — one written and then cut short by the kernel, two
+/// cut short through the ABI, which keeps the extent whole — are grown
+/// through the ABI, inside that sector and past it. The rest of the old
+/// last sector must read as zeros (#421): `btrfs check` and
+/// `--check-data-csum` call the volume clean, the kernel reports each
+/// file's size and SHA-256 with zeros from the old end, and a scrub passes.
+#[test]
+fn files_ending_partway_through_a_sector_grow_with_zeros_from_their_old_end() {
+    let (scratch, _) = Scratch::made(
+        "truncate-grow-mid-sector",
+        "no-holes",
+        "cd \"$MNT\"\n\
+         head -c 10000 /dev/urandom > tail\n\
+         sync\n\
+         truncate -s 6000 tail\n\
+         head -c 10000 /dev/urandom > cut\n\
+         head -c 10000 /dev/urandom > cut2\n\
+         sync",
+    );
+    let image = scratch.image();
+    let fs = unsafe { fs_btrfs_mount_rw(c(&image).as_ptr()) };
+    assert!(!fs.is_null(), "mount_rw: {}", last_error());
+
+    let tail = read(fs, "/tail", 1 << 20);
+    assert_eq!(tail.len(), 6000, "/tail is not the size made");
+    let cut = read(fs, "/cut", 1 << 20);
+    let cut2 = read(fs, "/cut2", 1 << 20);
+    assert_eq!(truncate(fs, "/cut", 6000), 0, "{}", last_error());
+    assert_eq!(truncate(fs, "/cut2", 5000), 0, "{}", last_error());
+
+    // Past the old last sector, and inside it.
+    let grown = [
+        ("tail", 50_000usize, &tail[..6000]),
+        ("cut", 7000, &cut[..6000]),
+        ("cut2", 30_000, &cut2[..5000]),
+    ];
+    let want: Vec<(&str, Vec<u8>)> = grown
+        .iter()
+        .map(|(name, size, kept)| {
+            let mut bytes = kept.to_vec();
+            bytes.resize(*size, 0);
+            (*name, bytes)
+        })
+        .collect();
+    for (name, size, _) in &grown {
+        let at = format!("/{name}");
+        assert_eq!(
+            truncate(fs, &at, *size as u64),
+            0,
+            "{name}: {}",
+            last_error()
+        );
+    }
+    for (name, bytes) in &want {
+        assert!(
+            read(fs, &format!("/{name}"), 1 << 20) == *bytes,
+            "/{name} does not read as its kept bytes and then zeros"
+        );
+    }
+    unsafe { fs_btrfs_umount(fs) };
+
+    assert_btrfs_check_clean(
+        Path::new(&image),
+        "after files ending partway through a sector were grown",
+    );
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum finds data that disagrees with its digests:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let seen = guest_kernel_read_ok(
+        &image,
+        "after growing files that end partway through a sector",
+        "cd \"$MNT\"\n\
+         for f in tail cut cut2; do \
+           printf '%s %s %s\\n' \"$f\" \"$(stat -c %s \"$f\")\" \
+             \"$(sha256sum \"$f\" | cut -d' ' -f1)\"; done",
+    );
+    let expected: String = want
+        .iter()
+        .map(|(name, bytes)| format!("{name} {} {}\n", bytes.len(), sha256_hex(bytes)))
+        .collect();
+    let lines: Vec<&str> = seen.lines().collect();
+    assert_eq!(
+        lines.join("\n") + "\n",
+        expected,
+        "the kernel sees the grown files differently"
+    );
+
+    guest_kernel_write_ok(&image, "scrub", "btrfs scrub start -B \"$MNT\" >/dev/null");
 }
