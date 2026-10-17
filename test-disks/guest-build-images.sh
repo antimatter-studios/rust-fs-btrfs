@@ -1221,6 +1221,7 @@ build_dirtylog() {
     build_dirtylog_refused nbytes 'compress=no,max_inline=2048' nbytes
     build_dirtylog_refused extrefexists 'compress=no,max_inline=2048' extrefexists
     build_dirtylog_refused extrefcreated 'compress=no,max_inline=2048' extrefcreated
+    build_dirtylog_refused extrefremoved 'compress=no,max_inline=2048' extrefremoved
 }
 
 # fsync_path <path> — fsync one file or directory, and nothing else.
@@ -1386,6 +1387,19 @@ for i in range(64):
             python3 -c 'import os, sys
 for i in range(64):
     os.link(sys.argv[1] + "/f", sys.argv[1] + "/" + ("%03d" % i) * 85)' "$MNT" ;;
+        extrefremoved)
+            # f with the same 64 more names in /, then every name but the
+            # last of them removed, f itself among them: f is committed
+            # with one link, no INODE_REF item and one INODE_EXTREF item.
+            # k is committed beside it.
+            printf 'committed-inline-bytes-0123456789' > "$MNT/f"
+            python3 -c 'import os, sys
+for i in range(64):
+    os.link(sys.argv[1] + "/f", sys.argv[1] + "/" + ("%03d" % i) * 85)
+os.unlink(sys.argv[1] + "/f")
+for i in range(63):
+    os.unlink(sys.argv[1] + "/" + ("%03d" % i) * 85)' "$MNT"
+            printf 'kept' > "$MNT/k" ;;
         subvol)
             # A file in the top level and one in a subvolume, committed.
             btrfs subvolume create "$MNT/sv" >/dev/null
@@ -1490,6 +1504,14 @@ if kind == "extrefcreated":
         os.link(d + "/n", d + "/" + ("%03d" % i) * 85)
     dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
     sys.exit(0)
+if kind == "extrefremoved":
+    # The last name of f, held in its one INODE_EXTREF item, is removed
+    # after the commit, and only / is fsynced. The log holds index ranges
+    # of / covering the removed index and no entry there, and does not
+    # hold f: its replay deletes f with its extended reference and data.
+    os.unlink(d + "/" + "063" * 85)
+    dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    sys.exit(0)
 fd = os.open(d + "/f", os.O_WRONLY)
 if kind == "sizechange":
     os.pwrite(fd, b"replayed-and-longer-inline-bytes-0123456789", 0)
@@ -1553,7 +1575,7 @@ print(roots[0])
 PY2
     )
     btrfs inspect-internal dump-tree --follow -b "$log_tree" "$copy" >> "$out.logdump.partial"
-    python3 - "$out.logdump.partial" "$kind" <<'PY2'
+    python3 - "$out.logdump.partial" "$kind" "$copy" <<'PY2'
 import re, sys
 dump, kind = open(sys.argv[1]).read(), sys.argv[2]
 want = {
@@ -1572,6 +1594,7 @@ want = {
     'nbytes': r'size 33 nbytes (?!0\n|33\n)\d+\n',
     'extrefexists': r'INODE_REF (?!256\))\d+\)[^\n]*\n\s+index \d+ namelen 1 name: g\n',
     'extrefcreated': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: n\n',
+    'extrefremoved': r'key \(256 DIR_LOG_INDEX \d+\) itemoff \d+ itemsize \d+\n\s+dir log end \d+\n',
 }[kind]
 assert re.search(want, dump), (kind, 'native dump does not show the unsupported shape')
 if kind == 'symlink':
@@ -1786,6 +1809,40 @@ if kind == 'extrefcreated':
         r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
     assert all(any(a <= i <= b for a, b in ranges) for i in entries), \
         (kind, 'an entry of / naming n is outside every logged index range', ranges)
+if kind == 'extrefremoved':
+    # Committed, f has 33 bytes, one link, no INODE_REF item and one
+    # INODE_EXTREF item, whose one record is its last long name in /,
+    # named by an entry of / at that record's index. The log does not
+    # hold f or any entry naming it, holds no extended reference, and
+    # holds an index range of / covering that index with no entry there.
+    import subprocess
+    tree = subprocess.run(['btrfs', 'inspect-internal', 'dump-tree', '-t', '5', sys.argv[3]],
+                          check=True, capture_output=True, text=True).stdout
+    ext = re.findall(r'key \((\d+) INODE_EXTREF \d+\) itemoff \d+ itemsize \d+\n'
+                     r'((?:[ \t]+index \d+ parent \d+ namelen \d+ name: [^\n]*\n)+)', tree)
+    assert len(ext) == 1, (kind, 'the committed trees do not hold one extended reference', len(ext))
+    f, records = ext[0]
+    named = re.findall(r'index (\d+) parent (\d+) namelen \d+ name: ([^\n]*)\n', records)
+    assert len(named) == 1 and named[0][1:] == ('256', '063' * 85), \
+        (kind, 'the extended reference of f is not one record of its last name in /', named)
+    at = int(named[0][0])
+    item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation \d+ transid \d+ size (\d+) nbytes \d+\n'
+                     r'\s+block group \d+ mode 100644 links (\d+) ' % f, tree)
+    assert item and item.groups() == ('33', '1'), \
+        (kind, 'f is not committed with 33 bytes and one link', item and item.groups())
+    assert not re.search(r'key \(%s INODE_REF ' % f, tree), (kind, 'f is committed with an INODE_REF item')
+    assert re.search(r'key \(256 DIR_INDEX %d\) itemoff \d+ itemsize \d+\n'
+                     r'\s+location key \(%s INODE_ITEM 0\) type FILE\n' % (at, f), tree), \
+        (kind, 'no committed entry of / names f at the index of its extended reference', at)
+    assert not re.search(r'\bkey \(%s ' % f, dump), (kind, 'the log holds f or an entry naming it')
+    assert not re.search(r'key \(\d+ INODE_EXTREF ', dump), (kind, 'the log holds an extended reference')
+    assert not re.search(r'key \(256 DIR_INDEX %d\) ' % at, dump), \
+        (kind, 'the log holds an entry of / at the removed index', at)
+    ranges = [(int(a), int(b)) for a, b in re.findall(
+        r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
+    assert any(a <= at <= b for a, b in ranges), \
+        (kind, 'no logged index range of / holds the removed index', at, ranges)
 if kind == 'compressedinline':
     # The native tool must print a compressed inline extent: nonzero
     # compression on the inline line itself, stored smaller than its bytes.
