@@ -1216,6 +1216,7 @@ build_dirtylog() {
     build_dirtylog_refused symlink 'compress=no,max_inline=2048' symlink
     build_dirtylog_refused special 'compress=no,max_inline=2048' special
     build_dirtylog_refused hardlink 'compress=no,max_inline=2048' hardlink
+    build_dirtylog_refused extref 'compress=no,max_inline=2048' extref
 }
 
 # fsync_path <path> — fsync one file or directory, and nothing else.
@@ -1365,6 +1366,14 @@ build_dirtylog_refused() {
             printf 'committed-inline-bytes-0123456789' > "$MNT/f" ;;
         externalextent)
             head -c 8192 /dev/zero | tr '\0' 'c' > "$MNT/f" ;;
+        extref)
+            # f with 64 more names in /, each 255 bytes: the first 61 fill
+            # its INODE_REF to the largest item a 16 KiB leaf holds, and
+            # the rest are committed as INODE_EXTREF items.
+            printf 'committed-inline-bytes-0123456789' > "$MNT/f"
+            python3 -c 'import os, sys
+for i in range(64):
+    os.link(sys.argv[1] + "/f", sys.argv[1] + "/" + ("%03d" % i) * 85)' "$MNT" ;;
         subvol)
             # A file in the top level and one in a subvolume, committed.
             btrfs subvolume create "$MNT/sv" >/dev/null
@@ -1426,6 +1435,16 @@ if kind == "hardlink":
     os.link(d + "/n", d + "/m")
     for name in ("f", "n"):
         fd = os.open(d + "/" + name, os.O_RDONLY); os.fsync(fd); os.close(fd)
+    sys.exit(0)
+if kind == "extref":
+    # The committed f, whose INODE_REF is full, is given a 66th name after
+    # the commit, which the kernel stores as one more INODE_EXTREF item.
+    # An fsync of / makes it durable: the log holds the entry of / naming
+    # it, and f with its link count raised and every reference it has,
+    # the new extended one among them. An fsync of f itself would fall
+    # back to a full commit and leave no log.
+    os.link(d + "/f", d + "/" + "064" * 85)
+    dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
     sys.exit(0)
 fd = os.open(d + "/f", os.O_WRONLY)
 if kind == "sizechange":
@@ -1498,6 +1517,7 @@ want = {
     'symlink': r'location key \(\d+ INODE_ITEM 0\) type SYMLINK',
     'special': r'location key \(\d+ INODE_ITEM 0\) type CHRDEV',
     'hardlink': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: f\n\s+index \d+ namelen 1 name: g\n',
+    'extref': r'INODE_EXTREF \d+\) itemoff \d+ itemsize \d+\n\s+index \d+ parent 256 namelen 255 name: (064){85}\n',
 }[kind]
 assert re.search(want, dump), (kind, 'native dump does not show the unsupported shape')
 if kind == 'symlink':
@@ -1544,6 +1564,42 @@ if kind == 'hardlink':
                          r'\s+location key \(%s INODE_ITEM 0\) type FILE\n[^\n]*\n\s+name: %s\n'
                          % (ino, name), dump), \
             (kind, 'native dump shows no logged entry of / naming', name)
+if kind == 'extref':
+    # f is logged at the generation it was committed with, older than the
+    # transaction that logged it, with 66 links: its INODE_REF to / and
+    # its INODE_EXTREF items, whose records name / as the parent and hold
+    # exactly the three names committed past the full INODE_REF and the
+    # one given after the commit. The entry of / the log speaks for names
+    # the new one, f's inode, inside a logged index range.
+    ref = re.search(r'key \((\d+) INODE_REF 256\) itemoff \d+ itemsize \d+\n'
+                    r'\s+index \d+ namelen 1 name: f\n', dump)
+    assert ref, (kind, 'native dump shows no logged reference of f to /')
+    f = ref.group(1)
+    item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation (\d+) transid (\d+) size 33 nbytes \d+\n'
+                     r'\s+block group \d+ mode 100644 links (\d+) ' % f, dump)
+    assert item, (kind, 'native dump shows no logged inode item of f')
+    generation, transid, links = map(int, item.groups())
+    assert links == 66 and 0 < generation < transid, \
+        (kind, 'f is not logged as a committed inode with 66 links', generation, transid, links)
+    records = []
+    for body in re.findall(r'key \(%s INODE_EXTREF \d+\) itemoff \d+ itemsize \d+\n'
+                           r'((?:\s+index \d+ parent \d+ namelen \d+ name: [^\n]*\n)+)' % f, dump):
+        records += re.findall(r'index (\d+) parent (\d+) namelen \d+ name: ([^\n]*)\n', body)
+    names = sorted(name for _, _, name in records)
+    assert names == [('%03d' % i) * 85 for i in range(61, 65)], \
+        (kind, 'f is not logged with extended references naming exactly 061 to 064', names)
+    assert all(parent == '256' for _, parent, _ in records), \
+        (kind, 'an extended reference of f names a parent other than /', records)
+    index = int(next(i for i, _, name in records if name == '064' * 85))
+    assert re.search(r'key \(256 DIR_INDEX %d\) itemoff \d+ itemsize \d+\n'
+                     r'\s+location key \(%s INODE_ITEM 0\) type FILE\n[^\n]*\n\s+name: (064){85}\n'
+                     % (index, f), dump), \
+        (kind, 'native dump shows no logged entry of / naming the new name at its index', index)
+    ranges = [(int(a), int(b)) for a, b in re.findall(
+        r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
+    assert any(a <= index <= b for a, b in ranges), \
+        (kind, 'no logged index range of / holds the new name', index, ranges)
 if kind == 'compressedinline':
     # The native tool must print a compressed inline extent: nonzero
     # compression on the inline line itself, stored smaller than its bytes.
