@@ -123,6 +123,9 @@ read_file_huge_size       1
 read_path_cost            1
 readlink_kernel_oracle    1
 release_attestation       2
+# Two executed: the empty data group relocated and judged by the kernel,
+# and the refusals before anything is written (#397).
+relocate_empty_group_kernel 2
 rename_kernel             2
 render_plan               4
 send_stream_kernel        3

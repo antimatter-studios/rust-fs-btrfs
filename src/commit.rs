@@ -86,6 +86,10 @@ enum Membership<'a> {
     /// superblocks are not written: the caller wipes them after the
     /// commit, see [`crate::devices`].
     Removed { devid: u64, size: u64 },
+    /// A chunk is allocated or removed (#397): device `devid`'s chunks
+    /// now take `bytes_used`, which the chunk tree's device item records
+    /// and the device's superblock copy of it has to agree with.
+    BytesUsed { devid: u64, bytes_used: u64 },
 }
 
 /// One tree block, built and placed, waiting to be written.
@@ -189,6 +193,26 @@ impl Filesystem {
             commit,
             0,
             Membership::Removed { devid, size },
+            false,
+        )
+    }
+
+    /// [`Filesystem::commit`], setting device `devid`'s `bytes_used` to
+    /// `bytes_used` in its superblock's copy of its device item: a chunk
+    /// allocated or removed (#397). The transaction's chunk tree carries
+    /// the same number in the device's item.
+    pub(crate) fn commit_bytes_used(
+        &self,
+        blocks: &[PlacedBlock],
+        commit: &Commit,
+        devid: u64,
+        bytes_used: u64,
+    ) -> Result<()> {
+        self.commit_with(
+            blocks,
+            commit,
+            0,
+            Membership::BytesUsed { devid, bytes_used },
             false,
         )
     }
@@ -393,6 +417,7 @@ impl Filesystem {
         };
         let mut roots = None;
         let mut images = Vec::new();
+        let mut used_set = 0usize;
         for device in devices {
             let mut raw = vec![0u8; SUPERBLOCK_SIZE];
             device.read_at(SUPER_OFFSETS[0], &mut raw)?;
@@ -420,6 +445,14 @@ impl Filesystem {
                     raw[at..at + 8].copy_from_slice(&size.to_le_bytes());
                 }
             }
+            if let Membership::BytesUsed { devid, bytes_used } = membership {
+                let at = so::DEV_ITEM + dev_item_offsets::DEVID;
+                if u64::from_le_bytes(raw[at..at + 8].try_into().expect("8 bytes")) == devid {
+                    let at = so::DEV_ITEM + dev_item_offsets::BYTES_USED;
+                    raw[at..at + 8].copy_from_slice(&bytes_used.to_le_bytes());
+                    used_set += 1;
+                }
+            }
             if let Some((num_devices, total)) = counted {
                 raw[so::NUM_DEVICES..so::NUM_DEVICES + 8]
                     .copy_from_slice(&num_devices.to_le_bytes());
@@ -432,6 +465,16 @@ impl Filesystem {
             super_write::write_backup(&mut raw, commit.generation, roots);
             super_write::stamp_checksum(&mut raw, self.sb.csum_type);
             images.push((device, raw));
+        }
+        // A count for a device no superblock written here carries would be
+        // a change the chunk tree records and no superblock does.
+        if let Membership::BytesUsed { devid, .. } = membership {
+            if used_set != 1 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "device {devid}'s bytes used change, and {used_set} of the superblocks \
+                     this commit writes are its"
+                )));
+            }
         }
         if let Some((device, dev_item, _, _)) = joined {
             let mut raw = images
