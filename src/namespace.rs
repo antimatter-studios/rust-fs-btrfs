@@ -29,7 +29,7 @@
 //!
 //! - anything outside the top-level subvolume (tree 5), which is the
 //!   only tree a mount writes;
-//! - a full leaf that cannot be split: one a snapshot shares, or one
+//! - a full leaf that cannot be split: one flagged full backrefs, or one
 //!   whose parent node has no room for another pointer. A full leaf is
 //!   otherwise split in the same transaction, so a large directory goes
 //!   on taking names; a refused one has nothing written;
@@ -40,10 +40,10 @@
 //!   `INODE_EXTREF` item, as the kernel files it (#425);
 //! - a symbolic link whose target does not fit inline in one sector.
 //!
-//! - removing the last name of a file whose data extents a snapshot may
-//!   share, which truncate refuses too; otherwise the file's data is
-//!   released with its last name, in the same transaction, and an extent a
-//!   reflink shares loses the file's reference and stays (#262);
+//! - removing the last name of a file whose data reference is not inline;
+//!   otherwise the file's data is released with its last name, in the same
+//!   transaction, and an extent a reflink or snapshot shares loses the
+//!   file's reference and stays (#262);
 //! - removing a directory that is not empty;
 //! - moving a directory into itself or below itself.
 //!
@@ -55,8 +55,8 @@
 //! Renaming is a removal and an addition in one transaction: the old
 //! entries and reference go, new ones are filed under a fresh index in
 //! the destination, and a name already there is removed first, exactly
-//! as an unlink or rmdir would. Truncating is the rest of #262 and not
-//! here yet.
+//! as an unlink or rmdir would. Truncating uses the same reference-release
+//! machinery in [`crate::truncate`].
 
 use crate::chunk::{objectid, DiskKey};
 use crate::dir::{self, ftype, DIR_INDEX_KEY, DIR_ITEM_KEY, MAX_NAME_LEN};
@@ -316,8 +316,8 @@ impl Filesystem {
     /// replace something else, [`Error::NotAFile`] when something else
     /// would replace a directory, and [`Error::UnsupportedFeature`] for a
     /// directory moved into itself or below itself, a replaced directory
-    /// that is not empty, and a replaced file whose data extents a
-    /// snapshot may share, as unlink refuses. A replaced file's
+    /// that is not empty, and a replaced file whose data references cannot
+    /// be released, as unlink refuses. A replaced file's
     /// last name otherwise takes its data with it, in the same
     /// transaction. Nothing is written unless everything is.
     pub fn rename(
@@ -587,7 +587,6 @@ impl Filesystem {
         }
         let mut releases = Vec::new();
         let mut unrefs = Vec::new();
-        let last_snapshot = self.fs_tree_last_snapshot()?;
         for (k, data) in self.items_of(ino)? {
             match k.key_type {
                 // A reference already emptied by this change.
@@ -597,24 +596,15 @@ impl Filesystem {
                 // The whole file goes: cut to nothing, as truncate cuts, so
                 // its extent is released and the item deleted.
                 EXTENT_DATA_KEY => {
-                    self.shrink_item(
-                        ino,
-                        0,
-                        0,
-                        last_snapshot,
-                        &k,
-                        &data,
-                        &mut releases,
-                        &mut unrefs,
-                    )
-                    .map_err(|e| match e {
-                        Error::UnsupportedFeature(why) => Error::UnsupportedFeature(format!(
-                            "{:?} is the last name of inode {ino}, and its data cannot \
+                    self.shrink_item(ino, 0, 0, &k, &data, &mut releases, &mut unrefs)
+                        .map_err(|e| match e {
+                            Error::UnsupportedFeature(why) => Error::UnsupportedFeature(format!(
+                                "{:?} is the last name of inode {ino}, and its data cannot \
                                  be released: {why}",
-                            String::from_utf8_lossy(name)
-                        )),
-                        other => other,
-                    })?;
+                                String::from_utf8_lossy(name)
+                            )),
+                            other => other,
+                        })?;
                     p.remove(self, k)?;
                 }
                 other => {
