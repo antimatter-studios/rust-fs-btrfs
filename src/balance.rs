@@ -133,6 +133,24 @@ impl Filesystem {
             .collect())
     }
 
+    /// Relocate the block group at `start` into a newly allocated chunk,
+    /// of `profile` when given and of its own profile otherwise, and
+    /// return where the new group is (#397).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`]: not implemented yet.
+    pub fn relocate_block_group(
+        &mut self,
+        start: u64,
+        profile: Option<crate::chunk::ChunkProfile>,
+    ) -> Result<u64> {
+        let _ = (start, profile);
+        Err(Error::UnsupportedFeature(
+            "relocating a block group is not implemented".into(),
+        ))
+    }
+
     /// The block group starting at `start`.
     fn block_group_at(&self, start: u64) -> Result<BlockGroup> {
         self.block_groups()?
