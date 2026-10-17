@@ -1169,6 +1169,59 @@ fn logged_xattr_changes_replay_as_the_kernel_does() {
     .is_empty());
 }
 
+/// Directories made after the last commit, durable by an fsync of `/`
+/// alone (#403): `a`, empty, and `b`, holding an empty file `x` and a
+/// directory `c` of its own. The committed trees hold none of them; the
+/// log holds `/`'s new entries and an inode item for each directory it
+/// creates. The kernel's replay of the same crash image is the oracle for
+/// every path the volume is left with.
+#[test]
+fn a_log_creating_directories_replays_as_the_kernel_does() {
+    const NEWDIR_FIXTURE: &str = "dirtylog/btrfs-dirty-log-newdir.img";
+    let image = fixture(NEWDIR_FIXTURE);
+    let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-newdir.logdump"))
+        .expect("the native transcript of the new-directory log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the new-directory fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        for path in ["/a", "/b"] {
+            assert!(
+                fs.lookup_path(path).is_err(),
+                "{path} was made after the commit, so the committed trees should not hold it"
+            );
+        }
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        for name in ["a", "b"] {
+            let ino = top
+                .inode_named(256, name.as_bytes())
+                .unwrap_or_else(|| panic!("the log names no {name} in /: {keys:?}"));
+            let logged = top
+                .inode(ino)
+                .unwrap()
+                .unwrap_or_else(|| panic!("the log holds no inode item for {name}: {keys:?}"));
+            assert!(
+                logged.is_dir(),
+                "the log's {name} is not a directory: {logged:?}"
+            );
+        }
+    }
+    replays_as_the_kernel_does(NEWDIR_FIXTURE, "dirtylog-newdir");
+}
+
 /// The inline writer's encoding fields are checked against the native
 /// tools, not against our own parser. `dump-tree` prints an inline file
 /// extent's data size, `ram_bytes` and compression; the raw item must hold
