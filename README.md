@@ -61,6 +61,7 @@ Metadata is JSON on stdout by default, `--text` for people. A failure is
 | verb | state |
 |---|---|
 | `ls [PATH]` | JSON entries: name, type, size, mode, mtime, inode, `subvolume`, and a symlink's target. A path into a subvolume or a snapshot is followed, as a mount shows it |
+| `stat PATH` | One path's inode, type, mode, owner, links, size, allocated bytes and all four times as signed seconds plus nanoseconds. A symlink is reported without following it; device nodes include major/minor numbers. `btrfs` holds subvolume id, flags, generation, transid, sequence and the compression property (null when absent) |
 | `read PATH [-o FILE]` | the file's raw bytes: inline, compressed (zlib, LZO, zstd), sparse, inside a subvolume or through a snapshot |
 | `get [KEY]` / `info [KEY]` | `fs`, `label`, `total_bytes`, `free_bytes` (from `bytes_used`), `block_size` (the sector size), `dirty` (a log to replay, or the error flag), and `btrfs.*`: fsid, metadata UUID, node size, checksum type, device count, generation, feature names. From the superblock alone, so a volume that will not mount still answers |
 | `write PATH` | an existing file, overwritten with exactly as many bytes from stdin as it holds: a NODATACOW file (`chattr +C`) in place, any other one copy-on-write into new extents, committed as one transaction. A new file, a different length, a path inside a subvolume, or a snapshotted, inline or preallocated extent is refused with exit 3 and the library's reason; the copy-on-write cases wait on [#261][i261], creating, removing and resizing on [#262][i262] |
