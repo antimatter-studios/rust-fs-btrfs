@@ -1581,8 +1581,10 @@ pub unsafe extern "C" fn fs_btrfs_rename(
 /// Returns 0, or -1 with the error recorded: ENOENT for no such path,
 /// EISDIR for anything but a regular file, EROFS on a read-only handle,
 /// and ENOTSUP for what cannot be written yet — an extent a snapshot may
-/// share, or growing a file whose last sector is partly past its end. An
-/// extent a reflink shares loses the file's reference and stays.
+/// share, or growing a file whose last sector is partly past its end on a
+/// volume without the no-holes feature. Elsewhere the rest of that sector
+/// is rewritten with zeros first. An extent a reflink shares loses the
+/// file's reference and stays.
 ///
 /// # Safety
 ///

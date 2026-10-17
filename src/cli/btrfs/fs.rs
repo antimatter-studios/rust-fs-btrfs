@@ -357,8 +357,9 @@ fn command() -> Cmd {
                      Committed as one transaction. Shrinking releases the extents wholly past \
                      the new end, or drops the file's reference of one a reflink shares; \
                      growing records the new range as a hole. An extent a snapshot may \
-                     share, and growing a file whose last sector is partly past its end, \
-                     are refused with exit 3 (rust-fs-btrfs#262).",
+                     share, and growing a file whose last sector is partly past its end on \
+                     a volume without no-holes, are refused with exit 3 \
+                     (rust-fs-btrfs#262, rust-fs-btrfs#421).",
                 ),
         )
         .subcommand(key_command(
