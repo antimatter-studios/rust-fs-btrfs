@@ -1214,6 +1214,7 @@ build_dirtylog() {
     build_dirtylog_refused subvol 'compress=no,max_inline=2048' subvol
     build_dirtylog_refused newdir 'compress=no,max_inline=2048' newdir
     build_dirtylog_refused symlink 'compress=no,max_inline=2048' symlink
+    build_dirtylog_refused special 'compress=no,max_inline=2048' special
 }
 
 # fsync_path <path> — fsync one file or directory, and nothing else.
@@ -1359,7 +1360,7 @@ build_dirtylog_refused() {
     mkfs.btrfs -f "$img" >/dev/null
     mount -o "loop,commit=300,$opts" "$img" "$MNT"
     case "$kind" in
-        mixedlog|sizechange|compressedinline|newdir|symlink)
+        mixedlog|sizechange|compressedinline|newdir|symlink|special)
             printf 'committed-inline-bytes-0123456789' > "$MNT/f" ;;
         externalextent)
             head -c 8192 /dev/zero | tr '\0' 'c' > "$MNT/f" ;;
@@ -1393,6 +1394,22 @@ if kind == "symlink":
     # alone: the log holds its inode, its reference and the inline extent
     # that holds its target. The committed f keeps its name.
     os.symlink("target-of-the-link", d + "/l")
+    dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    sys.exit(0)
+if kind == "special":
+    # A character device, a block device, a FIFO and a bound UNIX socket
+    # made after the commit and durable by an fsync of / alone: the log
+    # holds each inode, with its type and device number, and its
+    # reference. A minor above 255 keeps the device number encoding
+    # honest. The committed f keeps its name.
+    import socket, stat
+    os.umask(0o022)
+    os.mknod(d + "/c", 0o644 | stat.S_IFCHR, os.makedev(240, 300))
+    os.mknod(d + "/b", 0o644 | stat.S_IFBLK, os.makedev(241, 5))
+    os.mkfifo(d + "/p", 0o644)
+    s = socket.socket(socket.AF_UNIX)
+    s.bind(d + "/s")
+    s.close()
     dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
     sys.exit(0)
 fd = os.open(d + "/f", os.O_WRONLY)
@@ -1464,12 +1481,24 @@ want = {
     'subvol': r'TREE_LOG ROOT_ITEM 25[6-9]',
     'newdir': r'location key \(\d+ INODE_ITEM 0\) type DIR',
     'symlink': r'location key \(\d+ INODE_ITEM 0\) type SYMLINK',
+    'special': r'location key \(\d+ INODE_ITEM 0\) type CHRDEV',
 }[kind]
 assert re.search(want, dump), (kind, 'native dump does not show the unsupported shape')
 if kind == 'symlink':
     # The target itself is logged, uncompressed and inline: 18 bytes.
     assert re.search(r'inline extent data size 18 ram_bytes 18 compression 0\b', dump), \
         (kind, 'native dump shows no inline extent holding the link target')
+if kind == 'special':
+    # Each node is named by a typed entry, and its inode item carries its
+    # type in the mode, printed in octal, and for a device the device
+    # number as the kernel keeps it: major << 20 | minor, so 240:300 and
+    # 241:5. Under the umask of 022 the socket is 755, the others 644.
+    for ftype in ('CHRDEV', 'BLKDEV', 'FIFO', 'SOCK'):
+        assert re.search(r'location key \(\d+ INODE_ITEM 0\) type %s\b' % ftype, dump), \
+            (kind, 'native dump shows no logged entry of type', ftype)
+    for mode, rdev in (('20644', 251658540), ('60644', 252706821), ('10644', 0), ('140755', 0)):
+        assert re.search(r'mode %s links 1 uid \d+ gid \d+ rdev %d\b' % (mode, rdev), dump), \
+            (kind, 'native dump shows no logged inode of mode and rdev', mode, rdev)
 if kind == 'compressedinline':
     # The native tool must print a compressed inline extent: nonzero
     # compression on the inline line itself, stored smaller than its bytes.
