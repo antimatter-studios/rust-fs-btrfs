@@ -95,7 +95,7 @@ leaf_edit_oracle          3
 leaf_split                1
 leaf_split_oracle         1
 lib                       232
-log_tree_kernel           4
+log_tree_kernel           17
 lookup_by_name_key        1
 namespace_kernel          2
 node_write_oracle         4
