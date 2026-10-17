@@ -507,6 +507,9 @@ tasks:
       # a committed empty directory removed and / alone fsynced, which
       # leaves the directory unlogged for replay to remove
       - test-disks/dirtylog/btrfs-dirty-log-rmdir.img
+      # one of two committed names of a file removed and / alone fsynced,
+      # which leaves the file unlogged with one link for replay to drop
+      - test-disks/dirtylog/btrfs-dirty-log-linkremoved.img
       # the volume the command-line tools are tested against, labelled
       # CLITEST, with a manifest of what the kernel wrote into it
       - test-disks/cli/btrfs-cli.img
