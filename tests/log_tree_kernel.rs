@@ -740,9 +740,21 @@ fn an_unsupported_log_is_refused_without_writing(shape: &str) {
     assert_eq!(before, after, "{shape}: the refusal wrote to the image");
 }
 
+/// An inline rewrite of `/f` logged with a name added to `/` (#377,
+/// #378): `g` created, renamed to `h`, and `/` fsynced, so the log holds
+/// `/` itself, the index range it speaks for, and `h`'s entry in it,
+/// which names a file the log also creates.
 #[test]
-fn a_mixed_names_and_inline_log_is_refused_without_writing() {
-    an_unsupported_log_is_refused_without_writing("mixedlog");
+fn a_mixed_names_and_inline_log_replays_as_the_kernel_does() {
+    an_inline_rewrite_replays_as_the_kernel_does("mixedlog", b"replayed-inline-bytes-ABCDEFGHIJK");
+}
+
+/// A log of shapes replay does not take yet -- data appended, truncated
+/// and partly overwritten, names removed and renamed (#374) -- is refused
+/// before anything is written.
+#[test]
+fn a_log_replay_cannot_take_yet_is_refused_without_writing() {
+    an_unsupported_log_is_refused_without_writing("replay");
 }
 
 /// An inline rewrite of `/f`, made durable by fsync alone, that #364's

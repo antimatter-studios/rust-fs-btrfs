@@ -292,16 +292,36 @@ impl Filesystem {
             // which is all the log says of the name: an fsync of a new file
             // logs no directory item for it.
             let mut created: BTreeSet<u64> = BTreeSet::new();
+            // Directories whose own inode the log holds (#377): the log
+            // speaks for their names in the index ranges it records.
+            let mut logged_dirs: BTreeSet<u64> = BTreeSet::new();
             for ino in top.inodes() {
                 let at = DiskKey {
                     objectid: ino,
                     key_type: INODE_ITEM_KEY,
                     offset: 0,
                 };
-                if tree.search(self.fs_tree_root, &at)?.is_none() {
-                    created.insert(ino);
+                match tree.search(self.fs_tree_root, &at)? {
+                    None => {
+                        created.insert(ino);
+                    }
+                    Some(item) if Inode::parse(&item.data, ino)?.is_dir() => {
+                        logged_dirs.insert(ino);
+                    }
+                    Some(_) => {}
                 }
             }
+            // The name a logged directory's index range gives `child` at
+            // `index`, if it gives it that one.
+            let logged_name = |dir: u64, index: u64, child: u64, name: &[u8]| -> Result<bool> {
+                let Some(item) = top.items.iter().find(|i| {
+                    (i.key.objectid, i.key.key_type, i.key.offset) == (dir, DIR_INDEX_KEY, index)
+                }) else {
+                    return Ok(false);
+                };
+                let entries = dir::parse_dir_items(&item.data)?;
+                Ok(entries.len() == 1 && entries[0].ino == child && entries[0].name == name)
+            };
             let mut grown: BTreeMap<u64, u64> = BTreeMap::new();
             for &ino in &created {
                 let inode = top.inode(ino)?.ok_or(Error::DirtyLog)?;
@@ -329,11 +349,26 @@ impl Filesystem {
                             let dir_item = tree
                                 .search(self.fs_tree_root, &at)?
                                 .ok_or(Error::DirtyLog)?;
-                            // A directory the log also speaks for is #377's.
-                            if !Inode::parse(&dir_item.data, parent)?.is_dir()
-                                || top.inode(parent)?.is_some()
-                            {
+                            if !Inode::parse(&dir_item.data, parent)?.is_dir() {
                                 return Err(Error::DirtyLog);
+                            }
+                            // In a directory the log speaks for, the name is
+                            // its logged entry's, entered with the
+                            // directory's other names below (#377).
+                            if logged_dirs.contains(&parent) {
+                                for (index, name) in
+                                    ref_records(&item.data).ok_or(Error::DirtyLog)?
+                                {
+                                    if !logged_name(parent, index, ino, name)? {
+                                        return Err(Error::DirtyLog);
+                                    }
+                                    names += 1;
+                                }
+                                edits.push(ItemEdit::Put(OwnedItem {
+                                    key: item.key,
+                                    data: item.data.clone(),
+                                }));
+                                continue;
                             }
                             for (index, name) in ref_records(&item.data).ok_or(Error::DirtyLog)? {
                                 let by_hash = DiskKey {
@@ -405,6 +440,103 @@ impl Filesystem {
                     data: raw,
                 }));
             }
+            // Each directory the log speaks for (#377): within the index
+            // ranges it logs, the log's names are the directory's names.
+            // A committed name there must be logged as it stands -- a name
+            // removed or renamed is not replayed yet -- and each logged
+            // name the directory lacks, of a file the log creates, is
+            // entered under both indexes. The directory's own item is put
+            // as logged, its size what those names make it.
+            for &d in &logged_dirs {
+                let mut ranges = Vec::new();
+                for item in top.items.iter().filter(|i| i.key.objectid == d) {
+                    match item.key.key_type {
+                        INODE_ITEM_KEY | INODE_REF_KEY | DIR_INDEX_KEY => {}
+                        DIR_LOG_INDEX_KEY if item.data.len() == 8 => {
+                            ranges.push((item.key.offset, le64(&item.data, 0)));
+                        }
+                        _ => return Err(Error::DirtyLog),
+                    }
+                }
+                let in_range = |index: u64| ranges.iter().any(|&(a, b)| a <= index && index <= b);
+                for committed in tree.find_all(self.fs_tree_root, d, DIR_INDEX_KEY)? {
+                    if !in_range(committed.key.offset) {
+                        continue;
+                    }
+                    let same = top
+                        .items
+                        .iter()
+                        .any(|i| i.key == committed.key && i.data == committed.data);
+                    if !same {
+                        return Err(Error::DirtyLog);
+                    }
+                }
+                let mut added = 0u64;
+                for item in top
+                    .items
+                    .iter()
+                    .filter(|i| i.key.objectid == d && i.key.key_type == DIR_INDEX_KEY)
+                {
+                    if !in_range(item.key.offset) {
+                        return Err(Error::DirtyLog);
+                    }
+                    if tree.search(self.fs_tree_root, &item.key)?.is_some() {
+                        continue;
+                    }
+                    let entries = dir::parse_dir_items(&item.data)?;
+                    let [entry] = entries.as_slice() else {
+                        return Err(Error::DirtyLog);
+                    };
+                    if !created.contains(&entry.ino) || entry.location_type != INODE_ITEM_KEY {
+                        return Err(Error::DirtyLog);
+                    }
+                    let by_hash = DiskKey {
+                        objectid: d,
+                        key_type: dir::DIR_ITEM_KEY,
+                        offset: dir::name_hash(&entry.name),
+                    };
+                    if tree.search(self.fs_tree_root, &by_hash)?.is_some() {
+                        return Err(Error::DirtyLog);
+                    }
+                    edits.push(ItemEdit::Put(OwnedItem {
+                        key: by_hash,
+                        data: item.data.clone(),
+                    }));
+                    edits.push(ItemEdit::Put(OwnedItem {
+                        key: item.key,
+                        data: item.data.clone(),
+                    }));
+                    added += 2 * entry.name.len() as u64;
+                }
+                let at = DiskKey {
+                    objectid: d,
+                    key_type: INODE_ITEM_KEY,
+                    offset: 0,
+                };
+                let committed = tree
+                    .search(self.fs_tree_root, &at)?
+                    .ok_or(Error::DirtyLog)?;
+                let before = Inode::parse(&committed.data, d)?;
+                let logged = top
+                    .items
+                    .iter()
+                    .find(|i| i.key == at)
+                    .ok_or(Error::DirtyLog)?;
+                let after = Inode::parse(&logged.data, d)?;
+                if !after.is_dir()
+                    || logged.data.len() != INODE_ITEM_SIZE
+                    || before.size.checked_add(added) != Some(after.size)
+                    || before.nlink != after.nlink
+                    || before.generation != after.generation
+                    || before.flags != after.flags
+                {
+                    return Err(Error::DirtyLog);
+                }
+                let mut data = logged.data.clone();
+                data[crate::inode::offsets::NBYTES..crate::inode::offsets::NBYTES + 8]
+                    .copy_from_slice(&before.nbytes.to_le_bytes());
+                edits.push(ItemEdit::Put(OwnedItem { key: at, data }));
+            }
             // Each parent's size counts its new names twice, once for each
             // of its two indexes, as a directory's size does.
             for (parent, added) in grown {
@@ -424,6 +556,14 @@ impl Filesystem {
             }
             for item in &top.items {
                 if created.contains(&item.key.objectid) {
+                    continue;
+                }
+                if logged_dirs.contains(&item.key.objectid)
+                    && matches!(
+                        item.key.key_type,
+                        INODE_ITEM_KEY | DIR_INDEX_KEY | DIR_LOG_INDEX_KEY
+                    )
+                {
                     continue;
                 }
                 // The digests of logged data, checked below against the
