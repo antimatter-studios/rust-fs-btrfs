@@ -14,7 +14,10 @@
 //!   new range is an implicit hole; without it every range up to the size,
 //!   rounded up to a sector, must have an item, so each part of the new
 //!   range no item covers gets a hole item, a regular extent item whose disk
-//!   bytenr is 0, as the kernel records it (#420).
+//!   bytenr is 0, as the kernel records it (#420). A file that ends
+//!   partway through a sector first has the rest of that sector rewritten
+//!   copy-on-write with zeros (#421), through [`Filesystem::write`], so
+//!   stale bytes past the old end never read back.
 //!
 //! Either way the inode's `nbytes` is recounted from the items left (inline
 //! data at its length, every other item with an extent at its `num_bytes`,
@@ -26,9 +29,9 @@
 //!   snapshot; an extent a reflink shares has this file's reference
 //!   dropped and stays for the others (#262), unless that reference is held
 //!   anywhere but inline in the extent's record, or is its last;
-//! - growing a file whose last sector is partly past its end, or that holds
-//!   inline data: the bytes between the old end and the sector boundary
-//!   must read as zeros, which means writing that sector;
+//! - growing a file that holds inline data, which means moving that data
+//!   into an extent; and, on a volume without `NO_HOLES`, growing a file
+//!   whose last sector is partly past its end.
 //! - a compressed inline extent cut short, and any subvolume other than the
 //!   top level.
 
@@ -56,7 +59,9 @@ impl Filesystem {
     /// [`Error::NotAFile`] for anything but a regular file, and
     /// [`Error::UnsupportedFeature`] for every refusal the [module
     /// documentation](crate::truncate) lists. Nothing is written unless
-    /// everything is.
+    /// everything is, except that a file ending partway through a sector
+    /// and grown past it commits the zeroed sector first: if the growth
+    /// after it then fails, the file ends at that sector's boundary.
     pub fn truncate(&mut self, ino: u64, size: u64) -> Result<()> {
         self.require_writable_top_level()?;
         let inode = self.read_inode(ino)?;
@@ -80,6 +85,17 @@ impl Filesystem {
         let mut released = Vec::new();
         if size > inode.size {
             self.refuse_growth(ino, inode.size, &items)?;
+            if !inode.size.is_multiple_of(sector) && !items.is_empty() {
+                // The rest of the old last sector may hold stale bytes, so
+                // it is rewritten copy-on-write with zeros past the old end,
+                // as the kernel does; the write moves the size up to the
+                // sector boundary or to `size`, whichever comes first, and
+                // any growth past that boundary is then sector-aligned.
+                let boundary = inode.size.next_multiple_of(sector);
+                let zeros = vec![0u8; (size.min(boundary) - inode.size) as usize];
+                self.write(ino, inode.size, &zeros)?;
+                return self.truncate(ino, size);
+            }
             if !self.sb.has_no_holes() {
                 let from = inode.size.next_multiple_of(sector);
                 let to = size.next_multiple_of(sector);
@@ -153,10 +169,14 @@ impl Filesystem {
                  an extent, which is not written yet"
             )));
         }
-        if !old.is_multiple_of(u64::from(self.sb.sectorsize)) && !items.is_empty() {
+        if !old.is_multiple_of(u64::from(self.sb.sectorsize))
+            && !items.is_empty()
+            && !self.sb.has_no_holes()
+        {
             return Err(Error::UnsupportedFeature(format!(
-                "inode {ino} ends partway through a sector at {old}, and growing it means \
-                 zeroing the rest of that sector, which is not written yet"
+                "inode {ino} ends partway through a sector at {old}, and growing it on a \
+                 volume without the no-holes feature means zeroing the rest of that sector \
+                 with a write that keeps hole items, which is not implemented"
             )));
         }
         Ok(())
