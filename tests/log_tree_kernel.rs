@@ -277,8 +277,10 @@ fn the_log_holds_what_the_kernels_replay_produces() {
     }
 }
 
-/// Every path's type, link count and size, and every regular file's
-/// modification time, as the kernel reports them for the mounted image.
+/// Every path's type, link count and size, every regular file's
+/// modification time, and every device's major and minor numbers (in
+/// hex, as `stat` prints them), as the kernel reports them for the
+/// mounted image.
 ///
 /// A directory's times are left out: a name the replay removes moves its
 /// directory's times to the moment of the replay, in the kernel's replay
@@ -287,6 +289,9 @@ const STATS: &str = r#"
 cd "$MNT"
 find . -mindepth 1 -printf 'stat\t%P\t%y %n %s\n' | sort
 find . -mindepth 1 -type f -printf 'mtime\t%P\t%T@\n' | sort
+find . -mindepth 1 \( -type b -o -type c \) -printf '%P\n' | sort | while read -r p; do
+    printf 'rdev\t%s\t%s\n' "$p" "$(stat -c '%t:%T' "$p")"
+done
 "#;
 
 /// `kind<TAB>path<TAB>value` lines, keyed by `(kind, path)`.
@@ -337,7 +342,9 @@ fn differences(
 
 /// Replay a copy of `fixture_name` with the kernel and another with this
 /// crate, and require the two to be the same volume to the kernel.
-fn replays_as_the_kernel_does(fixture_name: &str, tag: &str) {
+/// Returns the kernel's view of its own replay, for a test that also
+/// needs to know what that view holds.
+fn replays_as_the_kernel_does(fixture_name: &str, tag: &str) -> BTreeMap<(String, String), String> {
     let image = fixture(fixture_name);
 
     let theirs = PathBuf::from(temp_path!("{tag}-kernel-replay.img"));
@@ -380,6 +387,7 @@ fn replays_as_the_kernel_does(fixture_name: &str, tag: &str) {
         "[{tag}] the volume this crate replayed differs from the kernel's replay:\n{}",
         differ.join("\n")
     );
+    theirs_view
 }
 
 /// `durable.txt` rewritten in place and `fsynced.txt` created, both made
@@ -1275,6 +1283,91 @@ fn a_log_creating_a_symlink_replays_as_the_kernel_does() {
         );
     }
     replays_as_the_kernel_does(SYMLINK_FIXTURE, "dirtylog-symlink");
+}
+
+/// A character device `c` (240:300), a block device `b` (241:5), a FIFO
+/// `p` and a UNIX socket `s`, made after the last commit and durable by
+/// an fsync of `/` alone (#405). The committed trees hold none of them;
+/// the log holds `/`'s new entries and each node's inode item, carrying
+/// its type and device number, and its reference, with no data. The
+/// kernel's replay of the same crash image is the oracle, down to the
+/// type and the device numbers it reports for each node in both copies.
+#[test]
+fn a_log_creating_device_fifo_and_socket_nodes_replays_as_the_kernel_does() {
+    use fs_btrfs::inode::FileType;
+    const SPECIAL_FIXTURE: &str = "dirtylog/btrfs-dirty-log-special.img";
+    // Each node, its type, and its device number as the kernel keeps it
+    // on disk: major << 20 | minor.
+    let nodes: [(&str, FileType, u64); 4] = [
+        ("c", FileType::CharDevice, (240 << 20) | 300),
+        ("b", FileType::BlockDevice, (241 << 20) | 5),
+        ("p", FileType::Fifo, 0),
+        ("s", FileType::Socket, 0),
+    ];
+    let image = fixture(SPECIAL_FIXTURE);
+    let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-special.logdump"))
+        .expect("the native transcript of the special-node log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the special-node fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        for (name, kind, rdev) in &nodes {
+            assert!(
+                fs.lookup_path(&format!("/{name}")).is_err(),
+                "/{name} was made after the commit, so the committed trees should not hold it"
+            );
+            let ino = top
+                .inode_named(256, name.as_bytes())
+                .unwrap_or_else(|| panic!("the log names no {name} in /: {keys:?}"));
+            let logged = top
+                .inode(ino)
+                .unwrap()
+                .unwrap_or_else(|| panic!("the log holds no inode item for {name}: {keys:?}"));
+            assert_eq!(
+                (logged.file_type(), logged.rdev, logged.size),
+                (Some(*kind), *rdev, 0),
+                "the log's {name} is not the node the recipe made: {logged:?}"
+            );
+            assert!(
+                !top.items
+                    .iter()
+                    .any(|i| (i.key.objectid, i.key.key_type)
+                        == (ino, fs_btrfs::fs::EXTENT_DATA_KEY)),
+                "the log holds data for {name}, a node that has none: {keys:?}"
+            );
+        }
+    }
+    let theirs = replays_as_the_kernel_does(SPECIAL_FIXTURE, "dirtylog-special");
+    // The two replays agree; this is what they agree on, as the kernel
+    // reports it, so a node both left out cannot pass.
+    for (name, kind, rdev) in [
+        ("c", "character-special-file", Some("f0:12c")),
+        ("b", "block-special-file", Some("f1:5")),
+        ("p", "fifo", None),
+        ("s", "socket", None),
+    ] {
+        let get = |k: &str| {
+            theirs
+                .get(&(k.to_string(), name.to_string()))
+                .map(String::as_str)
+        };
+        assert_eq!(get("type"), Some(kind), "the kernel's replay of {name}");
+        assert_eq!(get("rdev"), rdev, "the kernel's replay of {name}");
+    }
 }
 
 /// The inline writer's encoding fields are checked against the native
