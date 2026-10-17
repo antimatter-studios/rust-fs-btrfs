@@ -1275,7 +1275,7 @@ fn inode_ref(index: u64, name: &[u8]) -> Vec<u8> {
 
 /// One directory entry record, as `DIR_ITEM` and `DIR_INDEX` both hold
 /// it: the child's inode key, the transaction, no data, the name.
-fn dir_entry(child: u64, generation: u64, ft: u8, name: &[u8]) -> Vec<u8> {
+pub(crate) fn dir_entry(child: u64, generation: u64, ft: u8, name: &[u8]) -> Vec<u8> {
     use dir::offsets as d;
     let mut b = vec![0u8; d::NAME];
     b[d::LOCATION..d::LOCATION + 8].copy_from_slice(&child.to_le_bytes());
