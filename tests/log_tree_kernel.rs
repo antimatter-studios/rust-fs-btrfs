@@ -763,7 +763,7 @@ fn a_same_length_inline_overwrite_replays_as_the_kernel_does() {
 /// by `mount_rw` with `DirtyLog`, and the refusal must write nothing: the
 /// whole image hashes the same before and after. The transcript is the
 /// native `dump-tree` of that exact image, bound by sha256 and superblock.
-fn an_unsupported_log_is_refused_without_writing(shape: &str) {
+fn an_unsupported_log_is_refused_without_writing(shape: &str, damage: impl FnOnce(&Path)) {
     use sha2::Digest;
     let image = fixture(&format!("dirtylog/btrfs-dirty-log-{shape}.img"));
     let transcript = std::fs::read_to_string(fixture(&format!(
@@ -774,6 +774,7 @@ fn an_unsupported_log_is_refused_without_writing(shape: &str) {
     transcript_binding(&transcript, &bytes).expect("transcript bound to this image");
     let guard = ScratchCopy::of(&image, temp_path!("refused-{shape}.img"));
     let copy = guard.0.clone();
+    damage(&copy);
     let before = format!("{:x}", sha2::Sha256::digest(std::fs::read(&copy).unwrap()));
     let result =
         Filesystem::mount_rw(Arc::new(FileDevice::open_rw(&copy).unwrap()) as Arc<dyn BlockDevice>);
@@ -795,12 +796,46 @@ fn a_mixed_names_and_inline_log_replays_as_the_kernel_does() {
     an_inline_rewrite_replays_as_the_kernel_does("mixedlog", b"replayed-inline-bytes-ABCDEFGHIJK");
 }
 
-/// A log of shapes replay does not take yet -- data appended, truncated
-/// and partly overwritten, names removed and renamed (#374) -- is refused
-/// before anything is written.
+/// A log whose data did not reach the disk as logged (#375): one byte of
+/// the extent the log gives `new.bin` is changed on a copy of the crash
+/// image, so the extent's bytes no longer match the digests the log
+/// carries for them. Replay must refuse to record data the log does not
+/// vouch for, before anything is written.
 #[test]
-fn a_log_replay_cannot_take_yet_is_refused_without_writing() {
-    an_unsupported_log_is_refused_without_writing("replay");
+fn a_log_whose_data_disagrees_with_its_checksums_is_refused_without_writing() {
+    an_unsupported_log_is_refused_without_writing("replay", |copy| {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(copy).expect("open the copy"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the copy without replay");
+        let log = fs.log().unwrap().expect("the copy holds a log");
+        let top = &log.trees[0];
+        let ino = top
+            .inode_named(256, b"new.bin")
+            .expect("the log creates new.bin");
+        let extent = top
+            .items
+            .iter()
+            .find(|i| i.key.objectid == ino && i.key.key_type == fs_btrfs::fs::EXTENT_DATA_KEY)
+            .expect("the log holds new.bin's extent");
+        let logical = u64::from_le_bytes(extent.data[21..29].try_into().unwrap());
+        drop(fs);
+        // Where the extent is on the device, from the native tool.
+        let out = oracle("btrfs-map-logical")
+            .args(["-l", &logical.to_string()])
+            .arg(copy)
+            .output();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let physical: u64 = text
+            .split_whitespace()
+            .skip_while(|w| *w != "physical")
+            .nth(1)
+            .and_then(|w| w.parse().ok())
+            .unwrap_or_else(|| panic!("btrfs-map-logical names no physical offset: {text}"));
+        let mut bytes = std::fs::read(copy).unwrap();
+        bytes[physical as usize] ^= 0xff;
+        std::fs::write(copy, bytes).unwrap();
+    });
 }
 
 /// An inline rewrite of `/f`, made durable by fsync alone, that #364's
