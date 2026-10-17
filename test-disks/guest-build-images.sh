@@ -1213,6 +1213,7 @@ build_dirtylog() {
     build_dirtylog_refused xattr 'compress=no,max_inline=2048' xattr
     build_dirtylog_refused subvol 'compress=no,max_inline=2048' subvol
     build_dirtylog_refused newdir 'compress=no,max_inline=2048' newdir
+    build_dirtylog_refused symlink 'compress=no,max_inline=2048' symlink
 }
 
 # fsync_path <path> — fsync one file or directory, and nothing else.
@@ -1358,7 +1359,7 @@ build_dirtylog_refused() {
     mkfs.btrfs -f "$img" >/dev/null
     mount -o "loop,commit=300,$opts" "$img" "$MNT"
     case "$kind" in
-        mixedlog|sizechange|compressedinline|newdir)
+        mixedlog|sizechange|compressedinline|newdir|symlink)
             printf 'committed-inline-bytes-0123456789' > "$MNT/f" ;;
         externalextent)
             head -c 8192 /dev/zero | tr '\0' 'c' > "$MNT/f" ;;
@@ -1385,6 +1386,13 @@ if kind == "newdir":
     os.mkdir(d + "/b")
     os.mkdir(d + "/b/c")
     open(d + "/b/x", "w").close()
+    dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    sys.exit(0)
+if kind == "symlink":
+    # A symbolic link made after the commit and durable by an fsync of /
+    # alone: the log holds its inode, its reference and the inline extent
+    # that holds its target. The committed f keeps its name.
+    os.symlink("target-of-the-link", d + "/l")
     dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
     sys.exit(0)
 fd = os.open(d + "/f", os.O_WRONLY)
@@ -1455,8 +1463,13 @@ want = {
     'xattr': r'XATTR_ITEM',
     'subvol': r'TREE_LOG ROOT_ITEM 25[6-9]',
     'newdir': r'location key \(\d+ INODE_ITEM 0\) type DIR',
+    'symlink': r'location key \(\d+ INODE_ITEM 0\) type SYMLINK',
 }[kind]
 assert re.search(want, dump), (kind, 'native dump does not show the unsupported shape')
+if kind == 'symlink':
+    # The target itself is logged, uncompressed and inline: 18 bytes.
+    assert re.search(r'inline extent data size 18 ram_bytes 18 compression 0\b', dump), \
+        (kind, 'native dump shows no inline extent holding the link target')
 if kind == 'compressedinline':
     # The native tool must print a compressed inline extent: nonzero
     # compression on the inline line itself, stored smaller than its bytes.
