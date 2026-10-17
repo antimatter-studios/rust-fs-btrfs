@@ -743,9 +743,11 @@ tasks:
     # BUDGET: 26 lines and 1047 bytes measured with fsck.btrfs's checks in
     # the tier (#260, run 37378163675), so 26 lines and 1200 bytes.
     # test-stat.sh adds exactly three success lines, so 29 lines now.
+    # Recursive ls adds 62 installed assertions (#466) and three success
+    # lines (95 bytes); add them to the existing floor and budget.
     cmds:
-      - '../rust-fs-core/scripts/tier.sh test:cli cli 29 1200 -- scripts/test-cli.sh'
-      - 'bash ../rust-fs-core/scripts/test-floor.sh cli 207'
+      - '../rust-fs-core/scripts/tier.sh test:cli cli 32 1295 -- scripts/test-cli.sh'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh cli 269'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
