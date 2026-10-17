@@ -58,7 +58,7 @@ use crate::fs::{
 };
 use crate::leaf_edit::OwnedItem;
 use crate::super_write::Commit;
-use crate::transaction::{DataWrite, ItemEdit};
+use crate::transaction::{DataWrite, ItemEdit, RecordEdit};
 
 /// How many rounds a chunk change's plan has to close over its own
 /// bookkeeping.
@@ -68,6 +68,13 @@ const PLAN_ROUNDS: usize = 64;
 /// kernel leaves the first MiB of every device alone, and places device
 /// extents on MiB boundaries.
 const MIB: u64 = 1 << 20;
+
+/// The most data extents one relocation moves, all in one transaction
+/// (#493): a group holding more is refused before anything is written.
+const EXTENTS_PER_TRANSACTION: usize = 64;
+
+/// How much of an extent is read and written at a time while it is copied.
+const COPY_PIECE: u64 = MIB;
 
 /// `BTRFS_DEV_EXTENT_KEY`.
 const DEV_EXTENT_KEY: u8 = 204;
@@ -212,10 +219,113 @@ impl Filesystem {
             return Err(Error::ReadOnly);
         }
         let group = self.block_group_at(start)?;
-        self.refuse_unrelocatable(&group, profile)?;
+        let extents = self.refuse_unrelocatable(&group, profile)?;
         let new = self.allocate_chunk(group.flags, group.length)?;
+        if !extents.is_empty() {
+            if let Err(e) = self.move_data_extents(&extents, new) {
+                // Nothing has moved: the new chunk is empty, and taking it
+                // away again leaves the filesystem as it was.
+                self.remove_block_group(new)?;
+                return Err(e);
+            }
+        }
         self.remove_block_group(start)?;
         Ok(new)
+    }
+
+    /// Move `extents`, every data extent of one group, into the empty
+    /// group at `to` in one committed transaction (#493).
+    ///
+    /// Each extent's bytes are read as the file read path reads them,
+    /// verified against their digests from whichever copy verifies, and
+    /// written to the new address before anything is committed: the new
+    /// chunk is free space until then, so a crash before the superblock
+    /// write leaves the files reading their old extents. The commit then
+    /// re-points the one file item naming each extent, moves its
+    /// `EXTENT_ITEM` and keyed back references unchanged, and files its
+    /// checksums under the new sectors; the records' release and
+    /// allocation carry the free-space tree and both groups' `used`.
+    fn move_data_extents(&mut self, extents: &[DataExtent], to: u64) -> Result<()> {
+        let target = self.block_group_at(to)?;
+        let lens: Vec<u64> = extents.iter().map(|e| e.len).collect();
+        let news = self.find_extents_in(std::slice::from_ref(&target), &lens)?;
+
+        for (e, &new) in extents.iter().zip(&news) {
+            let mut done = 0u64;
+            while done < e.len {
+                let n = (e.len - done).min(COPY_PIECE);
+                let mut buf = vec![0u8; n as usize];
+                self.read_data_verified(e.at + done, &mut buf, true)?;
+                self.write_logical_all_mirrors(new + done, &buf)?;
+                done += n;
+            }
+        }
+
+        // Deletes first, so a leaf is at its smallest before anything is
+        // added to it.
+        let extent_tree = objectid::EXTENT_TREE;
+        let mut deletes: Vec<(u64, ItemEdit)> = Vec::new();
+        let mut puts: Vec<(u64, ItemEdit)> = Vec::new();
+        let mut records = Vec::new();
+        for (e, &new) in extents.iter().zip(&news) {
+            records.push(RecordEdit {
+                bytenr: e.at,
+                len: e.len,
+                before: Some(e.body.clone()),
+                after: None,
+            });
+            records.push(RecordEdit {
+                bytenr: new,
+                len: e.len,
+                before: None,
+                after: Some(e.body.clone()),
+            });
+            // A keyed reference's offset is a hash of what it names, not of
+            // where the extent is, so it moves as it is.
+            for item in &e.keyed {
+                deletes.push((extent_tree, ItemEdit::Delete(item.key)));
+                puts.push((
+                    extent_tree,
+                    ItemEdit::Put(OwnedItem {
+                        key: DiskKey {
+                            objectid: new,
+                            ..item.key
+                        },
+                        data: item.data.clone(),
+                    }),
+                ));
+            }
+            for (tree, item) in &e.items {
+                let mut data = item.data.clone();
+                data[fe::DISK_BYTENR..fe::DISK_BYTENR + 8].copy_from_slice(&new.to_le_bytes());
+                puts.push((
+                    *tree,
+                    ItemEdit::Put(OwnedItem {
+                        key: item.key,
+                        data,
+                    }),
+                ));
+            }
+        }
+        let moved: Vec<(u64, u64, u64)> = extents
+            .iter()
+            .zip(&news)
+            .map(|(e, &new)| (e.at, new, e.len))
+            .collect();
+        let csum_edits = self.csum_move_edits(&moved)?;
+        let mut tree_edits = deletes;
+        tree_edits.extend(puts);
+        let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
+            Error::UnsupportedFeature("the generation counter is exhausted".into())
+        })?;
+        let write = DataWrite {
+            root: objectid::FS_TREE,
+            tree_edits,
+            csum_edits,
+            records,
+            ..Default::default()
+        };
+        self.commit_write(write, generation)
     }
 
     /// Refuse a group this does not relocate, before anything is written.
@@ -223,7 +333,7 @@ impl Filesystem {
         &self,
         group: &BlockGroup,
         profile: Option<ChunkProfile>,
-    ) -> Result<()> {
+    ) -> Result<Vec<DataExtent>> {
         if group.flags & bg::SYSTEM != 0 {
             return Err(Error::UnsupportedFeature(format!(
                 "the block group at {} holds the chunk tree, which the superblock's chunk \
@@ -267,14 +377,42 @@ impl Filesystem {
                     .into(),
             ));
         }
-        if group.used != 0 || !self.data_extents_in(group)?.is_empty() {
+        let extents = self.data_extents_in(group)?;
+        if extents.len() > EXTENTS_PER_TRANSACTION {
             return Err(Error::UnsupportedFeature(format!(
-                "the block group at {} holds {} bytes of extents, and moving them is not \
-                 implemented; only an empty group is relocated",
+                "the block group at {} holds {} data extents, and moving more than {} in one \
+                 transaction is not implemented",
+                group.start,
+                extents.len(),
+                EXTENTS_PER_TRANSACTION
+            )));
+        }
+        let sector = u64::from(self.sb.sectorsize).max(1);
+        for e in &extents {
+            if e.items.len() != 1 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "the extent at {} is named by {} file items, and moving an extent more \
+                     than one names is not implemented",
+                    e.at,
+                    e.items.len()
+                )));
+            }
+            if self.data_digests(e.at, e.len)?.len() as u64 != e.len / sector {
+                return Err(Error::UnsupportedFeature(format!(
+                    "the extent at {} has sectors with no checksum, and moving data stored \
+                     without checksums is not implemented",
+                    e.at
+                )));
+            }
+        }
+        if group.used != extents.iter().map(|e| e.len).sum::<u64>() {
+            return Err(Error::UnsupportedFeature(format!(
+                "the block group at {} records {} bytes used, and its data extents do not \
+                 add up to that",
                 group.start, group.used
             )));
         }
-        Ok(())
+        Ok(extents)
     }
 
     /// Allocate a single chunk of `length` logical bytes and `flags`, with
