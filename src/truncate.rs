@@ -10,8 +10,11 @@
 //!   leave the checksum tree. An item that straddles the new end keeps its
 //!   extent whole and references less of it (`num_bytes` shrinks), as the
 //!   kernel does; an inline item is cut to the new length.
-//! - **Growing** moves only the inode's size, which needs the `NO_HOLES`
-//!   feature: without it the kernel records the new range as a hole item.
+//! - **Growing** moves the inode's size. With the `NO_HOLES` feature the
+//!   new range is an implicit hole; without it every range up to the size,
+//!   rounded up to a sector, must have an item, so each part of the new
+//!   range no item covers gets a hole item, a regular extent item whose disk
+//!   bytenr is 0, as the kernel records it (#420).
 //!
 //! Either way the inode's `nbytes` is recounted from the items left (inline
 //! data at its length, every other item with an extent at its `num_bytes`,
@@ -39,6 +42,8 @@ use crate::write::window_inside_extent;
 
 /// `BTRFS_FILE_EXTENT_INLINE`.
 const INLINE: u8 = 0;
+/// `BTRFS_FILE_EXTENT_REG`.
+const REGULAR: u8 = 1;
 
 impl Filesystem {
     /// Set the length of regular file `ino` to `size`, as one committed
@@ -68,12 +73,18 @@ impl Filesystem {
             .filter(|(k, _)| k.key_type == EXTENT_DATA_KEY)
             .collect();
 
+        let generation = self.next_generation()?;
         let mut edits = Vec::new();
         let mut releases = Vec::new();
         let mut unrefs = Vec::new();
         let mut released = Vec::new();
         if size > inode.size {
             self.refuse_growth(ino, inode.size, &items)?;
+            if !self.sb.has_no_holes() {
+                let from = inode.size.next_multiple_of(sector);
+                let to = size.next_multiple_of(sector);
+                edits.extend(hole_items(ino, from, to, &items, generation));
+            }
         } else {
             let cut = size.next_multiple_of(sector);
             let last_snapshot = self.fs_tree_last_snapshot()?;
@@ -97,7 +108,6 @@ impl Filesystem {
                 .collect();
         }
 
-        let generation = self.next_generation()?;
         let now = crate::namespace::now();
         let mut raw = self.raw_inode(ino)?;
         raw[io::SIZE..io::SIZE + 8].copy_from_slice(&size.to_le_bytes());
@@ -137,12 +147,6 @@ impl Filesystem {
     /// Refuse growing a file whose new bytes could not be read as zeros
     /// without writing data.
     fn refuse_growth(&self, ino: u64, old: u64, items: &[(DiskKey, Vec<u8>)]) -> Result<()> {
-        if !self.sb.has_no_holes() {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino}: growing a file on a volume without the no-holes feature means \
-                 recording the new range as a hole item, which is not written yet"
-            )));
-        }
         if items.iter().any(|(_, d)| d.get(fe::TYPE) == Some(&INLINE)) {
             return Err(Error::UnsupportedFeature(format!(
                 "inode {ino} holds inline data, and growing it means moving that data into \
@@ -263,6 +267,56 @@ impl Filesystem {
     }
 }
 
+/// A hole item, generation `generation`, for each part of `[from, to)` that
+/// none of the file's extent `items` covers, on a volume without `NO_HOLES`
+/// (#420). An extent preallocated past the old end keeps its range; a hole
+/// is a regular extent item with disk bytenr 0 and its length as both
+/// `num_bytes` and `ram_bytes`.
+fn hole_items(
+    ino: u64,
+    from: u64,
+    to: u64,
+    items: &[(DiskKey, Vec<u8>)],
+    generation: u64,
+) -> Vec<ItemEdit> {
+    let covered = items
+        .iter()
+        .filter(|(_, d)| d.len() >= fe::REGULAR_SIZE && d[fe::TYPE] != INLINE)
+        .map(|(k, d)| (k.offset, k.offset.saturating_add(le64(d, fe::NUM_BYTES))));
+    let mut gaps = Vec::new();
+    let mut at = from;
+    for (start, end) in covered {
+        if start >= to {
+            break;
+        }
+        if start > at {
+            gaps.push((at, start));
+        }
+        at = at.max(end);
+    }
+    if at < to {
+        gaps.push((at, to));
+    }
+    gaps.into_iter()
+        .map(|(start, end)| {
+            let len = (end - start).to_le_bytes();
+            let mut data = vec![0u8; fe::REGULAR_SIZE];
+            data[fe::GENERATION..fe::GENERATION + 8].copy_from_slice(&generation.to_le_bytes());
+            data[fe::RAM_BYTES..fe::RAM_BYTES + 8].copy_from_slice(&len);
+            data[fe::TYPE] = REGULAR;
+            data[fe::NUM_BYTES..fe::NUM_BYTES + 8].copy_from_slice(&len);
+            ItemEdit::Put(OwnedItem {
+                key: DiskKey {
+                    objectid: ino,
+                    key_type: EXTENT_DATA_KEY,
+                    offset: start,
+                },
+                data,
+            })
+        })
+        .collect()
+}
+
 /// The inode's `nbytes` once `edits` apply to its extent items: inline data
 /// at its length, and every other item that has an extent at its
 /// `num_bytes` — the count `btrfs check` compares with the inode.
@@ -335,5 +389,55 @@ mod tests {
         ];
         assert_eq!(counted_bytes(&items, &edits).unwrap(), 4096);
         assert_eq!(counted_bytes(&[(key(0), inline)], &[]).unwrap(), 5);
+    }
+
+    /// Each hole item's `(offset, disk bytenr, num_bytes, ram_bytes)`.
+    fn holes(from: u64, to: u64, items: &[(DiskKey, Vec<u8>)]) -> Vec<(u64, u64, u64, u64)> {
+        hole_items(257, from, to, items, 9)
+            .into_iter()
+            .map(|e| match e {
+                ItemEdit::Put(item) => {
+                    assert_eq!(item.key.key_type, EXTENT_DATA_KEY);
+                    assert_eq!(le64(&item.data, fe::GENERATION), 9);
+                    assert_eq!(item.data[fe::TYPE], REGULAR);
+                    (
+                        item.key.offset,
+                        le64(&item.data, fe::DISK_BYTENR),
+                        le64(&item.data, fe::NUM_BYTES),
+                        le64(&item.data, fe::RAM_BYTES),
+                    )
+                }
+                ItemEdit::Delete(k) => panic!("a hole deletes {k:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn growth_holes_cover_only_what_no_item_does() {
+        assert_eq!(holes(0, 1 << 20, &[]), vec![(0, 0, 1 << 20, 1 << 20)]);
+        assert_eq!(
+            holes(8192, 65536, &[(key(0), regular(1 << 20, 8192))]),
+            vec![(8192, 0, 57344, 57344)]
+        );
+        // An extent preallocated past the old end keeps its range.
+        let mut prealloc = regular(2 << 20, 8192);
+        prealloc[fe::TYPE] = 2;
+        assert_eq!(
+            holes(
+                8192,
+                65536,
+                &[
+                    (key(0), regular(1 << 20, 8192)),
+                    (key(16384), prealloc.clone())
+                ]
+            ),
+            vec![(8192, 0, 8192, 8192), (24576, 0, 40960, 40960)]
+        );
+        // One that reaches past the new end leaves nothing to fill there.
+        assert_eq!(
+            holes(8192, 20480, &[(key(16384), prealloc)]),
+            vec![(8192, 0, 8192, 8192)]
+        );
+        assert!(holes(8192, 8192, &[]).is_empty());
     }
 }

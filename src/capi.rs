@@ -1573,7 +1573,8 @@ pub unsafe extern "C" fn fs_btrfs_rename(
 
 /// Set the length of the regular file at `path` to `size`, as one
 /// committed transaction. Shrinking releases the extents wholly past the
-/// new end; growing needs the volume's no-holes feature.
+/// new end; growing records the new range as a hole, an item of its own on
+/// a volume without the no-holes feature.
 ///
 /// Returns 0, or -1 with the error recorded: ENOENT for no such path,
 /// EISDIR for anything but a regular file, EROFS on a read-only handle,
