@@ -467,6 +467,8 @@ tasks:
       - test-disks/dirtylog/btrfs-dirty-log-sizechange.img
       # xattrs changed, removed and added on a committed file, fsynced
       - test-disks/dirtylog/btrfs-dirty-log-xattr.img
+      # fsynced changes in the top level and in a subvolume
+      - test-disks/dirtylog/btrfs-dirty-log-subvol.img
       # the volume the command-line tools are tested against, labelled
       # CLITEST, with a manifest of what the kernel wrote into it
       - test-disks/cli/btrfs-cli.img

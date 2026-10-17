@@ -1082,6 +1082,27 @@ fn a_size_changing_inline_rewrite_replays_as_the_kernel_does() {
     );
 }
 
+/// Fsynced changes in the top level and in a subvolume (#380): the log
+/// root tree names a log tree for each, and replay must fold both into
+/// their subvolumes in one transaction, as the kernel does.
+#[test]
+fn logs_of_two_subvolumes_replay_as_the_kernel_does() {
+    const SUBVOL_FIXTURE: &str = "dirtylog/btrfs-dirty-log-subvol.img";
+    {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(fixture(SUBVOL_FIXTURE)).expect("open the subvolume fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        let log = fs.log().unwrap().expect("a dirty log");
+        let subvolumes: Vec<u64> = log.trees.iter().map(|t| t.subvolume).collect();
+        assert!(
+            subvolumes.len() == 2 && subvolumes.contains(&5),
+            "the log holds a log tree for the top level and one for the subvolume: {subvolumes:?}"
+        );
+    }
+    replays_as_the_kernel_does(SUBVOL_FIXTURE, "dirtylog-subvol");
+}
+
 /// Extended attributes changed, removed and added on a committed file,
 /// made durable by fsync alone (#379): the log holds the file's
 /// attributes as they stand. The kernel's replay is the oracle for the
