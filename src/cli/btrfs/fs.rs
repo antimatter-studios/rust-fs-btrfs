@@ -170,6 +170,13 @@ fn command() -> Cmd {
 
                 )
                 .arg(
+                    Arg::new("at")
+                        .long("at")
+                        .value_name("BYTES")
+                        .value_parser(value_parser!(u64))
+                        .help("Position inside the file; positioned writes are not implemented (exit 3)"),
+                )
+                .arg(
                     Arg::new("path")
                         .value_name("PATH")
                         .required(true)
@@ -177,7 +184,11 @@ fn command() -> Cmd {
                 )
                 .after_help(
                     "Examples:\n  fs.btrfs disk.img write /vm/disk.raw < disk.raw\n  \
-                     fs.btrfs disk.img read /db/data | fix-up | fs.btrfs disk.img write /db/data\n\n\
+                     fs.btrfs disk.img read /db/data | fix-up | fs.btrfs disk.img write /db/data\n  \
+                     fs.btrfs disk.img write --at 0 /f < payload.bin\n\n\
+                     --at is a byte position inside the file: positioned writes are not \
+                     implemented and exit 3 before reading stdin or opening TARGET, even \
+                     at zero. --offset remains the filesystem's position inside TARGET.\n\n\
                      The file must exist and get exactly as many bytes as it already holds. \
                      A NODATACOW file (chattr +C) is overwritten in place; any other is written \
                      copy-on-write into new extents and committed as one transaction. A new \
@@ -450,6 +461,9 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
             path_arg(sub),
             sub.get_one("output"),
         ),
+        "write" if sub.get_one::<u64>("at").is_some() => Err(CliError::not_implemented(
+            "positioned write (--at) is not supported",
+        )),
         "write" => write(target, offset, path_arg(sub)),
         "mkdir" if sub.get_flag("parents") => mkdir_parents(target, offset, sub),
         "mkdir" | "create" | "rm" | "rmdir" | "ln" | "mv" => names(target, offset, verb, sub),
