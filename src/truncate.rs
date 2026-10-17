@@ -27,12 +27,17 @@
 //! data at its length, every other item with an extent at its `num_bytes`,
 //! as `btrfs check` counts it), and its change and modification times move.
 //!
+//! An extent something else still reads stays, and only this file's
+//! reference to it goes (#262): one a reflink shares, counting more than
+//! one reference, and one a snapshot shares, whose file item sits in a leaf
+//! the snapshot reaches too. Copying that leaf out of the snapshot's way
+//! gives the extent a reference naming the old leaf, as the kernel's
+//! copy-on-write does, so the snapshot keeps reading it.
+//!
 //! # What it refuses
 //!
-//! - an extent a snapshot may share, one from at or before the last
-//!   snapshot; an extent a reflink shares has this file's reference
-//!   dropped and stays for the others (#262), unless that reference is held
-//!   anywhere but inline in the extent's record, or is its last;
+//! - an extent whose reference from this file is held anywhere but inline
+//!   in the extent's record;
 //! - on a volume without `NO_HOLES`, growing a file whose last sector is
 //!   partly past its end, inline data included; and growing a `nodatacow`
 //!   file that holds inline data.
@@ -119,18 +124,10 @@ impl Filesystem {
             }
         } else {
             let cut = size.next_multiple_of(sector);
-            let last_snapshot = self.fs_tree_last_snapshot()?;
             for (k, d) in &items {
-                if let Some(edit) = self.shrink_item(
-                    ino,
-                    size,
-                    cut,
-                    last_snapshot,
-                    k,
-                    d,
-                    &mut releases,
-                    &mut unrefs,
-                )? {
+                if let Some(edit) =
+                    self.shrink_item(ino, size, cut, k, d, &mut releases, &mut unrefs)?
+                {
                     edits.push(edit);
                 }
             }
@@ -195,14 +192,13 @@ impl Filesystem {
     /// What shrinking to `size` does to one `EXTENT_DATA` item: nothing,
     /// a shorter item, or its deletion — with its extent released when
     /// this item was its one reference, and its reference dropped from the
-    /// extent when a reflink shares it (#262).
+    /// extent when a reflink or a snapshot shares it (#262).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn shrink_item(
         &self,
         ino: u64,
         size: u64,
         cut: u64,
-        last_snapshot: u64,
         k: &DiskKey,
         d: &[u8],
         releases: &mut Vec<DataRelease>,
@@ -284,7 +280,7 @@ impl Filesystem {
                 let bytenr = le64(d, fe::DISK_BYTENR);
                 if bytenr != 0 {
                     let offset = le64(d, fe::OFFSET);
-                    let (refs, extent_len, generation) = self.extent_item(bytenr)?;
+                    let (refs, extent_len, _) = self.extent_item(bytenr)?;
                     // A compressed extent's window is in its decoded bytes,
                     // which its on-disk length does not bound.
                     let compressed = d[fe::COMPRESSION] != 0;
@@ -297,23 +293,18 @@ impl Filesystem {
                             bytenr + offset
                         )));
                     }
-                    if generation <= last_snapshot {
-                        return Err(Error::UnsupportedFeature(format!(
-                            "inode {ino}: the extent at {bytenr} is from generation \
-                             {generation}, at or before the snapshot taken at {last_snapshot}, \
-                             so the snapshot may still be reading it"
-                        )));
-                    }
                     let release = DataRelease {
                         old: bytenr,
                         old_len: extent_len,
                         old_ref_offset: start - offset,
                     };
-                    // Newer than the last snapshot, so every other
-                    // reference is a file item a reflink made -- another
-                    // file's, or another of this file's: this one's is
-                    // dropped and the extent stays for the rest (#262).
-                    if refs == 1 {
+                    // Another reference is a file item a reflink made, or
+                    // a snapshot's own copy of a leaf; a leaf the snapshot
+                    // still shares counts none, and gains one naming it
+                    // when this change copies it. Either way this item's
+                    // reference is dropped and the extent stays for the
+                    // rest (#262).
+                    if refs == 1 && !self.leaf_shared(crate::chunk::objectid::FS_TREE, k)? {
                         releases.push(release);
                     } else {
                         unrefs.push(release);
