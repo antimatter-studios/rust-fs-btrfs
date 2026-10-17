@@ -506,7 +506,9 @@ impl Filesystem {
     ///   and that was its last name, is deleted with its data. A logged
     ///   name the directory lacks is added.
     /// - **Inodes logged only to say they exist** (generation 0) keep
-    ///   their committed item; their logged references are their names.
+    ///   their committed item; their logged references are their names,
+    ///   each new one named by a logged entry and a committed one kept
+    ///   where the log does not speak for its index (#461).
     pub(crate) fn replay_inode_only_log(&mut self) -> Result<()> {
         use crate::backref::{self, EXTENT_DATA_REF, SHARED_DATA_REF};
         use crate::chunk::{key_type::EXTENT_ITEM, objectid};
@@ -652,6 +654,16 @@ impl Filesystem {
                         return Err(Error::DirtyLog);
                     }
                     Ok(entries.pop())
+                };
+                // Whether a logged index range of directory `dir` holds
+                // `index`: the log speaks for that name of it.
+                let in_logged_range = |dir: u64, index: u64| {
+                    top.items
+                        .iter()
+                        .filter(|i| i.key.objectid == dir && i.key.key_type == DIR_LOG_INDEX_KEY)
+                        .any(|i| {
+                            i.data.len() == 8 && i.key.offset <= index && index <= le64(&i.data, 0)
+                        })
                 };
 
                 // Each file's data, whether the log creates the file or holds
@@ -869,7 +881,14 @@ impl Filesystem {
                         }
                         for (index, name) in ref_records(&r.data).ok_or(Error::DirtyLog)? {
                             *names.entry(ino).or_default() += 1;
-                            if spoken_for(parent) {
+                            // An inode logged only to say it exists keeps a
+                            // name at an index of a committed directory the
+                            // log does not speak for (#461); it must be the
+                            // committed one, as below.
+                            let kept = exists_only.contains(&ino)
+                                && dirs.contains(&parent)
+                                && !in_logged_range(parent, index);
+                            if spoken_for(parent) && !kept {
                                 let entry = logged_entry(parent, index)?.ok_or(Error::DirtyLog)?;
                                 if entry.ino != ino
                                     || entry.name != name
@@ -1155,14 +1174,7 @@ impl Filesystem {
                                 continue;
                             }
                             let gone = dirs.contains(&c.key.offset)
-                                && top
-                                    .items
-                                    .iter()
-                                    .filter(|i| {
-                                        i.key.objectid == c.key.offset
-                                            && i.key.key_type == DIR_LOG_INDEX_KEY
-                                    })
-                                    .any(|i| i.key.offset <= index && index <= le64(&i.data, 0))
+                                && in_logged_range(c.key.offset, index)
                                 && logged_entry(c.key.offset, index)?.is_none();
                             if !gone {
                                 return Err(Error::DirtyLog);
