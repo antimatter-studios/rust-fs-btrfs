@@ -410,7 +410,10 @@ impl Filesystem {
     ///   cover their ranges -- a committed item they cover in part keeps
     ///   its head and its tail -- and the file is cut at its logged size,
     ///   rounded up to a sector, as the logged inode item is the truth of
-    ///   it. Its `nbytes` is counted from what is left.
+    ///   it. Its `nbytes` is counted from what is left. Its references
+    ///   keep every committed name and may add hard links (#406), each in
+    ///   a directory the log speaks for, its link count raised by one for
+    ///   each.
     /// - **Extents**: every file item that names an extent is one
     ///   reference to it. The references replay adds and drops are applied
     ///   to each extent's record: an extent nothing recorded yet is
@@ -563,6 +566,23 @@ impl Filesystem {
                     }
                 }
 
+                // The one logged entry of directory `dir` at `index`, if the
+                // log holds one.
+                let logged_entry = |dir: u64, index: u64| -> Result<Option<DirEntry>> {
+                    let Some(item) = top
+                        .items
+                        .iter()
+                        .find(|i| i.key == key(dir, DIR_INDEX_KEY, index))
+                    else {
+                        return Ok(None);
+                    };
+                    let mut entries = dir::parse_dir_items(&item.data)?;
+                    if entries.len() != 1 {
+                        return Err(Error::DirtyLog);
+                    }
+                    Ok(entries.pop())
+                };
+
                 // Each file's data, whether the log creates the file or holds
                 // an existing one in full.
                 for &ino in files.iter().chain(created.iter()) {
@@ -644,23 +664,65 @@ impl Filesystem {
                             || (logged.nbytes != 0 && logged.nbytes != before.nbytes)
                             || before.generation != logged.generation
                             || before.nlink == 0
-                            || before.nlink != logged.nlink
                             || before.flags != logged.flags
                             || before.rdev != logged.rdev
                             || before.block_group != logged.block_group
                         {
                             return Err(Error::DirtyLog);
                         }
-                        // Its names do not change here: a renamed or relinked
+                        // Its references keep every committed name, and may
+                        // add names (#406): each one in a committed directory
+                        // the log speaks for, whose logged entry at that index
+                        // is the name, which the directory pass adds. A renamed
                         // file is replayed through its directory.
+                        let mut gained = 0u32;
                         for r in top
                             .items
                             .iter()
                             .filter(|i| i.key.objectid == ino && i.key.key_type == INODE_REF_KEY)
                         {
-                            if tree.search(root, &r.key)?.map(|c| c.data) != Some(r.data.clone()) {
+                            let committed = tree.search(root, &r.key)?.map(|c| c.data);
+                            let had = match &committed {
+                                Some(data) => ref_records(data).ok_or(Error::DirtyLog)?,
+                                None => Vec::new(),
+                            };
+                            let has = ref_records(&r.data).ok_or(Error::DirtyLog)?;
+                            if had.iter().any(|record| !has.contains(record)) {
                                 return Err(Error::DirtyLog);
                             }
+                            let parent = r.key.offset;
+                            for &(index, name) in has.iter().filter(|r| !had.contains(r)) {
+                                let entry = logged_entry(parent, index)?.ok_or(Error::DirtyLog)?;
+                                if !dirs.contains(&parent)
+                                    || entry.ino != ino
+                                    || entry.name != name
+                                    || entry.ftype != logged.file_type()
+                                {
+                                    return Err(Error::DirtyLog);
+                                }
+                                gained += 1;
+                            }
+                            if committed.as_deref() != Some(&r.data[..]) {
+                                edits.push(put(r.key, r.data.clone()));
+                            }
+                        }
+                        // Its link count is its committed names and the ones
+                        // it gains, each committed name in an `INODE_REF`.
+                        let nlink = if gained == 0 {
+                            before.nlink
+                        } else {
+                            let mut committed_names = 0u32;
+                            for c in tree.find_all(root, ino, INODE_REF_KEY)? {
+                                committed_names +=
+                                    ref_records(&c.data).ok_or(Error::DirtyLog)?.len() as u32;
+                            }
+                            if committed_names != before.nlink {
+                                return Err(Error::DirtyLog);
+                            }
+                            before.nlink.checked_add(gained).ok_or(Error::DirtyLog)?
+                        };
+                        if logged.nlink != nlink {
+                            return Err(Error::DirtyLog);
                         }
                     }
                     raw[io::NBYTES..io::NBYTES + 8].copy_from_slice(&nbytes.to_le_bytes());
@@ -703,20 +765,6 @@ impl Filesystem {
                 // speak for gets its entries from its reference; any other
                 // logged reference must match a logged directory entry, or be
                 // the committed one.
-                let logged_entry = |dir: u64, index: u64| -> Result<Option<DirEntry>> {
-                    let Some(item) = top
-                        .items
-                        .iter()
-                        .find(|i| i.key == key(dir, DIR_INDEX_KEY, index))
-                    else {
-                        return Ok(None);
-                    };
-                    let mut entries = dir::parse_dir_items(&item.data)?;
-                    if entries.len() != 1 {
-                        return Err(Error::DirtyLog);
-                    }
-                    Ok(entries.pop())
-                };
                 let mut grown: BTreeMap<u64, i64> = BTreeMap::new();
                 let mut names: BTreeMap<u64, u32> = BTreeMap::new();
                 let spoken_for = |d: u64| dirs.contains(&d) || new_dirs.contains(&d);
