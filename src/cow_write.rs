@@ -49,7 +49,10 @@
 //! 6. **The inode** is stamped with the transaction, a new change count
 //!    and new change and modification times. A write into a hole, or past
 //!    the end of the file, adds the sectors it allocates to `nbytes`; one
-//!    past the end moves `size` to where it stops (#432). Without the
+//!    past the end moves `size` to where it stops (#432). One that starts
+//!    past the end leaves a gap, an implicit hole with no item; first, as
+//!    the kernel does, the old last sector is copied with zeros past the
+//!    old end when the write does not cover it (#433). Without the
 //!    no-holes feature, explicit hole items keep the ranges before and
 //!    after each fill, trimmed or split in the same transaction (#434).
 //!
@@ -66,9 +69,6 @@
 //!   root, or a full one that cannot be split (its parent node has no
 //!   room for another pointer): removing a leaf and splitting a node are
 //!   not written yet;
-//! - a write that starts **past the end** of the file, leaving a gap: the
-//!   kernel zeroes the rest of the old last sector first (#433). One that
-//!   starts at or before the end and grows the file is written;
 //! - a write that grows a file on a volume **without the no-holes
 //!   feature**, where the hole a file ends with is an item of its own
 //!   (#436);
@@ -216,30 +216,27 @@ impl Filesystem {
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or_else(|| Error::UnsupportedFeature("write range overflows".into()))?;
-        // A write that grows the file starts at or before its end, so the
-        // sectors past its last extent are planned as a hole is (#432).
-        // One that starts past the end leaves a gap, and the kernel zeroes
-        // the rest of the old last sector before it makes one (#433). A
-        // volume without no-holes records the hole a file ends with as an
-        // item the hole fill does not maintain (#436).
+        // A write that grows the file plans the sectors past its last
+        // extent as a hole is (#432). One that starts past the end leaves a
+        // gap, and the kernel zeroes the rest of the old last sector before
+        // it makes one: that sector is copied too, reading as zeros past
+        // the old end (#433). A volume without no-holes records the hole a
+        // file ends with as an item the hole fill does not maintain (#436).
+        let mut tail = None;
         if end > inode.size {
-            if offset > inode.size {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino}: writing at {offset} starts past the file's end at {}, and \
-                     a write that leaves a gap is not implemented",
-                    inode.size
-                )));
-            }
             if !self.sb.has_no_holes() {
                 return Err(Error::UnsupportedFeature(format!(
                     "inode {ino}: growing a file on a volume without the no-holes feature \
                      means keeping its hole items, which is not implemented"
                 )));
             }
+            if offset > inode.size && !inode.size.is_multiple_of(u64::from(self.sb.sectorsize)) {
+                tail = Some(inode.size);
+            }
         }
 
         // Every refusal before anything is allocated.
-        let targets = self.plan_cow_targets(ino, offset, end, move_inline)?;
+        let targets = self.plan_cow_targets(ino, tail, offset, end, move_inline)?;
 
         // Each copy: the item's bytes as they read now, with the write
         // laid over them. Past the end of the file the last sector reads
@@ -261,10 +258,14 @@ impl Filesystem {
                 .map_err(|_| Error::UnsupportedFeature(format!("an extent of {} bytes", t.len)))?;
             let mut buf = vec![0u8; size];
             self.read_at(ino, t.start, &mut buf)?;
+            // The old last sector a write past the end copies may lie
+            // wholly before the write, and then takes none of it (#433).
             let from = offset.max(t.start);
             let to = end.min(t.start + t.len);
-            buf[(from - t.start) as usize..(to - t.start) as usize]
-                .copy_from_slice(&data[(from - offset) as usize..(to - offset) as usize]);
+            if from < to {
+                buf[(from - t.start) as usize..(to - t.start) as usize]
+                    .copy_from_slice(&data[(from - offset) as usize..(to - offset) as usize]);
+            }
             let mut at = t.start;
             for chunk in buf.chunks(unit) {
                 let (bytes, compression) = self.encode_copy(chunk.to_vec(), algo);
@@ -558,6 +559,7 @@ impl Filesystem {
     fn plan_cow_targets(
         &self,
         ino: u64,
+        tail: Option<u64>,
         offset: u64,
         end: u64,
         move_inline: bool,
@@ -599,85 +601,104 @@ impl Filesystem {
             });
             pos = stop;
         }
-        while pos < end {
-            let Some(piece) = pieces
+        // A write past the end of a file whose end is partway through a
+        // sector copies the item holding that sector first, which reads as
+        // zeros past the old end (#433). The planning below then starts
+        // past it; a hole there needs nothing, as it reads as zeros.
+        let mut spans = Vec::with_capacity(2);
+        if let Some(size) = tail {
+            if pieces
                 .iter()
-                .find(|p| pos >= p.start && pos < p.start + p.len)
-            else {
-                // A hole: whole sectors of it, from the sector the write
-                // starts in to the one it ends in, never past the next
-                // item. The sectors read as zeros, and the copy keeps them.
-                let start = (pos / sector * sector).max(
-                    pieces
-                        .iter()
-                        .map(|p| p.start + p.len)
-                        .filter(|&e| e <= pos)
-                        .max()
-                        .unwrap_or(0),
-                );
-                let next = pieces
-                    .iter()
-                    .map(|p| p.start)
-                    .filter(|&s| s > pos)
-                    .min()
-                    .unwrap_or(u64::MAX);
-                let stop = end.div_ceil(sector).saturating_mul(sector).min(next);
-                out.push(Target {
-                    start,
-                    len: stop - start,
-                    extent_start: 0,
-                    extent_len: 0,
-                    extent_offset: 0,
-                    shared: false,
-                    hole: true,
-                    inline: 0,
-                });
-                pos = stop;
-                continue;
-            };
-            // A compressed extent's window is in its decoded bytes, which
-            // reading it already bounds by `ram_bytes`; on disk the whole
-            // extent is released, so there is no window to check there.
-            let logical = if piece.compressed {
-                None
-            } else {
-                Some(piece.logical.ok_or_else(|| {
-                    Error::UnsupportedFeature(format!(
-                        "inode {ino}: offset {pos} is inline or preallocated, and writing it \
-                         changes the item's kind, which is not implemented"
-                    ))
-                })?)
-            };
-            let (refs, extent_len, generation) = self.extent_item(piece.extent_start)?;
-            if let Some(logical) = logical {
-                if !window_inside_extent(logical, piece.len, piece.extent_start, extent_len) {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "inode {ino}: offset {pos} maps to [{logical}, +{}), outside the \
-                         {extent_len}-byte extent the extent tree records at {}",
-                        piece.len, piece.extent_start
-                    )));
-                }
+                .any(|p| size >= p.start && size < p.start + p.len)
+            {
+                spans.push((size, size + 1));
             }
-            if generation <= last_snapshot {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino}: the extent at {} is from generation {generation}, at or \
+        }
+        spans.push((pos, end));
+        for (mut pos, end) in spans {
+            if let Some(last) = out.last() {
+                pos = pos.max(last.start + last.len);
+            }
+            while pos < end {
+                let Some(piece) = pieces
+                    .iter()
+                    .find(|p| pos >= p.start && pos < p.start + p.len)
+                else {
+                    // A hole: whole sectors of it, from the sector the write
+                    // starts in to the one it ends in, never past the next
+                    // item. The sectors read as zeros, and the copy keeps them.
+                    let start = (pos / sector * sector).max(
+                        pieces
+                            .iter()
+                            .map(|p| p.start + p.len)
+                            .filter(|&e| e <= pos)
+                            .max()
+                            .unwrap_or(0),
+                    );
+                    let next = pieces
+                        .iter()
+                        .map(|p| p.start)
+                        .filter(|&s| s > pos)
+                        .min()
+                        .unwrap_or(u64::MAX);
+                    let stop = end.div_ceil(sector).saturating_mul(sector).min(next);
+                    out.push(Target {
+                        start,
+                        len: stop - start,
+                        extent_start: 0,
+                        extent_len: 0,
+                        extent_offset: 0,
+                        shared: false,
+                        hole: true,
+                        inline: 0,
+                    });
+                    pos = stop;
+                    continue;
+                };
+                // A compressed extent's window is in its decoded bytes, which
+                // reading it already bounds by `ram_bytes`; on disk the whole
+                // extent is released, so there is no window to check there.
+                let logical = if piece.compressed {
+                    None
+                } else {
+                    Some(piece.logical.ok_or_else(|| {
+                        Error::UnsupportedFeature(format!(
+                            "inode {ino}: offset {pos} is inline or preallocated, and writing it \
+                         changes the item's kind, which is not implemented"
+                        ))
+                    })?)
+                };
+                let (refs, extent_len, generation) = self.extent_item(piece.extent_start)?;
+                if let Some(logical) = logical {
+                    if !window_inside_extent(logical, piece.len, piece.extent_start, extent_len) {
+                        return Err(Error::UnsupportedFeature(format!(
+                            "inode {ino}: offset {pos} maps to [{logical}, +{}), outside the \
+                         {extent_len}-byte extent the extent tree records at {}",
+                            piece.len, piece.extent_start
+                        )));
+                    }
+                }
+                if generation <= last_snapshot {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "inode {ino}: the extent at {} is from generation {generation}, at or \
                      before the snapshot taken at {last_snapshot}, so the snapshot may still \
                      be reading it",
-                    piece.extent_start
-                )));
+                        piece.extent_start
+                    )));
+                }
+                out.push(Target {
+                    start: piece.start,
+                    len: piece.len,
+                    extent_start: piece.extent_start,
+                    extent_len,
+                    extent_offset: piece.ref_offset,
+                    shared: false,
+                    hole: false,
+                    inline: 0,
+                });
+                refs_of.insert(piece.extent_start, refs);
+                pos = piece.start + piece.len;
             }
-            out.push(Target {
-                start: piece.start,
-                len: piece.len,
-                extent_start: piece.extent_start,
-                extent_len,
-                extent_offset: piece.ref_offset,
-                shared: false,
-                hole: false,
-                inline: 0,
-            });
-            refs_of.insert(piece.extent_start, refs);
-            pos = piece.start + piece.len;
         }
         // Shared when the extent has references beyond the write's own
         // items. More items than its record counts is a record that does

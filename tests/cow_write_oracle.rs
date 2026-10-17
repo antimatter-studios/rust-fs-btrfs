@@ -992,9 +992,6 @@ const GROW_FILL: &str =
 /// `btrfs check --check-data-csum` sees a digest missing for a new sector,
 /// a record with no item or a wrong `nbytes`; a scrub makes the kernel
 /// verify every sector, and it reads every byte back.
-///
-/// A write that starts past the end is still refused (#433), before
-/// anything is written.
 #[test]
 fn a_write_past_the_end_grows_the_file_the_checker_and_kernel_accept() {
     const MID: &str = "mid.bin";
@@ -1016,21 +1013,6 @@ fn a_write_past_the_end_grows_the_file_the_checker_and_kernel_accept() {
         );
         expected.insert(name, fs.read_file(ino).unwrap());
     }
-
-    // Past the end, leaving a gap: refused, and nothing written.
-    let untouched = sha256_hex(&std::fs::read(&image).unwrap());
-    let err = fs
-        .write(ino_of(&fs, MID), 40_000 + 8192, b"past the end")
-        .expect_err("a write that starts past the end must still be refused");
-    assert!(
-        matches!(err, fs_btrfs::Error::UnsupportedFeature(_)),
-        "the refusal should be a named unsupported case: {err}"
-    );
-    assert_eq!(
-        sha256_hex(&std::fs::read(&image).unwrap()),
-        untouched,
-        "a refused write changed the image"
-    );
 
     // (file, offset, bytes), the controls' writes in the same order.
     let writes: Vec<(&str, u64, Vec<u8>)> = vec![
@@ -1141,6 +1123,217 @@ fn a_write_past_the_end_grows_the_file_the_checker_and_kernel_accept() {
             after[name].0,
             sha256_hex(&expected[name]),
             "the kernel reads back different bytes from {name} than were written"
+        );
+        assert_eq!(
+            after[name].0,
+            after[&control(name)].0,
+            "{name} does not read as the kernel's own writes left its control"
+        );
+    }
+}
+
+/// `far.bin` and `near.bin` are each 40,960 random bytes, checksummed, in
+/// one extent; each `*-control.bin` is written by the same `tee`. The
+/// kernel cuts its controls to 40,000 bytes and then makes the writes
+/// [`a_write_that_starts_past_the_end_zeroes_the_rest_of_the_old_last_sector`]
+/// makes through this driver, at the same offsets, in transactions of its
+/// own: `far` several sectors past the end, `near` inside the old last
+/// sector but past the end.
+const GAP_FILL: &str =
+    "head -c 40960 /dev/urandom | tee \"$MNT/far.bin\" > \"$MNT/far-control.bin\"\n\
+     head -c 40960 /dev/urandom | tee \"$MNT/near.bin\" > \"$MNT/near-control.bin\"\n\
+     sync\n\
+     truncate -s 40000 \"$MNT/far-control.bin\"\n\
+     truncate -s 40000 \"$MNT/near-control.bin\"\n\
+     sync\n\
+     head -c 100 /dev/zero | tr '\\000' '\\132' \
+     | dd of=\"$MNT/far-control.bin\" bs=1 seek=53000 conv=notrunc status=none\n\
+     sync\n\
+     head -c 50 /dev/zero | tr '\\000' '\\245' \
+     | dd of=\"$MNT/near-control.bin\" bs=1 seek=40500 conv=notrunc status=none\n\
+     sync";
+
+/// The kernel's `stat` of each named file: its size, and the bytes it
+/// says are allocated (`%b` blocks of `%B` bytes).
+fn kernel_stats(image: &Path, what: &str, names: &[&str]) -> BTreeMap<String, (u64, u64)> {
+    let mut script = String::new();
+    for name in names {
+        script.push_str(&format!("stat -c '{name} %s %b %B' \"$MNT/{name}\"\n"));
+    }
+    guest_kernel_read_ok(&image.to_string_lossy(), what, &script)
+        .lines()
+        .map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(words.len(), 4, "{what}: stat printed {line:?}");
+            let n = |w: &str| -> u64 {
+                w.parse()
+                    .unwrap_or_else(|e| panic!("{what}: stat printed {line:?}: {e}"))
+            };
+            (
+                words[0].to_string(),
+                (n(words[1]), n(words[2]) * n(words[3])),
+            )
+        })
+        .collect()
+}
+
+/// A write that starts past the end of a file leaves a gap (#433). Before
+/// the kernel extends a file whose end lies partway through a sector, it
+/// zeroes the rest of that sector, so the bytes between the old end and
+/// the next sector boundary read as zeros whatever the extent held there;
+/// the gap past that is an implicit hole with no item on a `no-holes`
+/// volume, and the write's own sectors are a new extent.
+///
+/// This driver's truncate keeps an extent's last sector as it was, so
+/// `far.bin` and `near.bin`, cut from 40,960 bytes to 40,000, still hold
+/// random bytes on disk past their end: the test reads that sector raw
+/// and shows them there, so a write that skipped the zeroing would read
+/// them back. The kernel made the same writes into the controls, so the
+/// expected bytes, `size`, `nbytes` and allocation are its own.
+/// `btrfs check --check-data-csum` and a scrub verify every digest.
+#[test]
+fn a_write_that_starts_past_the_end_zeroes_the_rest_of_the_old_last_sector() {
+    const FAR: &str = "far.bin";
+    const NEAR: &str = "near.bin";
+    const OLD_END: u64 = 40_000;
+    const SECTOR: u64 = 4096;
+    let control = |name: &str| name.replace(".bin", "-control.bin");
+    let scratch = Scratch::new("cow-write-gap", GAP_FILL);
+    let image = scratch.image();
+
+    let mut fs = mount_rw(&image);
+    for name in [FAR, NEAR] {
+        let ino = ino_of(&fs, name);
+        let inode = fs.read_inode(ino).unwrap();
+        assert_eq!(inode.size, 40_960, "{name} is not the size made");
+        assert_eq!(
+            inode.flags & fs_btrfs::write::INODE_NODATASUM,
+            0,
+            "{name} must be checksummed for this to test anything"
+        );
+        fs.truncate(ino, OLD_END)
+            .unwrap_or_else(|e| panic!("cutting {name} to {OLD_END}: {e}"));
+    }
+    drop(fs);
+
+    // Where the kernel says each file's last sector lies, read raw: the
+    // bytes past the old end are the random ones the truncate kept.
+    let last_block = OLD_END / SECTOR;
+    let mapped = kernel_map(&image, "where the old last sectors lie", &[FAR, NEAR]);
+    let mut fs = mount_rw(&image);
+    let mut expected: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
+    for name in [FAR, NEAR] {
+        let extent = mapped[name]
+            .1
+            .iter()
+            .filter(|m| m.logical <= last_block)
+            .max_by_key(|m| m.logical)
+            .unwrap_or_else(|| panic!("{name}: no extent holds block {last_block}"));
+        let logical = (extent.physical + last_block - extent.logical) * SECTOR;
+        let at = fs
+            .chunk_map()
+            .map_mirror(logical, 0)
+            .unwrap_or_else(|e| panic!("{name}: mapping {logical}: {e}"))
+            .physical;
+        let mut raw = vec![0u8; SECTOR as usize];
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = std::fs::File::open(&image).unwrap();
+            file.seek(SeekFrom::Start(at)).unwrap();
+            file.read_exact(&mut raw).unwrap();
+        }
+        let tail = &raw[(OLD_END % SECTOR) as usize..];
+        assert!(
+            tail.iter().any(|&b| b != 0),
+            "{name}: the bytes on disk past the old end are already zeros, so this tests nothing"
+        );
+        let file = fs.read_file(ino_of(&fs, name)).unwrap();
+        assert_eq!(file.len() as u64, OLD_END, "{name} was not cut");
+        expected.insert(name, file);
+    }
+
+    let writes: Vec<(&str, u64, Vec<u8>)> = vec![
+        (FAR, 53_000, vec![0x5a; 100]),
+        (NEAR, 40_500, vec![0xa5; 50]),
+    ];
+    let generation = fs.superblock().generation;
+    for (name, offset, bytes) in &writes {
+        let ino = ino_of(&fs, name);
+        let n = fs.write(ino, *offset, bytes).unwrap_or_else(|e| {
+            panic!(
+                "writing {} bytes at {offset} of {name}, past its end at {OLD_END}: {e}",
+                bytes.len()
+            )
+        });
+        assert_eq!(n, bytes.len(), "a short write");
+        let file = expected.get_mut(name).unwrap();
+        let end = *offset as usize + bytes.len();
+        file.resize(end, 0);
+        file[*offset as usize..end].copy_from_slice(bytes);
+        assert_eq!(
+            fs.read_inode(ino).unwrap().size,
+            end as u64,
+            "{name}'s size is not the end of the write"
+        );
+        // Our own reading of what we committed, before the oracles'.
+        assert_eq!(
+            &fs.read_file(ino).unwrap(),
+            file,
+            "{name} reads back differently through this driver after the write"
+        );
+    }
+    assert_eq!(
+        fs.superblock().generation,
+        generation + writes.len() as u64,
+        "each write is one committed transaction"
+    );
+    for name in [FAR, NEAR] {
+        let ours = fs.read_inode(ino_of(&fs, name)).unwrap();
+        let theirs = fs.read_inode(ino_of(&fs, &control(name))).unwrap();
+        assert_eq!(
+            (ours.size, ours.nbytes),
+            (theirs.size, theirs.nbytes),
+            "{name}'s size and nbytes are not what the kernel's own writes gave its control"
+        );
+    }
+    drop(fs);
+
+    assert_btrfs_check_clean(&image, "after writes that leave a gap");
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum finds data that disagrees with its digests:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after writes that leave a gap",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+
+    let names = [FAR, NEAR, "far-control.bin", "near-control.bin"];
+    let stats = kernel_stats(
+        &image,
+        "the kernel's stat after writes that leave a gap",
+        &names,
+    );
+    let after = kernel_view(&image, "after writes that leave a gap", &names);
+    for name in [FAR, NEAR] {
+        assert_eq!(
+            stats[name],
+            stats[&control(name)],
+            "the kernel's size and allocation of {name} differ from its control's"
+        );
+        assert_eq!(
+            after[name].0,
+            sha256_hex(&expected[name]),
+            "the kernel reads back different bytes from {name} than were written: the gap \
+             and the old last sector's tail must read as zeros"
         );
         assert_eq!(
             after[name].0,
