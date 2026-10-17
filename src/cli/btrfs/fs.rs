@@ -861,6 +861,14 @@ fn stat(root: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
     let compression = fs
         .get_xattr(inode.ino, b"btrfs.compression")
         .map_err(|e| btrfs_error(path, e))?;
+    // The kernel's stat accounts in whole filesystem sectors, including
+    // inline data; nbytes itself can hold a partial sector.
+    let sector = u64::from(fs.superblock().sectorsize);
+    let allocated = inode
+        .nbytes
+        .checked_add(sector - 1)
+        .ok_or_else(|| CliError::failed(format!("{}: allocated size overflows", show(path))))?
+        & !(sector - 1);
     let mut fields = vec![("path", Json::from(show(path)))];
     if std::str::from_utf8(path).is_err() {
         fields.push((
@@ -876,9 +884,7 @@ fn stat(root: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
         ("gid", Json::from(inode.gid)),
         ("nlink", Json::from(inode.nlink)),
         ("size", Json::from(inode.size)),
-        // stat counts complete 512-byte blocks; inline residual bytes
-        // are kept in nbytes but do not contribute to st_blocks.
-        ("allocated_bytes", Json::from(inode.nbytes & !511)),
+        ("allocated_bytes", Json::from(allocated)),
         ("atime", Json::from(inode.atime.sec)),
         ("atime_nsec", Json::from(inode.atime.nsec)),
         ("mtime", Json::from(inode.mtime.sec)),
