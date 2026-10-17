@@ -1623,6 +1623,154 @@ fn a_log_adding_an_extended_reference_replays_as_the_kernel_does() {
     }
 }
 
+/// The committed file `f` given a second name `g` after the last commit,
+/// made durable by an fsync of `/` alone (#461). The committed trees hold
+/// `f` alone, with one link. The log holds the entry of `/` naming `g`,
+/// in an index range of `/` that starts past `f`'s committed index, and
+/// `f` only as an inode that exists: generation 0, two links, no data,
+/// and its reference to `/` holding both names, the committed one at an
+/// index the log does not speak for. The kernel's replay of the same
+/// crash image is the oracle, down to each name's link count and inode.
+#[test]
+fn a_hard_link_made_durable_by_its_directory_replays_as_the_kernel_does() {
+    const DIRLINK_FIXTURE: &str = "dirtylog/btrfs-dirty-log-dirlink.img";
+    let image = fixture(DIRLINK_FIXTURE);
+    let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-dirlink.logdump"))
+        .expect("the native transcript of the directory-fsync hard-link log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the directory-fsync hard-link fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        let committed = fs.lookup_path("/f").expect("the committed trees hold /f");
+        assert_eq!(committed.nlink, 1, "/f is committed with one name");
+        assert!(
+            fs.lookup_path("/g").is_err(),
+            "/g was made after the commit, so the committed trees should not hold it"
+        );
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        // f's logged reference to /, read from the raw item: each name's
+        // index in / and the name.
+        let reference = top
+            .items
+            .iter()
+            .find(|i| {
+                (i.key.objectid, i.key.key_type, i.key.offset)
+                    == (committed.ino, INODE_REF_KEY, 256)
+            })
+            .unwrap_or_else(|| panic!("the log holds no reference of f to /: {keys:?}"));
+        let mut records: Vec<(u64, Vec<u8>)> = Vec::new();
+        let d = &reference.data;
+        let mut at = 0;
+        while at < d.len() {
+            let len = usize::from(u16::from_le_bytes(d[at + 8..at + 10].try_into().unwrap()));
+            records.push((
+                u64::from_le_bytes(d[at..at + 8].try_into().unwrap()),
+                d[at + 10..at + 10 + len].to_vec(),
+            ));
+            at += 10 + len;
+        }
+        let index_of = |name: &str| {
+            records
+                .iter()
+                .find(|r| r.1 == name.as_bytes())
+                .map(|r| r.0)
+                .unwrap_or_else(|| panic!("f's logged reference holds no {name}: {records:?}"))
+        };
+        assert_eq!(
+            records.len(),
+            2,
+            "f's logged reference holds f and g: {records:?}"
+        );
+        let (at_f, at_g) = (index_of("f"), index_of("g"));
+        let logged_f = top
+            .inode(committed.ino)
+            .unwrap()
+            .expect("f's logged inode item");
+        assert_eq!(
+            (logged_f.generation, logged_f.nlink),
+            (0, 2),
+            "the log holds f only as an inode that exists, with two links: {logged_f:?}"
+        );
+        assert!(
+            !top.items.iter().any(|i| (i.key.objectid, i.key.key_type)
+                == (committed.ino, fs_btrfs::fs::EXTENT_DATA_KEY)),
+            "the log holds no data of f: {keys:?}"
+        );
+        let entry_at = |index: u64| {
+            top.items
+                .iter()
+                .find(|i| {
+                    (i.key.objectid, i.key.key_type, i.key.offset) == (256, DIR_INDEX_KEY, index)
+                })
+                .map(|i| parse_dir_items(&i.data).unwrap())
+        };
+        assert_eq!(
+            entry_at(at_g)
+                .unwrap_or_else(|| panic!("the log holds no entry of / at index {at_g}: {keys:?}"))
+                .iter()
+                .map(|e| (e.ino, e.name.clone()))
+                .collect::<Vec<_>>(),
+            vec![(committed.ino, b"g".to_vec())],
+            "the logged entry of / at index {at_g} names f by g"
+        );
+        assert!(
+            entry_at(at_f).is_none(),
+            "the log holds an entry of / at f's committed index {at_f}: {keys:?}"
+        );
+        let ranges: Vec<(u64, u64)> = top
+            .items
+            .iter()
+            .filter(|i| i.key.objectid == 256 && i.key.key_type == DIR_LOG_INDEX_KEY)
+            .map(|i| {
+                (
+                    i.key.offset,
+                    u64::from_le_bytes(i.data[..8].try_into().unwrap()),
+                )
+            })
+            .collect();
+        let in_range = |index: u64| ranges.iter().any(|&(a, b)| a <= index && index <= b);
+        assert!(
+            in_range(at_g) && !in_range(at_f),
+            "a logged index range of / holds g at {at_g} and none holds f at {at_f}: {ranges:?}"
+        );
+    }
+    let theirs = replays_as_the_kernel_does(DIRLINK_FIXTURE, "dirtylog-dirlink");
+    // The two replays agree; this is what they agree on, as the kernel
+    // reports it, so a name both left out cannot pass.
+    let get = |kind: &str, name: &str| {
+        theirs
+            .get(&(kind.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("the kernel's replay reports no {kind} for {name}"))
+    };
+    for name in ["f", "g"] {
+        assert_eq!(get("stat", name), "f 2 33", "the kernel's replay of {name}");
+    }
+    assert_eq!(
+        get("ino", "f"),
+        get("ino", "g"),
+        "the kernel's replay names f and g as one inode"
+    );
+    assert_eq!(
+        get("sha256", "f"),
+        get("sha256", "g"),
+        "f and g read back differently"
+    );
+}
+
 /// The inline writer's encoding fields are checked against the native
 /// tools, not against our own parser. `dump-tree` prints an inline file
 /// extent's data size, `ram_bytes` and compression; the raw item must hold
