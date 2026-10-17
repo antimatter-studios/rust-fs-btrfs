@@ -507,7 +507,8 @@ impl Filesystem {
     /// - **Directories the log speaks for** (#377): in each logged index
     ///   range the log's names are the directory's names. A committed name
     ///   the log lacks is removed; its inode, if the log does not hold it
-    ///   and that was its last name, is deleted with its data. A logged
+    ///   and that was its last name, is deleted with its data, whether the
+    ///   name was in an `INODE_REF` or an `INODE_EXTREF` item (#478). A logged
     ///   name the directory lacks is added.
     /// - **Inodes logged only to say they exist** (generation 0) keep
     ///   their committed item; their logged references are their names,
@@ -1096,12 +1097,18 @@ impl Filesystem {
                             continue;
                         }
                         // An inode the log does not hold, losing this name: only
-                        // its last, which deletes it with its data.
+                        // its last, which deletes it with its data. That name is
+                        // its one reference item's one record, in an `INODE_REF`
+                        // or, once that was emptied, an `INODE_EXTREF` (#478).
                         let refs = tree.find_all(root, child, INODE_REF_KEY)?;
-                        let only = refs.len() == 1
-                            && refs[0].key.offset == d
-                            && ref_records(&refs[0].data).ok_or(Error::DirtyLog)?
-                                == vec![(c.key.offset, &entry.name[..])];
+                        let extrefs = tree.find_all(root, child, INODE_EXTREF_KEY)?;
+                        let only = match (&refs[..], &extrefs[..]) {
+                            ([r], []) | ([], [r]) => {
+                                name_records(&r.key, &r.data).ok_or(Error::DirtyLog)?
+                                    == vec![(d, c.key.offset, &entry.name[..])]
+                            }
+                            _ => false,
+                        };
                         let inode = tree
                             .search(root, &key(child, INODE_ITEM_KEY, 0))?
                             .ok_or(Error::DirtyLog)?;
@@ -1117,6 +1124,7 @@ impl Filesystem {
                         for kind in [
                             INODE_ITEM_KEY,
                             INODE_REF_KEY,
+                            INODE_EXTREF_KEY,
                             dir::XATTR_ITEM_KEY,
                             EXTENT_DATA_KEY,
                         ] {
@@ -1130,12 +1138,9 @@ impl Filesystem {
                                 edits.push(ItemEdit::Delete(item.key));
                             }
                         }
-                        for kind in [INODE_EXTREF_KEY, 48] {
-                            // Extended references and orphan items are not
-                            // deleted here.
-                            if !tree.find_all(root, child, kind)?.is_empty() {
-                                return Err(Error::DirtyLog);
-                            }
+                        // Orphan items are not deleted here.
+                        if !tree.find_all(root, child, 48)?.is_empty() {
+                            return Err(Error::DirtyLog);
                         }
                     }
                     // Logged names the directory lacks.
