@@ -522,6 +522,8 @@ impl Filesystem {
     ///   and that was its last name, is deleted with its data, whether the
     ///   name was in an `INODE_REF` or an `INODE_EXTREF` item (#478). An
     ///   empty directory losing its name is removed with its items (#410).
+    ///   A regular file the log does not hold, losing one name of several,
+    ///   drops that name's `INODE_REF` record and one link (#411).
     ///   A logged name the directory lacks is added.
     /// - **Inodes logged only to say they exist** (generation 0) keep
     ///   their committed item; their logged references are their names,
@@ -1033,6 +1035,10 @@ impl Filesystem {
 
                 // Each directory the log speaks for, committed or created.
                 let mut removed_inodes: BTreeSet<u64> = BTreeSet::new();
+                // Names removed from inodes that keep others (#411), as
+                // (parent, index, name) per inode, applied once every
+                // directory has been read.
+                let mut lost_names: BTreeMap<u64, Vec<(u64, u64, Vec<u8>)>> = BTreeMap::new();
                 for &d in dirs.iter().chain(&new_dirs) {
                     let created_dir = new_dirs.contains(&d);
                     let mut ranges = Vec::new();
@@ -1126,6 +1132,25 @@ impl Filesystem {
                             .search(root, &key(child, INODE_ITEM_KEY, 0))?
                             .ok_or(Error::DirtyLog)?;
                         let inode = Inode::parse(&inode.data, child)?;
+                        // A regular file with other names loses only this
+                        // one, from its `INODE_REF` to this directory (#411).
+                        if !only && inode.is_regular_file() && inode.nlink > 1 {
+                            let in_ref = refs.iter().any(|r| {
+                                r.key.offset == d
+                                    && ref_records(&r.data).is_some_and(|records| {
+                                        records.contains(&(c.key.offset, &entry.name[..]))
+                                    })
+                            });
+                            if !in_ref {
+                                return Err(Error::DirtyLog);
+                            }
+                            lost_names.entry(child).or_default().push((
+                                d,
+                                c.key.offset,
+                                entry.name.clone(),
+                            ));
+                            continue;
+                        }
                         // A directory goes only empty, as `rmdir` left it:
                         // no names of its own and no size counting any (#410).
                         let removable = if inode.is_dir() {
@@ -1222,6 +1247,52 @@ impl Filesystem {
                     let mut data = logged.data.clone();
                     data[io::NBYTES..io::NBYTES + 8].copy_from_slice(&nbytes.to_le_bytes());
                     edits.push(put(at, data));
+                }
+                // Each inode keeping other names drops the removed ones from
+                // its references and counts one link fewer for each (#411).
+                for (&ino, lost) in &lost_names {
+                    if removed_inodes.contains(&ino) {
+                        return Err(Error::DirtyLog);
+                    }
+                    let parents: BTreeSet<u64> = lost.iter().map(|&(p, _, _)| p).collect();
+                    for parent in parents {
+                        let at = key(ino, INODE_REF_KEY, parent);
+                        let r = tree.search(root, &at)?.ok_or(Error::DirtyLog)?;
+                        let records = ref_records(&r.data).ok_or(Error::DirtyLog)?;
+                        let mut kept = Vec::new();
+                        let mut dropped = 0;
+                        for (index, name) in records {
+                            if lost.contains(&(parent, index, name.to_vec())) {
+                                dropped += 1;
+                                continue;
+                            }
+                            kept.extend_from_slice(&index.to_le_bytes());
+                            kept.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                            kept.extend_from_slice(name);
+                        }
+                        if dropped != lost.iter().filter(|&&(p, _, _)| p == parent).count() {
+                            return Err(Error::DirtyLog);
+                        }
+                        edits.push(if kept.is_empty() {
+                            ItemEdit::Delete(at)
+                        } else {
+                            put(at, kept)
+                        });
+                    }
+                    let at = key(ino, INODE_ITEM_KEY, 0);
+                    let c = tree.search(root, &at)?.ok_or(Error::DirtyLog)?;
+                    let inode = Inode::parse(&c.data, ino)?;
+                    let nlink = u32::try_from(lost.len())
+                        .ok()
+                        .and_then(|n| inode.nlink.checked_sub(n))
+                        .filter(|&n| n > 0)
+                        .ok_or(Error::DirtyLog)?;
+                    if c.data.len() != INODE_ITEM_SIZE {
+                        return Err(Error::DirtyLog);
+                    }
+                    let mut raw = c.data.clone();
+                    raw[io::NLINK..io::NLINK + 4].copy_from_slice(&nlink.to_le_bytes());
+                    edits.push(put(at, raw));
                 }
                 // A renamed inode must have lost every name its logged
                 // references no longer hold.
