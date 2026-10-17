@@ -669,6 +669,18 @@ impl Filesystem {
                     .into(),
             ));
         }
+        // Quota groups are not maintained either. The kernel updates each
+        // group's referenced and exclusive counts in the transaction that
+        // moves an extent; this driver does not, so a write would leave
+        // them wrong and `btrfs check` would report the volume damaged
+        // (#270). Their tree is present while quotas are enabled.
+        if self.tree_root(crate::subvol::QUOTA_TREE_OBJECTID).is_ok() {
+            return Err(Error::UnsupportedFeature(
+                "this volume has quotas enabled, which can be read but not written: a write \
+                 would leave the quota groups' counts wrong"
+                    .into(),
+            ));
+        }
         crate::superblock::refuse_unmaintained_compat_ro(self.sb.compat_ro_flags)?;
         // A SEED DEVICE IS READ-ONLY BY CONSTRUCTION (#76). Another
         // filesystem is layered on it, and writes belong to that sprout;

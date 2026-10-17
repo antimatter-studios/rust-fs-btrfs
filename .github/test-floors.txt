@@ -104,6 +104,7 @@ pool_degraded             7
 pool_oracle               4
 pool_write_kernel         5
 prealloc_extent_write     1
+qgroup_kernel             2
 raid56_oracle             6
 raid56_write_kernel       2
 read_file_huge_size       1
