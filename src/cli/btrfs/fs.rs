@@ -247,7 +247,7 @@ fn command() -> Cmd {
                      fs.btrfs disk.img truncate /sparse.img 1073741824\n\n\
                      Committed as one transaction. Shrinking releases the extents wholly past \
                      the new end, or drops the file's reference of one a reflink shares; \
-                     growing needs the volume's no-holes feature. An extent a snapshot may \
+                     growing records the new range as a hole. An extent a snapshot may \
                      share, and growing a file whose last sector is partly past its end, \
                      are refused with exit 3 (rust-fs-btrfs#262).",
                 ),
