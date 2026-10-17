@@ -1215,6 +1215,7 @@ build_dirtylog() {
     build_dirtylog_refused newdir 'compress=no,max_inline=2048' newdir
     build_dirtylog_refused symlink 'compress=no,max_inline=2048' symlink
     build_dirtylog_refused special 'compress=no,max_inline=2048' special
+    build_dirtylog_refused hardlink 'compress=no,max_inline=2048' hardlink
 }
 
 # fsync_path <path> — fsync one file or directory, and nothing else.
@@ -1360,7 +1361,7 @@ build_dirtylog_refused() {
     mkfs.btrfs -f "$img" >/dev/null
     mount -o "loop,commit=300,$opts" "$img" "$MNT"
     case "$kind" in
-        mixedlog|sizechange|compressedinline|newdir|symlink|special)
+        mixedlog|sizechange|compressedinline|newdir|symlink|special|hardlink)
             printf 'committed-inline-bytes-0123456789' > "$MNT/f" ;;
         externalextent)
             head -c 8192 /dev/zero | tr '\0' 'c' > "$MNT/f" ;;
@@ -1411,6 +1412,20 @@ if kind == "special":
     s.bind(d + "/s")
     s.close()
     dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    sys.exit(0)
+if kind == "hardlink":
+    # The committed f is given a second name g, and n is created with
+    # data and given a second name m, after the commit. An fsync of f and
+    # then one of n make both durable: the log holds f in full, with its
+    # link count raised and its reference holding both names, n with its
+    # data and both its names, and the entries of / that name g, n and m.
+    os.link(d + "/f", d + "/g")
+    fd = os.open(d + "/n", os.O_WRONLY | os.O_CREAT, 0o644)
+    os.write(fd, b"created-then-linked")
+    os.close(fd)
+    os.link(d + "/n", d + "/m")
+    for name in ("f", "n"):
+        fd = os.open(d + "/" + name, os.O_RDONLY); os.fsync(fd); os.close(fd)
     sys.exit(0)
 fd = os.open(d + "/f", os.O_WRONLY)
 if kind == "sizechange":
@@ -1482,6 +1497,7 @@ want = {
     'newdir': r'location key \(\d+ INODE_ITEM 0\) type DIR',
     'symlink': r'location key \(\d+ INODE_ITEM 0\) type SYMLINK',
     'special': r'location key \(\d+ INODE_ITEM 0\) type CHRDEV',
+    'hardlink': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: f\n\s+index \d+ namelen 1 name: g\n',
 }[kind]
 assert re.search(want, dump), (kind, 'native dump does not show the unsupported shape')
 if kind == 'symlink':
@@ -1499,6 +1515,35 @@ if kind == 'special':
     for mode, rdev in (('20644', 251658540), ('60644', 252706821), ('10644', 0), ('140755', 0)):
         assert re.search(r'mode %s links 1 uid \d+ gid \d+ rdev %d\b' % (mode, rdev), dump), \
             (kind, 'native dump shows no logged inode of mode and rdev', mode, rdev)
+if kind == 'hardlink':
+    # Each inode is logged with one reference to / holding both its
+    # names, and a link count of 2: f in full, at the generation it was
+    # committed with, older than the transaction that logged it; n as
+    # created in that transaction, with its 19 bytes. The entries of /
+    # the log speaks for name g, n and m, each the inode its reference
+    # gives it.
+    def logged(a, b, size):
+        ref = re.search(r'key \((\d+) INODE_REF 256\) itemoff \d+ itemsize \d+\n'
+                        r'\s+index \d+ namelen 1 name: %s\n\s+index \d+ namelen 1 name: %s\n'
+                        % (a, b), dump)
+        assert ref, (kind, 'native dump shows no reference naming both', a, b)
+        ino = ref.group(1)
+        item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                         r'\s+generation (\d+) transid (\d+) size %d nbytes \d+\n'
+                         r'\s+block group \d+ mode 100644 links (\d+) ' % (ino, size), dump)
+        assert item, (kind, 'native dump shows no logged inode item of size', size, 'for', a)
+        return ino, tuple(map(int, item.groups()))
+    f, (generation, transid, links) = logged('f', 'g', 33)
+    assert links == 2 and 0 < generation < transid, \
+        (kind, 'f is not logged in full as a committed inode with two links', generation, transid, links)
+    n, (generation, transid, links) = logged('n', 'm', 19)
+    assert links == 2 and generation == transid, \
+        (kind, 'n is not logged as created with two links', generation, transid, links)
+    for name, ino in (('g', f), ('n', n), ('m', n)):
+        assert re.search(r'key \(256 DIR_INDEX \d+\) itemoff \d+ itemsize \d+\n'
+                         r'\s+location key \(%s INODE_ITEM 0\) type FILE\n[^\n]*\n\s+name: %s\n'
+                         % (ino, name), dump), \
+            (kind, 'native dump shows no logged entry of / naming', name)
 if kind == 'compressedinline':
     # The native tool must print a compressed inline extent: nonzero
     # compression on the inline line itself, stored smaller than its bytes.
