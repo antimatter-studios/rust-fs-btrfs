@@ -420,7 +420,8 @@ impl Filesystem {
     ///   the bytes on disk.
     /// - **Inodes the log creates** are inserted, named from their
     ///   references, or from the logged entries of a directory the log
-    ///   speaks for.
+    ///   speaks for. A directory the log creates (#403) is named only
+    ///   that way, and holds the names the log gives it.
     /// - **Directories the log speaks for** (#377): in each logged index
     ///   range the log's names are the directory's names. A committed name
     ///   the log lacks is removed; its inode, if the log does not hold it
@@ -495,6 +496,8 @@ impl Filesystem {
                 let mut files: BTreeSet<u64> = BTreeSet::new();
                 let mut exists_only: BTreeSet<u64> = BTreeSet::new();
                 let mut dirs: BTreeSet<u64> = BTreeSet::new();
+                // Directories the log creates (#403).
+                let mut new_dirs: BTreeSet<u64> = BTreeSet::new();
                 for &ino in &logged_inodes {
                     let logged = top.inode(ino)?.ok_or(Error::DirtyLog)?;
                     if ino < FIRST_FREE_OBJECTID {
@@ -503,6 +506,9 @@ impl Filesystem {
                     match tree.search(root, &key(ino, INODE_ITEM_KEY, 0))? {
                         None if logged.is_regular_file() && ino >= FIRST_FREE_OBJECTID => {
                             created.insert(ino);
+                        }
+                        None if logged.is_dir() => {
+                            new_dirs.insert(ino);
                         }
                         Some(c) => {
                             let committed = Inode::parse(&c.data, ino)?;
@@ -671,27 +677,35 @@ impl Filesystem {
                 };
                 let mut grown: BTreeMap<u64, i64> = BTreeMap::new();
                 let mut names: BTreeMap<u64, u32> = BTreeMap::new();
-                for &ino in created.iter().chain(exists_only.iter()) {
+                let spoken_for = |d: u64| dirs.contains(&d) || new_dirs.contains(&d);
+                for &ino in created.iter().chain(&exists_only).chain(&new_dirs) {
                     for r in top
                         .items
                         .iter()
                         .filter(|i| i.key.objectid == ino && i.key.key_type == INODE_REF_KEY)
                     {
                         let parent = r.key.offset;
-                        let p = tree
-                            .search(root, &key(parent, INODE_ITEM_KEY, 0))?
-                            .ok_or(Error::DirtyLog)?;
-                        if !Inode::parse(&p.data, parent)?.is_dir() {
-                            return Err(Error::DirtyLog);
+                        if !new_dirs.contains(&parent) {
+                            let p = tree
+                                .search(root, &key(parent, INODE_ITEM_KEY, 0))?
+                                .ok_or(Error::DirtyLog)?;
+                            if !Inode::parse(&p.data, parent)?.is_dir() {
+                                return Err(Error::DirtyLog);
+                            }
                         }
                         for (index, name) in ref_records(&r.data).ok_or(Error::DirtyLog)? {
                             *names.entry(ino).or_default() += 1;
-                            if dirs.contains(&parent) {
+                            if spoken_for(parent) {
                                 let entry = logged_entry(parent, index)?.ok_or(Error::DirtyLog)?;
                                 if entry.ino != ino || entry.name != name {
                                     return Err(Error::DirtyLog);
                                 }
                                 continue;
+                            }
+                            if new_dirs.contains(&ino) {
+                                // A directory named where the log does not
+                                // speak for its parent.
+                                return Err(Error::DirtyLog);
                             }
                             if exists_only.contains(&ino) {
                                 // Named where the log does not speak for the
@@ -726,9 +740,12 @@ impl Filesystem {
                         edits.push(put(r.key, r.data.clone()));
                     }
                 }
-                for &ino in &created {
+                for &ino in created.iter().chain(&new_dirs) {
                     let logged = top.inode(ino)?.ok_or(Error::DirtyLog)?;
-                    if names.get(&ino).copied().unwrap_or(0) != logged.nlink || logged.nlink == 0 {
+                    if names.get(&ino).copied().unwrap_or(0) != logged.nlink
+                        || logged.nlink == 0
+                        || (new_dirs.contains(&ino) && logged.nlink != 1)
+                    {
                         return Err(Error::DirtyLog);
                     }
                 }
@@ -770,9 +787,10 @@ impl Filesystem {
                     edits.push(put(key(ino, INODE_ITEM_KEY, 0), raw));
                 }
 
-                // Each directory the log speaks for.
+                // Each directory the log speaks for, committed or created.
                 let mut removed_inodes: BTreeSet<u64> = BTreeSet::new();
-                for &d in &dirs {
+                for &d in dirs.iter().chain(&new_dirs) {
+                    let created_dir = new_dirs.contains(&d);
                     let mut ranges = Vec::new();
                     for item in top.items.iter().filter(|i| i.key.objectid == d) {
                         match item.key.key_type {
@@ -783,12 +801,29 @@ impl Filesystem {
                             _ => return Err(Error::DirtyLog),
                         }
                     }
+                    if created_dir {
+                        // Nothing of a directory the log creates is committed;
+                        // its references were put with the names above.
+                        for kind in [
+                            INODE_REF_KEY,
+                            dir::DIR_ITEM_KEY,
+                            DIR_INDEX_KEY,
+                            dir::XATTR_ITEM_KEY,
+                            EXTENT_DATA_KEY,
+                        ] {
+                            if !tree.find_all(root, d, kind)?.is_empty() {
+                                return Err(Error::DirtyLog);
+                            }
+                        }
+                    }
                     for r in top
                         .items
                         .iter()
                         .filter(|i| i.key.objectid == d && i.key.key_type == INODE_REF_KEY)
                     {
-                        if tree.search(root, &r.key)?.map(|c| c.data) != Some(r.data.clone()) {
+                        if !created_dir
+                            && tree.search(root, &r.key)?.map(|c| c.data) != Some(r.data.clone())
+                        {
                             return Err(Error::DirtyLog);
                         }
                     }
@@ -889,7 +924,9 @@ impl Filesystem {
                         .iter()
                         .filter(|i| i.key.objectid == d && i.key.key_type == DIR_INDEX_KEY)
                     {
-                        if !in_range(item.key.offset) {
+                        // A range says which committed names the log speaks
+                        // for; a created directory has none.
+                        if !created_dir && !in_range(item.key.offset) {
                             return Err(Error::DirtyLog);
                         }
                         if tree.search(root, &item.key)?.is_some() {
@@ -919,25 +956,35 @@ impl Filesystem {
                         delta += 2 * entry.name.len() as i64;
                     }
                     let at = key(d, INODE_ITEM_KEY, 0);
-                    let c = tree.search(root, &at)?.ok_or(Error::DirtyLog)?;
-                    let before = Inode::parse(&c.data, d)?;
                     let logged = top
                         .items
                         .iter()
                         .find(|i| i.key == at)
                         .ok_or(Error::DirtyLog)?;
                     let after = Inode::parse(&logged.data, d)?;
+                    // A created directory starts empty and keeps its logged
+                    // `nbytes`; a committed one keeps its committed count.
+                    let (size, nbytes) = if created_dir {
+                        (0, after.nbytes)
+                    } else {
+                        let c = tree.search(root, &at)?.ok_or(Error::DirtyLog)?;
+                        let before = Inode::parse(&c.data, d)?;
+                        if before.nlink != after.nlink
+                            || before.generation != after.generation
+                            || before.flags != after.flags
+                        {
+                            return Err(Error::DirtyLog);
+                        }
+                        (before.size, before.nbytes)
+                    };
                     if logged.data.len() != INODE_ITEM_SIZE
-                        || before.size.checked_add_signed(delta) != Some(after.size)
-                        || before.nlink != after.nlink
-                        || before.generation != after.generation
-                        || before.flags != after.flags
+                        || size.checked_add_signed(delta) != Some(after.size)
                         || grown.contains_key(&d)
                     {
                         return Err(Error::DirtyLog);
                     }
                     let mut data = logged.data.clone();
-                    data[io::NBYTES..io::NBYTES + 8].copy_from_slice(&before.nbytes.to_le_bytes());
+                    data[io::NBYTES..io::NBYTES + 8].copy_from_slice(&nbytes.to_le_bytes());
                     edits.push(put(at, data));
                 }
                 // A renamed inode must have lost every name its logged
