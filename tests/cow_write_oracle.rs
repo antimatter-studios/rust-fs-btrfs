@@ -939,11 +939,20 @@ fn explicit_holes(image: &Path, ino: u64) -> Vec<(u64, u64)> {
 
 /// As [`explicit_holes`], for a file whose items end at `to`.
 fn explicit_holes_to(image: &Path, ino: u64, to: u64) -> Vec<(u64, u64)> {
+    extent_layout_to(image, ino, to)
+        .into_iter()
+        .filter_map(|(offset, len, hole)| hole.then_some((offset, len)))
+        .collect()
+}
+
+/// Every explicit item's logical span and whether it is a hole, with
+/// complete coverage checked independently by btrfs-progs.
+fn extent_layout_to(image: &Path, ino: u64, to: u64) -> Vec<(u64, u64, bool)> {
     let tree = dump_tree(image, "5");
     let lines: Vec<&str> = tree.lines().collect();
     let needle = format!("key ({ino} EXTENT_DATA ");
     let mut end = 0;
-    let mut holes = Vec::new();
+    let mut layout = Vec::new();
     for (at, line) in lines.iter().enumerate() {
         let Some((_, key)) = line.split_once(&needle) else {
             continue;
@@ -967,12 +976,10 @@ fn explicit_holes_to(image: &Path, ino: u64, to: u64) -> Vec<(u64, u64)> {
         );
         assert!(len > 0, "inode {ino}: empty extent at {offset}");
         end = offset + len;
-        if field("extent data disk byte", "byte") == 0 {
-            holes.push((offset, len));
-        }
+        layout.push((offset, len, field("extent data disk byte", "byte") == 0));
     }
     assert_eq!(end, to, "inode {ino}: incomplete extent coverage\n{tree}");
-    holes
+    layout
 }
 
 /// Without NO_HOLES, a hole is an item that must be trimmed, split or
@@ -1839,6 +1846,142 @@ fn a_growing_write_coalesces_the_gap_with_the_trailing_hole() {
             seen[name].0,
             seen[&format!("{name}-control")].0,
             "{name}: differs from kernel control"
+        );
+    }
+}
+
+/// A hole at the old EOF needs no zeroing allocation (#601). The kernel
+/// independently grows twin files from a partial hole sector: into the
+/// next sector, several sectors away, and inside the old EOF sector
+/// itself (where only the sector the payload touches must be allocated).
+/// Compare every extent item's span and kind, inode size and nbytes,
+/// exact expected content hashes, data checksums and a kernel scrub.
+#[test]
+fn a_growing_write_keeps_an_untouched_old_eof_hole_sector_sparse() {
+    const OLD_SIZE: u64 = 40_000;
+    const SECTOR: u64 = 4096;
+    let cases = [
+        ("far", 8192u64, 70_000u64, 5000usize),
+        ("next", 8192, 40_960, 100),
+        ("same", 8192, 40_100, 100),
+        ("empty", 0, 70_000, 5000),
+    ];
+    let mut script = String::new();
+    for (name, data_len, _, _) in cases {
+        script.push_str(&format!(
+            "head -c {data_len} /dev/urandom | tee \"$MNT/{name}\" > \"$MNT/{name}-control\"\n\
+             truncate -s {OLD_SIZE} \"$MNT/{name}\" \"$MNT/{name}-control\"\n"
+        ));
+    }
+    script.push_str("sync\n");
+    for (name, _, offset, len) in cases {
+        script.push_str(&format!(
+            "head -c {len} /dev/zero | tr '\\000' '\\245' \
+             | dd of=\"$MNT/{name}-control\" bs=1 seek={offset} conv=notrunc status=none\n\
+             sync\n"
+        ));
+    }
+    let scratch = Scratch::made("cow-sparse-eof", "crc32c", "^no-holes", &script);
+    let image = scratch.image();
+    let mut fs = mount_rw(&image);
+    assert!(!fs.superblock().has_no_holes(), "mkfs enabled NO_HOLES");
+    let mut expected = BTreeMap::new();
+    for (name, data_len, offset, len) in cases {
+        let ino = ino_of(&fs, name);
+        let before = fs.read_inode(ino).unwrap();
+        assert_eq!((before.size, before.nbytes), (OLD_SIZE, data_len));
+        assert_eq!(
+            before.flags & (fs_btrfs::write::INODE_NODATACOW | fs_btrfs::write::INODE_NODATASUM),
+            0,
+            "{name}: the kernel must have made a checksummed CoW file"
+        );
+        assert_eq!(
+            explicit_holes_to(&image, ino, OLD_SIZE.next_multiple_of(SECTOR)),
+            vec![(data_len, OLD_SIZE.next_multiple_of(SECTOR) - data_len)],
+            "{name}: old EOF must lie inside an explicit hole"
+        );
+        let mut bytes = fs.read_file(ino).unwrap();
+        bytes.resize(offset as usize, 0);
+        bytes.extend(std::iter::repeat_n(0xa5, len));
+        assert_eq!(fs.write(ino, offset, &vec![0xa5; len]).unwrap(), len);
+        assert_eq!(fs.read_file(ino).unwrap(), bytes, "{name}");
+        expected.insert(name, bytes);
+
+        let ours = fs.read_inode(ino).unwrap();
+        let control = ino_of(&fs, &format!("{name}-control"));
+        let theirs = fs.read_inode(control).unwrap();
+        let start = offset / SECTOR * SECTOR;
+        let end = (offset + len as u64).next_multiple_of(SECTOR);
+        assert_eq!(
+            (ours.size, ours.nbytes),
+            (theirs.size, theirs.nbytes),
+            "{name}: allocation differs from the kernel's write"
+        );
+        assert_eq!(
+            ours.nbytes - before.nbytes,
+            end - start,
+            "{name}: only payload sectors may be allocated"
+        );
+        let layout = vec![
+            (data_len, start - data_len, true),
+            (start, end - start, false),
+        ];
+        let mut wanted = Vec::new();
+        if data_len > 0 {
+            wanted.push((0, data_len, false));
+        }
+        wanted.extend(layout);
+        let kernel_layout = extent_layout_to(&image, control, end);
+        assert_eq!(kernel_layout, wanted, "{name}: kernel extent items");
+        assert_eq!(
+            extent_layout_to(&image, ino, end),
+            kernel_layout,
+            "{name}: extent items differ from the kernel's write"
+        );
+    }
+    drop(fs);
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum after sparse EOF growth:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after sparse EOF growth",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+    let names = [
+        "far",
+        "far-control",
+        "next",
+        "next-control",
+        "same",
+        "same-control",
+        "empty",
+        "empty-control",
+    ];
+    let seen = kernel_view(&image, "read back sparse EOF growth", &names);
+    let stats = kernel_stats(&image, "stat sparse EOF growth", &names);
+    for (name, _, _, _) in cases {
+        let control = format!("{name}-control");
+        assert_eq!(
+            seen[name].0,
+            sha256_hex(&expected[name]),
+            "{name}: wrong bytes"
+        );
+        assert_eq!(
+            seen[name].0, seen[&control].0,
+            "{name}: kernel control differs"
+        );
+        assert_eq!(
+            stats[name], stats[&control],
+            "{name}: kernel size and blocks"
         );
     }
 }
