@@ -75,11 +75,14 @@
 //! - a write past the end of a file, on a volume **without the no-holes
 //!   feature**, whose gap an extent item past the end (a preallocated one)
 //!   already reaches into;
-//! - a **preallocated** extent, or an **inline** one the write does not
+//! - a **preallocated** extent the write covers only part of, or one
+//!   another reference shares, or an **inline** one the write does not
 //!   lie within, or one that is encrypted or encoded: each changes the
 //!   item's kind, not only where it points. A write within inline data
 //!   rewrites that item, and the file stays inline (#437); compressed
-//!   inline data is decoded, written and encoded again (#438);
+//!   inline data is decoded, written and encoded again (#438); a write
+//!   covering the whole of a preallocated item is written where its
+//!   extent lies, and the item becomes regular in place (#535);
 //! - an extent a **snapshot** may share — one from at or before the last
 //!   snapshot, which the snapshot reads through a tree block it shares
 //!   and its record counts once for both;
@@ -95,7 +98,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::chunk::{objectid, DiskKey};
 use crate::compression::Compression;
 use crate::error::{Error, Result};
-use crate::fs::{Filesystem, EXTENT_DATA_KEY};
+use crate::fs::{Filesystem, EXTENT_DATA_KEY, EXTENT_PREALLOC, EXTENT_REGULAR};
 use crate::inode::{Inode, INODE_ITEM_KEY, INODE_NODATACOW, INODE_NODATASUM};
 use crate::leaf_edit::OwnedItem;
 use crate::super_write::Commit;
@@ -228,6 +231,13 @@ impl Filesystem {
         let grows_inline = offset <= inode.size && inode.size < u64::from(self.sb.sectorsize);
         if !move_inline && (end <= inode.size || grows_inline) {
             if let Some(written) = self.write_inline(inode, offset, data)? {
+                return Ok(written);
+            }
+        }
+        // A write over the whole of a preallocated item is written where
+        // its extent lies, and the item becomes regular (#535).
+        if !move_inline && end <= inode.size {
+            if let Some(written) = self.write_prealloc(inode, offset, data, summed)? {
                 return Ok(written);
             }
         }
@@ -654,6 +664,110 @@ impl Filesystem {
             }),
         ];
         self.commit_edits(ino, edits, generation, now)?;
+        Ok(Some(data.len()))
+    }
+
+    /// Write `data` at `offset` over the whole of a preallocated extent
+    /// item, the one starting there and covering exactly the write, when
+    /// that item is the extent's only reference (#535). The bytes go where
+    /// the extent lies — they were never readable, and nothing reads them
+    /// until the commit turns the item regular — and the item, stamped
+    /// with the transaction, changes kind in place, as the kernel's
+    /// `btrfs_mark_extent_written` does for a write covering the item. No
+    /// item is added, so the extent's record, the free space and the
+    /// inode's `nbytes` stay; the checksum tree gains the written sectors'
+    /// digests, unless the file is `nodatasum`. `None` when no such item
+    /// starts at `offset` with the write's length: the planner then
+    /// refuses a partial write into one by name.
+    fn write_prealloc(
+        &mut self,
+        inode: &Inode,
+        offset: u64,
+        data: &[u8],
+        summed: bool,
+    ) -> Result<Option<usize>> {
+        use crate::fs::file_extent as fe;
+        use crate::inode::offsets as io;
+        use crate::superblock::le64;
+        let ino = inode.ino;
+        let len = data.len() as u64;
+        let Some((key, item)) = self.items_of(ino)?.into_iter().find(|(k, d)| {
+            k.key_type == EXTENT_DATA_KEY
+                && k.offset == offset
+                && d.len() >= fe::REGULAR_SIZE
+                && d[fe::TYPE] == EXTENT_PREALLOC
+                && le64(d, fe::NUM_BYTES) == len
+        }) else {
+            return Ok(None);
+        };
+        if item[fe::COMPRESSION] != 0
+            || item[fe::ENCRYPTION] != 0
+            || item[fe::OTHER_ENCODING..fe::OTHER_ENCODING + 2] != [0, 0]
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}: the preallocated extent item at {offset} is compressed, \
+                 encrypted or encoded, and writing one is not implemented"
+            )));
+        }
+        let extent_start = le64(&item, fe::DISK_BYTENR);
+        let at = extent_start + le64(&item, fe::OFFSET);
+        let (refs, extent_len, made) = self.extent_item(extent_start)?;
+        if !window_inside_extent(at, len, extent_start, extent_len) {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}: offset {offset} maps to [{at}, +{len}), outside the \
+                 {extent_len}-byte extent the extent tree records at {extent_start}"
+            )));
+        }
+        let last_snapshot = self.fs_tree_last_snapshot()?;
+        if refs != 1 || made <= last_snapshot {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}: the preallocated extent at {extent_start} has {refs} references \
+                 or predates the snapshot taken at {last_snapshot}, and writing one another \
+                 reference may read is not implemented"
+            )));
+        }
+        let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
+            Error::UnsupportedFeature("the generation counter is exhausted".into())
+        })?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let now = (now.as_secs(), now.subsec_nanos());
+
+        let mut rewritten = item;
+        rewritten[fe::GENERATION..fe::GENERATION + 8].copy_from_slice(&generation.to_le_bytes());
+        rewritten[fe::TYPE] = EXTENT_REGULAR;
+        let mut raw = self.raw_inode(ino)?;
+        crate::namespace::touch(&mut raw, generation, now, &[io::CTIME, io::MTIME]);
+        let edits = vec![
+            ItemEdit::Put(OwnedItem {
+                key,
+                data: rewritten,
+            }),
+            ItemEdit::Put(OwnedItem {
+                key: DiskKey {
+                    objectid: ino,
+                    key_type: INODE_ITEM_KEY,
+                    offset: 0,
+                },
+                data: raw,
+            }),
+        ];
+        let csum_edits = self.csum_edits(&[], &[(at, data.to_vec())], summed)?;
+
+        // The data, to every mirror, before the commit that makes the
+        // item regular: until then the item still reads as zeros.
+        self.mirror_spans(at, data.len())?;
+        self.write_logical_all_mirrors(at, data)?;
+        let write = DataWrite {
+            root: objectid::FS_TREE,
+            ino,
+            time: now,
+            edits,
+            csum_edits,
+            ..Default::default()
+        };
+        self.commit_write(write, generation)?;
         Ok(Some(data.len()))
     }
 
