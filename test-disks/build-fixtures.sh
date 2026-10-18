@@ -36,7 +36,7 @@ DISKS="$REPO/test-disks"
 
 # target -> the artefacts it produces, relative to test-disks/, in build
 # order. Every name here is checked by --check and named in chores.yml.
-TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog cli features scrub seed squota"
+TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog cli features scrub seed squota encoded"
 
 artefacts_for() {
     case "$1" in
@@ -193,6 +193,10 @@ artefacts_for() {
             ;;
         squota)
             echo squota/btrfs-squota.img; echo squota/btrfs-squota.manifest
+            ;;
+        encoded)
+            echo encoded/btrfs-encoded.img; echo encoded/btrfs-encoded.manifest
+            echo encoded/btrfs-encoded.compression
             ;;
         *)
             echo "build-fixtures: unknown target '$1'" >&2
