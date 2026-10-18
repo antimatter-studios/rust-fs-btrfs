@@ -2443,7 +2443,7 @@ fn extent_offsets(image: &Path, ino: u64) -> (Vec<u64>, bool) {
 /// end, and a write that starts past the end within the first sector. The
 /// driver's files must then hold no inline item and only sector-aligned
 /// extents, with the controls' `size` and `nbytes`, and `btrfs check
-/// --check-data-csum` and a kernel read-back must agree.
+/// --check-data-csum`, a kernel scrub and a kernel read-back must agree (#531).
 #[test]
 fn an_append_outgrowing_inline_data_moves_it_into_sector_aligned_extents() {
     let control = |name: &str| name.replace(".bin", "-control.bin");
@@ -2535,6 +2535,11 @@ fn an_append_outgrowing_inline_data_moves_it_into_sector_aligned_extents() {
         "btrfs check --check-data-csum after appending to inline files:\n{}{}",
         String::from_utf8_lossy(&checked.stdout),
         String::from_utf8_lossy(&checked.stderr)
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after writes that outgrow inline data",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
     );
     let names: Vec<String> = files
         .iter()
