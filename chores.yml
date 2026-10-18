@@ -473,6 +473,8 @@ tasks:
       - test-disks/dirtylog/btrfs-dirty-log-subvol.img
       # directories made after the commit, durable by an fsync of /
       - test-disks/dirtylog/btrfs-dirty-log-newdir.img
+      # a symbolic link made after the commit, durable by an fsync of /
+      - test-disks/dirtylog/btrfs-dirty-log-symlink.img
       # the volume the command-line tools are tested against, labelled
       # CLITEST, with a manifest of what the kernel wrote into it
       - test-disks/cli/btrfs-cli.img
