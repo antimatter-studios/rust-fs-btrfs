@@ -127,6 +127,74 @@ const SHARED_DATA_REF: u8 = crate::backref::SHARED_DATA_REF;
 /// extent's first byte, and a count.
 const DATA_REF_SIZE: usize = 28;
 
+/// Which block groups a balance relocates, and what it makes of them:
+/// the kernel's balance filters, for the ones it implements (#584).
+#[derive(Debug, Clone, Default)]
+pub struct Balance {
+    /// What the groups hold, as [`crate::chunk::block_group`] bits: a
+    /// group holding any of them is a candidate.
+    pub kinds: u64,
+    /// Only groups less than this many per cent used, as the kernel's
+    /// `usage=` filter; `Some(0)` takes only empty ones.
+    pub usage: Option<u8>,
+    /// Only groups in one of these profiles, as the kernel's `profiles=`.
+    pub profiles: Option<Vec<ChunkProfile>>,
+    /// The profile each relocated group's new chunk is given; `None` keeps
+    /// the group's own. A group already in it is left where it is, as the
+    /// kernel's `soft` modifier leaves it.
+    pub convert: Option<ChunkProfile>,
+}
+
+impl Balance {
+    /// Whether `group` is one this balance relocates.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadChunkItem`] when the group's flags set more than one
+    /// profile bit, as [`ChunkProfile::from_type`] refuses them.
+    pub fn selects(&self, group: &BlockGroup) -> Result<bool> {
+        if group.flags & self.kinds & bg::TYPE_MASK == 0 {
+            return Ok(false);
+        }
+        let profile = ChunkProfile::from_type(group.flags)?;
+        if let Some(wanted) = &self.profiles {
+            if !wanted.contains(&profile) {
+                return Ok(false);
+            }
+        }
+        if self.convert == Some(profile) {
+            return Ok(false);
+        }
+        if let Some(usage) = self.usage {
+            // The kernel's threshold: a share of the group's length, and
+            // one byte for a usage of zero, so that it takes empty groups.
+            let threshold = match usage {
+                0 => 1,
+                u => (u128::from(group.length) * u128::from(u.min(100)) / 100) as u64,
+            };
+            if group.used >= threshold {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// The profile bits of a chunk `type` for `profile`: none for single.
+pub fn profile_bits(profile: ChunkProfile) -> u64 {
+    match profile {
+        ChunkProfile::Single => 0,
+        ChunkProfile::Dup => bg::DUP,
+        ChunkProfile::Raid0 => bg::RAID0,
+        ChunkProfile::Raid1 => bg::RAID1,
+        ChunkProfile::Raid1c3 => bg::RAID1C3,
+        ChunkProfile::Raid1c4 => bg::RAID1C4,
+        ChunkProfile::Raid10 => bg::RAID10,
+        ChunkProfile::Raid5 => bg::RAID5,
+        ChunkProfile::Raid6 => bg::RAID6,
+    }
+}
+
 /// One data extent of a block group, and every file item naming it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupExtent {
@@ -1723,6 +1791,76 @@ mod tests {
             assert!(
                 inside.is_empty(),
                 "tree blocks still in the old group: {inside:?}"
+            );
+        }
+    }
+
+    fn group(flags: u64, used: u64) -> BlockGroup {
+        BlockGroup {
+            start: 1 << 30,
+            length: 100 * MIB,
+            used,
+            flags,
+        }
+    }
+
+    #[test]
+    fn a_balance_selects_by_kind_profile_usage_and_conversion() {
+        let data = Balance {
+            kinds: bg::DATA,
+            ..Default::default()
+        };
+        assert!(data.selects(&group(bg::DATA, 0)).unwrap());
+        assert!(!data.selects(&group(bg::METADATA | bg::DUP, 0)).unwrap());
+
+        let dup_only = Balance {
+            profiles: Some(vec![ChunkProfile::Dup]),
+            ..data.clone()
+        };
+        assert!(!dup_only.selects(&group(bg::DATA, 0)).unwrap());
+        assert!(dup_only.selects(&group(bg::DATA | bg::DUP, 0)).unwrap());
+
+        // A group already in the profile asked for stays where it is.
+        let to_dup = Balance {
+            convert: Some(ChunkProfile::Dup),
+            ..data.clone()
+        };
+        assert!(to_dup.selects(&group(bg::DATA, 50 * MIB)).unwrap());
+        assert!(!to_dup
+            .selects(&group(bg::DATA | bg::DUP, 50 * MIB))
+            .unwrap());
+
+        // Less than the share asked for; zero takes only empty groups.
+        let half = Balance {
+            usage: Some(50),
+            ..data.clone()
+        };
+        assert!(half.selects(&group(bg::DATA, 50 * MIB - 1)).unwrap());
+        assert!(!half.selects(&group(bg::DATA, 50 * MIB)).unwrap());
+        let empty = Balance {
+            usage: Some(0),
+            ..data
+        };
+        assert!(empty.selects(&group(bg::DATA, 0)).unwrap());
+        assert!(!empty.selects(&group(bg::DATA, 4096)).unwrap());
+    }
+
+    #[test]
+    fn every_profile_has_the_bits_its_chunk_type_is_read_back_by() {
+        for p in [
+            ChunkProfile::Single,
+            ChunkProfile::Dup,
+            ChunkProfile::Raid0,
+            ChunkProfile::Raid1,
+            ChunkProfile::Raid1c3,
+            ChunkProfile::Raid1c4,
+            ChunkProfile::Raid10,
+            ChunkProfile::Raid5,
+            ChunkProfile::Raid6,
+        ] {
+            assert_eq!(
+                ChunkProfile::from_type(bg::DATA | profile_bits(p)).unwrap(),
+                p
             );
         }
     }
