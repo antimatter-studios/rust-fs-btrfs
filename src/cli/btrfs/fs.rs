@@ -1,7 +1,7 @@
 //! `fs.btrfs <target> <verb>`: an errand inside a Btrfs image or device,
 //! without mounting it.
 //!
-//! The verbs are the shared set: `ls`, `stat`, `read`, `xattr`, `write`, `mkdir`,
+//! The verbs are the shared set: `ls`, `stat`, `read`, `export`, `xattr`, `write`, `mkdir`,
 //! `get`/`info`, `set`, `resize`. Metadata is JSON (or `--text`); file
 //! content is raw bytes. A verb the library cannot do yet still exists and
 //! answers `not implemented` with exit status 3, so a script moved between
@@ -24,7 +24,7 @@ use super::device;
 use fs_btrfs::inode::{FileType, Inode};
 use fs_btrfs::superblock::{compat_ro, incompat};
 use fs_btrfs::{ChecksumType, Error, Filesystem, Superblock};
-use fs_core::cli::{CliError, Format, Json, Outcome, Tool};
+use fs_core::cli::{transfer, CliError, Format, Json, Outcome, Tool};
 
 pub const TOOL: Tool = Tool {
     name: "fs.btrfs",
@@ -161,6 +161,20 @@ fn command() -> Cmd {
                     "Examples:\n  fs.btrfs disk.img read /etc/hostname\n  \
                      fs.btrfs disk.img read /snapshots/home/notes.txt | less\n  \
                      fs.btrfs disk.img read /backup.tar -o backup.tar",
+                ),
+        )
+        .subcommand(
+            Cmd::new("export")
+                .about("Copy a regular file out through the shared bounded transfer")
+                .args(transfer::export_args())
+                .after_help(
+                    "Examples:\n  fs.btrfs disk.img export /backup.tar backup.tar\n  \
+                     fs.btrfs disk.img export --replace /etc/hostname hostname\n  \
+                     fs.btrfs disk.img export /backup.tar - | tar tf -\n\n\
+                     Files are copied in fixed chunks. A local destination is published only \
+                     when complete; an existing name is refused unless --replace is given. \
+                     The report includes the byte count and SHA-256; DEST - writes only raw \
+                     bytes to stdout. Directories, symlinks and special files are refused.",
                 ),
         )
         .subcommand(
@@ -497,6 +511,10 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
             path_arg(sub),
             sub.get_one("output"),
         ),
+        "export" => {
+            let request = transfer::ExportRequest::from_matches(sub)?;
+            export(&device::mount(target, offset)?, &request)
+        }
         "write" if sub.get_one::<u64>("at").is_some() => Err(CliError::not_implemented(
             "positioned write (--at) is not supported",
         )),
@@ -1530,6 +1548,57 @@ fn xattr(
         })
         .collect();
     Ok(Outcome::report(Json::Arr(entries)).with_text(text))
+}
+
+/// A positioned source in the resolved path's own subvolume or snapshot.
+struct ExportSource<'a> {
+    fs: &'a Filesystem,
+    inode: &'a Inode,
+    path: &'a [u8],
+}
+
+impl transfer::FileSource for ExportSource<'_> {
+    fn size(&self) -> u64 {
+        self.inode.size
+    }
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize, CliError> {
+        self.fs
+            .read_at(self.inode.ino, offset, buf)
+            .map_err(|e| btrfs_error(self.path, e))
+    }
+}
+
+/// Resolve the source here; core owns copying, digesting and publication.
+fn export(root: &Filesystem, request: &transfer::ExportRequest) -> Result<Outcome, CliError> {
+    let path = os_bytes(&request.path);
+    let found = root
+        .resolve_path_bytes(path)
+        .map_err(|e| btrfs_error(path, e))?;
+    let inode = &found.inode;
+    if inode.is_dir() {
+        return Err(CliError::failed(format!("{}: is a directory", show(path))));
+    }
+    if inode.is_symlink() {
+        return Err(CliError::failed(format!(
+            "{}: is a symlink; export the target instead",
+            show(path)
+        )));
+    }
+    if !inode.is_regular_file() {
+        return Err(CliError::failed(format!(
+            "{}: not a regular file",
+            show(path)
+        )));
+    }
+    transfer::export(
+        request,
+        &mut ExportSource {
+            fs: found.fs(root),
+            inode,
+            path,
+        },
+    )
 }
 
 /// Stream a regular file's bytes. Each chunk is read before it is

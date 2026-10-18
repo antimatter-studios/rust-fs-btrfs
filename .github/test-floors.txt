@@ -53,6 +53,9 @@ chunk_tree_items          3
 ci_profile                67
 cli_dispatch              15
 cli_docs                  2
+# One unit contract and two independent-kernel export cases (#540).
+cli_export                1
+cli_export_kernel         2
 cli_fsck_oracle           4
 cli_label_kernel          2
 # One find comparison covers nested subvolumes and an ancestor snapshot (#466);
