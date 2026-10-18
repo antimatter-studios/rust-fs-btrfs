@@ -84,7 +84,7 @@ compressed_extent_window  3
 compress_write_kernel     3
 compressed_short_decode   2
 compression_oracle        3
-cow_write_oracle          15
+cow_write_oracle          16
 crash_consistency         3
 csum_oracle               6
 csum_width_populated      1
