@@ -98,15 +98,12 @@ chore_min_version: 0.10.0
 #   warm, 957 on the first run in a fresh guest.
 #
 #     tier      measured          budget            headroom, and why
-#     unit        621 /  40,059      830 /  54,000   ~1/3: tests get added.
-#                                                    Cold CI on #589, run
-#                                                    39194916804, job
-#                                                    118394214267: all 494
-#                                                    cases passed; only the
-#                                                    byte budget failed.
-#                                                    Was 497 / 30,611 on
-#                                                    #225 (36613265993),
-#                                                    with 650 / 40,000.
+#     unit        669 /  42,273      850 /  55,000   ~30%: cold local unit run
+#                                                    on 2026-10-18 for #615,
+#                                                    commit 6eea85c: 513 cases
+#                                                    pass, including six new
+#                                                    multi-way split cases.
+#                                                    Warm: 618 / 40,323.
 #     images      384 /  18,065      500 /  23,500   ~30%. 384 / 18,065 is
 #                                                    CI's aarch64 job with
 #                                                    #301's
@@ -575,7 +572,7 @@ tasks:
     # rather than listed here. CI runs this job with no fixtures present,
     # which is what proves the split.
     cmds:
-      - 'EXPECT_OVERFLOW_CHECKS=1 ../rust-fs-core/scripts/tier.sh test:unit unit 830 54000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
+      - 'EXPECT_OVERFLOW_CHECKS=1 ../rust-fs-core/scripts/tier.sh test:unit unit 850 55000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
 
   test:images:
     desc: 'The tests that read a fixture but need no VM — what a host without KVM can still run'

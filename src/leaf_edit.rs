@@ -161,20 +161,15 @@ pub fn fit(nodesize: u32, items: &[OwnedItem]) -> bool {
     space_needed(&borrowed) <= nodesize as usize
 }
 
-/// Divide `items` into two leaves that each fit in `nodesize` bytes, at
-/// the boundary that leaves the two closest in size (#342). [`split`]
-/// halves the item count, which leaves one half too big when the items
-/// differ much in size.
+/// Divide `items` into non-empty leaves that each fit in `nodesize`
+/// bytes. Keep the closest-sized pair when two leaves suffice (#342);
+/// otherwise fill successive leaves in key order (#615).
 ///
 /// # Errors
 ///
-/// [`Error::UnsupportedFeature`] when there are fewer than two items, or
-/// when no boundary leaves both halves inside a block: the items need
-/// three blocks or more, which a single split does not make.
-pub fn split_to_fit(
-    nodesize: u32,
-    items: &[OwnedItem],
-) -> Result<(Vec<OwnedItem>, Vec<OwnedItem>)> {
+/// [`Error::UnsupportedFeature`] when there are fewer than two items or
+/// a single item cannot fit in a leaf; item bodies cannot be divided here.
+pub fn split_to_fit(nodesize: u32, items: &[OwnedItem]) -> Result<Vec<Vec<OwnedItem>>> {
     if items.len() < 2 {
         return Err(Error::UnsupportedFeature(format!(
             "a leaf of {} item(s) cannot be split into two that both hold something",
@@ -196,14 +191,29 @@ pub fn split_to_fit(
             best = Some((at, gap));
         }
     }
-    let (at, _) = best.ok_or_else(|| {
-        Error::UnsupportedFeature(format!(
-            "{} items cannot be divided into two {nodesize}-byte leaves; splitting one \
-             leaf into three is not implemented",
-            items.len()
-        ))
-    })?;
-    Ok((items[..at].to_vec(), items[at..].to_vec()))
+    if let Some((at, _)) = best {
+        return Ok(vec![items[..at].to_vec(), items[at..].to_vec()]);
+    }
+    let mut leaves = Vec::new();
+    let mut start = 0;
+    let mut used = crate::btree::HEADER_SIZE;
+    for (at, item) in items.iter().enumerate() {
+        let size = crate::btree::ITEM_SIZE + item.data.len();
+        if crate::btree::HEADER_SIZE + size > nodesize as usize {
+            return Err(Error::UnsupportedFeature(format!(
+                "the item under {:?} does not fit in a {nodesize}-byte leaf",
+                item.key
+            )));
+        }
+        if used + size > nodesize as usize {
+            leaves.push(items[start..at].to_vec());
+            start = at;
+            used = crate::btree::HEADER_SIZE;
+        }
+        used += size;
+    }
+    leaves.push(items[start..].to_vec());
+    Ok(leaves)
 }
 
 /// Take the item under `key` out.
@@ -356,6 +366,31 @@ mod tests {
         let items = vec![item(1, 8), item(5, 8)];
         let err = insert(4096, &items, item(5, 16)).expect_err("5 is already there");
         assert!(err.to_string().contains("already holds"), "{err}");
+    }
+
+    #[test]
+    fn a_split_returns_every_leaf_needed_in_key_order() {
+        let items: Vec<_> = (1..=7).map(|n| item(n, 1900)).collect();
+        let leaves = split_to_fit(4096, &items).unwrap();
+        assert_eq!(leaves.len(), 4);
+        assert!(leaves
+            .iter()
+            .all(|leaf| !leaf.is_empty() && fit(4096, leaf)));
+        assert_eq!(leaves.concat(), items);
+    }
+
+    #[test]
+    fn a_split_still_balances_two_leaves_by_bytes() {
+        let items = vec![item(1, 3000), item(2, 500), item(3, 1000)];
+        let leaves = split_to_fit(4096, &items).unwrap();
+        assert_eq!(leaves.iter().map(Vec::len).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(leaves.concat(), items);
+    }
+
+    #[test]
+    fn splitting_refuses_an_indivisible_oversized_item() {
+        let err = split_to_fit(4096, &[item(1, 4000), item(2, 1)]).unwrap_err();
+        assert!(err.to_string().contains("does not fit"), "{err}");
     }
 
     /// An item that will not fit is refused, naming the missing piece.
