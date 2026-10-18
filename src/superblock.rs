@@ -338,10 +338,16 @@ pub fn refuse_unreadable_incompat(incompat_flags: u64) -> Result<()> {
         return Ok(());
     }
     let mut named = Vec::new();
-    for (bit, name) in [(
-        incompat::EXTENT_TREE_V2,
-        "extent-tree-v2 (the second-generation extent tree)",
-    )] {
+    for (bit, name) in [
+        (
+            incompat::EXTENT_TREE_V2,
+            "extent-tree-v2 (the second-generation extent tree)",
+        ),
+        (
+            incompat::REMAP_TREE,
+            "remap-tree (the tree that remaps block addresses)",
+        ),
+    ] {
         if unreadable & bit != 0 {
             named.push(name.to_string());
             unreadable &= !bit;
