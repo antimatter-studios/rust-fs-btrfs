@@ -167,18 +167,18 @@ fn a_group_this_does_not_relocate_is_refused_before_anything_is_written() {
     let before = sha256_hex(&std::fs::read(&image).unwrap());
 
     let mut fs = mount_rw(&image);
-    let metadata = fs
+    let system = fs
         .block_groups()
         .unwrap()
         .into_iter()
-        .find(|g| g.holds_metadata())
-        .expect("a metadata group");
+        .find(|g| g.flags & fs_btrfs::chunk::block_group::SYSTEM != 0)
+        .expect("a system group");
     let err = fs
-        .relocate_block_group(metadata.start, None)
-        .expect_err("a metadata group is refused");
+        .relocate_block_group(system.start, None)
+        .expect_err("a system group is refused");
     assert!(
-        matches!(&err, Error::UnsupportedFeature(why) if why.contains("tree blocks")
-            || why.contains("chunk tree")),
+        matches!(&err, Error::UnsupportedFeature(why) if why.contains("system")
+            && why.contains("chunk array")),
         "{err}"
     );
     let err = fs
