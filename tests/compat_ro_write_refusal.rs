@@ -51,12 +51,9 @@ fn image_with_compat_ro(name: &str, bits: u64) -> std::path::PathBuf {
 #[test]
 fn an_unmaintained_compat_ro_feature_mounts_read_only_and_refuses_read_write() {
     for (name, bits) in [
-        (
-            "bgt-verity",
-            compat_ro::BLOCK_GROUP_TREE | compat_ro::VERITY,
-        ),
-        ("verity", compat_ro::VERITY),
         ("future", 1 << 40),
+        ("bgt-future", compat_ro::BLOCK_GROUP_TREE | (1 << 40)),
+        ("verity-future", compat_ro::VERITY | (1 << 40)),
     ] {
         let path = image_with_compat_ro(name, bits);
         let ro = FileDevice::open(&path).unwrap();
@@ -79,9 +76,11 @@ fn an_unmaintained_compat_ro_feature_mounts_read_only_and_refuses_read_write() {
 /// this driver maintains, still mounts read-write.
 #[test]
 fn a_fresh_image_still_mounts_read_write() {
-    let path = image_with_compat_ro("fresh", 0);
-    let rw = FileDevice::open_rw(&path).unwrap();
-    Filesystem::mount_rw(Arc::new(rw) as Arc<dyn BlockDevice>)
-        .unwrap_or_else(|e| panic!("a fresh image must mount read-write: {e:?}"));
-    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    for (name, flags) in [("fresh", 0), ("verity", compat_ro::VERITY)] {
+        let path = image_with_compat_ro(name, flags);
+        let rw = FileDevice::open_rw(&path).unwrap();
+        Filesystem::mount_rw(Arc::new(rw) as Arc<dyn BlockDevice>)
+            .unwrap_or_else(|e| panic!("{name} must mount read-write: {e:?}"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 }

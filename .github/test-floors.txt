@@ -116,7 +116,7 @@ leaf_edit_oracle          3
 leaf_split                1
 leaf_split_oracle         1
 # The whole-suite counter includes the CLI inode flag unit case (#412).
-lib                       237
+lib                       239
 link_extref_kernel        1
 log_tree_kernel           30
 lookup_by_name_key        1
@@ -178,5 +178,6 @@ trim_oracle               3
 # Six executed (2 passed, 4 failed) in full CI run 38624143978 at a2dc3b6;
 # the descriptor-header correction keeps all six oracle cases unchanged.
 verity_oracle             6
+verity_write_kernel       1
 write_oracle              3
 xattr_oracle              9

@@ -394,8 +394,9 @@ pub mod compat_ro {
     /// commit could not, which is the state the format defines for that.
     /// Block group items are maintained in tree 11 when `BLOCK_GROUP_TREE`
     /// is set, including when chunks are created or removed.
-    /// Not `VERITY`, whose Merkle tree a data write invalidates.
-    pub const SUPPORTED: u64 = FREE_SPACE_TREE | FREE_SPACE_TREE_VALID | BLOCK_GROUP_TREE;
+    /// Verity metadata stays unchanged because sealed inodes refuse data
+    /// mutations and removal.
+    pub const SUPPORTED: u64 = FREE_SPACE_TREE | FREE_SPACE_TREE_VALID | BLOCK_GROUP_TREE | VERITY;
 }
 
 /// Refuse to WRITE a volume carrying a `compat_ro` feature this driver
@@ -404,27 +405,13 @@ pub mod compat_ro {
 /// Reading such a volume is sound, which is what the bit's class says, so
 /// this is checked at `mount_rw` and not at parse.
 pub fn refuse_unmaintained_compat_ro(compat_ro_flags: u64) -> Result<()> {
-    let mut unmaintained = compat_ro_flags & !compat_ro::SUPPORTED;
+    let unmaintained = compat_ro_flags & !compat_ro::SUPPORTED;
     if unmaintained == 0 {
         return Ok(());
     }
-    let mut named = Vec::new();
-    for (bit, name) in [
-        (compat_ro::VERITY, "fs-verity"),
-        (compat_ro::BLOCK_GROUP_TREE, "the block group tree"),
-    ] {
-        if unmaintained & bit != 0 {
-            named.push(name.to_string());
-            unmaintained &= !bit;
-        }
-    }
-    if unmaintained != 0 {
-        named.push(format!("unknown bits {unmaintained:#018x}"));
-    }
     Err(Error::UnsupportedFeature(format!(
         "this volume uses read-only-compatible features this driver does not maintain \
-         ({}), so it can be read but not written",
-        named.join(", ")
+         (unknown bits {unmaintained:#018x}), so it can be read but not written"
     )))
 }
 
@@ -448,6 +435,8 @@ mod compat_ro_tests {
             0,
             compat_ro::FREE_SPACE_TREE,
             compat_ro::FREE_SPACE_TREE | compat_ro::FREE_SPACE_TREE_VALID,
+            compat_ro::VERITY,
+            compat_ro::SUPPORTED | compat_ro::VERITY,
         ] {
             refuse_unmaintained_compat_ro(flags)
                 .unwrap_or_else(|e| panic!("{flags:#x} must be writable: {e:?}"));
@@ -468,13 +457,8 @@ mod compat_ro_tests {
     #[test]
     fn a_volume_with_an_unmaintained_feature_is_refused_by_name() {
         for (flags, needle) in [
-            (compat_ro::VERITY, "fs-verity"),
-            (compat_ro::BLOCK_GROUP_TREE | compat_ro::VERITY, "fs-verity"),
             (1 << 40, "0x0000010000000000"),
-            (
-                compat_ro::FREE_SPACE_TREE | compat_ro::BLOCK_GROUP_TREE | (1 << 7),
-                "0x0000000000000080",
-            ),
+            (compat_ro::SUPPORTED | (1 << 7), "0x0000000000000080"),
         ] {
             match refuse_unmaintained_compat_ro(flags) {
                 Err(Error::UnsupportedFeature(m)) => {
