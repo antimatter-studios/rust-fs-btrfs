@@ -1615,3 +1615,148 @@ fn a_write_inside_an_inline_extent_rewrites_it_and_the_file_stays_inline() {
         );
     }
 }
+
+/// A small compressible file written through a `compress=zlib` mount, and
+/// another through `compress=zstd`, are stored as compressed inline
+/// extents (#438). A write inside each decodes the item, applies the
+/// bytes and stores the result inline again, compressed with the mount's
+/// algorithm when that is smaller, as the kernel decides. The kernel made
+/// the same writes into the controls, so the bytes, `size`, `nbytes` and
+/// the inline item's `ram_bytes` the driver is held to are its own.
+#[test]
+fn a_write_inside_a_compressed_inline_extent_rewrites_it_and_the_file_stays_inline() {
+    use fs_btrfs::compression::Compression;
+    let control = |name: &str| format!("{name}-control");
+    // (file, mount algorithm, size).
+    let files = [
+        ("zl", "zlib", Compression::Zlib, 3000u64),
+        ("zs", "zstd", Compression::Zstd, 2500),
+    ];
+    // (file, offset, length, byte): the start, the middle, the last byte.
+    let writes = [
+        ("zl", 0u64, 17usize, 0x5au8),
+        ("zl", 1200, 400, 0xa5),
+        ("zl", 2999, 1, 0x11),
+        ("zs", 0, 1, 0x22),
+        ("zs", 700, 333, 0x33),
+        ("zs", 2400, 100, 0x44),
+    ];
+    let mut script = String::new();
+    for (name, mount, _, size) in files {
+        script.push_str(&format!(
+            "mount -o remount,compress={mount} \"$MNT\"\n\
+             awk -v size={size} 'BEGIN {{ s = \"a compressible line of text\\n\"; \
+               while (length(s) < size) s = s s; printf \"%s\", substr(s, 1, size) }}' \
+               | tee \"$MNT/{name}\" \
+             > \"$MNT/{}\"\n\
+             sync\n",
+            control(name)
+        ));
+        for (file, offset, len, byte) in writes {
+            if file != name {
+                continue;
+            }
+            script.push_str(&format!(
+                "head -c {len} /dev/zero | tr '\\000' '\\{byte:03o}' \
+                 | dd of=\"$MNT/{}\" bs=1 seek={offset} conv=notrunc status=none\n\
+                 sync\n",
+                control(name)
+            ));
+        }
+    }
+    let scratch = Scratch::new("cow-write-compressed-inline", &script);
+    let image = scratch.image();
+    for (name, _, _, size) in files {
+        let fs = mount_rw(&image);
+        let (ino, theirs) = (ino_of(&fs, name), ino_of(&fs, &control(name)));
+        drop(fs);
+        let (_, ram, compression) = inline_extent(&image, ino)
+            .unwrap_or_else(|| panic!("the kernel did not store {name} inline"));
+        assert_eq!(ram, size, "{name}'s inline ram_bytes before");
+        assert_ne!(compression, "0", "the kernel did not compress {name}");
+        assert!(
+            inline_extent(&image, theirs).is_some(),
+            "the kernel's writes moved {}'s data out of line",
+            control(name)
+        );
+    }
+
+    let mut fs = mount_rw(&image);
+    let mut expected = BTreeMap::new();
+    for (name, _, _, _) in files {
+        let ino = ino_of(&fs, name);
+        expected.insert(name, fs.read_file(ino).unwrap());
+    }
+    for (name, _, algo, _) in files {
+        fs.set_compression(algo);
+        for (file, offset, len, byte) in writes {
+            if file != name {
+                continue;
+            }
+            let ino = ino_of(&fs, name);
+            assert_eq!(
+                fs.write(ino, offset, &vec![byte; len])
+                    .unwrap_or_else(|e| panic!("writing {name} at {offset}: {e}")),
+                len
+            );
+            let bytes = expected.get_mut(name).unwrap();
+            bytes[offset as usize..offset as usize + len].fill(byte);
+            assert_eq!(&fs.read_file(ino).unwrap(), bytes, "{name} reads back");
+        }
+    }
+    for (name, _, _, _) in files {
+        let ours = fs.read_inode(ino_of(&fs, name)).unwrap();
+        let theirs = fs.read_inode(ino_of(&fs, &control(name))).unwrap();
+        assert_eq!(
+            (ours.size, ours.nbytes),
+            (theirs.size, theirs.nbytes),
+            "{name}'s size and nbytes are not what the kernel's own writes gave its control"
+        );
+    }
+    let inos: Vec<(&str, u64, u64)> = files
+        .iter()
+        .map(|&(name, _, _, _)| (name, ino_of(&fs, name), ino_of(&fs, &control(name))))
+        .collect();
+    drop(fs);
+    for (name, ours, theirs) in inos {
+        let (_, their_ram, _) = inline_extent(&image, theirs)
+            .unwrap_or_else(|| panic!("{} is not inline", control(name)));
+        let (_, our_ram, _) =
+            inline_extent(&image, ours).unwrap_or_else(|| panic!("{name} is not inline"));
+        assert_eq!(our_ram, their_ram, "{name}'s inline ram_bytes");
+    }
+
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum after writes inside compressed inline extents:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let names: Vec<String> = files
+        .iter()
+        .flat_map(|&(name, _, _, _)| [name.to_string(), control(name)])
+        .collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let seen = kernel_view(
+        &image,
+        "after writes inside compressed inline extents",
+        &refs,
+    );
+    for (name, _, _, _) in files {
+        assert_eq!(
+            seen[name].0,
+            sha256_hex(&expected[name]),
+            "{name}: wrong bytes"
+        );
+        assert_eq!(
+            seen[name].0,
+            seen[&control(name)].0,
+            "{name} does not read as the kernel's own writes left its control"
+        );
+    }
+}
