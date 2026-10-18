@@ -81,7 +81,7 @@ fn every_tool_help_carries_an_example_for_every_verb() {
             continue;
         }
         for verb in [
-            "ls", "read", "write", "mkdir", "get", "info", "set", "resize",
+            "ls", "stat", "read", "write", "mkdir", "get", "info", "set", "resize",
         ] {
             let out = ok(tool(&name).args(["image.img", verb, "--help"]));
             assert!(
