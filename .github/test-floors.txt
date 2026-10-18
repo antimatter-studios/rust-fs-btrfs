@@ -84,7 +84,8 @@ compressed_extent_window  3
 compress_write_kernel     3
 compressed_short_decode   2
 compression_oracle        3
-cow_write_oracle          16
+# Trailing-hole growth adds one twin-file kernel comparison (#602).
+cow_write_oracle          17
 crash_consistency         3
 csum_oracle               6
 csum_width_populated      1
@@ -126,7 +127,8 @@ leaf_split_oracle         1
 # two library tests (#585); the kernel case runs in the whole-suite tier.
 # Two synthetic planner shapes cover a cascade to the root and a cascade
 # stopping at an ancestor with exactly one pointer free (#515).
-lib                       354
+# One no-tool trailing-hole growth regression adds three file shapes (#602).
+lib                       355
 link_extref_kernel        1
 log_tree_kernel           31
 lookup_by_name_key        1
