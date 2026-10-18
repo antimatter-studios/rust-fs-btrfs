@@ -1,6 +1,6 @@
 //! Changing a regular file's length: truncate (#262).
 //!
-//! A truncate is one committed transaction on the top-level subvolume,
+//! A truncate is one committed transaction on the selected subvolume,
 //! through the same planner and commit as [`crate::namespace`]:
 //!
 //! - **Shrinking** deletes every `EXTENT_DATA` item that begins at or past
@@ -41,9 +41,8 @@
 //! - on a volume without `NO_HOLES`, growing a file whose last sector is
 //!   partly past its end, inline data included; and growing a `nodatacow`
 //!   file that holds inline data.
-//! - an encrypted or otherwise encoded inline extent cut short, a
-//!   compressed one cut to a sector or more, and any subvolume other than
-//!   the top level.
+//! - an encrypted or otherwise encoded inline extent cut short, and a
+//!   compressed one cut to a sector or more.
 
 use crate::chunk::DiskKey;
 use crate::error::{Error, Result};
@@ -74,7 +73,12 @@ impl Filesystem {
     /// first: if the growth after it then fails, the file ends at that
     /// sector's boundary.
     pub fn truncate(&mut self, ino: u64, size: u64) -> Result<()> {
-        self.require_writable_top_level()?;
+        if self.writable.is_none() && self.subvolume_writes.is_some() {
+            return self.writing_subvolume(|fs| fs.truncate(ino, size));
+        }
+        if self.writable.is_none() {
+            return Err(Error::ReadOnly);
+        }
         let inode = self.read_inode(ino)?;
         if !inode.is_regular_file() {
             return Err(Error::NotAFile);
@@ -104,7 +108,11 @@ impl Filesystem {
                 // past that boundary is then sector-aligned.
                 let boundary = (inode.size / sector + 1) * sector;
                 let zeros = vec![0u8; (size.min(boundary) - inode.size) as usize];
-                self.write_moving_inline(ino, inode.size, &zeros)?;
+                if self.subvolume_writes.is_some() {
+                    self.writing_subvolume(|fs| fs.write_moving_inline(ino, inode.size, &zeros))?;
+                } else {
+                    self.write_moving_inline(ino, inode.size, &zeros)?;
+                }
                 return self.truncate(ino, size);
             }
             if !inode.size.is_multiple_of(sector) && !items.is_empty() {
@@ -115,7 +123,11 @@ impl Filesystem {
                 // any growth past that boundary is then sector-aligned.
                 let boundary = inode.size.next_multiple_of(sector);
                 let zeros = vec![0u8; (size.min(boundary) - inode.size) as usize];
-                self.write(ino, inode.size, &zeros)?;
+                if self.subvolume_writes.is_some() {
+                    self.writing_subvolume(|fs| fs.write(ino, inode.size, &zeros))?;
+                } else {
+                    self.write(ino, inode.size, &zeros)?;
+                }
                 return self.truncate(ino, size);
             }
             if !self.sb.has_no_holes() {
@@ -154,7 +166,7 @@ impl Filesystem {
         }));
 
         let write = DataWrite {
-            root: crate::chunk::objectid::FS_TREE,
+            root: self.written_tree(),
             ino,
             moves: Vec::new(),
             adds: Vec::new(),

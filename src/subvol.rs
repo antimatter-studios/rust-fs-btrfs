@@ -393,9 +393,9 @@ impl Filesystem {
     /// mount it holds the devices aside for the operations that name the
     /// subvolume's tree in their transaction: [`Filesystem::create`],
     /// [`Filesystem::mkdir`], [`Filesystem::symlink`], [`Filesystem::link`],
-    /// [`Filesystem::unlink`], [`Filesystem::rmdir`], [`Filesystem::rename`]
-    /// and copy-on-write [`Filesystem::write`]. After each commit it is
-    /// this subvolume's handle on the new generation.
+    /// [`Filesystem::unlink`], [`Filesystem::rmdir`], [`Filesystem::rename`],
+    /// [`Filesystem::truncate`] and copy-on-write [`Filesystem::write`]. After
+    /// each commit it is this subvolume's handle on the new generation.
     ///
     /// # Errors
     ///
