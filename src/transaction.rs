@@ -2050,8 +2050,10 @@ impl Filesystem {
             .collect()
     }
 
-    /// The keyed item at the unshifted hash, and the leaf holding it.
-    /// Collision probing is separate from cross-leaf routing (#608).
+    /// The keyed item holding this reference, and the leaf holding it.
+    /// The kernel files a reference whose hash key is taken at the next
+    /// free key offset, so the probe walks up from the hash and matches
+    /// each item by its root, inode and offset (#608). A gap ends it.
     fn keyed_data_ref_leaf(
         &self,
         old: u64,
@@ -2059,20 +2061,26 @@ impl Filesystem {
         ino: u64,
         offset: u64,
     ) -> Result<Option<(DiskKey, u64)>> {
-        let key = DiskKey {
+        let root = self.tree_root(objectid::EXTENT_TREE)?;
+        let reader = self.pool_reader();
+        let mut key = DiskKey {
             objectid: old,
             key_type: crate::backref::EXTENT_DATA_REF,
             offset: crate::extent_write::data_ref_hash(tree, ino, offset),
         };
-        let reader = self.pool_reader();
-        let leaf = reader
-            .tree()
-            .descend(self.tree_root(objectid::EXTENT_TREE)?, &key)?;
-        Ok(leaf
-            .body
-            .items()
-            .is_some_and(|items| items.iter().any(|i| i.key == key))
-            .then_some((key, leaf.header.bytenr)))
+        loop {
+            let Some(item) = reader.tree().search(root, &key)? else {
+                return Ok(None);
+            };
+            if keyed_data_ref_names(&item.data, tree, ino, offset) {
+                let leaf = reader.tree().descend(root, &key)?;
+                return Ok(Some((key, leaf.header.bytenr)));
+            }
+            let Some(next) = key.offset.checked_add(1) else {
+                return Ok(None);
+            };
+            key.offset = next;
+        }
     }
 }
 
@@ -2281,15 +2289,19 @@ impl Filesystem {
                     if record_here {
                         applied.keyed_expected += 1;
                     }
-                    let keyed = DiskKey {
-                        objectid: old,
-                        key_type: crate::backref::EXTENT_DATA_REF,
-                        offset: crate::extent_write::data_ref_hash(
-                            data.root,
-                            data.ino,
-                            old_ref_offset,
-                        ),
-                    };
+                    // The item's actual key, which a taken hash shifts.
+                    let keyed = keyed_location.map_or(
+                        DiskKey {
+                            objectid: old,
+                            key_type: crate::backref::EXTENT_DATA_REF,
+                            offset: crate::extent_write::data_ref_hash(
+                                data.root,
+                                data.ino,
+                                old_ref_offset,
+                            ),
+                        },
+                        |(key, _)| key,
+                    );
                     let item = if keyed_here {
                         out.iter().find(|i| i.key == keyed).map(|i| i.data.clone())
                     } else {
@@ -3087,6 +3099,16 @@ fn drop_kept_tree_ref(
 struct Rendered {
     blocks: Vec<crate::commit::PlacedBlock>,
     leaves: BTreeMap<u64, Vec<crate::leaf_edit::OwnedItem>>,
+}
+
+/// Whether a keyed `EXTENT_DATA_REF` body names this reference: its
+/// root, inode and offset, little-endian, ahead of its count.
+fn keyed_data_ref_names(body: &[u8], tree: u64, ino: u64, offset: u64) -> bool {
+    let field = |at: usize| {
+        body.get(at..at + 8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    };
+    field(0) == Some(tree) && field(8) == Some(ino) && field(16) == Some(offset)
 }
 
 /// How much of a [`DataWrite`] the rendered leaves carried.

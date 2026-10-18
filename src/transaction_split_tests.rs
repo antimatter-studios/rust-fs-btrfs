@@ -276,3 +276,28 @@ fn an_extent_record_precedes_a_leaf_starting_with_its_keyed_references() {
         BTreeSet::from([record])
     );
 }
+
+/// A collision probe matches a keyed reference by every field of its
+/// body, so a reference that differs in one field, or a short body, is
+/// passed over rather than dropped in its place (#608).
+#[test]
+fn a_keyed_reference_is_matched_by_its_root_inode_and_offset() {
+    let body = |tree: u64, ino: u64, offset: u64| {
+        let mut b = Vec::new();
+        for v in [tree, ino, offset] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b
+    };
+    assert!(keyed_data_ref_names(&body(5, 300, 65536), 5, 300, 65536));
+    assert!(!keyed_data_ref_names(&body(6, 300, 65536), 5, 300, 65536));
+    assert!(!keyed_data_ref_names(&body(5, 301, 65536), 5, 300, 65536));
+    assert!(!keyed_data_ref_names(&body(5, 300, 69632), 5, 300, 65536));
+    assert!(!keyed_data_ref_names(
+        &body(5, 300, 65536)[..20],
+        5,
+        300,
+        65536
+    ));
+}
