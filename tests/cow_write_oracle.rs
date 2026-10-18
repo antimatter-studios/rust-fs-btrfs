@@ -1884,3 +1884,154 @@ fn a_write_growing_an_inline_file_within_the_inline_limit_keeps_it_inline() {
         );
     }
 }
+
+/// The kind (`regular`, `prealloc`, `inline`) and disk address of the
+/// `EXTENT_DATA` item at `offset` in inode `ino`, as `btrfs inspect-internal
+/// dump-tree` prints it, and the reference count the extent tree records
+/// for that address.
+fn extent_kind_and_refs(image: &Path, ino: u64, offset: u64) -> (String, u64, u64) {
+    let tree = dump_tree(image, "5");
+    let lines: Vec<&str> = tree.lines().collect();
+    let needle = format!("key ({ino} EXTENT_DATA {offset})");
+    let at = lines
+        .iter()
+        .position(|l| l.contains(&needle))
+        .unwrap_or_else(|| panic!("inode {ino} has no extent item at {offset}\n{tree}"));
+    let body: Vec<&str> = lines[at + 1..]
+        .iter()
+        .take_while(|l| !l.contains(" key ("))
+        .copied()
+        .collect();
+    let kind = body
+        .iter()
+        .find_map(|l| {
+            let open = l.find(" type ")?;
+            let rest = &l[open..];
+            Some(rest[rest.find('(')? + 1..rest.find(')')?].to_string())
+        })
+        .unwrap_or_else(|| panic!("no type for inode {ino} at {offset}: {body:?}"));
+    let bytenr: u64 = body
+        .iter()
+        .find_map(|l| {
+            let words: Vec<&str> = l.split_whitespace().collect();
+            let i = words.iter().position(|w| *w == "byte")?;
+            words.get(i + 1)?.parse().ok()
+        })
+        .unwrap_or_else(|| panic!("no disk byte for inode {ino} at {offset}: {body:?}"));
+    let extents = dump_tree(image, "2");
+    let lines: Vec<&str> = extents.lines().collect();
+    let needle = format!("key ({bytenr} EXTENT_ITEM ");
+    let at = lines
+        .iter()
+        .position(|l| l.contains(&needle))
+        .unwrap_or_else(|| panic!("no extent record at {bytenr}\n{extents}"));
+    let words: Vec<&str> = lines[at + 1].split_whitespace().collect();
+    let refs = words
+        .iter()
+        .position(|w| *w == "refs")
+        .and_then(|i| words.get(i + 1)?.parse().ok())
+        .unwrap_or_else(|| panic!("no refs in {:?}", lines[at + 1]));
+    (kind, bytenr, refs)
+}
+
+/// A write covering every sector of a preallocated item, in a checksummed
+/// copy-on-write file whose preallocated extent only that item references,
+/// is written where the extent lies and the item becomes regular, in place
+/// (#535): no item is added, so the extent record's reference count does
+/// not move, and the written sectors gain digests. The kernel made the same
+/// write into a control `fallocate`d alongside, so the item kind and
+/// reference count the driver is held to are its own; `btrfs check
+/// --check-data-csum` and a kernel scrub verify the new digests, and
+/// `filefrag` must report no unwritten range left in either file.
+#[test]
+fn a_write_covering_a_whole_preallocated_item_makes_it_regular_in_place() {
+    const OURS: &str = "pre.bin";
+    const THEIRS: &str = "pre-control.bin";
+    const LEN: usize = 65536;
+    let script = format!(
+        "fallocate -l {LEN} \"$MNT/{OURS}\"\n\
+         fallocate -l {LEN} \"$MNT/{THEIRS}\"\n\
+         sync\n\
+         head -c {LEN} /dev/zero | tr '\\000' '\\132' \
+         | dd of=\"$MNT/{THEIRS}\" bs={LEN} conv=notrunc status=none\n\
+         sync\n"
+    );
+    let scratch = Scratch::new("cow-write-prealloc-whole", &script);
+    let image = scratch.image();
+
+    let mut fs = mount_rw(&image);
+    let (ino, theirs) = (ino_of(&fs, OURS), ino_of(&fs, THEIRS));
+    drop(fs);
+    let (kind, before, _) = extent_kind_and_refs(&image, ino, 0);
+    assert_eq!(kind, "prealloc", "the kernel did not preallocate {OURS}");
+
+    fs = mount_rw(&image);
+    let data = vec![0x5au8; LEN];
+    assert_eq!(
+        fs.write(ino, 0, &data)
+            .unwrap_or_else(|e| panic!("writing the whole preallocated range: {e}")),
+        LEN
+    );
+    assert_eq!(fs.read_file(ino).unwrap(), data, "{OURS} reads back");
+    let (ours_inode, theirs_inode) = (fs.read_inode(ino).unwrap(), fs.read_inode(theirs).unwrap());
+    assert_eq!(
+        (ours_inode.size, ours_inode.nbytes),
+        (theirs_inode.size, theirs_inode.nbytes),
+        "{OURS}'s size and nbytes are not what the kernel's write gave its control"
+    );
+    drop(fs);
+
+    let (kind, after, refs) = extent_kind_and_refs(&image, ino, 0);
+    let (their_kind, _, their_refs) = extent_kind_and_refs(&image, theirs, 0);
+    assert_eq!(
+        their_kind, "regular",
+        "the kernel left its control preallocated"
+    );
+    assert_eq!(
+        (kind.as_str(), refs),
+        (their_kind.as_str(), their_refs),
+        "{OURS}'s item kind and reference count differ from the control's"
+    );
+    assert_eq!(
+        after, before,
+        "the write did not land where the preallocated extent lies"
+    );
+
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum after writing a preallocated range:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after writing a preallocated range",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+    let unwritten = guest_kernel_read_ok(
+        &image.to_string_lossy(),
+        "unwritten ranges after writing a preallocated range",
+        &format!(
+            "for f in {OURS} {THEIRS}; do \
+             printf '%s %s\\n' \"$f\" \"$(filefrag -v \"$MNT/$f\" | grep -c unwritten)\"; done\n"
+        ),
+    );
+    for line in unwritten.lines() {
+        assert!(line.ends_with(" 0"), "an unwritten range is left: {line}");
+    }
+    let seen = kernel_view(
+        &image,
+        "after writing a preallocated range",
+        &[OURS, THEIRS],
+    );
+    assert_eq!(seen[OURS].0, sha256_hex(&data), "{OURS}: wrong bytes");
+    assert_eq!(
+        seen[OURS].0, seen[THEIRS].0,
+        "{OURS} does not read as its control"
+    );
+}
