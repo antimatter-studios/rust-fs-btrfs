@@ -134,11 +134,18 @@ fs_btrfs_fs_t *fs_btrfs_mount_with_fs_core_device(struct FsCoreDevice *handle);
  */
 fs_btrfs_fs_t *fs_btrfs_mount_pool(const char *const *device_paths, size_t count);
 /*
- * A new, read-only handle over subvolume or snapshot `id` (as `btrfs
- * subvolume list` numbers them); paths through it are absolute within the
- * subvolume. Release it with fs_btrfs_umount, independently of `fs`.
- * Paths given to `fs` itself already cross into subvolumes, as a mount
- * shows them; this is for a caller that wants one subvolume as its root.
+ * A new handle over subvolume or snapshot `id` (as `btrfs subvolume list`
+ * numbers them); paths through it are absolute within the subvolume.
+ * Release it with fs_btrfs_umount, independently of `fs`. Paths given to
+ * `fs` itself already cross into subvolumes for reading, as a mount shows
+ * them; this is for a caller that wants one subvolume as its root.
+ *
+ * On a handle from fs_btrfs_mount_rw it writes that subvolume's tree:
+ * create, mkdir, symlink, link, unlink, rmdir, rename, truncate and
+ * write_file each commit one transaction against it, and the handle stays
+ * on the subvolume after each. Other writes refuse it, and
+ * fs_btrfs_is_writable answers 0 for it. The subvolume of a read-only
+ * mount refuses every write with EROFS.
  */
 fs_btrfs_fs_t *fs_btrfs_open_subvolume(fs_btrfs_fs_t *fs, uint64_t id);
 
