@@ -64,6 +64,11 @@ impl Scratch {
     }
 
     fn made(name: &str, algorithm: &str, features: &str, script: &str) -> Self {
+        Self::sized(name, algorithm, features, "16384", script)
+    }
+
+    /// As [`Scratch::made`], with tree blocks of `nodesize` bytes.
+    fn sized(name: &str, algorithm: &str, features: &str, nodesize: &str, script: &str) -> Self {
         let dir = PathBuf::from(temp_path!("{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         let image = dir.join("fs.img");
@@ -72,7 +77,7 @@ impl Scratch {
             .unwrap();
         let made = oracle("mkfs.btrfs")
             .args([
-                "-q", "-f", "-s", "4096", "-n", "16384", "--csum", algorithm, "-O", features,
+                "-q", "-f", "-s", "4096", "-n", nodesize, "--csum", algorithm, "-O", features,
             ])
             .arg(&image)
             .output();
@@ -3104,6 +3109,218 @@ fn a_write_drops_a_keyed_reference_filed_above_its_taken_hash_key() {
     guest_kernel_write_ok(
         &image.to_string_lossy(),
         "scrub after dropping a shifted keyed reference",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+}
+
+/// One block of the checksum tree, from `dump-tree -t csum`.
+#[derive(Debug, Default)]
+struct CsumBlock {
+    /// The first key's offset: for a leaf its first item's, for a node
+    /// its first key pointer's.
+    first: Option<u64>,
+    /// A node's key pointers: (key offset, child address).
+    ptrs: Vec<(u64, u64)>,
+    /// A leaf's item count.
+    items: usize,
+    /// A leaf's digest ranges, [start, end) in logical bytes.
+    ranges: Vec<(u64, u64)>,
+    leaf: bool,
+}
+
+/// The checksum tree's blocks, by address.
+fn csum_tree(image: &Path) -> BTreeMap<u64, CsumBlock> {
+    let tree = dump_tree(image, "csum");
+    let mut out: BTreeMap<u64, CsumBlock> = BTreeMap::new();
+    let mut at = 0u64;
+    let offset = |w: &str| -> u64 {
+        w.trim_end_matches(')')
+            .parse()
+            .unwrap_or_else(|e| panic!("dump-tree printed a key offset {w:?}: {e}"))
+    };
+    for line in tree.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.as_slice() {
+            [kind @ ("leaf" | "node"), addr, rest @ ..] => {
+                at = addr.parse().unwrap();
+                let items = rest
+                    .iter()
+                    .position(|w| *w == "items")
+                    .and_then(|i| rest.get(i + 1)?.parse().ok())
+                    .unwrap_or_else(|| panic!("no item count in {line:?}"));
+                out.insert(
+                    at,
+                    CsumBlock {
+                        items,
+                        leaf: *kind == "leaf",
+                        ..CsumBlock::default()
+                    },
+                );
+            }
+            ["key", _, _, off, "block", child, ..] => {
+                let block = out.get_mut(&at).unwrap();
+                let key = offset(off);
+                block.first.get_or_insert(key);
+                block.ptrs.push((key, child.parse().unwrap()));
+            }
+            ["item", _, "key", _, _, off, ..] => {
+                out.get_mut(&at).unwrap().first.get_or_insert(offset(off));
+            }
+            ["range", "start", start, "end", end, ..] => {
+                out.get_mut(&at)
+                    .unwrap()
+                    .ranges
+                    .push((start.parse().unwrap(), end.parse().unwrap()));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The logical byte ranges `filefrag` maps for a file, [start, end).
+fn mapped_ranges(extents: &[Mapped], len: u64) -> Vec<(u64, u64)> {
+    const BLOCK: u64 = 4096;
+    let mut out = Vec::new();
+    for (i, e) in extents.iter().enumerate() {
+        let end = extents
+            .get(i + 1)
+            .map_or(len.div_ceil(BLOCK), |next| next.logical);
+        out.push((e.physical * BLOCK, (e.physical + end - e.logical) * BLOCK));
+    }
+    out
+}
+
+/// Bytes the first file holds: its digests outgrow one 4 KiB checksum
+/// leaf (about 990 crc32c digests) more than once over.
+const FIRST_LEAF_LEN: u64 = 6 << 20;
+
+/// A write that releases every digest in the checksum tree's first leaf
+/// removes that leaf, its parent's first child, and the key pointer
+/// naming the parent's next child becomes the parent's first (#547).
+///
+/// The kernel writes two checksummed files on 4 KiB nodes, the first
+/// large enough that its digests alone fill the checksum tree's first
+/// leaf, and this driver overwrites the first file whole in one write.
+/// Then:
+///
+/// - `btrfs check --readonly --check-data-csum` calls the volume clean
+///   and a kernel scrub passes;
+/// - the kernel reads back exactly the bytes written, in both files;
+/// - `dump-tree -t csum` shows no empty leaf, no digest for the released
+///   extents, and each node's key pointer equal to its child's first key.
+#[test]
+fn a_write_emptying_the_checksum_trees_first_leaf_removes_it_and_the_checker_agrees() {
+    let fill = format!(
+        "head -c {FIRST_LEAF_LEN} /dev/urandom > \"$MNT/a.bin\"\n\
+         sync\n\
+         head -c 262144 /dev/urandom > \"$MNT/b.bin\"\n\
+         sync"
+    );
+    let scratch = Scratch::sized(
+        "cow-write-first-csum-leaf",
+        "crc32c",
+        "no-holes",
+        "4096",
+        &fill,
+    );
+    let image = scratch.image();
+
+    let before = kernel_map(&image, "before the write", &["a.bin", "b.bin"]);
+    let released = mapped_ranges(&before["a.bin"].1, FIRST_LEAF_LEN);
+    let tree = csum_tree(&image);
+    let leaves: Vec<&CsumBlock> = tree.values().filter(|b| b.leaf).collect();
+    let first = leaves
+        .iter()
+        .min_by_key(|b| b.first)
+        .expect("the checksum tree has no leaf");
+    // Without a first leaf of the first file's digests alone, in a tree
+    // of more than one leaf, there is nothing for the write to empty.
+    assert!(
+        leaves.len() > 1
+            && first.items > 0
+            && first
+                .ranges
+                .iter()
+                .all(|&(s, e)| released.iter().any(|&(rs, re)| rs <= s && e <= re)),
+        "the checksum tree's first leaf does not hold only a.bin's digests, so this tests \
+         nothing:\n{tree:?}\na.bin: {released:?}"
+    );
+
+    let mut fs = mount_rw(&image);
+    let a = ino_of(&fs, "a.bin");
+    let b = ino_of(&fs, "b.bin");
+    let expected_b = fs.read_file(b).unwrap();
+    let bytes: Vec<u8> = (0..FIRST_LEAF_LEN)
+        .map(|i| (i * 7 + i / 4093) as u8)
+        .collect();
+    let n = fs
+        .write(a, 0, &bytes)
+        .unwrap_or_else(|e| panic!("overwriting a.bin whole: {e}"));
+    assert_eq!(n, bytes.len(), "a short write");
+    assert_eq!(
+        fs.read_file(a).unwrap(),
+        bytes,
+        "a.bin reads back differently"
+    );
+    assert_eq!(
+        fs.read_file(b).unwrap(),
+        expected_b,
+        "b.bin reads back differently"
+    );
+    drop(fs);
+
+    assert_btrfs_check_clean(&image, "after emptying the first checksum leaf");
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum finds data that disagrees with its digests:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let tree = csum_tree(&image);
+    for (at, block) in &tree {
+        assert!(
+            block.items > 0,
+            "the checksum tree keeps an empty block at {at}:\n{tree:?}"
+        );
+        for &(s, e) in &block.ranges {
+            assert!(
+                released.iter().all(|&(rs, re)| e <= rs || re <= s),
+                "the checksum tree keeps a digest of a released extent, [{s}, {e}):\n{tree:?}"
+            );
+        }
+        for &(key, child) in &block.ptrs {
+            let below = tree
+                .get(&child)
+                .unwrap_or_else(|| panic!("the node at {at} points at {child}, not in the tree"));
+            assert_eq!(
+                Some(key),
+                below.first,
+                "the node at {at} names {child} by a key other than its first:\n{tree:?}"
+            );
+        }
+    }
+
+    let after = kernel_view(&image, "after the write", &["a.bin", "b.bin"]);
+    assert_eq!(
+        after["a.bin"].0,
+        sha256_hex(&bytes),
+        "the kernel reads back different bytes from a.bin than were written"
+    );
+    assert_eq!(
+        after["b.bin"].0,
+        sha256_hex(&expected_b),
+        "the kernel reads back different bytes from b.bin than it wrote"
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after emptying the first checksum leaf",
         "btrfs scrub start -B \"$MNT\" >/dev/null",
     );
 }
