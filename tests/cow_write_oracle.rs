@@ -3391,6 +3391,173 @@ fn a_write_emptying_the_checksum_trees_first_leaf_removes_it_and_the_checker_agr
 /// (about 990 each), so the one leaf they land in divides four ways.
 const MULTI_LEAF_LEN: u64 = 12 << 20;
 
+/// One whole-file overwrite removes leaves holding only the old digests
+/// and splits the receiving checksum leaf more than once (#616, #550).
+/// The kernel makes the original 12 MiB extent and a small control file;
+/// its replacement needs 3072 digests, or at least four 4 KiB leaves.
+/// This stays far below a full root node, leaving multi-level growth to
+/// #617. All four oracles must agree on the same committed image.
+#[test]
+fn one_overwrite_removes_old_checksum_leaves_and_splits_the_receiving_leaf_as_often_as_needed() {
+    let fill = format!(
+        "head -c {MULTI_LEAF_LEN} /dev/urandom > \"$MNT/a.bin\"\n\
+         sync\n\
+         head -c 262144 /dev/urandom > \"$MNT/b.bin\"\n\
+         sync"
+    );
+    let scratch = Scratch::sized(
+        "cow-overwrite-remove-multi-split",
+        "crc32c",
+        "no-holes",
+        "4096",
+        &fill,
+    );
+    let image = scratch.image();
+    let before = kernel_map(&image, "before the combined overwrite", &["a.bin", "b.bin"]);
+    assert_eq!(
+        before["a.bin"].1.len(),
+        1,
+        "the kernel must make one extent so its replacement inserts all 3072 digests together"
+    );
+    assert!(
+        !before["a.bin"].1[0].shared,
+        "the old extent must be unshared so the overwrite releases its digests"
+    );
+    let released = mapped_ranges(&before["a.bin"].1, MULTI_LEAF_LEN);
+    let original = csum_tree(&image);
+    let exclusive_leaves = original
+        .values()
+        .filter(|block| {
+            block.leaf
+                && !block.ranges.is_empty()
+                && block
+                    .ranges
+                    .iter()
+                    .all(|&(s, e)| released.iter().any(|&(rs, re)| rs <= s && e <= re))
+        })
+        .count();
+    assert!(
+        exclusive_leaves >= 2,
+        "at least two old leaves must hold only a.bin's digests to exercise removal:\n\
+         {original:?}\na.bin: {released:?}"
+    );
+    let receiving_first = original
+        .values()
+        .filter(|block| block.leaf)
+        .filter_map(|block| block.first)
+        .max()
+        .expect("the original checksum tree has no nonempty leaf");
+
+    let mut fs = mount_rw(&image);
+    let a = ino_of(&fs, "a.bin");
+    let inode = fs.read_inode(a).unwrap();
+    assert_eq!(inode.size, MULTI_LEAF_LEN, "this must be an overwrite");
+    assert_eq!(
+        inode.flags & (fs_btrfs::write::INODE_NODATACOW | fs_btrfs::write::INODE_NODATASUM),
+        0,
+        "the file must be copy-on-write and checksummed"
+    );
+    let bytes: Vec<u8> = (0..MULTI_LEAF_LEN)
+        .map(|i| (i * 17 + i / 4093) as u8)
+        .collect();
+    let generation = fs.superblock().generation;
+    let n = fs
+        .write(a, 0, &bytes)
+        .unwrap_or_else(|e| panic!("overwriting all 12 MiB in one transaction: {e}"));
+    assert_eq!(n, bytes.len(), "a short write");
+    assert_eq!(
+        fs.superblock().generation,
+        generation + 1,
+        "leaf removal and repeated splitting must commit in the same transaction"
+    );
+    assert_eq!(fs.read_file(a).unwrap(), bytes);
+    drop(fs);
+
+    assert_btrfs_check_clean(&image, "after checksum leaf removal and repeated splitting");
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum after the combined overwrite:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let after = kernel_map(&image, "after the combined overwrite", &["a.bin", "b.bin"]);
+    assert_eq!(
+        after["a.bin"].0,
+        sha256_hex(&bytes),
+        "the kernel must read back exactly the replacement bytes"
+    );
+    assert_eq!(
+        after["b.bin"], before["b.bin"],
+        "the control file's bytes and physical mapping must stay unchanged"
+    );
+    assert_eq!(
+        after["a.bin"].1.len(),
+        1,
+        "the replacement must insert one extent's 3072 digests"
+    );
+    let written = mapped_ranges(&after["a.bin"].1, MULTI_LEAF_LEN);
+    assert!(
+        written.iter().all(|&(s, e)| {
+            s >= receiving_first && released.iter().all(|&(rs, re)| e <= rs || re <= s)
+        }),
+        "all new digests must land in the original last leaf, outside the released extent:\n\
+         new: {written:?}\nold: {released:?}\nlast leaf first key: {receiving_first}"
+    );
+
+    let tree = csum_tree(&image);
+    assert!(
+        tree.values().filter(|block| block.leaf).count() >= 4,
+        "3072 replacement digests need at least four 4 KiB leaves:\n{tree:?}"
+    );
+    let mut covered = Vec::new();
+    for (at, block) in &tree {
+        assert!(
+            block.items > 0,
+            "the checksum tree keeps an empty block at {at}:\n{tree:?}"
+        );
+        for &(s, e) in &block.ranges {
+            assert!(
+                released.iter().all(|&(rs, re)| e <= rs || re <= s),
+                "the checksum tree keeps old digests in [{s}, {e}):\n{tree:?}"
+            );
+            covered.push((s, e));
+        }
+        for &(key, child) in &block.ptrs {
+            let below = tree
+                .get(&child)
+                .unwrap_or_else(|| panic!("the node at {at} points outside the tree at {child}"));
+            assert_eq!(
+                Some(key),
+                below.first,
+                "the node at {at} must name child {child} by its first key:\n{tree:?}"
+            );
+        }
+    }
+    for &(start, end) in &written {
+        let mut at = start;
+        while at < end {
+            at = covered
+                .iter()
+                .find(|&&(s, e)| s <= at && at < e)
+                .map(|&(_, e)| e)
+                .unwrap_or_else(|| {
+                    panic!("no digest covers new sector at {at} in [{start}, {end}):\n{tree:?}")
+                });
+        }
+    }
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after checksum leaf removal and repeated splitting",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+}
+
 /// A write whose new digests fill more than two checksum leaves splits
 /// the leaf they land in as many times as it needs, in one transaction
 /// (#615, part of #550).
