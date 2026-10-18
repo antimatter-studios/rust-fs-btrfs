@@ -2099,9 +2099,9 @@ impl Filesystem {
         // Each data extent another reference shares, of which the write
         // drops one (#262, #261): its record stays, less this file item's
         // inline reference -- counted down, or removed at a count of one --
-        // and one from its total. A reference held any other way, or the
-        // extent's last, is refused: the last is a release, and a keyed or
-        // shared reference is not edited here.
+        // and one from its total. A reference the kernel filed as a keyed
+        // item is dropped from that item (#442). A shared reference, or
+        // the extent's last, is refused: the last is a release.
         for (old, old_len, old_ref_offset) in data.dropped_references() {
             if !mine(old)? {
                 continue;
@@ -2120,21 +2120,61 @@ impl Filesystem {
                         "the shared data extent at {old} has no record where the plan looked"
                     ))
                 })?;
-            let dropped = crate::backref::drop_inline_data_ref(
+            let inline = crate::backref::drop_inline_data_ref(
                 key_type::EXTENT_ITEM,
                 &body,
                 data.root,
                 data.ino,
                 old_ref_offset,
-            )?
-            .ok_or_else(|| {
-                Error::UnsupportedFeature(format!(
-                    "the shared data extent at {old} holds no inline reference from inode {} \
-                     at {old_ref_offset} in tree {}, so which of its references to drop is \
-                     not known",
-                    data.ino, data.root
-                ))
-            })?;
+            )?;
+            let dropped = match inline {
+                Some(dropped) => dropped,
+                // Not inline: the kernel filed it as a keyed item of its
+                // own, keyed by a hash of its fields (#442). It is counted
+                // down, or deleted at a count of one, and the record loses
+                // one from its total.
+                None => {
+                    let keyed = DiskKey {
+                        objectid: old,
+                        key_type: crate::backref::EXTENT_DATA_REF,
+                        offset: crate::extent_write::data_ref_hash(
+                            data.root,
+                            data.ino,
+                            old_ref_offset,
+                        ),
+                    };
+                    let item = out
+                        .iter()
+                        .find(|i| i.key == keyed)
+                        .map(|i| i.data.clone())
+                        .ok_or_else(|| {
+                            Error::UnsupportedFeature(format!(
+                                "the shared data extent at {old} holds no reference from inode \
+                                 {} at {old_ref_offset} in tree {}, inline or keyed beside \
+                                 its record, so which of its references to drop is not known",
+                                data.ino, data.root
+                            ))
+                        })?;
+                    let lowered = crate::backref::lower_total(key_type::EXTENT_ITEM, &body)?;
+                    let kept = crate::backref::drop_keyed_data_ref(
+                        &item,
+                        data.root,
+                        data.ino,
+                        old_ref_offset,
+                    )?;
+                    out = delete(&out, &keyed)?;
+                    if let Some(kept) = kept {
+                        out = insert(
+                            &out,
+                            OwnedItem {
+                                key: keyed,
+                                data: kept,
+                            },
+                        )?;
+                    }
+                    lowered
+                }
+            };
             out = delete(&out, &key)?;
             out = insert(&out, OwnedItem { key, data: dropped })?;
             applied.unreffed += 1;

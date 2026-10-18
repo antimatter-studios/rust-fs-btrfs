@@ -2035,3 +2035,164 @@ fn a_write_covering_a_whole_preallocated_item_makes_it_regular_in_place() {
         "{OURS} does not read as its control"
     );
 }
+
+/// How many reflinks of `orig.bin` the keyed-reference fill makes: more
+/// than a 16 KiB node's extent record holds inline (about 33 data
+/// references), so the kernel files the rest as keyed `EXTENT_DATA_REF`
+/// items of their own.
+const KEYED_REFLINKS: usize = 48;
+
+/// The fill for the keyed-reference test: one checksummed 64 KiB extent,
+/// reflinked [`KEYED_REFLINKS`] times.
+fn keyed_fill() -> String {
+    let mut script = String::from("head -c 65536 /dev/urandom > \"$MNT/orig.bin\"\nsync\n");
+    for i in 0..KEYED_REFLINKS {
+        script.push_str(&format!(
+            "cp --reflink=always \"$MNT/orig.bin\" \"$MNT/r{i:02}.bin\"\n"
+        ));
+    }
+    script.push_str("sync");
+    script
+}
+
+/// The extent record of `bytenr`, from the kernel's tools: its total, and
+/// each keyed `EXTENT_DATA_REF` item's inode and count.
+fn keyed_refs(image: &Path, bytenr: u64) -> (u64, BTreeMap<u64, u64>) {
+    let extents = dump_tree(image, "2");
+    let lines: Vec<&str> = extents.lines().collect();
+    let record = format!("key ({bytenr} EXTENT_ITEM ");
+    let at = lines
+        .iter()
+        .position(|l| l.contains(&record))
+        .unwrap_or_else(|| panic!("no extent record at {bytenr}\n{extents}"));
+    let words: Vec<&str> = lines[at + 1].split_whitespace().collect();
+    let total = words
+        .iter()
+        .position(|w| *w == "refs")
+        .and_then(|i| words.get(i + 1)?.parse().ok())
+        .unwrap_or_else(|| panic!("no refs in {:?}", lines[at + 1]));
+    let keyed_key = format!("key ({bytenr} EXTENT_DATA_REF ");
+    let mut keyed = BTreeMap::new();
+    for (i, line) in lines.iter().enumerate() {
+        if !line.contains(&keyed_key) {
+            continue;
+        }
+        let words: Vec<&str> = lines[i + 1].split_whitespace().collect();
+        let field = |name: &str| -> u64 {
+            words
+                .iter()
+                .position(|w| *w == name)
+                .and_then(|j| words.get(j + 1)?.parse().ok())
+                .unwrap_or_else(|| panic!("no {name} in {:?}", lines[i + 1]))
+        };
+        keyed.insert(field("objectid"), field("count"));
+    }
+    (total, keyed)
+}
+
+/// A write into a reflink whose reference the kernel filed as a keyed
+/// `EXTENT_DATA_REF` item, not inline in the extent record (#442), copies
+/// the extent and drops that item -- its count down, or the item gone at a
+/// count of one -- and one from the record's total. The kernel made every
+/// reference; `dump-tree` shows which are keyed before the write and that
+/// the written file's is gone after it, `btrfs check --check-data-csum`
+/// counts every reference against the items naming it, a kernel scrub
+/// verifies every digest, and the kernel reads every file back.
+#[test]
+fn a_write_into_a_reflink_whose_reference_is_a_keyed_item_drops_that_item() {
+    let scratch = Scratch::new("cow-write-keyed-ref", &keyed_fill());
+    let image = scratch.image();
+    let names: Vec<String> = std::iter::once("orig.bin".to_string())
+        .chain((0..KEYED_REFLINKS).map(|i| format!("r{i:02}.bin")))
+        .collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+
+    let mut fs = mount_rw(&image);
+    let inos: BTreeMap<&str, u64> = refs.iter().map(|n| (*n, ino_of(&fs, n))).collect();
+    let bytenr = {
+        let tree = dump_tree(&image, "5");
+        let lines: Vec<&str> = tree.lines().collect();
+        let needle = format!("key ({} EXTENT_DATA 0)", inos["orig.bin"]);
+        let at = lines
+            .iter()
+            .position(|l| l.contains(&needle))
+            .unwrap_or_else(|| panic!("orig.bin has no extent item at 0\n{tree}"));
+        lines[at + 1..]
+            .iter()
+            .take_while(|l| !l.contains(" key ("))
+            .find_map(|l| {
+                let words: Vec<&str> = l.split_whitespace().collect();
+                let i = words.iter().position(|w| *w == "byte")?;
+                words.get(i + 1)?.parse::<u64>().ok()
+            })
+            .unwrap_or_else(|| panic!("no disk byte for orig.bin"))
+    };
+
+    // The premise, from the kernel's tools: some references are keyed.
+    let (total, keyed) = keyed_refs(&image, bytenr);
+    assert_eq!(
+        total,
+        KEYED_REFLINKS as u64 + 1,
+        "the extent should count orig.bin and every reflink"
+    );
+    let (victim, &victim_ino) = inos
+        .iter()
+        .find(|(_, ino)| keyed.get(ino) == Some(&1))
+        .unwrap_or_else(|| panic!("no reference is a keyed item counting one: {keyed:?}"));
+
+    let mut expected: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
+    for name in &refs {
+        expected.insert(name, fs.read_file(inos[name]).unwrap());
+    }
+    let bytes = b"a keyed reference, copied on write ".repeat(100);
+    let n = fs
+        .write(victim_ino, 5000, &bytes)
+        .unwrap_or_else(|e| panic!("writing into {victim}, whose reference is keyed: {e}"));
+    assert_eq!(n, bytes.len(), "a short write");
+    expected.get_mut(victim).unwrap()[5000..5000 + bytes.len()].copy_from_slice(&bytes);
+    drop(fs);
+
+    assert_btrfs_check_clean(&image, "after a write dropping a keyed reference");
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum finds data that disagrees with its digests:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let (after_total, after_keyed) = keyed_refs(&image, bytenr);
+    assert_eq!(
+        after_total,
+        total - 1,
+        "the record's total should be one lower"
+    );
+    assert!(
+        !after_keyed.contains_key(&victim_ino),
+        "{victim}'s keyed reference should be gone: {after_keyed:?}"
+    );
+    let mut rest = keyed.clone();
+    rest.remove(&victim_ino);
+    assert_eq!(
+        after_keyed, rest,
+        "every other keyed reference should be untouched"
+    );
+
+    let after = kernel_view(&image, "after the keyed-reference write", &refs);
+    for name in &refs {
+        assert_eq!(
+            after[*name].0,
+            sha256_hex(&expected[name]),
+            "the kernel reads back different bytes from {name} than were written"
+        );
+    }
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after dropping a keyed reference",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+}

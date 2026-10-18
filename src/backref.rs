@@ -391,6 +391,69 @@ pub fn drop_inline_data_ref(
     Ok(Some(rebuild(&head, start, refs)))
 }
 
+/// The body of a keyed `EXTENT_DATA_REF` item -- a data reference the
+/// kernel filed as an item of its own once its record had no room inline
+/// (#442) -- with one reference dropped: its count down by one, or `None`
+/// when its count was one and the item goes.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] when the item is not 28 bytes naming
+/// `tree`, `objectid` and `offset` (a hash collision files the reference
+/// under another key, which is not searched here) or counts nothing.
+pub fn drop_keyed_data_ref(
+    item: &[u8],
+    tree: u64,
+    objectid: u64,
+    offset: u64,
+) -> Result<Option<Vec<u8>>> {
+    let mut fields = Vec::with_capacity(24);
+    for v in [tree, objectid, offset] {
+        fields.extend_from_slice(&v.to_le_bytes());
+    }
+    if item.len() != 28 || item[..24] != fields[..] {
+        return Err(Error::UnsupportedFeature(format!(
+            "the keyed data reference where inode {objectid} in tree {tree} at {offset} \
+             hashes is {} bytes naming something else",
+            item.len()
+        )));
+    }
+    let count = u32::from_le_bytes(item[24..28].try_into().expect("28 bytes"));
+    match count {
+        0 => Err(Error::UnsupportedFeature(format!(
+            "the keyed data reference of inode {objectid} in tree {tree} at {offset} counts \
+             nothing"
+        ))),
+        1 => Ok(None),
+        _ => {
+            let mut kept = item.to_vec();
+            kept[24..28].copy_from_slice(&(count - 1).to_le_bytes());
+            Ok(Some(kept))
+        }
+    }
+}
+
+/// An extent record's `body` with one from its total, for a reference
+/// dropped from a keyed item rather than inline (#442).
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] when the total is one or less: dropping
+/// the last reference is releasing the extent, which is not this edit.
+/// And as [`refs_start`].
+pub fn lower_total(item_type: u8, body: &[u8]) -> Result<Vec<u8>> {
+    refs_start(item_type, body)?;
+    let total = u64::from_le_bytes(body[..8].try_into().expect("a fixed part"));
+    if total <= 1 {
+        return Err(Error::UnsupportedFeature(
+            "the reference is its extent's last, and dropping it is releasing the extent".into(),
+        ));
+    }
+    let mut out = body.to_vec();
+    out[..8].copy_from_slice(&(total - 1).to_le_bytes());
+    Ok(out)
+}
+
 /// `body` with one more reference from the file item of inode `objectid`
 /// in `tree` that puts the extent's first byte at file offset `offset`
 /// (#269): an inline `EXTENT_DATA_REF` already naming those three counted
@@ -737,6 +800,30 @@ mod tests {
         assert!(
             add_inline_keyed(key_type::METADATA_ITEM, &body, Keyed::Block { tree: 5 }, 1).is_err()
         );
+    }
+
+    #[test]
+    fn a_keyed_data_reference_counts_down_and_goes_at_one() {
+        let mut item = Vec::new();
+        for v in [5u64, 257, 0] {
+            item.extend_from_slice(&v.to_le_bytes());
+        }
+        item.extend_from_slice(&2u32.to_le_bytes());
+        let kept = drop_keyed_data_ref(&item, 5, 257, 0).unwrap().unwrap();
+        assert_eq!(u32::from_le_bytes(kept[24..28].try_into().unwrap()), 1);
+        assert_eq!(drop_keyed_data_ref(&kept, 5, 257, 0).unwrap(), None);
+        assert!(drop_keyed_data_ref(&item, 5, 258, 0).is_err());
+        assert!(drop_keyed_data_ref(&item[..27], 5, 257, 0).is_err());
+    }
+
+    #[test]
+    fn a_record_total_is_lowered_but_never_past_its_last_reference() {
+        let body = header(3, crate::extent_write::EXTENT_FLAG_DATA);
+        let lowered = lower_total(key_type::EXTENT_ITEM, &body).unwrap();
+        assert_eq!(u64::from_le_bytes(lowered[..8].try_into().unwrap()), 2);
+        assert_eq!(lowered[8..], body[8..]);
+        let last = header(1, crate::extent_write::EXTENT_FLAG_DATA);
+        assert!(lower_total(key_type::EXTENT_ITEM, &last).is_err());
     }
 
     #[test]
