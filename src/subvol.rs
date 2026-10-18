@@ -391,9 +391,11 @@ impl Filesystem {
     /// to write the top level: [`Filesystem::is_writable`] is false, and
     /// those refuse it as [`crate::error::Error::ReadOnly`]. On a writable
     /// mount it holds the devices aside for the operations that name the
-    /// subvolume's tree in their transaction (#517) — [`Filesystem::create`],
-    /// [`Filesystem::mkdir`] and [`Filesystem::symlink`] — and after each
-    /// commit it is this subvolume's handle on the new generation.
+    /// subvolume's tree in their transaction: [`Filesystem::create`],
+    /// [`Filesystem::mkdir`], [`Filesystem::symlink`], [`Filesystem::link`],
+    /// [`Filesystem::unlink`], [`Filesystem::rmdir`], [`Filesystem::rename`]
+    /// and copy-on-write [`Filesystem::write`]. After each commit it is
+    /// this subvolume's handle on the new generation.
     ///
     /// # Errors
     ///
