@@ -171,16 +171,18 @@ chore_min_version: 0.10.0
 #                                                    both measured locally.
 #                                                    Was 72 / 3,400 -> 95 /
 #                                                    4,450 on 2026-09-26
-#     vm        1,262 /  66,689    1,640 /  86,700   ~30%: the same suite,
-#                                                    plus the guest's own
-#                                                    build, from cold. Was
-#                                                    957 / 50,636 -> 1,250 /
-#                                                    66,000 until a merge
-#                                                    queue group (main, #293,
-#                                                    #296, #315) printed
-#                                                    1,262 / 66,689 and
-#                                                    failed it (run
-#                                                    37992298587)
+#     vm        1,783 / 103,604    2,320 / 135,000   ~30% over a conservative
+#                                                    projection through #533
+#                                                    (851b6b2). Cold queue
+#                                                    run 39074893971 (#486)
+#                                                    measured 1,645 / 87,224.
+#                                                    The layers above add 54
+#                                                    test lines and 12 target
+#                                                    wrappers of 7 lines:
+#                                                    138 / 16,380 more, with
+#                                                    byte allowances below.
+#                                                    Was 1,640 / 86,700 from
+#                                                    run 37992298587
 #     cli          20 /     693       26 /     900   ~30%: 20 / 671 on macOS
 #                                                    with test-docs.sh, plus
 #                                                    the 22 bytes CI's longer
@@ -642,10 +644,14 @@ tasks:
           guest_args="$guest_args $arg"
         done
         # shellcheck disable=SC2086  # the words are the point
-        # Budget: the queue group that outgrew 1250 / 66000 (main with
-        # #293, #296 and #315, run 37992298587) printed 1262 lines and
-        # 66689 bytes; ~30% over that, as the table above sizes every tier.
-        bash ../rust-fs-core/scripts/tier.sh test:vm vm 1640 86700 -- \
+        # Budget: run 39074893971's vm.log measured 1645 lines / 87224
+        # bytes. Through #533 (851b6b2), 54 added tests each print one
+        # line; their names plus 128 bytes each for qualification and
+        # libtest formatting allow 10236 bytes. Twelve new test targets
+        # add 7 wrapper lines each, allowing 512 bytes each (6144 total).
+        # No savings from removed output are credited. The conservative
+        # projection is 1783 / 103604; allow ~30% over the whole chain.
+        bash ../rust-fs-core/scripts/tier.sh test:vm vm 2320 135000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
 
   test:

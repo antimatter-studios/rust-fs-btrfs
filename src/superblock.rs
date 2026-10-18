@@ -286,7 +286,7 @@ pub mod incompat {
     ///
     /// - [`ZONED`], [`EXTENT_TREE_V2`], [`RAID_STRIPE_TREE`],
     ///   [`REMAP_TREE`] — each restructures something the read path
-    ///   depends on.
+    ///   depends on. [`super::refuse_unreadable_incompat`] refuses them.
     ///
     /// [`SIMPLE_QUOTA`] IS accepted (#270): it adds an owner reference to
     /// each data extent item and keeps usage in the quota tree, neither of
@@ -322,6 +322,39 @@ pub mod incompat {
         // parity chunk spans several.
         | RAID56
         | SIMPLE_QUOTA;
+}
+
+/// Refuse a volume carrying an incompatible feature this driver cannot
+/// read, naming each feature it knows (#447).
+///
+/// A bit outside [`incompat::SUPPORTED`] means the kernel that wrote the
+/// volume laid something out in a way this driver does not understand, so
+/// reading it at all would be guessing. The refusal used to give only the
+/// mask, which says nothing a user can act on; a known feature is named,
+/// and a bit no feature is known by is still given by its value.
+pub fn refuse_unreadable_incompat(incompat_flags: u64) -> Result<()> {
+    let mut unreadable = incompat_flags & !incompat::SUPPORTED;
+    if unreadable == 0 {
+        return Ok(());
+    }
+    let mut named = Vec::new();
+    for (bit, name) in [(
+        incompat::EXTENT_TREE_V2,
+        "extent-tree-v2 (the second-generation extent tree)",
+    )] {
+        if unreadable & bit != 0 {
+            named.push(name.to_string());
+            unreadable &= !bit;
+        }
+    }
+    if unreadable != 0 {
+        named.push(format!("incompatible feature bits {unreadable:#018x}"));
+    }
+    Err(Error::UnsupportedFeature(format!(
+        "this volume uses incompatible features this driver cannot read ({}), so it cannot \
+         be mounted",
+        named.join(", ")
+    )))
 }
 
 /// `compat_ro_flags` bits: features an implementation may ignore while
@@ -763,12 +796,7 @@ impl Superblock {
         }
 
         let incompat_flags = le64(buf, offsets::INCOMPAT_FLAGS);
-        let unknown = incompat_flags & !incompat::SUPPORTED;
-        if unknown != 0 {
-            return Err(Error::UnsupportedFeature(format!(
-                "incompatible feature bits {unknown:#018x} not implemented"
-            )));
-        }
+        refuse_unreadable_incompat(incompat_flags)?;
 
         let sys_len = le32(buf, offsets::SYS_CHUNK_ARRAY_SIZE) as usize;
         if sys_len > SYS_CHUNK_ARRAY_SIZE {
@@ -1106,10 +1134,21 @@ impl Superblock {
 /// A copy past the end of the device is ABSENT, not damaged: a volume
 /// under 256 GiB has no copy 2, and one under 64 MiB has only copy 0.
 ///
+/// AN UNREADABLE INCOMPAT FEATURE IS NOT DAMAGE (#447). A copy whose
+/// checksum verifies and which names its own offset is intact, and when
+/// it declares an incompatible feature this driver cannot read, the
+/// volume uses that feature. Passing over it as damaged let the
+/// read-only mount fall back to an older mirror and read the volume as
+/// though the feature were not there, which is exactly what incompat
+/// forbids. Every mount is refused instead, by
+/// [`refuse_unreadable_incompat`]'s message.
+///
 /// # Errors
 ///
-/// When no copy is valid, the primary's own error -- the one a caller
-/// would have seen before.
+/// [`Error::UnsupportedFeature`] when an intact copy declares an
+/// incompatible feature this driver cannot read. Otherwise, when no copy
+/// is valid, the primary's own error -- the one a caller would have seen
+/// before.
 pub fn read_superblock(dev: &dyn fs_core::BlockRead) -> Result<(Superblock, usize)> {
     let size = dev.size_bytes();
     let mut best: Option<(Superblock, usize)> = None;
@@ -1131,6 +1170,12 @@ pub fn read_superblock(dev: &dyn fs_core::BlockRead) -> Result<(Superblock, usiz
                 {
                     best = Some((sb, copy));
                 }
+            }
+            // `parse` checks the incompat bits only after the magic and
+            // the checksum, so this copy is intact; its `bytenr` is
+            // checked here because `parse_at` never got that far.
+            Err(e @ Error::UnsupportedFeature(_)) if le64(&buf, offsets::BYTENR) == offset => {
+                return Err(e)
             }
             Err(e) if copy == 0 => primary_error = Some(e),
             Err(_) => {}
@@ -1465,6 +1510,35 @@ pub(crate) mod tests {
                 matches!(Superblock::parse(&b), Err(Error::UnsupportedFeature(_))),
                 "incompat bit {bit:#x} should have been refused"
             );
+        }
+    }
+
+    /// An intact primary declaring a feature this driver cannot read is
+    /// not passed over for a mirror that does not declare it (#447): the
+    /// mirror would be read as though the feature were not there.
+    #[test]
+    fn an_unreadable_incompat_feature_is_not_read_around_from_a_mirror() {
+        struct Copies;
+        impl fs_core::BlockRead for Copies {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+                let mut raw = sb_bytes();
+                put64(&mut raw, offsets::BYTENR, offset);
+                if offset == SUPER_OFFSETS[0] {
+                    let flags = le64(&raw, offsets::INCOMPAT_FLAGS) | incompat::EXTENT_TREE_V2;
+                    put64(&mut raw, offsets::INCOMPAT_FLAGS, flags);
+                }
+                reseal(&mut raw);
+                buf.copy_from_slice(&raw);
+                Ok(())
+            }
+            fn size_bytes(&self) -> u64 {
+                256 << 20
+            }
+        }
+        match read_superblock(&Copies) {
+            Err(Error::UnsupportedFeature(m)) => assert!(m.contains("extent-tree-v2"), "{m}"),
+            Err(other) => panic!("refused for the wrong reason: {other:?}"),
+            Ok((_, copy)) => panic!("copy {copy} was read around the feature"),
         }
     }
 
