@@ -116,15 +116,19 @@ pub struct Plan {
     /// is this tree's own; the old block stays where it is for the other
     /// tree, one reference fewer, and is not released.
     pub kept: BTreeSet<u64>,
-    /// Every leaf the change leaves with no items that is not its tree's
-    /// root (#546): it leaves its tree. Its pointer leaves the parent
+    /// Every leaf or node the change empties that is not its tree's
+    /// root (#546, #548): it leaves its tree. Its pointer leaves the parent
     /// node, and its block is released and given no new home.
     pub removed: Vec<Rewrite>,
+    /// Old addresses of root nodes whose children all leave (#548).
+    /// Their rewrites keep the old level for releasing the old record,
+    /// but the new block and its record are an empty leaf at level zero.
+    pub collapsed: BTreeSet<u64>,
 }
 
 impl Plan {
     /// The addresses this frees: every rewrite's old block but those
-    /// another tree keeps, and every leaf the change removes.
+    /// another tree keeps, and every block the change removes.
     pub fn released(&self) -> Vec<u64> {
         self.rewrites
             .iter()
@@ -1095,7 +1099,7 @@ impl Filesystem {
                 .map(|(t, e)| Ok(tree.descend(self.edit_root(*t)?, &e.key())?.header.bytenr))
                 .collect::<Result<_>>()?
         };
-        // The leaves the change empties (#546): not rendered, and their
+        // The blocks the change empties (#546, #548): not rendered, and their
         // edits, which the planner saw empty them, applied by removing them.
         let removed: BTreeSet<u64> = plan.removed.iter().map(|r| r.old).collect();
         let mut edits_applied = edit_leaves
@@ -1148,7 +1152,7 @@ impl Filesystem {
                     let mut gained = 0usize;
                     for p in ptrs {
                         let child = p.blockptr;
-                        // A leaf the change empties leaves its tree (#546).
+                        // A leaf or node the change empties leaves its tree.
                         if removed.contains(&child) {
                             continue;
                         }
@@ -1169,6 +1173,19 @@ impl Filesystem {
                             });
                             gained += 1;
                         }
+                    }
+                    if plan.collapsed.contains(&rewrite.old) {
+                        if !updated.is_empty() {
+                            return Err(Error::UnsupportedFeature(format!(
+                                "the plan collapses root {}, but it still has children",
+                                rewrite.old
+                            )));
+                        }
+                        out.push(PlacedBlock {
+                            logical: rewrite.new,
+                            bytes: build_leaf(&self.sb, BlockIdentity { level: 0, ..id }, &[])?,
+                        });
+                        continue;
                     }
                     let capacity = crate::tree_write::key_ptr_capacity(&self.sb);
                     match plan.split_of(rewrite.old) {
@@ -1392,6 +1409,9 @@ impl Filesystem {
                             let grown = split.and_then(|s| s.root);
                             if let Some(split) = split {
                                 item.data[root_item::LEVEL] = split.level + 1;
+                            }
+                            if plan.collapsed.contains(&at) {
+                                item.data[root_item::LEVEL] = 0;
                             }
                             if let Some(to) = grown.or_else(|| moved.get(&at).copied()) {
                                 item.data[root_item::BYTENR..root_item::BYTENR + 8]
@@ -1917,19 +1937,19 @@ impl Filesystem {
         ))
     }
 
-    /// Move each leaf `plan` leaves with no items, other than a tree's
-    /// root, from its rewrites to its removals (#546).
-    ///
-    /// # Errors
+    /// Move empty leaves and, from the leaves up, nodes whose children
+    /// all leave, from rewrites to removals (#546, #548). An empty root
+    /// node instead becomes one empty leaf.
     ///
     /// A leaf that is its parent's first child leaves too (#547): the
     /// render then gives the parent the first key of its next child left,
     /// and carries it up through every ancestor whose own first key it
     /// was.
     ///
-    /// [`Error::UnsupportedFeature`] for a removal this does not make: of
-    /// every leaf under one node, which would leave the node with no key
-    /// pointers; and of a leaf a snapshot shares.
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] for an empty block a snapshot shares,
+    /// or collapsing a root whose level the superblock names.
     fn plan_removals(&self, plan: &mut Plan, data: &DataWrite) -> Result<()> {
         let generation = self.sb.generation + 1;
         // A change the render refuses is the render's to report (#87).
@@ -1937,33 +1957,49 @@ impl Filesystem {
             return Ok(());
         };
         let places = self.placements()?;
-        for (&old, items) in &leaves {
-            if !items.is_empty() {
+        let mut empty: BTreeSet<u64> = leaves
+            .iter()
+            .filter(|(_, items)| items.is_empty())
+            .map(|(&old, _)| old)
+            .collect();
+        let mut order = plan.rewrites.clone();
+        order.sort_by_key(|r| r.level);
+        for rewrite in order {
+            let old = rewrite.old;
+            if rewrite.level > 0 {
+                let block = self.read_tree_block(old)?;
+                if block.body.key_ptrs().is_some_and(|ptrs| {
+                    !ptrs.is_empty() && ptrs.iter().all(|p| empty.contains(&p.blockptr))
+                }) {
+                    empty.insert(old);
+                }
+            }
+            if !empty.contains(&old) {
                 continue;
             }
             let Some(place) = places.get(&old) else {
                 continue;
             };
-            let Some(parent) = place.parent else {
+            if place.parent.is_none() && rewrite.level == 0 {
                 continue;
-            };
+            }
             if plan.kept.contains(&old) {
                 return Err(Error::UnsupportedFeature(format!(
-                    "the change empties the leaf at {old}, which a snapshot shares, and \
-                     removing a shared leaf from its tree is not implemented"
+                    "the change empties the {} at {old}, which a snapshot shares, and \
+                     removing a shared block from its tree is not implemented",
+                    if rewrite.level == 0 { "leaf" } else { "node" }
                 )));
             }
-            let block = self.read_tree_block(parent)?;
-            let left = block.body.key_ptrs().map_or(0, |ptrs| {
-                ptrs.iter()
-                    .filter(|p| !leaves.get(&p.blockptr).is_some_and(Vec::is_empty))
-                    .count()
-            });
-            if left == 0 {
-                return Err(Error::UnsupportedFeature(format!(
-                    "the change empties every leaf under the node at {parent}, the leaf at \
-                     {old} among them, and removing a node from its tree is not implemented"
-                )));
+            if place.parent.is_none() {
+                if matches!(rewrite.owner, objectid::ROOT_TREE | objectid::CHUNK_TREE) {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "the change empties root node {old} of tree {}, whose level the \
+                         superblock names, and collapsing that tree is not implemented",
+                        rewrite.owner
+                    )));
+                }
+                plan.collapsed.insert(old);
+                continue;
             }
             if let Some(at) = plan.rewrites.iter().position(|r| r.old == old) {
                 plan.removed.push(plan.rewrites.remove(at));
@@ -2450,7 +2486,11 @@ impl Filesystem {
             }
             let alloc = TreeBlockAllocation {
                 bytenr: rewrite.new,
-                level: rewrite.level,
+                level: if moves.plan.collapsed.contains(&rewrite.old) {
+                    0
+                } else {
+                    rewrite.level
+                },
                 generation,
                 owner: rewrite.owner,
             };
@@ -2720,7 +2760,12 @@ impl Filesystem {
         let extent_root = self.tree_root(objectid::EXTENT_TREE)?;
         let reader = self.pool_reader();
         let tree = reader.tree();
-        let moving: BTreeSet<u64> = plan.rewrites.iter().map(|r| r.old).collect();
+        let moving: BTreeSet<u64> = plan
+            .rewrites
+            .iter()
+            .chain(&plan.removed)
+            .map(|r| r.old)
+            .collect();
         let le64 =
             |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes"));
 
