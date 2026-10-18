@@ -2368,6 +2368,166 @@ fn a_file_the_log_creates_with_extended_references_replays_as_the_kernel_does() 
     }
 }
 
+/// `n`, created empty after the commit and given a second name `m` in
+/// `/`, made durable by an fsync of `/` alone (#470). The committed trees
+/// hold neither. The log holds the entries of `/` naming `n` and `m`, and
+/// `n` only as an inode that exists, though nothing of it is committed:
+/// generation 0, size 0, two links, no data, and its reference to `/`
+/// holding both names. The kernel's replay of the same crash image
+/// creates `n` in its own transaction with both names, and is the
+/// oracle, down to each name's link count and inode and `n`'s inode item.
+#[test]
+fn a_file_the_log_creates_with_two_names_durable_by_its_directory_replays_as_the_kernel_does() {
+    const CREATED_LINK_FIXTURE: &str = "dirtylog/btrfs-dirty-log-createdlink.img";
+    let image = fixture(CREATED_LINK_FIXTURE);
+    let transcript =
+        std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-createdlink.logdump"))
+            .expect("the native transcript of the created two-name log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    let (n, committed_generation) = {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the created two-name fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        for name in ["/n", "/m"] {
+            assert!(
+                fs.lookup_path(name).is_err(),
+                "{name} was made after the commit, so the committed trees should not hold it"
+            );
+        }
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        let n = top.inode_named(256, b"n").expect("the log names n in /");
+        assert_eq!(
+            top.inode_named(256, b"m"),
+            Some(n),
+            "the log's reference of n names m in /"
+        );
+        assert!(
+            fs.read_inode(n).is_err(),
+            "the committed trees hold no inode {n}, so the log creates n"
+        );
+        let logged = top.inode(n).unwrap().expect("n's logged inode item");
+        assert_eq!(
+            (logged.generation, logged.size, logged.nlink),
+            (0, 0, 2),
+            "the log holds n only as an inode that exists, with two links: {logged:?}"
+        );
+        assert!(
+            !top.items
+                .iter()
+                .any(|i| (i.key.objectid, i.key.key_type) == (n, fs_btrfs::fs::EXTENT_DATA_KEY)),
+            "the log holds no data of n: {keys:?}"
+        );
+        let mut named: Vec<Vec<u8>> = Vec::new();
+        for i in top
+            .items
+            .iter()
+            .filter(|i| (i.key.objectid, i.key.key_type) == (256, DIR_INDEX_KEY))
+        {
+            let entries = parse_dir_items(&i.data).unwrap();
+            assert_eq!(
+                entries.iter().map(|e| e.ino).collect::<Vec<_>>(),
+                vec![n],
+                "the logged entry of / at index {} names n",
+                i.key.offset
+            );
+            assert!(
+                top.items
+                    .iter()
+                    .filter(|r| r.key.objectid == 256 && r.key.key_type == DIR_LOG_INDEX_KEY)
+                    .any(|r| r.key.offset <= i.key.offset
+                        && i.key.offset <= u64::from_le_bytes(r.data[..8].try_into().unwrap())),
+                "no logged index range of / holds index {}: {keys:?}",
+                i.key.offset
+            );
+            named.extend(entries.into_iter().map(|e| e.name));
+        }
+        named.sort();
+        assert_eq!(
+            named,
+            vec![b"m".to_vec(), b"n".to_vec()],
+            "the logged entries of / are n and m: {keys:?}"
+        );
+        (n, fs.superblock().generation)
+    };
+    // What the kernel's view does not show: n's inode item, as the native
+    // tool prints it from each replayed copy.
+    let inode_of_n = |image: &Path| {
+        let dump = dump_tree(image, "5");
+        let mut lines = dump
+            .lines()
+            .skip_while(|l| !l.contains(&format!("key ({n} INODE_ITEM 0) itemoff")));
+        lines
+            .next()
+            .unwrap_or_else(|| panic!("{} holds no inode item of n", image.display()));
+        let mut fields = BTreeMap::new();
+        for line in lines.take(2) {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            for name in ["generation", "size", "nbytes", "links"] {
+                if let Some(at) = words.iter().position(|w| *w == name) {
+                    fields.insert(name, words[at + 1].to_string());
+                }
+            }
+        }
+        fields
+    };
+    let theirs = replays_as_the_kernel_does_then(
+        CREATED_LINK_FIXTURE,
+        "dirtylog-createdlink",
+        |theirs, ours| {
+            let kernel = inode_of_n(theirs);
+            let replayed_in = (committed_generation + 1).to_string();
+            assert_eq!(
+                [
+                    kernel.get("generation"),
+                    kernel.get("size"),
+                    kernel.get("nbytes"),
+                    kernel.get("links")
+                ],
+                [
+                    Some(&replayed_in),
+                    Some(&"0".to_string()),
+                    Some(&"0".to_string()),
+                    Some(&"2".to_string())
+                ],
+                "the kernel's replay creates n in its own transaction, empty, with two links"
+            );
+            assert_eq!(
+                inode_of_n(ours),
+                kernel,
+                "n's inode item, this crate's replay and the kernel's"
+            );
+        },
+    );
+    // The two replays agree; this is what they agree on, as the kernel
+    // reports it, so a name both left out cannot pass.
+    let get = |kind: &str, name: &str| {
+        theirs
+            .get(&(kind.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("the kernel's replay reports no {kind} for {name}"))
+    };
+    for name in ["n", "m"] {
+        assert_eq!(get("stat", name), "f 2 0", "the kernel's replay of {name}");
+    }
+    assert_eq!(
+        get("ino", "n"),
+        get("ino", "m"),
+        "the kernel's replay names n and m as one inode"
+    );
+}
+
 /// `f`, committed with one link, its only name the last of 64 long names
 /// in `/`, held in an `INODE_EXTREF` item once its `INODE_REF` was
 /// emptied, loses that name after the commit, and only `/` is fsynced
