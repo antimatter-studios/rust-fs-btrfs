@@ -53,8 +53,10 @@
 //! Besides everything above, it refuses a system group, a conversion to
 //! another profile, any profile but single, a volume of more than one
 //! device, one with no free-space tree or with a block group tree, and a
-//! group holding an extent with a sector that has no checksum, each
-//! before anything is written. A batch
+//! group holding an extent with a sector that a checksummed file's
+//! regular item names and that has no checksum, each before anything is
+//! written. Preallocated extents and those of `NODATASUM` files move with
+//! the checksums they have and no others (#496). A batch
 //! that fails after an earlier one committed leaves both groups, every
 //! extent in exactly one of them.
 
@@ -67,6 +69,7 @@ use crate::fs::{
     file_extent as fe, root_item, Filesystem, EXTENT_DATA_KEY, EXTENT_PREALLOC, EXTENT_REGULAR,
     ROOT_ITEM_KEY,
 };
+use crate::inode::{Inode, INODE_ITEM_KEY, INODE_NODATASUM};
 use crate::leaf_edit::OwnedItem;
 use crate::super_write::Commit;
 use crate::transaction::{DataWrite, ItemEdit, RecordEdit};
@@ -399,15 +402,8 @@ impl Filesystem {
             ));
         }
         let extents = self.data_extents_in(group)?;
-        let sector = u64::from(self.sb.sectorsize).max(1);
         for e in &extents {
-            if self.data_digests(e.at, e.len)?.len() as u64 != e.len / sector {
-                return Err(Error::UnsupportedFeature(format!(
-                    "the extent at {} has sectors with no checksum, and moving data stored \
-                     without checksums is not implemented",
-                    e.at
-                )));
-            }
+            self.refuse_missing_digests(e)?;
         }
         if group.used != extents.iter().map(|e| e.len).sum::<u64>() {
             return Err(Error::UnsupportedFeature(format!(
@@ -417,6 +413,77 @@ impl Filesystem {
             )));
         }
         Ok(extents)
+    }
+
+    /// Refuse an extent with a sector a checksummed item names and the
+    /// checksum tree has no digest for (#496).
+    ///
+    /// A sector may lack a digest only where the kernel leaves it without
+    /// one: under a preallocated item, which names space never written, or
+    /// an item of a `NODATASUM` inode. Such sectors move with no digest,
+    /// so none is invented for them, while a sector a regular item of a
+    /// checksummed file names must have its digest to move with it. A
+    /// compressed item names its whole extent.
+    fn refuse_missing_digests(&self, e: &DataExtent) -> Result<()> {
+        let sector = u64::from(self.sb.sectorsize).max(1);
+        let digests = self.data_digests(e.at, e.len)?;
+        if digests.len() as u64 == e.len / sector {
+            return Ok(());
+        }
+        for (tree, item) in &e.items {
+            if item.data[fe::TYPE] == EXTENT_PREALLOC
+                || self.inode_flags(*tree, item.key.objectid)? & INODE_NODATASUM != 0
+            {
+                continue;
+            }
+            let (from, to) = if item.data[fe::COMPRESSION] != 0 {
+                (0, e.len)
+            } else {
+                let from = le64(&item.data, fe::OFFSET);
+                let to = from.saturating_add(le64(&item.data, fe::NUM_BYTES));
+                (from / sector * sector, to.div_ceil(sector) * sector)
+            };
+            let mut at = from;
+            while at < to.min(e.len) {
+                if !digests.contains_key(&(e.at + at)) {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "the extent at {} has a sector at {} that inode {} of tree {tree} \
+                         names as checksummed data and the checksum tree has no digest for",
+                        e.at,
+                        e.at + at,
+                        item.key.objectid
+                    )));
+                }
+                at += sector;
+            }
+        }
+        Ok(())
+    }
+
+    /// The flags of inode `ino` in `tree`.
+    fn inode_flags(&self, tree: u64, ino: u64) -> Result<u64> {
+        let root = self.tree_root(tree)?;
+        let reader = self.pool_reader();
+        let from = DiskKey {
+            objectid: ino,
+            key_type: INODE_ITEM_KEY,
+            offset: 0,
+        };
+        let mut found: Option<Vec<u8>> = None;
+        reader
+            .tree()
+            .for_each_from(root, &from, &mut |k: &DiskKey, d: &[u8]| {
+                if k.objectid == ino && k.key_type == INODE_ITEM_KEY {
+                    found = Some(d.to_vec());
+                }
+                Ok(false)
+            })?;
+        let data = found.ok_or_else(|| {
+            Error::UnsupportedFeature(format!(
+                "inode {ino} of tree {tree} names a data extent and has no inode item"
+            ))
+        })?;
+        Ok(Inode::parse(&data, ino)?.flags)
     }
 
     /// Allocate a single chunk of `length` logical bytes and `flags`, with

@@ -147,6 +147,10 @@ relocate_data_group_kernel 1
 # Two executed: the empty data group relocated and judged by the kernel,
 # and the refusals before anything is written (#397).
 relocate_empty_group_kernel 2
+# One executed: a data group of preallocated, partly written preallocated
+# and nodatasum extents relocated, judged by check --check-data-csum, a
+# read and a scrub, then written by the kernel and checked again (#496).
+relocate_prealloc_nodatasum_kernel 1
 # One executed: a data group of reflinked, self-cloned and partially
 # overwritten extents relocated, judged by check --check-data-csum, a
 # read and a scrub (#495).
