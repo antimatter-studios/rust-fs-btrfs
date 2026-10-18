@@ -121,13 +121,16 @@ leaf_split_oracle         1
 # refusal cases on kernel-made volumes raise it by three (#579).
 # DUP chunk serialization and a kernel allocation/write/scrub case add
 # two library tests (#585); the kernel case runs in the whole-suite tier.
-lib                       352
+# Two synthetic planner shapes cover a cascade to the root and a cascade
+# stopping at an ancestor with exactly one pointer free (#515).
+lib                       354
 link_extref_kernel        1
 log_tree_kernel           31
 lookup_by_name_key        1
 namespace_kernel          2
-# Root growth and a non-root split with room above it (#513, #514).
-node_split_kernel         2
+# Root growth, a non-root split with room above it, and a cascade through
+# two full ancestors (#513, #514, #515); CI verifies the new case executes.
+node_split_kernel         3
 node_write_oracle         4
 oracle_vm_fixtures        3
 pool_degraded             7
