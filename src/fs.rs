@@ -676,6 +676,15 @@ impl Filesystem {
 
     /// What every read-write mount refuses, a pool's as one device's.
     fn refuse_unwritable(&self) -> Result<()> {
+        // Emulated zones on regular devices have ordinary read mappings,
+        // but writes must obey zone append and reset rules (#454).
+        if self.sb.incompat_flags & crate::superblock::incompat::ZONED != 0 {
+            return Err(Error::UnsupportedFeature(
+                "this volume uses zoned mode, which can be read but not written: writes \
+                 require sequential zone allocation and zone reset support"
+                    .into(),
+            ));
+        }
         // Simple quotas are read and not maintained: an extent this driver
         // allocated would carry no owner reference and charge no quota
         // group, and the kernel's accounting would then be wrong (#270).

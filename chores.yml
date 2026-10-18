@@ -516,6 +516,7 @@ tasks:
       # one volume per optional on-disk feature; its own directory, as
       # some are refused for writing on purpose
       - test-disks/features/btrfs-bgt.img
+      - test-disks/features/btrfs-zoned.img
       - test-disks/features/btrfs-verity.img
       - test-disks/features/btrfs-verity-tampered.img
       # a DUP volume with three copies damaged on purpose, and the

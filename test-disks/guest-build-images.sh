@@ -2254,6 +2254,42 @@ build_features() {
     note "built features/btrfs-bgt"
 
     build_feature_verity
+    build_feature_zoned
+}
+
+# Emulated zones on a regular file retain conventional superblock
+# offsets. The kernel supplies the file bytes and manifest; btrfs-progs
+# supplies an independent consistency verdict before publication (#454).
+build_feature_zoned() {
+    local img="$WORK/btrfs-zoned.img" manifest="$WORK/btrfs-zoned.manifest" i f
+    truncate -s 2G "$img"
+    "$STATIC_PROGS/mkfs.btrfs" -f -d single -m single -O zoned "$img" >/dev/null
+    mount -o loop "$img" "$MNT"
+    mkdir -p "$MNT/dir"
+    for i in 1 2 3; do
+        echo "zoned file $i" > "$MNT/dir/file-$i.txt"
+    done
+    dd if=/dev/urandom of="$MNT/big.bin" bs=1M count=4 status=none
+    : > "$MNT/empty"
+    sync
+    manifest_of "$MNT" > "$manifest"
+    umount "$MNT"
+    "$STATIC_PROGS/btrfs" inspect-internal dump-super "$img" > "$WORK/zoned.superdump"
+    grep -q 'ZONED' "$WORK/zoned.superdump" || {
+        echo "guest-build-images: btrfs-zoned does not carry ZONED" >&2
+        exit 1
+    }
+    "$STATIC_PROGS/btrfs" check --readonly "$img" >/dev/null 2>&1 || {
+        echo "guest-build-images: btrfs check does not find btrfs-zoned clean" >&2
+        "$STATIC_PROGS/btrfs" check --readonly "$img" >&2 || true
+        exit 1
+    }
+    mkdir -p "$OUT/features"
+    for f in "$img" "$manifest"; do
+        cp --sparse=always "$f" "$OUT/features/$(basename "$f").partial"
+        mv -f "$OUT/features/$(basename "$f").partial" "$OUT/features/$(basename "$f")"
+    done
+    note "built features/btrfs-zoned"
 }
 
 # ---------------------------------------------------------------------
