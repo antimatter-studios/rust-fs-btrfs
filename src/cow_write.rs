@@ -83,9 +83,6 @@
 //!   inline data is decoded, written and encoded again (#438); a write
 //!   covering the whole of a preallocated item is written where its
 //!   extent lies, and the item becomes regular in place (#535);
-//! - an extent a **snapshot** may share — one from at or before the last
-//!   snapshot, which the snapshot reads through a tree block it shares
-//!   and its record counts once for both;
 //! - an extent another reference shares whose reference from this file
 //!   is held anywhere but inline in its record: which entry to count
 //!   down is not known.
@@ -853,15 +850,17 @@ impl Filesystem {
     /// The extent items `[offset, end)` touches, each checked writable.
     ///
     /// Every refusal happens here, while nothing is allocated: a window
-    /// outside its extent, or an extent from at or before the last
-    /// snapshot, which the snapshot may still be reading through a tree
-    /// block it shares — its record counts one reference for both.
+    /// outside its extent, or more of the write's items naming an extent
+    /// than its record counts.
     ///
-    /// An extent newer than the last snapshot is referenced only by file
-    /// items, each counted in its record. One whose references are all
-    /// items this write replaces is released; one with references beyond
-    /// them — a reflink's, or another item of this file outside the range
-    /// — is marked shared, and keeps them (#261).
+    /// One whose references are all items this write replaces is
+    /// released. One with references beyond them is marked shared, and
+    /// keeps them: a reflink's, another item of this file outside the
+    /// range (#261), or a snapshot's (#443). A snapshot's own copy of a
+    /// leaf counts in the record; a leaf it still shares with this tree
+    /// counts once for both, so an item there is shared too, and copying
+    /// that leaf gives the extent a reference naming the old one, which the
+    /// snapshot goes on reading, as the kernel's copy-on-write does.
     fn plan_cow_targets(
         &self,
         ino: u64,
@@ -871,7 +870,6 @@ impl Filesystem {
         move_inline: bool,
     ) -> Result<Vec<Target>> {
         let pieces = self.file_extents(ino)?;
-        let last_snapshot = self.fs_tree_last_snapshot()?;
         let mut out = Vec::new();
         // Each extent's reference count, from its record.
         let mut refs_of: BTreeMap<u64, u64> = BTreeMap::new();
@@ -974,7 +972,7 @@ impl Filesystem {
                         ))
                     })?)
                 };
-                let (refs, extent_len, generation) = self.extent_item(piece.extent_start)?;
+                let (refs, extent_len, _) = self.extent_item(piece.extent_start)?;
                 if let Some(logical) = logical {
                     if !window_inside_extent(logical, piece.len, piece.extent_start, extent_len) {
                         return Err(Error::UnsupportedFeature(format!(
@@ -983,14 +981,6 @@ impl Filesystem {
                             piece.len, piece.extent_start
                         )));
                     }
-                }
-                if generation <= last_snapshot {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "inode {ino}: the extent at {} is from generation {generation}, at or \
-                     before the snapshot taken at {last_snapshot}, so the snapshot may still \
-                     be reading it",
-                        piece.extent_start
-                    )));
                 }
                 out.push(Target {
                     start: piece.start,
@@ -1007,8 +997,9 @@ impl Filesystem {
             }
         }
         // Shared when the extent has references beyond the write's own
-        // items. More items than its record counts is a record that does
-        // not describe this file, and nothing is written over it.
+        // items, or its item sits in a leaf a snapshot shares (#443). More
+        // items than its record counts is a record that does not describe
+        // this file, and nothing is written over it.
         let mut ours: BTreeMap<u64, u64> = BTreeMap::new();
         for t in out.iter().filter(|t| !t.hole) {
             *ours.entry(t.extent_start).or_default() += 1;
@@ -1022,7 +1013,12 @@ impl Filesystem {
                     t.extent_start
                 )));
             }
-            t.shared = items < refs;
+            let key = DiskKey {
+                objectid: ino,
+                key_type: EXTENT_DATA_KEY,
+                offset: t.start,
+            };
+            t.shared = items < refs || self.leaf_shared(objectid::FS_TREE, &key)?;
         }
         Ok(out)
     }

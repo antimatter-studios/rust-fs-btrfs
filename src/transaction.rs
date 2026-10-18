@@ -168,8 +168,7 @@ impl Plan {
 /// referenced. The old extent is released whole when the write's items
 /// were its only references, once however many of them named it;
 /// otherwise (`old_shared`) it loses this item's reference and stays for
-/// the rest (#261). The planner refuses an extent a snapshot may share
-/// before a `DataMove` is made.
+/// the rest: a reflink's (#261), or a snapshot's (#443).
 ///
 /// A copy stored compressed is split into extents of one compression
 /// unit each (#357): the first takes the item's place, covering less of
