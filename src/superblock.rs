@@ -344,6 +344,10 @@ pub fn refuse_unreadable_incompat(incompat_flags: u64) -> Result<()> {
             "extent-tree-v2 (the second-generation extent tree)",
         ),
         (
+            incompat::RAID_STRIPE_TREE,
+            "raid-stripe-tree (the tree that records data stripe placement)",
+        ),
+        (
             incompat::REMAP_TREE,
             "remap-tree (the tree that remaps block addresses)",
         ),
