@@ -119,7 +119,9 @@ leaf_split_oracle         1
 # The baseline local unit run executed 343 library cases; four zoned
 # superblock cases raise the floor to 347 (#454). Three metadata evacuation
 # refusal cases on kernel-made volumes raise it by three (#579).
-lib                       350
+# DUP chunk serialization and a kernel allocation/write/scrub case add
+# two library tests (#585); the kernel case runs in the whole-suite tier.
+lib                       352
 link_extref_kernel        1
 log_tree_kernel           31
 lookup_by_name_key        1
