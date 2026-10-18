@@ -494,6 +494,10 @@ tasks:
       # committed directory, durable by an fsync of that directory alone,
       # which logs the file only as an inode that exists
       - test-disks/dirtylog/btrfs-dirty-log-extrefexists.img
+      # a file created after the commit and given 64 more names, three
+      # of them INODE_EXTREF items, durable by an fsync of / alone, which
+      # logs the file only as an inode that exists
+      - test-disks/dirtylog/btrfs-dirty-log-extrefcreated.img
       # the volume the command-line tools are tested against, labelled
       # CLITEST, with a manifest of what the kernel wrote into it
       - test-disks/cli/btrfs-cli.img

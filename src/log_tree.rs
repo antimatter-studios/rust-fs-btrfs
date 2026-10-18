@@ -494,8 +494,11 @@ impl Filesystem {
     ///   logged checksums of new extents must be exactly the digests of
     ///   the bytes on disk.
     /// - **Inodes the log creates** are inserted, named from their
-    ///   references, or from the logged entries of a directory the log
-    ///   speaks for. A directory the log creates (#403) is named only
+    ///   references, `INODE_REF` and `INODE_EXTREF` alike (#477), or from
+    ///   the logged entries of a directory the log speaks for. One logged
+    ///   only to say it exists (generation 0) holds no data and is given
+    ///   the generation of the replaying transaction, as the kernel's
+    ///   replay gives it. A directory the log creates (#403) is named only
     ///   that way, and holds the names the log gives it. A symbolic link
     ///   the log creates (#404) holds its target as logged, in one plain
     ///   inline extent. A device, FIFO or socket node the log creates
@@ -691,10 +694,22 @@ impl Filesystem {
                         .map(|i| (i.key.offset, i.data.clone()))
                         .collect();
                     if created.contains(&ino) {
-                        for kind in [INODE_REF_KEY, EXTENT_DATA_KEY, dir::XATTR_ITEM_KEY] {
+                        for kind in [
+                            INODE_REF_KEY,
+                            INODE_EXTREF_KEY,
+                            EXTENT_DATA_KEY,
+                            dir::XATTR_ITEM_KEY,
+                        ] {
                             if !tree.find_all(root, ino, kind)?.is_empty() {
                                 return Err(Error::DirtyLog);
                             }
+                        }
+                        // One logged only to say it exists (#477) holds no
+                        // data, and is given the generation of the
+                        // transaction replaying it, as the kernel's replay
+                        // gives it.
+                        if logged.generation == 0 && !logged_items.is_empty() {
+                            return Err(Error::DirtyLog);
                         }
                     }
                     if links.contains(&ino) {
@@ -816,21 +831,23 @@ impl Filesystem {
                         }
                     }
                     raw[io::NBYTES..io::NBYTES + 8].copy_from_slice(&nbytes.to_le_bytes());
+                    if created.contains(&ino) && logged.generation == 0 {
+                        raw[io::GENERATION..io::GENERATION + 8]
+                            .copy_from_slice(&generation.to_le_bytes());
+                    }
                     edits.push(put(key(ino, INODE_ITEM_KEY, 0), raw));
-                    // Extended references are replayed only for a file the
-                    // log holds in full; a created one is named from its
-                    // `INODE_REF` items alone.
+                    // Extended references are replayed for a file the log
+                    // holds in full (#407) or creates (#477), the latter
+                    // with its names below.
                     for item in top.items.iter().filter(|i| i.key.objectid == ino) {
-                        let extref = item.key.key_type == INODE_EXTREF_KEY && files.contains(&ino);
-                        if !extref
-                            && !matches!(
-                                item.key.key_type,
-                                INODE_ITEM_KEY
-                                    | INODE_REF_KEY
-                                    | EXTENT_DATA_KEY
-                                    | dir::XATTR_ITEM_KEY
-                            )
-                        {
+                        if !matches!(
+                            item.key.key_type,
+                            INODE_ITEM_KEY
+                                | INODE_REF_KEY
+                                | INODE_EXTREF_KEY
+                                | EXTENT_DATA_KEY
+                                | dir::XATTR_ITEM_KEY
+                        ) {
                             return Err(Error::DirtyLog);
                         }
                     }
@@ -863,27 +880,30 @@ impl Filesystem {
                 // Names. A created inode named in a directory the log does not
                 // speak for gets its entries from its reference; any other
                 // logged reference must match a logged directory entry, or be
-                // the committed one.
+                // the committed one. A created inode is named in its extended
+                // references too (#477).
                 let mut grown: BTreeMap<u64, i64> = BTreeMap::new();
                 let mut names: BTreeMap<u64, u32> = BTreeMap::new();
                 let spoken_for = |d: u64| dirs.contains(&d) || new_dirs.contains(&d);
+                let mut parents: BTreeSet<u64> = BTreeSet::new();
                 for &ino in created.iter().chain(&exists_only).chain(&new_dirs) {
                     let inode = top.inode(ino)?.ok_or(Error::DirtyLog)?;
-                    for r in top
-                        .items
-                        .iter()
-                        .filter(|i| i.key.objectid == ino && i.key.key_type == INODE_REF_KEY)
-                    {
-                        let parent = r.key.offset;
-                        if !new_dirs.contains(&parent) {
-                            let p = tree
-                                .search(root, &key(parent, INODE_ITEM_KEY, 0))?
-                                .ok_or(Error::DirtyLog)?;
-                            if !Inode::parse(&p.data, parent)?.is_dir() {
-                                return Err(Error::DirtyLog);
+                    for r in top.items.iter().filter(|i| {
+                        i.key.objectid == ino
+                            && (i.key.key_type == INODE_REF_KEY
+                                || (i.key.key_type == INODE_EXTREF_KEY && created.contains(&ino)))
+                    }) {
+                        for (parent, index, name) in
+                            name_records(&r.key, &r.data).ok_or(Error::DirtyLog)?
+                        {
+                            if !new_dirs.contains(&parent) && parents.insert(parent) {
+                                let p = tree
+                                    .search(root, &key(parent, INODE_ITEM_KEY, 0))?
+                                    .ok_or(Error::DirtyLog)?;
+                                if !Inode::parse(&p.data, parent)?.is_dir() {
+                                    return Err(Error::DirtyLog);
+                                }
                             }
-                        }
-                        for (index, name) in ref_records(&r.data).ok_or(Error::DirtyLog)? {
                             *names.entry(ino).or_default() += 1;
                             // An inode logged only to say it exists keeps a
                             // name at an index of a committed directory the
