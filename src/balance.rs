@@ -16,7 +16,7 @@
 //! count that does not add up, is refused rather than skipped, because a
 //! relocation that missed an item would leave it pointing at freed space.
 //!
-//! # What it refuses
+//! # What data enumeration refuses
 //!
 //! - a group that holds **tree blocks**, or is not a data group at all;
 //! - a **shared** data reference, one naming the tree block that holds
@@ -30,8 +30,8 @@
 //!
 //! # Relocating a group
 //!
-//! [`Filesystem::relocate_block_group`] moves a data group (#397, #493)
-//! in committed transactions, each leaving a filesystem the kernel and
+//! [`Filesystem::relocate_block_group`] moves a data or metadata group
+//! (#397, #493, #580) in committed transactions, each leaving a filesystem the kernel and
 //! `btrfs check` accept on its own:
 //!
 //! 1. **A new chunk** of the group's profile: its `CHUNK_ITEM` in the
@@ -47,8 +47,11 @@
 //!    inline and keyed back references unchanged, files its
 //!    checksums under the new sectors, and carries the free-space tree and
 //!    both groups' `used` with it.
+//!    For metadata, every tree block is copied out of the old group in
+//!    one transaction (#578), with the old group excluded from allocation.
 //! 3. **The old group goes**: its chunk item, device extents, block group
-//!    item and free-space records, and `bytes_used` lowered again.
+//!    item and free-space records, and `bytes_used` lowered again. Metadata
+//!    allocation still excludes it during this final transaction.
 //!
 //! Besides everything above, it refuses a system group, a conversion to
 //! another profile, any profile but single, a volume of more than one
@@ -59,6 +62,9 @@
 //! the checksums they have and no others (#496). A batch
 //! that fails after an earlier one committed leaves both groups, every
 //! extent in exactly one of them.
+//! Metadata relocation also refuses mixed data and metadata groups,
+//! shared tree blocks and a log tree awaiting replay before allocating
+//! the replacement chunk (#579).
 
 use crate::block_group::BlockGroup;
 use crate::chunk::{
@@ -209,14 +215,15 @@ impl Filesystem {
             .collect())
     }
 
-    /// Relocate the data block group at `start` into a newly allocated
+    /// Relocate the data or metadata block group at `start` into a new
     /// chunk of its own profile, and return where the new group is (#397,
-    /// #493).
+    /// #493, #580).
     ///
     /// Committed transactions, each leaving a filesystem the kernel
     /// accepts on its own: the new chunk is allocated, the group's extents
-    /// are moved into it a batch per transaction (#494), then the old
-    /// group is removed. A crash between them leaves both groups, every
+    /// are moved a batch per transaction (#494), or its tree blocks are
+    /// copied out in one transaction (#578), then the old group is removed.
+    /// A crash between them leaves both groups, every
     /// extent in exactly one of them.
     ///
     /// # Errors
@@ -227,6 +234,8 @@ impl Filesystem {
     /// documentation](crate::balance) lists, each before anything is
     /// written. An error from a later batch leaves the batches before it
     /// committed and both groups in place.
+    /// Metadata tree blocks move in one transaction; a failure after chunk
+    /// allocation leaves both groups available for a later retry.
     pub fn relocate_block_group(
         &mut self,
         start: u64,
@@ -238,6 +247,19 @@ impl Filesystem {
         let group = self.block_group_at(start)?;
         let extents = self.refuse_unrelocatable(&group, profile)?;
         let new = self.allocate_chunk(group.flags, group.length)?;
+        if group.holds_metadata() {
+            // Allocation commits while the old metadata is still in use.
+            // Only after that can copy-on-write allocate in the new chunk.
+            self.copy_tree_blocks_out_of(start)?;
+            // Removal itself rewrites bookkeeping trees. Keep their new
+            // blocks out of the group being removed, even though the copy
+            // transaction remounted and restored its allocator exclusion.
+            let was = self.emptying.replace(start);
+            let done = self.remove_block_group(start);
+            self.emptying = was;
+            done?;
+            return Ok(new);
+        }
         for (i, batch) in extents.chunks(EXTENTS_PER_TRANSACTION).enumerate() {
             if let Err(e) = self.move_data_extents(batch, new) {
                 if i == 0 {
@@ -280,6 +302,24 @@ impl Filesystem {
             return Err(Error::ReadOnly);
         }
         let group = self.block_group_at(start)?;
+        let dirty = self.metadata_evacuation_blocks(&group)?;
+        if dirty.is_empty() {
+            return Ok(());
+        }
+        let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
+            Error::UnsupportedFeature("the generation counter is exhausted".into())
+        })?;
+        let was = self.emptying.replace(start);
+        let done = self.commit_dirty_with(&dirty, DataWrite::default(), generation, false);
+        // The commit reopens the mount, which forgets the exclusion.
+        self.emptying = was;
+        done
+    }
+
+    /// Validate metadata evacuation without writing, including before a
+    /// relocation allocates its replacement chunk, and find its tree blocks.
+    fn metadata_evacuation_blocks(&self, group: &BlockGroup) -> Result<Vec<u64>> {
+        let start = group.start;
         if !group.holds_metadata() || group.flags & bg::SYSTEM != 0 {
             return Err(Error::UnsupportedFeature(format!(
                 "the group at {start} is not a metadata group, so it holds no tree blocks \
@@ -335,18 +375,7 @@ impl Filesystem {
                 }
                 Ok(true)
             })?;
-        let dirty = self.tree_blocks_in(start..group.end())?;
-        if dirty.is_empty() {
-            return Ok(());
-        }
-        let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
-            Error::UnsupportedFeature("the generation counter is exhausted".into())
-        })?;
-        let was = self.emptying.replace(start);
-        let done = self.commit_dirty_with(&dirty, DataWrite::default(), generation, false);
-        // The commit reopens the mount, which forgets the exclusion.
-        self.emptying = was;
-        done
+        self.tree_blocks_in(start..group.end())
     }
 
     /// Move `extents`, one batch of a group's data extents, into the group
@@ -455,12 +484,16 @@ impl Filesystem {
     ) -> Result<Vec<DataExtent>> {
         if group.flags & bg::SYSTEM != 0 {
             return Err(Error::UnsupportedFeature(format!(
-                "the block group at {} holds the chunk tree, which the superblock's chunk \
-                 array also names, and relocating it is not implemented",
+                "the system block group at {} holds the chunk tree, which the superblock's \
+                 chunk array also names, and relocating it is not implemented",
                 group.start
             )));
         }
-        self.refuse_unenumerable(group)?;
+        if group.holds_metadata() {
+            self.metadata_evacuation_blocks(group)?;
+        } else {
+            self.refuse_unenumerable(group)?;
+        }
         let own = ChunkProfile::from_type(group.flags)?;
         if let Some(p) = profile.filter(|&p| p != own) {
             return Err(Error::UnsupportedFeature(format!(
@@ -495,6 +528,9 @@ impl Filesystem {
                  allocating a chunk there is not implemented"
                     .into(),
             ));
+        }
+        if group.holds_metadata() {
+            return Ok(Vec::new());
         }
         let extents = self.data_extents_in(group)?;
         for e in &extents {
@@ -1417,24 +1453,30 @@ mod tests {
                 let before = self.digest();
                 let generation = fs.sb.generation;
                 let emptying = fs.emptying;
-                let result = fs.copy_tree_blocks_out_of(start);
-                assert_eq!(
-                    self.digest(),
-                    before,
-                    "refusal changed the image: {result:?}"
-                );
-                assert_eq!(
-                    fs.sb.generation, generation,
-                    "refusal committed a generation"
-                );
-                assert_eq!(
-                    fs.emptying, emptying,
-                    "refusal changed the allocator exclusion"
-                );
-                assert!(
-                    matches!(&result, Err(Error::UnsupportedFeature(why)) if why.contains(reason)),
-                    "expected UnsupportedFeature naming {reason}: {result:?}"
-                );
+                for relocate in [false, true] {
+                    let result = if relocate {
+                        fs.relocate_block_group(start, None).map(|_| ())
+                    } else {
+                        fs.copy_tree_blocks_out_of(start)
+                    };
+                    assert_eq!(
+                        self.digest(),
+                        before,
+                        "refusal changed the image: {result:?}"
+                    );
+                    assert_eq!(
+                        fs.sb.generation, generation,
+                        "refusal committed a generation"
+                    );
+                    assert_eq!(
+                        fs.emptying, emptying,
+                        "refusal changed the allocator exclusion"
+                    );
+                    assert!(
+                        matches!(&result, Err(Error::UnsupportedFeature(why)) if why.contains(reason)),
+                        "expected UnsupportedFeature naming {reason}: {result:?}"
+                    );
+                }
             }
         }
 
