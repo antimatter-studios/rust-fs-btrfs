@@ -34,7 +34,10 @@
 //!   otherwise split in the same transaction, so a large directory goes
 //!   on taking names; a refused one has nothing written;
 //! - a hard link to a directory, and a link whose `INODE_REF` item for
-//!   that parent would outgrow a leaf;
+//!   that parent would outgrow a leaf on a volume without the
+//!   `EXTENDED_IREF` feature, or whose `INODE_EXTREF` item would outgrow
+//!   one. With the feature, a name past a full `INODE_REF` is filed in an
+//!   `INODE_EXTREF` item, as the kernel files it (#425);
 //! - a symbolic link whose target does not fit inline in one sector.
 //!
 //! - removing the last name of a file whose data extents a snapshot may
@@ -66,6 +69,7 @@ use crate::inode::{
 use crate::leaf_edit::OwnedItem;
 use crate::log_tree::{extref_hash, INODE_EXTREF_KEY};
 use crate::super_write::Commit;
+use crate::superblock::incompat::EXTENDED_IREF;
 use crate::transaction::{DataRelease, DataWrite, ItemEdit};
 
 /// How many rounds a change's plan has to close over its own bookkeeping.
@@ -185,16 +189,18 @@ impl Filesystem {
         raw[io::NLINK..io::NLINK + 4].copy_from_slice(&(nlink + 1).to_le_bytes());
         touch(&mut raw, generation, now, &[io::CTIME]);
         edits.push(put(ino, INODE_ITEM_KEY, 0, raw));
-        // Its reference back to this parent, joining any it has there.
+        // Its reference back to this parent, joining any it has there,
+        // or an extended reference once that is full.
         let ref_key = key(ino, INODE_REF_KEY, parent);
         let mut refs = self.item_bytes(ref_key)?.unwrap_or_default();
         refs.extend(inode_ref(index, name));
-        if refs.len() > self.max_item_size() {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino}'s references from directory {parent} would outgrow a leaf, and \
-                 extended references are not written"
-            )));
-        }
+        let (ref_key, refs) = if refs.len() > self.max_item_size() {
+            let ext_key = key(ino, INODE_EXTREF_KEY, extref_hash(parent, name));
+            let held = self.item_bytes(ext_key)?;
+            (ext_key, self.extref_with(ino, parent, index, name, held)?)
+        } else {
+            (ref_key, refs)
+        };
         edits.push(ItemEdit::Put(OwnedItem {
             key: ref_key,
             data: refs,
@@ -532,12 +538,13 @@ impl Filesystem {
         let mut refs = p.get(self, ref_key)?.unwrap_or_default();
         refs.extend(inode_ref(index, name));
         if refs.len() > self.max_item_size() {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino}'s references from directory {parent} would outgrow a leaf, and \
-                 extended references are not written"
-            )));
+            let ext_key = key(ino, INODE_EXTREF_KEY, extref_hash(parent, name));
+            let held = p.get(self, ext_key)?;
+            let refs = self.extref_with(ino, parent, index, name, held)?;
+            p.set(ext_key, Some(refs));
+        } else {
+            p.set(ref_key, Some(refs));
         }
-        p.set(ref_key, Some(refs));
 
         let entry = dir_entry(ino, generation, ft, name);
         let hash_key = key(parent, DIR_ITEM_KEY, dir::name_hash(name));
@@ -967,6 +974,38 @@ impl Filesystem {
     pub(crate) fn max_item_size(&self) -> usize {
         self.sb.nodesize as usize - LEAF_HEADER - ITEM_HEADER
     }
+
+    /// The `INODE_EXTREF` item filing `name` in `parent` under `index`,
+    /// for a link whose `INODE_REF` item for that parent is full: `held`,
+    /// what the item under the hash of the parent and the name holds
+    /// already, with the record appended. The kernel files such a name
+    /// the same way on a volume with the `EXTENDED_IREF` feature, and
+    /// refuses it on one without (#425).
+    fn extref_with(
+        &self,
+        ino: u64,
+        parent: u64,
+        index: u64,
+        name: &[u8],
+        held: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        if self.sb.incompat_flags & EXTENDED_IREF == 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}'s references from directory {parent} would outgrow a leaf, and \
+                 the volume has no extended references (EXTENDED_IREF) to hold more"
+            )));
+        }
+        let mut refs = held.unwrap_or_default();
+        refs.extend(inode_extref(parent, index, name));
+        if refs.len() > self.max_item_size() {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}'s extended references sharing the hash of {:?} in directory \
+                 {parent} would outgrow a leaf",
+                String::from_utf8_lossy(name)
+            )));
+        }
+        Ok(refs)
+    }
 }
 
 /// A leaf's header, and the header of each item in it.
@@ -1304,6 +1343,16 @@ fn holds_no_extent(data: &[u8]) -> bool {
 /// One `INODE_REF` record: the name's index in the parent, and the name.
 fn inode_ref(index: u64, name: &[u8]) -> Vec<u8> {
     let mut b = Vec::with_capacity(INODE_REF_HEADER + name.len());
+    b.extend_from_slice(&index.to_le_bytes());
+    b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    b.extend_from_slice(name);
+    b
+}
+
+/// One `INODE_EXTREF` record: the parent, the index there, and the name.
+fn inode_extref(parent: u64, index: u64, name: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(INODE_EXTREF_HEADER + name.len());
+    b.extend_from_slice(&parent.to_le_bytes());
     b.extend_from_slice(&index.to_le_bytes());
     b.extend_from_slice(&(name.len() as u16).to_le_bytes());
     b.extend_from_slice(name);
