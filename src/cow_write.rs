@@ -1410,6 +1410,82 @@ fn kept_runs(
 mod tests {
     use super::kept_runs;
 
+    /// The independent comparison is the sparse EOF case in
+    /// cow_write_oracle.rs; this checks the planner before it allocates.
+    #[test]
+    fn old_eof_zeroing_is_planned_only_for_data_backed_sectors() {
+        use crate::{fs::file_extent as fe, mkfs, superblock::le64, Filesystem};
+        use fs_core::{BlockDevice, BlockRead, FileDevice};
+        use std::{path::PathBuf, sync::Arc};
+
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let image = Scratch(PathBuf::from(fs_btrfs_test_support::temp_path!(
+            "cow-sparse-eof-plan.img"
+        )));
+        std::fs::create_dir_all(image.0.parent().unwrap()).unwrap();
+        std::fs::File::create(&image.0)
+            .and_then(|f| f.set_len(128 << 20))
+            .unwrap();
+        let dev = Arc::new(FileDevice::open_rw(&image.0).unwrap());
+        mkfs::format(dev.as_ref(), &mkfs::Options::default()).unwrap();
+        for offset in [65_536, 64 << 20] {
+            let mut raw = [0; 4096];
+            dev.read_at(offset, &mut raw).unwrap();
+            let at = crate::superblock::offsets::INCOMPAT_FLAGS;
+            let flags = le64(&raw, at) & !crate::superblock::incompat::NO_HOLES;
+            raw[at..at + 8].copy_from_slice(&flags.to_le_bytes());
+            crate::super_write::stamp_checksum(&mut raw, crate::superblock::ChecksumType::Crc32c);
+            dev.write_at(offset, &raw).unwrap();
+        }
+        let mut fs = Filesystem::mount_rw(dev).unwrap();
+        let root = fs.lookup_path("/").unwrap().ino;
+        const OLD_SIZE: u64 = 40_000;
+        for (name, data_len, offset, len) in [
+            ("far", 8192usize, 70_000u64, 5000u64),
+            ("next", 8192, 40_960, 100),
+            ("same", 8192, 40_100, 100),
+            ("empty", 0, 70_000, 5000),
+            ("backed", 40_960, 70_000, 5000),
+        ] {
+            let ino = fs.create(root, name.as_bytes(), 0o644, 0, 0).unwrap();
+            if data_len > 0 {
+                fs.write(ino, 0, &vec![0x5a; data_len]).unwrap();
+            }
+            fs.truncate(ino, OLD_SIZE).unwrap();
+            assert!(!fs.superblock().has_no_holes());
+            let eof_in_hole = fs.items_of(ino).unwrap().iter().any(|(key, data)| {
+                key.key_type == super::EXTENT_DATA_KEY
+                    && data.len() >= fe::REGULAR_SIZE
+                    && le64(data, fe::DISK_BYTENR) == 0
+                    && key.offset <= OLD_SIZE
+                    && OLD_SIZE < key.offset + le64(data, fe::NUM_BYTES)
+            });
+            assert_eq!(eof_in_hole, name != "backed", "{name}: fixture shape");
+            let targets = fs
+                .plan_cow_targets(ino, Some(OLD_SIZE), offset, offset + len, false)
+                .unwrap();
+            let mut expected = Vec::new();
+            if name == "backed" {
+                expected.push((0, 40_960, false));
+            }
+            let start = offset / 4096 * 4096;
+            expected.push((start, (offset + len).next_multiple_of(4096) - start, true));
+            assert_eq!(
+                targets
+                    .iter()
+                    .map(|t| (t.start, t.len, t.hole))
+                    .collect::<Vec<_>>(),
+                expected,
+                "{name}: only data-backed EOF and payload sectors may be copied"
+            );
+        }
+    }
+
     /// The kernel comparison for these shapes lives in cow_write_oracle.rs.
     #[test]
     fn a_growing_write_extends_the_existing_trailing_hole() {
