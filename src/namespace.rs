@@ -27,8 +27,8 @@
 //!
 //! # What it refuses
 //!
-//! - anything outside the top-level subvolume (tree 5), which is the
-//!   only tree a mount writes;
+//! - a name belonging to another subvolume: inode numbers and parent
+//!   directories are scoped to the tree this handle reads;
 //! - a full leaf that cannot be split: one flagged full backrefs, or one
 //!   whose parent node has no room for another pointer. A full leaf is
 //!   otherwise split in the same transaction, so a large directory goes
@@ -169,7 +169,13 @@ impl Filesystem {
     /// As [`Filesystem::create`], and [`Error::NotAFile`] for a
     /// directory.
     pub fn link(&mut self, ino: u64, parent: u64, name: &[u8]) -> Result<()> {
-        self.require_writable_top_level()?;
+        if self.writable.is_none() && self.subvolume_writes.is_some() {
+            return self.writing_subvolume(|fs| fs.link(ino, parent, name));
+        }
+        if self.writable.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        let root = self.written_tree();
         let dir = self.writable_parent(parent, name)?;
         let target = self.read_inode(ino)?;
         if target.is_dir() {
@@ -217,7 +223,7 @@ impl Filesystem {
             generation,
             now,
         )?;
-        self.commit_edits(ino, edits, generation, now)
+        self.commit_edits_in(root, ino, edits, generation, now)
     }
 
     /// Remove the name `name` from directory `parent`. When it was the
@@ -249,7 +255,13 @@ impl Filesystem {
     }
 
     fn remove_name(&mut self, parent: u64, name: &[u8], want_dir: bool) -> Result<()> {
-        self.require_writable_top_level()?;
+        if self.writable.is_none() && self.subvolume_writes.is_some() {
+            return self.writing_subvolume(|fs| fs.remove_name(parent, name, want_dir));
+        }
+        if self.writable.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        let root = self.written_tree();
         check_name(name)?;
         let dir = self.read_inode(parent)?;
         if !dir.is_dir() {
@@ -272,7 +284,7 @@ impl Filesystem {
         let (releases, unrefs) = self.drop_link(&mut p, &child, name)?;
         let edits = p.into_edits(self, generation, now)?;
         if releases.is_empty() && unrefs.is_empty() {
-            return self.commit_edits(child.ino, edits, generation, now);
+            return self.commit_edits_in(root, child.ino, edits, generation, now);
         }
         // The file's data goes with its last name: each extent, its back
         // reference, its checksums and its block group's count, in the
@@ -282,7 +294,7 @@ impl Filesystem {
             .map(|r| (r.old, r.old + r.old_len))
             .collect();
         let write = DataWrite {
-            root: objectid::FS_TREE,
+            root,
             ino: child.ino,
             moves: Vec::new(),
             adds: Vec::new(),
@@ -329,7 +341,14 @@ impl Filesystem {
         new_parent: u64,
         new_name: &[u8],
     ) -> Result<()> {
-        self.require_writable_top_level()?;
+        if self.writable.is_none() && self.subvolume_writes.is_some() {
+            return self
+                .writing_subvolume(|fs| fs.rename(old_parent, old_name, new_parent, new_name));
+        }
+        if self.writable.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        let root = self.written_tree();
         check_name(old_name)?;
         check_name(new_name)?;
         for d in [old_parent, new_parent] {
@@ -390,14 +409,14 @@ impl Filesystem {
         p.touch(child.ino, &[io::CTIME]);
         let edits = p.into_edits(self, generation, now)?;
         let Some((ino, releases, unrefs)) = replaced else {
-            return self.commit_edits(child.ino, edits, generation, now);
+            return self.commit_edits_in(root, child.ino, edits, generation, now);
         };
         let released: Vec<(u64, u64)> = releases
             .iter()
             .map(|r| (r.old, r.old + r.old_len))
             .collect();
         let write = DataWrite {
-            root: objectid::FS_TREE,
+            root,
             ino,
             moves: Vec::new(),
             adds: Vec::new(),
