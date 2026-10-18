@@ -504,7 +504,7 @@ impl Filesystem {
         group.extend_from_slice(&objectid::FIRST_CHUNK_TREE.to_le_bytes());
         group.extend_from_slice(&flags.to_le_bytes());
         tree_edits.push((
-            objectid::EXTENT_TREE,
+            self.block_group_tree_id(),
             ItemEdit::Put(OwnedItem {
                 key: DiskKey {
                     objectid: logical,
@@ -609,7 +609,7 @@ impl Filesystem {
             ItemEdit::Put(OwnedItem { key, data: item }),
         ));
         tree_edits.push((
-            objectid::EXTENT_TREE,
+            self.block_group_tree_id(),
             ItemEdit::Delete(DiskKey {
                 objectid: start,
                 key_type: key_type::BLOCK_GROUP_ITEM,

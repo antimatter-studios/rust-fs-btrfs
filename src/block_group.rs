@@ -136,6 +136,15 @@ impl FreeExtent {
 }
 
 impl Filesystem {
+    /// The tree that owns block group items for both readers and writers.
+    pub(crate) fn block_group_tree_id(&self) -> u64 {
+        if self.superblock().has_block_group_tree() {
+            objectid::BLOCK_GROUP_TREE
+        } else {
+            objectid::EXTENT_TREE
+        }
+    }
+
     /// Every block group on the filesystem, in address order.
     ///
     /// # Errors
@@ -148,11 +157,7 @@ impl Filesystem {
     /// tree otherwise: with the `block_group_tree` feature the extent tree
     /// holds none, and reading it there found an empty list (#270).
     pub fn block_groups(&self) -> Result<Vec<BlockGroup>> {
-        let root = self.tree_root(if self.superblock().has_block_group_tree() {
-            objectid::BLOCK_GROUP_TREE
-        } else {
-            objectid::EXTENT_TREE
-        })?;
+        let root = self.tree_root(self.block_group_tree_id())?;
         let reader = self.pool_reader();
         let tree = reader.tree();
 
