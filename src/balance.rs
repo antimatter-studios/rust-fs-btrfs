@@ -42,8 +42,9 @@
 //! 2. **The extents move**, when the group holds any (#493), at most 64
 //!    per committed transaction (#494): each one's bytes are read verified
 //!    against their digests and written into the new chunk, then the
-//!    batch's commit re-points the file item naming it, moves
-//!    its `EXTENT_ITEM` and keyed back references unchanged, files its
+//!    batch's commit re-points every file item naming it (#495), each
+//!    keeping its offset into the extent, moves its `EXTENT_ITEM` and
+//!    inline and keyed back references unchanged, files its
 //!    checksums under the new sectors, and carries the free-space tree and
 //!    both groups' `used` with it.
 //! 3. **The old group goes**: its chunk item, device extents, block group
@@ -52,8 +53,8 @@
 //! Besides everything above, it refuses a system group, a conversion to
 //! another profile, any profile but single, a volume of more than one
 //! device, one with no free-space tree or with a block group tree, and a
-//! group holding an extent more than one file item names, or one with a
-//! sector that has no checksum, each before anything is written. A batch
+//! group holding an extent with a sector that has no checksum, each
+//! before anything is written. A batch
 //! that fails after an earlier one committed leaves both groups, every
 //! extent in exactly one of them.
 
@@ -258,8 +259,11 @@ impl Filesystem {
     /// written to the new address before anything is committed: the new
     /// chunk is free space until then, so a crash before the superblock
     /// write leaves the files reading their old extents. The commit then
-    /// re-points the one file item naming each extent, moves its
-    /// `EXTENT_ITEM` and keyed back references unchanged, and files its
+    /// re-points every file item naming each extent — reflinks, clones
+    /// and a partial overwrite's bookends alike — with its offset into the
+    /// extent unchanged, so each reference's tree, inode and file offset
+    /// still add up; moves its `EXTENT_ITEM` and keyed back references
+    /// unchanged; and files its
     /// checksums under the new sectors; the records' release and
     /// allocation carry the free-space tree and both groups' `used`.
     fn move_data_extents(&mut self, extents: &[DataExtent], to: u64) -> Result<()> {
@@ -397,14 +401,6 @@ impl Filesystem {
         let extents = self.data_extents_in(group)?;
         let sector = u64::from(self.sb.sectorsize).max(1);
         for e in &extents {
-            if e.items.len() != 1 {
-                return Err(Error::UnsupportedFeature(format!(
-                    "the extent at {} is named by {} file items, and moving an extent more \
-                     than one names is not implemented",
-                    e.at,
-                    e.items.len()
-                )));
-            }
             if self.data_digests(e.at, e.len)?.len() as u64 != e.len / sector {
                 return Err(Error::UnsupportedFeature(format!(
                     "the extent at {} has sectors with no checksum, and moving data stored \

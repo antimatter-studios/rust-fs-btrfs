@@ -147,6 +147,10 @@ relocate_data_group_kernel 1
 # Two executed: the empty data group relocated and judged by the kernel,
 # and the refusals before anything is written (#397).
 relocate_empty_group_kernel 2
+# One executed: a data group of reflinked, self-cloned and partially
+# overwritten extents relocated, judged by check --check-data-csum, a
+# read and a scrub (#495).
+relocate_shared_data_kernel 1
 rename_kernel             2
 render_plan               4
 send_stream_kernel        3
