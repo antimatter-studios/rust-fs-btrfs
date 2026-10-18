@@ -1218,6 +1218,7 @@ build_dirtylog() {
     build_dirtylog_refused hardlink 'compress=no,max_inline=2048' hardlink
     build_dirtylog_refused extref 'compress=no,max_inline=2048' extref
     build_dirtylog_refused dirlink 'compress=no,max_inline=2048' dirlink
+    build_dirtylog_refused nbytes 'compress=no,max_inline=2048' nbytes
 }
 
 # fsync_path <path> — fsync one file or directory, and nothing else.
@@ -1367,7 +1368,7 @@ build_dirtylog_refused() {
             printf 'committed-inline-bytes-0123456789' > "$MNT/f" ;;
         externalextent)
             head -c 8192 /dev/zero | tr '\0' 'c' > "$MNT/f" ;;
-        extref)
+        extref|nbytes)
             # f with 64 more names in /, each 255 bytes: the first 61 fill
             # its INODE_REF to the largest item a 16 KiB leaf holds, and
             # the rest are committed as INODE_EXTREF items.
@@ -1484,6 +1485,12 @@ elif kind == "compressedinline":
     # compress-force stores it as a compressed inline extent. The earlier
     # text payload did not shrink and fell back to an uncompressed one.
     os.pwrite(fd, b"z" * 33, 0)
+elif kind == "nbytes":
+    # The committed f, with INODE_EXTREF items, rewritten in place with
+    # 33 other bytes and made durable by an fsync of f alone. The log
+    # holds f in full, and the kernel leaves its nbytes holding stale
+    # bytes of a long name rather than a count.
+    os.pwrite(fd, b"replayed-inline-bytes-ABCDEFGHIJK", 0)
 else:
     os.pwrite(fd, b"replayed-inline-bytes-ABCDEFGHIJK", 0)
 if kind == "mixedlog":
@@ -1529,6 +1536,7 @@ want = {
     'hardlink': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: f\n\s+index \d+ namelen 1 name: g\n',
     'extref': r'INODE_EXTREF \d+\) itemoff \d+ itemsize \d+\n\s+index \d+ parent 256 namelen 255 name: (064){85}\n',
     'dirlink': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: f\n\s+index \d+ namelen 1 name: g\n',
+    'nbytes': r'size 33 nbytes (?!0\n|33\n)\d+\n',
 }[kind]
 assert re.search(want, dump), (kind, 'native dump does not show the unsupported shape')
 if kind == 'symlink':
@@ -1641,6 +1649,32 @@ if kind == 'dirlink':
         (kind, 'no logged index range of / holds g', at_g, ranges)
     assert not any(a <= at_f <= b for a, b in ranges), \
         (kind, 'a logged index range of / holds the committed name f', at_f, ranges)
+if kind == 'nbytes':
+    # f is logged in full: at the generation it was committed with, older
+    # than the transaction that logged it, with its 65 links and its
+    # rewritten 33 bytes in one plain inline extent of that transaction.
+    # Its logged nbytes is neither 0 nor the 33 bytes committed: stale
+    # bytes the kernel's own replay does not read. Only f was fsynced, so
+    # the log holds no entry or index range of a directory.
+    ext = re.search(r'key \((\d+) INODE_EXTREF \d+\) itemoff \d+ itemsize \d+\n'
+                    r'\s+index \d+ parent 256 namelen 255 name: ', dump)
+    assert ext, (kind, 'native dump shows no logged extended reference of f to /')
+    f = ext.group(1)
+    item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation (\d+) transid (\d+) size 33 nbytes (\d+)\n'
+                     r'\s+block group \d+ mode 100644 links (\d+) ' % f, dump)
+    assert item, (kind, 'native dump shows no logged inode item of f')
+    generation, transid, nbytes, links = map(int, item.groups())
+    assert links == 65 and 0 < generation < transid, \
+        (kind, 'f is not logged as a committed inode with 65 links', generation, transid, links)
+    assert nbytes not in (0, 33), (kind, 'f is logged with a counted nbytes', nbytes)
+    assert re.search(r'key \(%s EXTENT_DATA 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation %d type 0 \(inline\)\n'
+                     r'\s+inline extent data size 33 ram_bytes 33 compression 0\b'
+                     % (f, transid), dump), \
+        (kind, 'native dump shows no logged inline extent of the 33 rewritten bytes')
+    assert not re.search(r'key \(\d+ (DIR_ITEM|DIR_INDEX|DIR_LOG_ITEM|DIR_LOG_INDEX) ', dump), \
+        (kind, 'the log holds an entry or index range of a directory')
 if kind == 'compressedinline':
     # The native tool must print a compressed inline extent: nonzero
     # compression on the inline line itself, stored smaller than its bytes.
