@@ -280,7 +280,9 @@ while IFS= read -r -d '' image; do
         exit 1
     fi
     mkdir -p "$(dirname "$DISKS/$rel")"
-    cp --sparse=always "$image" "$DISKS/$rel.partial"
+    # GNU and BSD dd both preserve zero-filled runs as holes. Spell the
+    # block size in bytes so it has the same meaning on either userland.
+    dd if="$image" of="$DISKS/$rel.partial" bs=1048576 conv=sparse status=none
     mv -f "$DISKS/$rel.partial" "$DISKS/$rel"
     rm -f "$image"
     built=$((built + 1))
