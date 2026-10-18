@@ -157,6 +157,7 @@ simple_quota_oracle       3
 snapshot_shared_write     1
 space_cache_v1_kernel     2
 split_oracle              4
+subvol_cow_write_kernel   1
 subvol_create_kernel      1
 subvol_default_kernel     1
 subvol_namespace_kernel   1
