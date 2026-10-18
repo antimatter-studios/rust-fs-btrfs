@@ -568,7 +568,11 @@ impl Filesystem {
         let groups: Vec<BlockGroup> = self
             .block_groups()?
             .into_iter()
-            .filter(|g| g.holds_metadata() && self.emptying != Some(g.start))
+            .filter(|g| {
+                g.holds_metadata()
+                    && self.emptying != Some(g.start)
+                    && self.block_group_is_writable(g)
+            })
             .collect();
         for runs in self.free_extents_by_group(&groups)? {
             for run in runs {
@@ -594,6 +598,22 @@ impl Filesystem {
 }
 
 impl Filesystem {
+    /// A pool allocation must be writable on every stripe, including
+    /// mirrors and stripes the first byte does not map to. Seed groups
+    /// stay readable but cannot supply either data or tree blocks.
+    /// Single-device and read-only planning mounts have no writable pool.
+    pub(crate) fn block_group_is_writable(&self, group: &BlockGroup) -> bool {
+        self.map.chunk_for(group.start).is_some_and(|chunk| {
+            chunk.stripes.iter().all(|stripe| {
+                self.writable_pool.is_empty()
+                    || self
+                        .writable_pool
+                        .get(&stripe.devid)
+                        .is_some_and(|device| device.is_writable())
+            })
+        })
+    }
+
     /// Find room for new data extents, one of each length in `lens`.
     ///
     /// [`Filesystem::find_metadata_block`]'s counterpart for file data:
@@ -635,8 +655,13 @@ impl Filesystem {
     /// As [`Filesystem::find_data_extents`].
     pub(crate) fn find_extents_in(&self, groups: &[BlockGroup], lens: &[u64]) -> Result<Vec<u64>> {
         let sectorsize = u64::from(self.sb.sectorsize).max(1);
+        let groups: Vec<_> = groups
+            .iter()
+            .copied()
+            .filter(|g| self.block_group_is_writable(g))
+            .collect();
         let mut runs: Vec<FreeExtent> = self
-            .free_extents_by_group(groups)?
+            .free_extents_by_group(&groups)?
             .into_iter()
             .flatten()
             .collect();
@@ -755,6 +780,57 @@ pub(crate) fn merge_adjacent(runs: Vec<FreeExtent>) -> Vec<FreeExtent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A writable first mirror does not make a whole block group writable.
+    /// The seed fixture and btrfs check independently cover the disk format.
+    #[test]
+    fn allocators_refuse_groups_with_an_unwritable_stripe() {
+        use fs_core::{BlockDevice, FileDevice};
+        use std::sync::Arc;
+        let image =
+            std::path::PathBuf::from(fs_btrfs_test_support::temp_path!("unwritable-stripe.img"));
+        std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+        std::fs::File::create(&image)
+            .unwrap()
+            .set_len(128 << 20)
+            .unwrap();
+        let dev = Arc::new(FileDevice::open_rw(&image).unwrap());
+        crate::mkfs::format(dev.as_ref(), &crate::mkfs::Options::default()).unwrap();
+        let mut fs = Filesystem::mount_rw(dev.clone()).unwrap();
+        let id = fs.sb.dev_item.devid;
+        fs.writable_pool.insert(id, dev as Arc<dyn BlockDevice>);
+        let groups = fs.block_groups().unwrap();
+        assert!(fs.find_metadata_block().is_ok());
+        assert!(fs.find_data_extents(&[4096]).is_ok());
+        let chunks = fs.map.chunks().to_vec();
+        fs.map = crate::chunk::ChunkMap::new();
+        for mut chunk in chunks {
+            chunk.chunk_type &= !crate::chunk::block_group::DUP;
+            chunk.chunk_type |= crate::chunk::block_group::RAID1;
+            chunk.num_stripes = 2;
+            let mut seed = chunk.stripes[0];
+            seed.devid = id + 1;
+            chunk.stripes = vec![chunk.stripes[0], seed];
+            fs.map.insert(chunk).unwrap();
+        }
+        assert!(
+            fs.find_metadata_block().is_err(),
+            "metadata chose a seed group"
+        );
+        assert!(
+            fs.find_data_extents(&[4096]).is_err(),
+            "data chose a seed group"
+        );
+        let data: Vec<_> = groups.into_iter().filter(|g| g.holds_data()).collect();
+        assert!(
+            fs.find_extents_in(&data, &[4096]).is_err(),
+            "explicit groups bypassed the filter"
+        );
+        assert!(
+            fs.plan_transaction(&[fs.sb.chunk_root]).is_err(),
+            "system blocks chose a seed group"
+        );
+    }
 
     fn run(start: u64, len: u64) -> FreeExtent {
         FreeExtent { start, len }

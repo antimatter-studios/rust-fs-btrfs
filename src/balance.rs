@@ -689,7 +689,19 @@ impl Filesystem {
     /// `flags`, with its empty block group, in one committed transaction,
     /// and return its logical address. DUP takes two stripes on this device.
     fn allocate_chunk(&mut self, flags: u64, length: u64) -> Result<u64> {
-        let devid = self.sb.dev_item.devid;
+        // A seed may have a device item and abundant physical space;
+        // only a device this mount can write may supply a new stripe.
+        let devid = if self.writable_pool.is_empty() {
+            self.writable
+                .as_ref()
+                .filter(|device| device.is_writable())
+                .map(|_| self.sb.dev_item.devid)
+        } else {
+            self.writable_pool
+                .iter()
+                .find_map(|(&id, device)| device.is_writable().then_some(id))
+        }
+        .ok_or(Error::ReadOnly)?;
         let copies = match ChunkProfile::from_type(flags)? {
             ChunkProfile::Single => 1,
             ChunkProfile::Dup => 2,
@@ -734,7 +746,7 @@ impl Filesystem {
             })?;
         dev_item[DEV_ITEM_BYTES_USED..DEV_ITEM_BYTES_USED + 8].copy_from_slice(&used.to_le_bytes());
 
-        let dev_uuid = self.sb.dev_item.uuid;
+        let dev_uuid = crate::superblock::DevItem::parse(&dev_item)?.uuid;
         let stripe_list: Vec<(u64, u64, [u8; 16])> =
             stripes.iter().map(|&p| (devid, p, dev_uuid)).collect();
         let mut tree_edits = vec![
@@ -1518,6 +1530,55 @@ mod tests {
     /// Tests that need the oracle VM; the unit tier skips them by name.
     mod needs_host {
         use super::*;
+
+        #[test]
+        fn a_sprouted_pool_allocates_new_chunk_stripes_only_on_the_sprout() {
+            use fs_btrfs_test_support::{fixture, oracle, sha256_hex, temp_path};
+            use fs_core::{BlockDevice, FileDevice};
+            use std::sync::Arc;
+            let seed = std::path::PathBuf::from(temp_path!("chunk-seed.img"));
+            let sprout = std::path::PathBuf::from(temp_path!("chunk-sprout.img"));
+            std::fs::copy(fixture("seed/btrfs-seed.img"), &seed).unwrap();
+            std::fs::copy(fixture("seed/btrfs-sprout.img"), &sprout).unwrap();
+            let before = sha256_hex(&std::fs::read(&seed).unwrap());
+            let members: Vec<Arc<dyn BlockDevice>> = [&seed, &sprout]
+                .iter()
+                .map(|p| Arc::new(FileDevice::open_rw(p).unwrap()) as Arc<dyn BlockDevice>)
+                .collect();
+            let mut fs = Filesystem::mount_pool_rw(members).unwrap();
+            let sprout_id = fs.sb.dev_item.devid;
+            for flags in [bg::DATA, bg::METADATA | bg::DUP] {
+                let at = fs
+                    .allocate_chunk(flags, 8 * MIB)
+                    .expect("allocate on the sprout");
+                let chunk = fs.map.chunk_for(at).unwrap();
+                assert!(chunk.stripes.iter().all(|s| s.devid == sprout_id));
+                let extents: Vec<_> = fs
+                    .dev_extents()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|e| e.chunk_offset == at)
+                    .collect();
+                assert_eq!(extents.len(), chunk.stripes.len());
+                assert!(extents.iter().all(|e| e.devid == sprout_id));
+            }
+            drop(fs);
+            assert_eq!(sha256_hex(&std::fs::read(&seed).unwrap()), before);
+            let out = oracle("bash")
+                .arg(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/support/check-pool.sh"),
+                )
+                .arg(&sprout)
+                .arg(&seed)
+                .output();
+            assert!(
+                out.status.success(),
+                "btrfs check: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
 
         /// A private copy of an oracle-made image, removed even on a panic.
         struct RefusalImage(std::path::PathBuf);

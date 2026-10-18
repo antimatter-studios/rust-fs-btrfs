@@ -15,7 +15,7 @@
 //! seed's before sprouting and the sprout's after.
 
 use fs_btrfs::fs::Filesystem;
-use fs_btrfs_test_support::{fixture, sha256_hex, temp_path};
+use fs_btrfs_test_support::{fixture, oracle, sha256_hex, temp_path};
 use fs_core::{BlockDevice, BlockRead, FileDevice};
 use std::sync::Arc;
 
@@ -160,4 +160,123 @@ fn an_unrelated_device_given_for_writing_is_still_another_filesystem() {
         Ok(_) => panic!("an unrelated filesystem's device was accepted beside the sprout"),
         Err(e) => assert!(e.to_string().contains("different filesystems"), "{e}"),
     }
+}
+
+/// Allocations, including the transaction's bookkeeping trees, must not
+/// consume free space in the seed's otherwise ordinary block groups (#625).
+#[test]
+fn new_data_and_tree_blocks_land_only_on_the_sprout() {
+    let seed_path = std::path::PathBuf::from(temp_path!("seed-allocation-seed.img"));
+    let sprout_path = std::path::PathBuf::from(temp_path!("seed-allocation-sprout.img"));
+    for (name, copy) in [
+        ("btrfs-seed.img", &seed_path),
+        ("btrfs-sprout.img", &sprout_path),
+    ] {
+        std::fs::copy(fixture(&format!("seed/{name}")), copy).expect("copy the member");
+    }
+    let before = sha256_hex(&std::fs::read(&seed_path).expect("read the seed"));
+    let seed = Arc::new(FileDevice::open_rw(&seed_path).unwrap()) as Arc<dyn BlockDevice>;
+    let sprout = Arc::new(FileDevice::open_rw(&sprout_path).unwrap()) as Arc<dyn BlockDevice>;
+    let mut fs = Filesystem::mount_pool_rw(vec![seed, sprout]).expect("mount the pair");
+    let sprout_id = fs.superblock().dev_item.devid;
+    let generation = fs.superblock().generation;
+    let old_chunks: std::collections::BTreeSet<u64> =
+        fs.chunk_map().chunks().iter().map(|c| c.logical).collect();
+    assert!(
+        fs.chunk_map()
+            .chunks()
+            .iter()
+            .any(|c| { c.stripes.iter().any(|s| s.devid != sprout_id) }),
+        "the pair must contain seed chunks"
+    );
+    let at = fs.find_metadata_block().expect("free writable metadata");
+    assert_on_sprout(&fs, at, sprout_id);
+    let parent = fs.lookup_path("/").unwrap().ino;
+    let ino = fs
+        .create(parent, b"allocated-on-sprout", 0o644, 0, 0)
+        .expect("create");
+    let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+    assert_eq!(
+        fs.write(ino, 0, &payload).expect("write regular data"),
+        payload.len()
+    );
+    assert_eq!(fs.read_file(ino).unwrap(), payload);
+    assert!(fs.superblock().generation > generation);
+    for chunk in fs
+        .chunk_map()
+        .chunks()
+        .iter()
+        .filter(|c| !old_chunks.contains(&c.logical))
+    {
+        assert!(
+            chunk.stripes.iter().all(|s| s.devid == sprout_id),
+            "new chunk on seed"
+        );
+    }
+    let mut roots = vec![fs.superblock().root, fs.superblock().chunk_root];
+    for (_, ty, _, data) in fs.root_tree_items().unwrap() {
+        if ty == 132 && data.len() >= 184 {
+            let root = u64::from_le_bytes(data[176..184].try_into().unwrap());
+            if root != 0 {
+                roots.push(root);
+            }
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut new_blocks = 0;
+    let mut data_extents = 0;
+    while let Some(at) = roots.pop() {
+        if !seen.insert(at) {
+            continue;
+        }
+        let block = fs.read_tree_block(at).expect("read a reachable tree block");
+        if block.header.generation > generation {
+            assert_on_sprout(&fs, at, sprout_id);
+            new_blocks += 1;
+        }
+        if let Some(children) = block.body.key_ptrs() {
+            roots.extend(children.iter().map(|p| p.blockptr));
+        }
+        if let Some(items) = block.body.items() {
+            for item in items.iter().filter(|i| {
+                block.header.owner == 5 && i.key.objectid == ino && i.key.key_type == 108
+            }) {
+                let data = block.item_data(item).unwrap();
+                assert!(data.len() >= 53 && data[20] == 1, "regular file extent");
+                let at = u64::from_le_bytes(data[21..29].try_into().unwrap());
+                assert_on_sprout(&fs, at, sprout_id);
+                data_extents += 1;
+            }
+        }
+    }
+    assert!(new_blocks >= 3, "the committed trees must have moved");
+    assert!(
+        data_extents > 0,
+        "the new file must allocate regular extents"
+    );
+    drop(fs);
+    assert_eq!(
+        sha256_hex(&std::fs::read(&seed_path).unwrap()),
+        before,
+        "seed changed"
+    );
+    let out = oracle("bash")
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/check-pool.sh"))
+        .arg(&sprout_path)
+        .arg(&seed_path)
+        .output();
+    assert!(
+        out.status.success(),
+        "btrfs check of the pair: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn assert_on_sprout(fs: &Filesystem, at: u64, sprout_id: u64) {
+    let chunk = fs.chunk_map().chunk_for(at).expect("a mapped allocation");
+    assert!(
+        chunk.stripes.iter().all(|s| s.devid == sprout_id),
+        "allocation at {at} has a stripe on the seed"
+    );
 }
