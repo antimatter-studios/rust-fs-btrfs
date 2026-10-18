@@ -167,6 +167,8 @@ artefacts_for() {
             echo dirtylog/btrfs-dirty-log-rmdir.logdump
             echo dirtylog/btrfs-dirty-log-linkremoved.img
             echo dirtylog/btrfs-dirty-log-linkremoved.logdump
+            echo dirtylog/btrfs-dirty-log-createdlink.img
+            echo dirtylog/btrfs-dirty-log-createdlink.logdump
             ;;
         cli)
             echo cli/btrfs-cli.img; echo cli/btrfs-cli.superdump; echo cli/btrfs-cli.manifest
