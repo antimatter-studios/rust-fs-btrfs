@@ -15,7 +15,7 @@
 //! seed's before sprouting and the sprout's after.
 
 use fs_btrfs::fs::Filesystem;
-use fs_btrfs_test_support::{fixture, oracle, sha256_hex, temp_path};
+use fs_btrfs_test_support::{fixture, guest_kernel_pool_read, oracle, sha256_hex, temp_path};
 use fs_core::{BlockDevice, BlockRead, FileDevice};
 use std::sync::Arc;
 
@@ -347,6 +347,120 @@ fn a_subvolume_handle_on_the_sprouted_pool_keeps_writing_with_the_seed() {
         .read_path("/written-through-subvolume")
         .expect("the file through the pool");
     assert_eq!(reread, payload, "the file read back through the pool");
+}
+
+/// A file whose extents live on the seed is overwritten in the sprouted
+/// pool (#563): the new bytes are written copy-on-write onto the sprout,
+/// the old seed extents leave only the sprout's accounting, the seed is
+/// never written, `btrfs check` finds the pair clean, and the guest kernel
+/// reads back the exact payload.
+#[test]
+fn a_file_that_lives_on_the_seed_is_overwritten_onto_the_sprout() {
+    let seed_path = std::path::PathBuf::from(temp_path!("seed-overwrite-seed.img"));
+    let sprout_path = std::path::PathBuf::from(temp_path!("seed-overwrite-sprout.img"));
+    for (name, copy) in [
+        ("btrfs-seed.img", &seed_path),
+        ("btrfs-sprout.img", &sprout_path),
+    ] {
+        std::fs::copy(fixture(&format!("seed/{name}")), copy).expect("copy the member");
+    }
+    let before = sha256_hex(&std::fs::read(&seed_path).expect("read the seed"));
+    let seed = Arc::new(FileDevice::open_rw(&seed_path).unwrap()) as Arc<dyn BlockDevice>;
+    let sprout = Arc::new(FileDevice::open_rw(&sprout_path).unwrap()) as Arc<dyn BlockDevice>;
+    let mut fs = Filesystem::mount_pool_rw(vec![seed, sprout]).expect("mount the pair");
+    let sprout_id = fs.superblock().dev_item.devid;
+    let generation = fs.superblock().generation;
+    let ino = fs.lookup_path("/old/big.bin").expect("the seed's file").ino;
+    let old = file_extents(&fs, ino);
+    assert!(!old.is_empty(), "the seed's file has regular extents");
+    for &at in &old {
+        let chunk = fs.chunk_map().chunk_for(at).expect("a mapped extent");
+        assert!(
+            chunk.stripes.iter().all(|s| s.devid != sprout_id),
+            "the file at {at} must start out on the seed"
+        );
+    }
+    let size = fs.read_file(ino).expect("read the seed's file").len();
+    let payload: Vec<u8> = (0..size).map(|i| (i % 247) as u8).collect();
+    assert_eq!(
+        fs.write(ino, 0, &payload)
+            .expect("overwrite the seed's file"),
+        payload.len()
+    );
+    assert!(
+        fs.superblock().generation > generation,
+        "nothing was committed"
+    );
+    assert_eq!(fs.read_file(ino).unwrap(), payload);
+    let new = file_extents(&fs, ino);
+    assert!(!new.is_empty(), "the overwritten file has regular extents");
+    for &at in &new {
+        assert_on_sprout(&fs, at, sprout_id);
+    }
+    drop(fs);
+    assert_eq!(
+        sha256_hex(&std::fs::read(&seed_path).unwrap()),
+        before,
+        "seed changed"
+    );
+    // The helper mounts its first member, so the sprout comes first.
+    let images = [sprout_path.to_string_lossy(), seed_path.to_string_lossy()];
+    let read = guest_kernel_pool_read(
+        &[images[0].as_ref(), images[1].as_ref()],
+        "cat \"$MNT/old/big.bin\"",
+    );
+    assert_eq!(
+        read.check_status, 0,
+        "btrfs check --readonly rejected the pair:\n{}",
+        read.check
+    );
+    assert!(
+        read.out.status.success(),
+        "the guest kernel could not read the pair:\n{}",
+        String::from_utf8_lossy(&read.out.stderr)
+    );
+    assert_eq!(
+        read.out.stdout.len(),
+        payload.len(),
+        "kernel readback length"
+    );
+    assert!(
+        read.out.stdout == payload,
+        "the guest kernel read different bytes from the overwritten file"
+    );
+}
+
+/// The disk addresses of every regular extent of `ino` in the top-level
+/// subvolume, holes left out.
+fn file_extents(fs: &Filesystem, ino: u64) -> Vec<u64> {
+    let mut roots = Vec::new();
+    for (objectid, ty, _, data) in fs.root_tree_items().unwrap() {
+        if objectid == 5 && ty == 132 && data.len() >= 184 {
+            roots.push(u64::from_le_bytes(data[176..184].try_into().unwrap()));
+        }
+    }
+    let mut out = Vec::new();
+    while let Some(at) = roots.pop() {
+        let block = fs.read_tree_block(at).expect("read a tree block");
+        if let Some(children) = block.body.key_ptrs() {
+            roots.extend(children.iter().map(|p| p.blockptr));
+        }
+        if let Some(items) = block.body.items() {
+            for item in items
+                .iter()
+                .filter(|i| i.key.objectid == ino && i.key.key_type == 108)
+            {
+                let data = block.item_data(item).unwrap();
+                if data.len() >= 53 && data[20] == 1 {
+                    let at = u64::from_le_bytes(data[21..29].try_into().unwrap());
+                    if at != 0 {
+                        out.push(at);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn assert_on_sprout(fs: &Filesystem, at: u64, sprout_id: u64) {

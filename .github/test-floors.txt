@@ -192,8 +192,10 @@ send_stream_kernel        3
 send_stream_kernel        2
 send_stream_kernel        1
 scrub_oracle              2
-# Eight cases: the allocation regression adds a committed write and a pair check (#625).
-seed_oracle               8
+# Ten cases: the allocation regression adds a committed write and a pair check (#625),
+# the subvolume handle a second write (#628), and the overwritten seed file a
+# kernel readback of the pair (#563).
+seed_oracle               10
 # One declared kernel case reads the exact crate-written binary payload
 # from the complete seed and sprout pair (#626); CI must execute it.
 seed_write_kernel         1
