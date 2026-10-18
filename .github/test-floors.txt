@@ -88,7 +88,7 @@ compression_oracle        3
 # Sparse EOF growth adds one comparison with four twin-file shapes (#601).
 # A cross-leaf keyed-reference case adds one kernel oracle (#607);
 # all 19 cases must execute in the first full CI run.
-cow_write_oracle          20
+cow_write_oracle          21
 crash_consistency         3
 csum_oracle               6
 csum_width_populated      1

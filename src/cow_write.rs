@@ -68,11 +68,10 @@
 //! Each refusal is a case not yet written, named so a caller can tell
 //! which it met:
 //!
-//! - a checksum tree leaf the change would empty that is its parent's
-//!   first child (an emptied leaf after it leaves its tree, #546), or a
-//!   full one that cannot be split (its parent node has no room for
-//!   another pointer): removing a first child and splitting a node are
-//!   not written yet;
+//! - a checksum tree change that would empty every leaf under one node
+//!   (an emptied leaf otherwise leaves its tree, #546, #547), or a full
+//!   leaf that cannot be split (its parent node has no room for another
+//!   pointer): removing a node and splitting a node are not written yet;
 //! - a write past the end of a file, on a volume **without the no-holes
 //!   feature**, whose gap an extent item past the end (a preallocated one)
 //!   already reaches into;
