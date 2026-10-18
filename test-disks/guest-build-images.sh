@@ -39,7 +39,7 @@ set -euo pipefail
 OUT="$1"
 shift
 
-TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog cli features scrub seed squota"
+TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog cli features scrub seed squota encoded"
 
 # ARGUMENTS FIRST, ENVIRONMENT SECOND. A misspelt target is the caller's
 # mistake and should be named as one wherever it is made; the root and
@@ -334,6 +334,88 @@ build_compression() {
         publish "$img" "${img%.img}.superdump" "$manifest" "$record"
         note "built btrfs-comp-$algo"
     done
+}
+
+# ---------------------------------------------------------------------
+# encoded — a volume whose compressed extents were stored through the
+# kernel's encoded-write path rather than compressed by the kernel (#556).
+#
+# The files are written on a compressing mount: zstd from the mount
+# option, zlib and lzo per file from the compression property, and one
+# incompressible file that stays plain. A read-only snapshot of them is
+# sent with `btrfs send --compressed-data`, which carries the extents
+# still compressed, and received onto a second volume mounted WITHOUT a
+# compression option. Every compressed extent on that volume was
+# therefore handed to the kernel already compressed, through the
+# encoded-write ioctl receive uses.
+#
+# If receive fell back to decompressing (an old kernel, a refused ioctl),
+# the received volume would hold only plain extents and the dump-tree
+# check below fails the build, rather than a test passing over a fixture
+# that does not hold what it claims to.
+#
+# In its own directory, so the suites that walk every image in
+# test-disks/ do not take it up; its own suite is the one that reads it.
+# ---------------------------------------------------------------------
+build_encoded() {
+    local src="$WORK/btrfs-encoded-source.img" img="$WORK/btrfs-encoded.img"
+    local manifest="$WORK/btrfs-encoded.manifest" record="$WORK/btrfs-encoded.compression"
+    local stream="$WORK/btrfs-encoded.stream" algo
+    rm -f "$src" "$img" "$manifest" "$record" "$stream"
+    truncate -s 400M "$src"
+    mkfs.btrfs -f "$src" >/dev/null
+    mount -o loop,compress=zstd "$src" "$MNT"
+    btrfs subvolume create "$MNT/vol" >/dev/null
+    python3 -c "print('the quick brown fox jumps over the lazy dog '*40000)" > "$MNT/vol/big-zstd.txt"
+    for algo in zlib lzo; do
+        touch "$MNT/vol/big-$algo.txt"
+        btrfs property set "$MNT/vol/big-$algo.txt" compression "$algo"
+        python3 -c "print('pack my box with five dozen liquor jugs $algo '*40000)" > "$MNT/vol/big-$algo.txt"
+    done
+    dd if=/dev/urandom of="$MNT/vol/plain.bin" bs=1M count=2 status=none
+    echo 'inline and compressible aaaaaaaaaaaaaaaaaaaaaaaa' > "$MNT/vol/inline.txt"
+    sync
+    btrfs subvolume snapshot -r "$MNT/vol" "$MNT/sent" >/dev/null
+    sync
+    btrfs send --proto 2 --compressed-data -f "$stream" "$MNT/sent" >/dev/null
+    umount "$MNT"
+    rm -f "$src"
+
+    truncate -s 400M "$img"
+    mkfs.btrfs -f "$img" >/dev/null
+    mount -o loop "$img" "$MNT"
+    btrfs receive -f "$stream" "$MNT" >/dev/null
+    sync
+    umount "$MNT"
+    rm -f "$stream"
+
+    # What the kernel says each received file holds, read back through
+    # its own driver on a read-only mount so the image is not disturbed.
+    mount -o loop,ro "$img" "$MNT"
+    ( cd "$MNT"
+      find . -mindepth 1 -type f | sort | while read -r p; do
+          printf '%s\t%s\t%s\n' "${p#.}" "$(stat -c%s "$p")" \
+              "$(sha256sum "$p" | cut -d' ' -f1)"
+      done
+    ) > "$manifest"
+    umount "$MNT"
+
+    btrfs inspect-internal dump-tree "$img" 2>/dev/null |
+        grep -o 'extent compression [0-9]* ([a-z]*)' | sort -u > "$record"
+    for algo in zstd zlib lzo none; do
+        grep -q "($algo)" "$record" || {
+            echo "guest-build-images: btrfs-encoded has no ($algo) extent after the receive: $(tr '\n' ' ' < "$record")" >&2
+            exit 1
+        }
+    done
+    mkdir -p "$OUT/encoded"
+    local f
+    for f in "$img" "$manifest" "$record"; do
+        cp --sparse=always "$f" "$OUT/encoded/$(basename "$f").partial"
+        mv -f "$OUT/encoded/$(basename "$f").partial" "$OUT/encoded/$(basename "$f")"
+        rm -f "$f"
+    done
+    note "built encoded/btrfs-encoded (received through encoded writes)"
 }
 
 # ---------------------------------------------------------------------
