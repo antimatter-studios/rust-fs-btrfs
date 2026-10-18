@@ -173,6 +173,7 @@ artefacts_for() {
             ;;
         features)
             echo features/btrfs-bgt.img; echo features/btrfs-bgt.manifest
+            echo features/btrfs-zoned.img; echo features/btrfs-zoned.manifest
             echo features/btrfs-verity.img; echo features/btrfs-verity.manifest
             echo features/btrfs-verity-tampered.img
             ;;

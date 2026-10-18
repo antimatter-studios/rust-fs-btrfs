@@ -284,9 +284,13 @@ pub mod incompat {
     ///
     /// The exclusions are deliberate, not accidental:
     ///
-    /// - [`ZONED`], [`EXTENT_TREE_V2`], [`RAID_STRIPE_TREE`],
+    /// - [`EXTENT_TREE_V2`], [`RAID_STRIPE_TREE`],
     ///   [`REMAP_TREE`] — each restructures something the read path
     ///   depends on. [`super::refuse_unreadable_incompat`] refuses them.
+    ///
+    /// [`ZONED`] is readable on a regular device with fixed-offset
+    /// superblocks. `read_superblock` refuses a real zoned device's
+    /// superblock log, and `mount_rw` refuses all zoned writes (#454).
     ///
     /// [`SIMPLE_QUOTA`] IS accepted (#270): it adds an owner reference to
     /// each data extent item and keeps usage in the quota tree, neither of
@@ -321,6 +325,7 @@ pub mod incompat {
         // kernel wrote. Never written: `mount_rw` takes one device, and a
         // parity chunk spans several.
         | RAID56
+        | ZONED
         | SIMPLE_QUOTA;
 }
 
@@ -1150,12 +1155,34 @@ impl Superblock {
 ///
 /// # Errors
 ///
-/// [`Error::UnsupportedFeature`] when an intact copy declares an
-/// incompatible feature this driver cannot read. Otherwise, when no copy
+/// [`Error::UnsupportedFeature`] when a zoned superblock log is detected
+/// at zero, or an intact copy declares an incompatible feature this
+/// driver cannot read. Otherwise, when no copy
 /// is valid, the primary's own error -- the one a caller would have seen
 /// before.
 pub fn read_superblock(dev: &dyn fs_core::BlockRead) -> Result<(Superblock, usize)> {
     let size = dev.size_bytes();
+    // Real zoned devices keep a superblock log starting at zero. An
+    // image has no zone write pointers, so a fixed-offset copy could be
+    // stale even when its checksum verifies. Inspect the first record
+    // before selecting any conventional mirror (#454). Its geometry is
+    // deliberately not parsed as a conventional superblock.
+    // Format reference: https://btrfs.readthedocs.io/en/latest/Zoned-mode.html
+    if size >= SUPER_INFO_SIZE as u64 {
+        let mut log = [0u8; SUPER_INFO_SIZE];
+        dev.read_at(0, &mut log)?;
+        if log[offsets::MAGIC..offsets::MAGIC + BTRFS_MAGIC.len()] == BTRFS_MAGIC
+            && le64(&log, offsets::INCOMPAT_FLAGS) & incompat::ZONED != 0
+            && ChecksumType::from_raw(le16(&log, offsets::CSUM_TYPE))
+                .is_ok_and(|kind| kind.verify(&log[CSUM_SIZE..], &log[..CSUM_SIZE]))
+        {
+            return Err(Error::UnsupportedFeature(
+                "this zoned device uses a superblock log; its latest superblock cannot be \
+                 located without zone write pointers, so fixed-offset copies cannot be read"
+                    .into(),
+            ));
+        }
+    }
     let mut best: Option<(Superblock, usize)> = None;
     let mut primary_error = None;
     for (copy, &offset) in SUPER_OFFSETS.iter().enumerate() {
@@ -1494,8 +1521,8 @@ pub(crate) mod tests {
         ));
     }
 
-    /// Known features this driver deliberately does not claim. They must
-    /// be refused, not ignored.
+    /// Keep the original refusal cases: zoned regular-device layouts
+    /// are now accepted; the remaining unsupported features are refused.
     #[test]
     fn rejects_known_but_unimplemented_incompat_features() {
         for bit in [
@@ -1511,10 +1538,14 @@ pub(crate) mod tests {
                 incompat::MIXED_BACKREF | bit,
             );
             reseal(&mut b);
-            assert!(
-                matches!(Superblock::parse(&b), Err(Error::UnsupportedFeature(_))),
-                "incompat bit {bit:#x} should have been refused"
-            );
+            if bit == incompat::ZONED {
+                assert!(Superblock::parse(&b).is_ok(), "zoned regular-device layout");
+            } else {
+                assert!(
+                    matches!(Superblock::parse(&b), Err(Error::UnsupportedFeature(_))),
+                    "incompat bit {bit:#x} should have been refused"
+                );
+            }
         }
     }
 
@@ -1556,6 +1587,76 @@ pub(crate) mod tests {
         b[offsets::METADATA_UUID..offsets::METADATA_UUID + UUID_SIZE].copy_from_slice(&TEST_FSID);
         reseal(&mut b);
         assert!(Superblock::parse(&b).is_ok());
+    }
+
+    #[test]
+    fn a_fixed_offset_zoned_superblock_is_readable() {
+        let mut raw = sb_bytes();
+        let flags = le64(&raw, offsets::INCOMPAT_FLAGS) | incompat::ZONED;
+        put64(&mut raw, offsets::INCOMPAT_FLAGS, flags);
+        reseal(&mut raw);
+        assert!(Superblock::parse_at(&raw, SUPER_INFO_OFFSET).is_ok());
+    }
+
+    /// A real zoned device's first log record must not be passed over
+    /// for a stale, ordinary superblock at 64 KiB (#454).
+    struct ZonedLog {
+        damaged: bool,
+        zoned: bool,
+    }
+
+    impl fs_core::BlockRead for ZonedLog {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+            let mut raw = sb_bytes();
+            put64(&mut raw, offsets::BYTENR, offset);
+            if offset == 0 && self.zoned {
+                put64(&mut raw, offsets::INCOMPAT_FLAGS, incompat::ZONED);
+            }
+            reseal(&mut raw);
+            if offset == 0 && self.damaged {
+                raw[CSUM_SIZE - 1] ^= 1;
+                raw[offsets::LABEL] ^= 1;
+            }
+            buf.copy_from_slice(&raw);
+            Ok(())
+        }
+
+        fn size_bytes(&self) -> u64 {
+            256 << 20
+        }
+    }
+
+    #[test]
+    fn a_zoned_superblock_log_is_refused_before_a_stale_fixed_copy() {
+        let dev = ZonedLog {
+            damaged: false,
+            zoned: true,
+        };
+        match read_superblock(&dev) {
+            Err(Error::UnsupportedFeature(message)) => {
+                assert!(message.contains("zoned"), "{message}");
+                assert!(message.contains("superblock log"), "{message}");
+            }
+            other => panic!("a zoned log was read around: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_damaged_zoned_header_at_zero_is_not_a_superblock_log() {
+        let dev = ZonedLog {
+            damaged: true,
+            zoned: true,
+        };
+        assert_eq!(read_superblock(&dev).unwrap().1, 0);
+    }
+
+    #[test]
+    fn a_non_zoned_header_at_zero_does_not_block_a_fixed_copy() {
+        let dev = ZonedLog {
+            damaged: false,
+            zoned: false,
+        };
+        assert_eq!(read_superblock(&dev).unwrap().1, 0);
     }
 
     /// Read-only-compatible bits never block a read-only mount, however
