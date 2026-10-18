@@ -205,3 +205,74 @@ fn a_cascade_stops_at_an_ancestor_with_one_pointer_free() {
     }
     assert!(plan.split_of(path[3]).is_none());
 }
+
+/// A record and its keyed references can start different leaves with
+/// the same objectid. Address routing must select the record's leaf.
+#[test]
+fn an_extent_record_precedes_a_leaf_starting_with_its_keyed_references() {
+    let dev = Arc::new(Sparse::default());
+    crate::mkfs::format(dev.as_ref(), &crate::mkfs::Options::default()).unwrap();
+    let fs = Filesystem::mount(dev.clone() as Arc<dyn BlockRead>).unwrap();
+    let group = fs
+        .block_groups()
+        .unwrap()
+        .into_iter()
+        .find(|g| g.holds_metadata())
+        .unwrap();
+    let root = group.start + group.length / 2;
+    let size = u64::from(fs.sb.nodesize);
+    let record = root + size;
+    let refs = record + size;
+    let original = fs
+        .read_tree_block(fs.tree_root(objectid::EXTENT_TREE).unwrap())
+        .unwrap();
+    let id = BlockIdentity {
+        bytenr: root,
+        owner: objectid::EXTENT_TREE,
+        generation: fs.sb.generation,
+        level: 1,
+        flags: tree_write::flags_for_new_block(),
+        chunk_tree_uuid: tree_write::chunk_tree_uuid_of(original.bytes()),
+    };
+    let record_key = DiskKey {
+        objectid: 1 << 20,
+        key_type: key_type::EXTENT_ITEM,
+        offset: 65536,
+    };
+    let ref_key = DiskKey {
+        key_type: crate::backref::EXTENT_DATA_REF,
+        offset: 123,
+        ..record_key
+    };
+    let mut ptrs = Vec::new();
+    for (at, key) in [(record, record_key), (refs, ref_key)] {
+        let leaf = tree_write::build_leaf(
+            &fs.sb,
+            BlockIdentity {
+                bytenr: at,
+                level: 0,
+                ..id
+            },
+            &[LeafItem { key, data: &[1] }],
+        )
+        .unwrap();
+        for mirror in 0..fs.map.mirrors_at(at).unwrap() {
+            dev.write_at(fs.map.map_mirror(at, mirror).unwrap().physical, &leaf)
+                .unwrap();
+        }
+        ptrs.push(KeyPtr {
+            key,
+            blockptr: at,
+            generation: id.generation,
+        });
+    }
+    let node = tree_write::build_node(&fs.sb, id, &ptrs).unwrap();
+    for mirror in 0..fs.map.mirrors_at(root).unwrap() {
+        dev.write_at(fs.map.map_mirror(root, mirror).unwrap().physical, &node)
+            .unwrap();
+    }
+    assert_eq!(
+        fs.leaves_holding(root, &[record_key.objectid]).unwrap(),
+        BTreeSet::from([record])
+    );
+}

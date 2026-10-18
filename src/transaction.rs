@@ -1610,6 +1610,12 @@ impl Filesystem {
                 applied.unreffed
             )));
         }
+        if applied.keyed_unreffed != applied.keyed_expected {
+            return Err(Error::UnsupportedFeature(format!(
+                "the write drops {} keyed data references, and the plan edited {} items",
+                applied.keyed_expected, applied.keyed_unreffed
+            )));
+        }
         if applied.records != data.records.len() {
             return Err(Error::UnsupportedFeature(format!(
                 "the change replaces the records of {} data extents, and the plan rewrote {} \
@@ -1742,6 +1748,15 @@ impl Filesystem {
 
             let before = seed.len();
             seed.extend(self.extent_leaves_for(&records)?);
+            // Keyed references need not share their extent record's
+            // leaf. Close over the leaf of each item we might drop.
+            for (old, _, offset) in data.dropped_references() {
+                if let Some((_, leaf)) =
+                    self.keyed_data_ref_leaf(old, data.root, data.ino, offset)?
+                {
+                    seed.insert(leaf);
+                }
+            }
             // A shared extent's record gains a reference, and nothing is
             // allocated or freed: its extent tree leaf is dirty, and no
             // free-space or block group leaf is (#269).
@@ -2007,37 +2022,57 @@ impl Filesystem {
     /// The leaves of `root` that an insert of each address would land
     /// in.
     fn leaves_holding(&self, root: u64, addresses: &[u64]) -> Result<BTreeSet<u64>> {
-        if addresses.is_empty() {
-            return Ok(BTreeSet::new());
-        }
+        // A reference leaf can begin with the same objectid as the
+        // record's leaf. Descend by the complete key, before all keyed
+        // backrefs, rather than comparing objectids alone.
+        let kind = if self.read_tree_block(root)?.header.owner == objectid::EXTENT_TREE {
+            key_type::METADATA_ITEM
+        } else {
+            key_type::FREE_SPACE_EXTENT
+        };
+        let reader = self.pool_reader();
+        let tree = reader.tree();
+        addresses
+            .iter()
+            .map(|at| {
+                Ok(tree
+                    .descend(
+                        root,
+                        &DiskKey {
+                            objectid: *at,
+                            key_type: kind,
+                            offset: u64::MAX,
+                        },
+                    )?
+                    .header
+                    .bytenr)
+            })
+            .collect()
+    }
 
-        // Every leaf, by its first key.
-        let mut leaves: Vec<(u64, u64)> = Vec::new();
-        self.for_each_tree_block(root, &mut |at, block, _| {
-            let Some(items) = block.body.items() else {
-                return;
-            };
-            if let Some(first) = items.first() {
-                leaves.push((first.key.objectid, at));
-            }
-        })?;
-        if leaves.is_empty() {
-            return Ok(BTreeSet::new());
-        }
-        leaves.sort();
-
-        let mut out = BTreeSet::new();
-        for a in addresses {
-            // The last leaf that begins at or before this key, or the
-            // first leaf when the key precedes everything.
-            let idx = match leaves.binary_search_by(|(first, _)| first.cmp(a)) {
-                Ok(i) => i,
-                Err(0) => 0,
-                Err(i) => i - 1,
-            };
-            out.insert(leaves[idx].1);
-        }
-        Ok(out)
+    /// The keyed item at the unshifted hash, and the leaf holding it.
+    /// Collision probing is separate from cross-leaf routing (#608).
+    fn keyed_data_ref_leaf(
+        &self,
+        old: u64,
+        tree: u64,
+        ino: u64,
+        offset: u64,
+    ) -> Result<Option<(DiskKey, u64)>> {
+        let key = DiskKey {
+            objectid: old,
+            key_type: crate::backref::EXTENT_DATA_REF,
+            offset: crate::extent_write::data_ref_hash(tree, ino, offset),
+        };
+        let reader = self.pool_reader();
+        let leaf = reader
+            .tree()
+            .descend(self.tree_root(objectid::EXTENT_TREE)?, &key)?;
+        Ok(leaf
+            .body
+            .items()
+            .is_some_and(|items| items.iter().any(|i| i.key == key))
+            .then_some((key, leaf.header.bytenr)))
     }
 }
 
@@ -2203,7 +2238,11 @@ impl Filesystem {
         // item is dropped from that item (#442). A shared reference, or
         // the extent's last, is refused: the last is a release.
         for (old, old_len, old_ref_offset) in data.dropped_references() {
-            if !mine(old)? {
+            let record_here = mine(old)?;
+            let keyed_location =
+                self.keyed_data_ref_leaf(old, data.root, data.ino, old_ref_offset)?;
+            let keyed_here = keyed_location.is_some_and(|(_, at)| at == leaf);
+            if !record_here && !keyed_here {
                 continue;
             }
             let key = DiskKey {
@@ -2211,15 +2250,19 @@ impl Filesystem {
                 key_type: key_type::EXTENT_ITEM,
                 offset: old_len,
             };
-            let body = out
-                .iter()
-                .find(|i| i.key == key)
-                .map(|i| i.data.clone())
-                .ok_or_else(|| {
-                    Error::UnsupportedFeature(format!(
-                        "the shared data extent at {old} has no record where the plan looked"
-                    ))
-                })?;
+            let body = if record_here {
+                out.iter().find(|i| i.key == key).map(|i| i.data.clone())
+            } else {
+                self.pool_reader()
+                    .tree()
+                    .search(root, &key)?
+                    .map(|i| i.data)
+            }
+            .ok_or_else(|| {
+                Error::UnsupportedFeature(format!(
+                    "the shared data extent at {old} has no record where the plan looked"
+                ))
+            })?;
             let inline = crate::backref::drop_inline_data_ref(
                 key_type::EXTENT_ITEM,
                 &body,
@@ -2228,12 +2271,16 @@ impl Filesystem {
                 old_ref_offset,
             )?;
             let dropped = match inline {
-                Some(dropped) => dropped,
+                Some(dropped) if record_here => dropped,
+                Some(_) => continue,
                 // Not inline: the kernel filed it as a keyed item of its
                 // own, keyed by a hash of its fields (#442). It is counted
                 // down, or deleted at a count of one, and the record loses
                 // one from its total.
                 None => {
+                    if record_here {
+                        applied.keyed_expected += 1;
+                    }
                     let keyed = DiskKey {
                         objectid: old,
                         key_type: crate::backref::EXTENT_DATA_REF,
@@ -2243,18 +2290,22 @@ impl Filesystem {
                             old_ref_offset,
                         ),
                     };
-                    let item = out
-                        .iter()
-                        .find(|i| i.key == keyed)
-                        .map(|i| i.data.clone())
-                        .ok_or_else(|| {
-                            Error::UnsupportedFeature(format!(
-                                "the shared data extent at {old} holds no reference from inode \
-                                 {} at {old_ref_offset} in tree {}, inline or keyed beside \
-                                 its record, so which of its references to drop is not known",
-                                data.ino, data.root
-                            ))
-                        })?;
+                    let item = if keyed_here {
+                        out.iter().find(|i| i.key == keyed).map(|i| i.data.clone())
+                    } else {
+                        self.pool_reader()
+                            .tree()
+                            .search(root, &keyed)?
+                            .map(|i| i.data)
+                    }
+                    .ok_or_else(|| {
+                        Error::UnsupportedFeature(format!(
+                            "the shared data extent at {old} holds no reference from inode \
+                                 {} at {old_ref_offset} in tree {}, inline or keyed at its \
+                                 hash, so which of its references to drop is not known",
+                            data.ino, data.root
+                        ))
+                    })?;
                     let lowered = crate::backref::lower_total(key_type::EXTENT_ITEM, &body)?;
                     let kept = crate::backref::drop_keyed_data_ref(
                         &item,
@@ -2262,19 +2313,25 @@ impl Filesystem {
                         data.ino,
                         old_ref_offset,
                     )?;
-                    out = delete(&out, &keyed)?;
-                    if let Some(kept) = kept {
-                        out = insert(
-                            &out,
-                            OwnedItem {
-                                key: keyed,
-                                data: kept,
-                            },
-                        )?;
+                    if keyed_here {
+                        out = delete(&out, &keyed)?;
+                        if let Some(kept) = kept {
+                            out = insert(
+                                &out,
+                                OwnedItem {
+                                    key: keyed,
+                                    data: kept,
+                                },
+                            )?;
+                        }
+                        applied.keyed_unreffed += 1;
                     }
                     lowered
                 }
             };
+            if !record_here {
+                continue;
+            }
             out = delete(&out, &key)?;
             out = insert(&out, OwnedItem { key, data: dropped })?;
             applied.unreffed += 1;
@@ -3043,6 +3100,9 @@ struct DataApplied {
     released: usize,
     /// Shared data extents whose record lost one reference.
     unreffed: usize,
+    /// Keyed drops counted by record edits and by reference item edits.
+    keyed_expected: usize,
+    keyed_unreffed: usize,
     /// Data extents whose record gained one reference from a clone.
     shared: usize,
     /// New data extents recorded.

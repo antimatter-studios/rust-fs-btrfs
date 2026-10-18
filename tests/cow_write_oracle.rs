@@ -2720,9 +2720,9 @@ const KEYED_REFLINKS: usize = 48;
 
 /// The fill for the keyed-reference test: one checksummed 64 KiB extent,
 /// reflinked [`KEYED_REFLINKS`] times.
-fn keyed_fill() -> String {
+fn keyed_fill(count: usize) -> String {
     let mut script = String::from("head -c 65536 /dev/urandom > \"$MNT/orig.bin\"\nsync\n");
-    for i in 0..KEYED_REFLINKS {
+    for i in 0..count {
         script.push_str(&format!(
             "cp --reflink=always \"$MNT/orig.bin\" \"$MNT/r{i:02}.bin\"\n"
         ));
@@ -2776,10 +2776,19 @@ fn keyed_refs(image: &Path, bytenr: u64) -> (u64, BTreeMap<u64, u64>) {
 /// verifies every digest, and the kernel reads every file back.
 #[test]
 fn a_write_into_a_reflink_whose_reference_is_a_keyed_item_drops_that_item() {
-    let scratch = Scratch::new("cow-write-keyed-ref", &keyed_fill());
+    write_keyed_reference(KEYED_REFLINKS, false);
+}
+
+#[test]
+fn a_write_drops_a_keyed_reference_in_another_leaf_from_its_extent_record() {
+    write_keyed_reference(512, true);
+}
+
+fn write_keyed_reference(count: usize, another_leaf: bool) {
+    let scratch = Scratch::new("cow-write-keyed-ref", &keyed_fill(count));
     let image = scratch.image();
     let names: Vec<String> = std::iter::once("orig.bin".to_string())
-        .chain((0..KEYED_REFLINKS).map(|i| format!("r{i:02}.bin")))
+        .chain((0..count).map(|i| format!("r{i:02}.bin")))
         .collect();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
 
@@ -2808,12 +2817,46 @@ fn a_write_into_a_reflink_whose_reference_is_a_keyed_item_drops_that_item() {
     let (total, keyed) = keyed_refs(&image, bytenr);
     assert_eq!(
         total,
-        KEYED_REFLINKS as u64 + 1,
+        count as u64 + 1,
         "the extent should count orig.bin and every reflink"
     );
+    // dump-tree supplies the actual leaf address for the record and
+    // each keyed item. The larger fill must exercise a different leaf.
+    let dump = dump_tree(&image, "2");
+    let mut leaf = 0;
+    let mut record_leaf = None;
+    let mut item_leaf = BTreeMap::new();
+    let mut keyed_leaf = None;
+    for line in dump.lines() {
+        if let Some(rest) = line.strip_prefix("leaf ") {
+            leaf = rest
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+        }
+        if line.contains(&format!("key ({bytenr} EXTENT_ITEM ")) {
+            record_leaf = Some(leaf);
+        }
+        if line.contains(" key (") {
+            keyed_leaf = line
+                .contains(&format!("key ({bytenr} EXTENT_DATA_REF "))
+                .then_some(leaf);
+        } else if let Some(at) = keyed_leaf {
+            let words: Vec<_> = line.split_whitespace().collect();
+            if let Some(i) = words.iter().position(|w| *w == "objectid") {
+                item_leaf.insert(words[i + 1].parse::<u64>().unwrap(), at);
+            }
+        }
+    }
+    let record_leaf = record_leaf.expect("the extent record has a leaf");
     let (victim, &victim_ino) = inos
         .iter()
-        .find(|(_, ino)| keyed.get(ino) == Some(&1))
+        .find(|(_, ino)| {
+            keyed.get(ino) == Some(&1)
+                && (!another_leaf || item_leaf.get(ino).is_some_and(|at| *at != record_leaf))
+        })
         .unwrap_or_else(|| panic!("no reference is a keyed item counting one: {keyed:?}"));
 
     let mut expected: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
