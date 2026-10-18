@@ -273,6 +273,82 @@ fn new_data_and_tree_blocks_land_only_on_the_sprout() {
     );
 }
 
+/// A subvolume handle on a sprouted pool keeps the seed when it hands
+/// write access back after a commit (#628): a second write through the
+/// same handle still reaches the sprout, the seed is never written, and
+/// the pair is one `btrfs check` finds clean.
+#[test]
+fn a_subvolume_handle_on_the_sprouted_pool_keeps_writing_with_the_seed() {
+    let seed_path = std::path::PathBuf::from(temp_path!("seed-subvolume-seed.img"));
+    let sprout_path = std::path::PathBuf::from(temp_path!("seed-subvolume-sprout.img"));
+    for (name, copy) in [
+        ("btrfs-seed.img", &seed_path),
+        ("btrfs-sprout.img", &sprout_path),
+    ] {
+        std::fs::copy(fixture(&format!("seed/{name}")), copy).expect("copy the member");
+    }
+    let before = sha256_hex(&std::fs::read(&seed_path).expect("read the seed"));
+    let seed = Arc::new(FileDevice::open_rw(&seed_path).unwrap()) as Arc<dyn BlockDevice>;
+    let sprout = Arc::new(FileDevice::open_rw(&sprout_path).unwrap()) as Arc<dyn BlockDevice>;
+    let mut fs = Filesystem::mount_pool_rw(vec![seed, sprout]).expect("mount the pair");
+    let top = fs.lookup_path("/").unwrap().ino;
+    let id = fs
+        .create_subvolume(top, b"sub-on-sprout", 0o755, 0, 0)
+        .expect("create a subvolume on the sprouted pool");
+    let mut sub = fs.open_subvolume(id).expect("open the subvolume");
+    drop(fs);
+    let root = sub.lookup_path("/").unwrap().ino;
+    let ino = sub
+        .create(root, b"written-through-subvolume", 0o644, 0, 0)
+        .expect("create a file through the subvolume handle");
+    let first: Vec<u8> = (0..64 * 1024).map(|i| (i % 241) as u8).collect();
+    assert_eq!(
+        sub.write(ino, 0, &first)
+            .expect("the first write after the create"),
+        first.len()
+    );
+    let generation = sub.superblock().generation;
+    let second: Vec<u8> = (0..64 * 1024).map(|i| (i % 239) as u8).collect();
+    assert_eq!(
+        sub.write(ino, first.len() as u64, &second)
+            .expect("a second write through the handle handed back after a commit"),
+        second.len()
+    );
+    assert!(
+        sub.superblock().generation > generation,
+        "nothing was committed"
+    );
+    let mut payload = first;
+    payload.extend_from_slice(&second);
+    assert_eq!(sub.read_file(ino).unwrap(), payload);
+    drop(sub);
+    assert_eq!(
+        sha256_hex(&std::fs::read(&seed_path).unwrap()),
+        before,
+        "seed changed"
+    );
+    let out = oracle("bash")
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/check-pool.sh"))
+        .arg(&sprout_path)
+        .arg(&seed_path)
+        .output();
+    assert!(
+        out.status.success(),
+        "btrfs check of the pair: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let seed = Arc::new(FileDevice::open(&seed_path).unwrap()) as Arc<dyn BlockRead>;
+    let sprout = Arc::new(FileDevice::open(&sprout_path).unwrap()) as Arc<dyn BlockRead>;
+    let pool = Filesystem::mount_pool(vec![seed, sprout]).expect("reopen the pair");
+    let reread = pool
+        .open_subvolume(id)
+        .expect("the subvolume through the pool")
+        .read_path("/written-through-subvolume")
+        .expect("the file through the pool");
+    assert_eq!(reread, payload, "the file read back through the pool");
+}
+
 fn assert_on_sprout(fs: &Filesystem, at: u64, sprout_id: u64) {
     let chunk = fs.chunk_map().chunk_for(at).expect("a mapped allocation");
     assert!(
