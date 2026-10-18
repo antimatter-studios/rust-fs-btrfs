@@ -463,7 +463,7 @@ impl Ledger {
 
 impl Filesystem {
     /// The `last_snapshot` of subvolume `objectid`'s `ROOT_ITEM` (#380).
-    fn root_last_snapshot(&self, objectid: u64) -> Result<u64> {
+    pub(crate) fn root_last_snapshot(&self, objectid: u64) -> Result<u64> {
         if objectid == crate::chunk::objectid::FS_TREE {
             return self.fs_tree_last_snapshot();
         }
