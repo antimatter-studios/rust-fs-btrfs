@@ -194,6 +194,9 @@ send_stream_kernel        1
 scrub_oracle              2
 # Eight cases: the allocation regression adds a committed write and a pair check (#625).
 seed_oracle               8
+# One declared kernel case reads the exact crate-written binary payload
+# from the complete seed and sprout pair (#626); CI must execute it.
+seed_write_kernel         1
 scrub_parity_oracle       4
 scrub_repair_kernel       7
 resize_kernel             2
