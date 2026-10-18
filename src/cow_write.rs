@@ -280,8 +280,7 @@ impl Filesystem {
                 })?;
                 let to = offset - offset % sector;
                 if from < to {
-                    self.check_gap_is_empty(ino, from)?;
-                    gap = Some((from, to));
+                    gap = Some((self.cow_gap_start(ino, from)?, to));
                 }
             }
         }
@@ -799,10 +798,13 @@ impl Filesystem {
 
     /// Refuse a gap past the end of a file that an extent item already
     /// reaches into — a preallocated extent kept past the end — as the
-    /// hole item recording the gap would overlap it (#436).
-    fn check_gap_is_empty(&self, ino: u64, from: u64) -> Result<()> {
+    /// hole item recording the gap would overlap it (#436). When a hole
+    /// ends exactly where the new gap starts, reuse its key so the put
+    /// extends that item instead of adding an adjacent hole (#602).
+    fn cow_gap_start(&self, ino: u64, from: u64) -> Result<u64> {
         use crate::fs::file_extent as fe;
         use crate::superblock::le64;
+        let mut start = from;
         for (key, data) in self.items_of(ino)? {
             // Inline data (type 0) only ever lies within the file's size.
             if key.key_type != EXTENT_DATA_KEY
@@ -811,14 +813,19 @@ impl Filesystem {
             {
                 continue;
             }
-            if key.offset.saturating_add(le64(&data, fe::NUM_BYTES)) > from {
+            let end = key.offset.saturating_add(le64(&data, fe::NUM_BYTES));
+            if end > from {
                 return Err(Error::UnsupportedFeature(format!(
                     "inode {ino}: an extent item past the end reaches into the gap a write \
                      past the end leaves, which a hole item cannot record without overlapping it"
                 )));
             }
+            if end == from && data[fe::TYPE] == EXTENT_REGULAR && le64(&data, fe::DISK_BYTENR) == 0
+            {
+                start = key.offset;
+            }
         }
-        Ok(())
+        Ok(start)
     }
 
     /// Preserve what remains of explicit hole items around the sectors
@@ -1402,6 +1409,83 @@ fn kept_runs(
 #[cfg(test)]
 mod tests {
     use super::kept_runs;
+
+    /// The kernel comparison for these shapes lives in cow_write_oracle.rs.
+    #[test]
+    fn a_growing_write_extends_the_existing_trailing_hole() {
+        use crate::{fs::file_extent as fe, mkfs, superblock::le64, Filesystem};
+        use fs_core::{BlockDevice, BlockRead, FileDevice};
+        use std::{path::PathBuf, sync::Arc};
+
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        for (name, old_size, data_len) in [
+            ("aligned", 32_768, 8192),
+            ("partial", 40_000, 8192),
+            ("sparse", 40_000, 0),
+        ] {
+            let image = Scratch(PathBuf::from(fs_btrfs_test_support::temp_path!(
+                "cow-grow-trailing-hole-{name}.img"
+            )));
+            std::fs::create_dir_all(image.0.parent().unwrap()).unwrap();
+            std::fs::File::create(&image.0)
+                .and_then(|f| f.set_len(128 << 20))
+                .unwrap();
+            let dev = Arc::new(FileDevice::open_rw(&image.0).unwrap());
+            mkfs::format(dev.as_ref(), &mkfs::Options::default()).unwrap();
+            // Change both on-disk superblocks: changing only the parsed
+            // flag would be lost when the first commit reloads the mount.
+            for offset in [65_536, 64 << 20] {
+                let mut raw = [0; 4096];
+                dev.read_at(offset, &mut raw).unwrap();
+                let at = crate::superblock::offsets::INCOMPAT_FLAGS;
+                let flags = le64(&raw, at) & !crate::superblock::incompat::NO_HOLES;
+                raw[at..at + 8].copy_from_slice(&flags.to_le_bytes());
+                crate::super_write::stamp_checksum(
+                    &mut raw,
+                    crate::superblock::ChecksumType::Crc32c,
+                );
+                dev.write_at(offset, &raw).unwrap();
+            }
+            let mut fs = Filesystem::mount_rw(dev).unwrap();
+            assert!(!fs.superblock().has_no_holes());
+            let root = fs.lookup_path("/").unwrap().ino;
+            let ino = fs.create(root, b"file", 0o644, 0, 0).unwrap();
+            if data_len > 0 {
+                fs.write(ino, 0, &vec![0x5a; data_len]).unwrap();
+            }
+            fs.truncate(ino, old_size).unwrap();
+            assert!(!fs.superblock().has_no_holes());
+            fs.write(ino, 65_536, &[0xc3; 5000]).unwrap();
+            let holes: Vec<_> = fs
+                .items_of(ino)
+                .unwrap()
+                .into_iter()
+                .filter(|(key, data)| {
+                    key.key_type == super::EXTENT_DATA_KEY
+                        && data.len() >= fe::REGULAR_SIZE
+                        && le64(data, fe::DISK_BYTENR) == 0
+                })
+                .map(|(key, data)| (key.offset, le64(&data, fe::NUM_BYTES)))
+                .collect();
+            assert_eq!(
+                holes,
+                vec![(data_len as u64, 65_536 - data_len as u64)],
+                "{name}: the old hole and the new gap must be one item"
+            );
+            let inode = fs.read_inode(ino).unwrap();
+            assert_eq!((inode.size, inode.nbytes), (70_536, data_len as u64 + 8192));
+            let mut expected = vec![0x5a; data_len];
+            expected.resize(65_536, 0);
+            expected.extend_from_slice(&[0xc3; 5000]);
+            assert_eq!(fs.read_file(ino).unwrap(), expected, "{name}");
+        }
+    }
 
     /// Eight 4-byte digests from 0x10000, one per 4 KiB sector, each
     /// holding its own index.

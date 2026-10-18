@@ -1741,6 +1741,108 @@ fn a_write_that_grows_a_file_without_no_holes_records_the_gap_as_a_hole_item() {
     }
 }
 
+/// A new gap adjoining an existing trailing hole extends that hole's item
+/// (#602, part of #526), including an EOF partway through a hole sector.
+/// The kernel writes identical controls; its item coverage, size, nbytes,
+/// byte readback and scrub are independent of this crate's interpretation.
+#[test]
+fn a_growing_write_coalesces_the_gap_with_the_trailing_hole() {
+    let cases = [
+        ("aligned", 32_768, 8192),
+        ("partial", 40_000, 8192),
+        ("sparse", 40_000, 0),
+    ];
+    let mut script = String::new();
+    for (name, size, data_len) in cases {
+        script.push_str(&format!(
+            "head -c {data_len} /dev/urandom | tee \"$MNT/{name}\" > \"$MNT/{name}-control\"\n\
+             truncate -s {size} \"$MNT/{name}\" \"$MNT/{name}-control\"\n"
+        ));
+    }
+    script.push_str("sync\n");
+    for (name, _, _) in cases {
+        script.push_str(&format!(
+            "head -c 5000 /dev/zero | tr '\\000' '\\303' \
+             | dd of=\"$MNT/{name}-control\" bs=1 seek=65536 conv=notrunc status=none\n\
+             sync\n"
+        ));
+    }
+    let scratch = Scratch::made("cow-grow-trailing-hole", "crc32c", "^no-holes", &script);
+    let image = scratch.image();
+    let mut fs = mount_rw(&image);
+    assert!(!fs.superblock().has_no_holes(), "mkfs enabled NO_HOLES");
+    let mut expected = BTreeMap::new();
+    for (name, size, data_len) in cases {
+        let ino = ino_of(&fs, name);
+        let inode = fs.read_inode(ino).unwrap();
+        assert_eq!((inode.size, inode.nbytes), (size, data_len));
+        assert_eq!(
+            explicit_holes_to(&image, ino, size.next_multiple_of(4096)),
+            vec![(data_len, size.next_multiple_of(4096) - data_len)],
+            "{name}: the kernel must have made one trailing hole"
+        );
+        let mut bytes = fs.read_file(ino).unwrap();
+        bytes.resize(65_536, 0);
+        bytes.extend_from_slice(&[0xc3; 5000]);
+        assert_eq!(fs.write(ino, 65_536, &[0xc3; 5000]).unwrap(), 5000);
+        assert_eq!(fs.read_file(ino).unwrap(), bytes, "{name}");
+        expected.insert(name, bytes);
+        let ours = fs.read_inode(ino).unwrap();
+        let control = ino_of(&fs, &format!("{name}-control"));
+        let theirs = fs.read_inode(control).unwrap();
+        assert_eq!(
+            (ours.size, ours.nbytes),
+            (theirs.size, theirs.nbytes),
+            "{name}"
+        );
+        let kernel_holes = explicit_holes_to(&image, control, 73_728);
+        assert_eq!(kernel_holes, vec![(data_len, 65_536 - data_len)]);
+        assert_eq!(
+            explicit_holes_to(&image, ino, 73_728),
+            kernel_holes,
+            "{name}: the old hole and the new gap differ from the kernel's items"
+        );
+    }
+    drop(fs);
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum after trailing-hole growth:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after trailing-hole growth",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+    let names = [
+        "aligned",
+        "aligned-control",
+        "partial",
+        "partial-control",
+        "sparse",
+        "sparse-control",
+    ];
+    let seen = kernel_view(&image, "read back trailing-hole growth", &names);
+    for (name, _, _) in cases {
+        assert_eq!(
+            seen[name].0,
+            sha256_hex(&expected[name]),
+            "{name}: wrong bytes"
+        );
+        assert_eq!(
+            seen[name].0,
+            seen[&format!("{name}-control")].0,
+            "{name}: differs from kernel control"
+        );
+    }
+}
+
 /// How `btrfs inspect-internal dump-tree` shows inode `ino`'s inline
 /// extent at offset zero: its data size, `ram_bytes` and compression.
 /// `None` when the item is not inline.
