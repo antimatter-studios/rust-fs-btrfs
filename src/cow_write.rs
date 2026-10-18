@@ -174,6 +174,9 @@ impl Filesystem {
     /// committed and the error is returned; this handle then still reads
     /// the previous generation and must be dropped.
     pub fn write(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize> {
+        if self.writable.is_none() && self.subvolume_writes.is_some() {
+            return self.writing_subvolume(|fs| fs.write(ino, offset, data));
+        }
         if self.writable.is_none() {
             return Err(Error::ReadOnly);
         }
@@ -185,6 +188,12 @@ impl Filesystem {
             return Err(Error::NotAFile);
         }
         if inode.flags & INODE_NODATACOW != 0 {
+            if self.written_tree() != objectid::FS_TREE {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino} is nodatacow, and writing one in place is only implemented \
+                     in the top-level subvolume"
+                )));
+            }
             return self.write_at(ino, offset, data);
         }
         self.write_cow(&inode, offset, data, false)
@@ -428,7 +437,7 @@ impl Filesystem {
             }));
         }
         let write = DataWrite {
-            root: objectid::FS_TREE,
+            root: self.written_tree(),
             ino,
             moves,
             adds,
@@ -661,7 +670,7 @@ impl Filesystem {
                 data: raw,
             }),
         ];
-        self.commit_edits(ino, edits, generation, now)?;
+        self.commit_edits_in(self.written_tree(), ino, edits, generation, now)?;
         Ok(Some(data.len()))
     }
 
@@ -716,7 +725,7 @@ impl Filesystem {
                  {extent_len}-byte extent the extent tree records at {extent_start}"
             )));
         }
-        let last_snapshot = self.fs_tree_last_snapshot()?;
+        let last_snapshot = self.root_last_snapshot(self.written_tree())?;
         if refs != 1 || made <= last_snapshot {
             return Err(Error::UnsupportedFeature(format!(
                 "inode {ino}: the preallocated extent at {extent_start} has {refs} references \
@@ -758,7 +767,7 @@ impl Filesystem {
         self.mirror_spans(at, data.len())?;
         self.write_logical_all_mirrors(at, data)?;
         let write = DataWrite {
-            root: objectid::FS_TREE,
+            root: self.written_tree(),
             ino,
             time: now,
             edits,
@@ -1019,7 +1028,7 @@ impl Filesystem {
                 key_type: EXTENT_DATA_KEY,
                 offset: t.start,
             };
-            t.shared = items < refs || self.leaf_shared(objectid::FS_TREE, &key)?;
+            t.shared = items < refs || self.leaf_shared(self.written_tree(), &key)?;
         }
         Ok(out)
     }
