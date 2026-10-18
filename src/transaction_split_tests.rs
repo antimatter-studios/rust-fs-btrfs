@@ -331,6 +331,10 @@ fn key(objectid: u64) -> DiskKey {
 /// A full rightmost path, with distinct, readable siblings. Only tree
 /// shape matters here: these synthetic items are not namespace records.
 fn cascade(root_room: usize, height: u8) -> (Plan, Vec<u64>) {
+    cascade_with_items(root_room, height, 1)
+}
+
+fn cascade_with_items(root_room: usize, height: u8, added: usize) -> (Plan, Vec<u64>) {
     let dev = Arc::new(Sparse::default());
     crate::mkfs::format(
         dev.as_ref(),
@@ -443,10 +447,14 @@ fn cascade(root_room: usize, height: u8) -> (Plan, Vec<u64>) {
     let leaf = path[0];
     let data = DataWrite {
         root: objectid::FS_TREE,
-        edits: vec![ItemEdit::Put(OwnedItem {
-            key: key(number),
-            data: vec![1],
-        })],
+        edits: (0..added)
+            .map(|i| {
+                ItemEdit::Put(OwnedItem {
+                    key: key(number + i as u64),
+                    data: vec![1; if added == 1 { 1 } else { 3000 }],
+                })
+            })
+            .collect(),
         ..Default::default()
     };
     let mut plan = fs.plan_transaction(&[leaf]).unwrap();
@@ -480,6 +488,41 @@ fn a_cascade_stops_at_an_ancestor_with_one_pointer_free() {
         assert!(plan.split_of(*old).unwrap().root.is_none());
     }
     assert!(plan.split_of(path[3]).is_none());
+}
+
+#[test]
+fn a_multi_way_leaf_split_allocates_every_part_under_a_new_root() {
+    let (plan, path) = cascade_with_items(0, 0, 4);
+    let split = plan.split_of(path[0]).unwrap();
+    assert_eq!(split.new.len(), 4);
+    assert!(split.root.is_some());
+    assert_eq!(plan.allocated().len(), plan.rewrites.len() + 5);
+    let allocated = plan.allocated();
+    assert_eq!(
+        allocated.iter().copied().collect::<BTreeSet<_>>().len(),
+        allocated.len()
+    );
+    assert_eq!(plan.usage_delta(4096), 5 * 4096);
+}
+
+#[test]
+fn every_new_leaf_pointer_counts_towards_the_parent_capacity() {
+    let (plan, path) = cascade_with_items(4, 1, 4);
+    assert_eq!(plan.split_of(path[0]).unwrap().new.len(), 4);
+    assert!(plan.split_of(path[1]).is_none());
+    let (plan, path) = cascade_with_items(3, 1, 4);
+    assert_eq!(plan.split_of(path[0]).unwrap().new.len(), 4);
+    assert_eq!(plan.split_of(path[1]).unwrap().new.len(), 1);
+    assert!(plan.split_of(path[1]).unwrap().root.is_some());
+}
+
+#[test]
+fn a_parent_can_split_into_more_than_two_nodes_in_one_transaction() {
+    let (plan, path) = cascade_with_items(0, 2, 250);
+    assert_eq!(plan.split_of(path[0]).unwrap().new.len(), 250);
+    assert_eq!(plan.split_of(path[1]).unwrap().new.len(), 3);
+    assert_eq!(plan.split_of(path[2]).unwrap().new.len(), 1);
+    assert!(plan.split_of(path[2]).unwrap().root.is_some());
 }
 
 /// A record and its keyed references can start different leaves with
