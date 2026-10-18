@@ -736,7 +736,8 @@ impl Filesystem {
     /// The chunk tree's blocks live in a SYSTEM block group, because the
     /// superblock's own chunk array has to be able to reach them, and
     /// every other tree's in a METADATA one (#264), so `owner` decides
-    /// which groups are asked.
+    /// which groups are asked. A group a relocation is emptying is never
+    /// asked (#574).
     fn next_free_block_for(&self, owner: u64, taken: &BTreeSet<u64>) -> Result<u64> {
         let nodesize = self.sb.nodesize as u64;
         let system = owner == objectid::CHUNK_TREE;
@@ -744,7 +745,9 @@ impl Filesystem {
             .block_groups()?
             .into_iter()
             .filter(|g| {
-                if system {
+                if self.emptying == Some(g.start) {
+                    false
+                } else if system {
                     g.flags & crate::chunk::block_group::SYSTEM != 0
                 } else {
                     g.holds_metadata()
