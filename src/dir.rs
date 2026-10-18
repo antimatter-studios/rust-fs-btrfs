@@ -502,6 +502,22 @@ mod tests {
         }
     }
 
+    /// A damaged directory item is a damaged directory item, not a
+    /// damaged superblock: the message a user reads has to name the
+    /// structure that is wrong (#473). The superblock it once blamed was
+    /// intact.
+    #[test]
+    fn a_malformed_directory_item_does_not_blame_the_superblock() {
+        let mut data = one(b"name", 300, ftype::REG_FILE);
+        data[offsets::NAME_LEN..offsets::NAME_LEN + 2].copy_from_slice(&300u16.to_le_bytes());
+        data.resize(DIR_ITEM_HEADER_SIZE + 300, b'x');
+        let e = parse_dir_items(&data).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "malformed Btrfs metadata: directory item 0 has a 300-byte name, past the 255-byte limit"
+        );
+    }
+
     /// Bytes left over after the last complete item mean the stride is
     /// wrong, and that has to be an error rather than a silently shorter
     /// listing — a caller cannot tell a truncated directory from a
