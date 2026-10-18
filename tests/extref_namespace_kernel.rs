@@ -255,3 +255,119 @@ fn spilled_names_are_unlinked_and_renamed_and_the_kernel_agrees() {
     assert_btrfs_check_clean(&image, "after the kernel changed the references we wrote");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The kernel removes all but one spilled name. Its remaining reference
+/// must be removed along with the inode, whether its data is inline or
+/// occupies a regular extent (#511).
+#[test]
+fn the_last_extended_reference_is_unlinked_and_the_kernel_agrees() {
+    let fit = names_that_fit();
+    for (kind, write, extent_marker) in [
+        (
+            "inline",
+            "printf hello > \"d/$(nm 0)\"",
+            "inline extent data size",
+        ),
+        (
+            "regular",
+            "dd if=/dev/zero of=\"d/$(nm 0)\" bs=4096 count=32 status=none",
+            "extent data disk byte",
+        ),
+    ] {
+        let dir = PathBuf::from(temp_path!("last-extref"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("fs.img");
+        std::fs::File::create(&image)
+            .and_then(|f| f.set_len(256 << 20))
+            .unwrap();
+        let made = oracle("mkfs.btrfs")
+            .args(["-q", "-f", "-O", "extref", "-s", "4096", "-n", "16384"])
+            .arg(&image)
+            .output();
+        assert!(
+            made.status.success(),
+            "mkfs.btrfs: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let img = image.to_string_lossy().into_owned();
+        guest_kernel_write_ok(
+            &img,
+            "the kernel fills an INODE_REF and spills one name",
+            &format!(
+                "{PRELUDE}mkdir d\n{write}\n\
+                 for i in $(seq 1 {fit}); do ln \"d/$(nm 0)\" \"d/$(nm \"$i\")\"; done\n\
+                 sync\n"
+            ),
+        );
+        let seen = guest_kernel_read_ok(
+            &img,
+            "the inode whose last name will be an extended reference",
+            &format!("{PRELUDE}stat -c %i \"d/$(nm 0)\"\n"),
+        );
+        let ino: u64 = seen.trim().parse().expect("the file's inode number");
+        let before = dump_tree(&image, "5");
+        assert!(before.contains(extent_marker), "{kind} data was not made");
+        let refs = back_refs(&before, ino);
+        assert_eq!(refs.len(), fit + 1);
+        let last = name(fit);
+        assert!(
+            refs.iter().any(|r| r.extref && r.name == last),
+            "the last name did not spill into an INODE_EXTREF"
+        );
+        for i in 0..fit {
+            assert!(
+                refs.iter().any(|r| !r.extref && r.name == name(i)),
+                "name {i} is not held in INODE_REF"
+            );
+        }
+
+        guest_kernel_write_ok(
+            &img,
+            "the kernel removes every INODE_REF name",
+            &format!(
+                "{PRELUDE}for i in $(seq 0 {}); do rm \"d/$(nm \"$i\")\"; done\nsync\n",
+                fit - 1
+            ),
+        );
+        let refs = back_refs(&dump_tree(&image, "5"), ino);
+        assert_eq!(refs.len(), 1, "exactly the spilled name must remain");
+        assert!(refs[0].extref && refs[0].name == last);
+        let seen = guest_kernel_read_ok(
+            &img,
+            "the kernel confirms the spilled name is the last link",
+            &format!("{PRELUDE}stat -c %h \"d/$(nm {fit})\"\nls d | wc -l\n"),
+        );
+        let seen: Vec<&str> = seen.lines().map(str::trim).collect();
+        assert_eq!(seen, ["1", "1"]);
+        assert_btrfs_check_clean(&image, "before unlinking the last extended reference");
+
+        let fs = unsafe { fs_btrfs_mount_rw(c(&img).as_ptr()) };
+        assert!(!fs.is_null(), "mount_rw: {}", last_error());
+        let rc = unsafe { fs_btrfs_unlink(fs, c(&format!("/d/{last}")).as_ptr()) };
+        let error = last_error();
+        unsafe { fs_btrfs_umount(fs) };
+        assert_eq!(rc, 0, "unlink of the last {kind} extref name: {error}");
+
+        assert_btrfs_check_clean(&image, "after unlinking the last extended reference");
+        let after = dump_tree(&image, "5");
+        assert!(
+            !after.contains(&format!("key ({ino} ")),
+            "the inode still owns items after its last name was removed"
+        );
+        assert!(back_refs(&after, ino).is_empty());
+        assert!(
+            !after.contains(&last),
+            "a directory entry or reference still names the file"
+        );
+        let seen = guest_kernel_read_ok(
+            &img,
+            "the kernel no longer lists the last extended-reference name",
+            &format!(
+                "{PRELUDE}test ! -e \"d/$(nm {fit})\"\n\
+                 ls -A d | wc -l\n"
+            ),
+        );
+        assert_eq!(seen.trim(), "0", "the kernel sees a remaining name");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

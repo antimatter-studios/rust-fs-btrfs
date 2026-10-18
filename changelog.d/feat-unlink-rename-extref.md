@@ -10,4 +10,5 @@
   into extended references, unlinks one spilled name and moves another to
   a second directory through the ABI, and has `btrfs check`, the kernel's
   listing and link count, and `btrfs inspect-internal inode-resolve`
-  agree. Adding a name past a full `INODE_REF` is still refused.
+  agree. Names past a full `INODE_REF` can also be added through extended
+  references (#425).
