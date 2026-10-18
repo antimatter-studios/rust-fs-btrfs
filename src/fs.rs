@@ -474,6 +474,10 @@ pub struct Filesystem {
     /// before the commit lands would leave a crash with a log that no
     /// longer reads. The kernel pins them for the same reason.
     pub(crate) pinned: Vec<(u64, u64)>,
+    /// The start of the block group a relocation is emptying, which no
+    /// new tree block may be placed in (#574): a copy-on-write that put a
+    /// block back into it would undo the move it is part of.
+    pub(crate) emptying: Option<u64>,
 }
 
 /// Tree blocks a mount keeps: 1024, 16 MiB at the default 16 KiB node.
@@ -1437,6 +1441,7 @@ impl Filesystem {
             nodes: std::sync::Mutex::new(NodeCache::new(NODE_CACHE_BLOCKS)),
             compression: crate::compression::Compression::None,
             pinned: Vec::new(),
+            emptying: None,
         };
         Ok(fs)
     }
@@ -1902,6 +1907,7 @@ impl Filesystem {
             nodes: std::sync::Mutex::new(NodeCache::new(NODE_CACHE_BLOCKS)),
             compression: self.compression,
             pinned: Vec::new(),
+            emptying: None,
         };
         Ok(fs)
     }

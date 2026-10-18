@@ -550,7 +550,8 @@ impl Filesystem {
     /// of work and not this one.
     ///
     /// It also does not allocate a new block group when every existing
-    /// one is full; it reports that instead.
+    /// one is full; it reports that instead. A group a relocation is
+    /// emptying is never offered (#574).
     ///
     /// # Errors
     ///
@@ -567,7 +568,7 @@ impl Filesystem {
         let groups: Vec<BlockGroup> = self
             .block_groups()?
             .into_iter()
-            .filter(|g| g.holds_metadata())
+            .filter(|g| g.holds_metadata() && self.emptying != Some(g.start))
             .collect();
         for runs in self.free_extents_by_group(&groups)? {
             for run in runs {
