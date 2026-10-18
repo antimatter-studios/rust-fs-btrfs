@@ -949,7 +949,8 @@ impl Filesystem {
     /// - a **free-space tree** leaf has the affected block groups' free
     ///   runs recomputed, since that tree is the complement of the
     ///   extent tree;
-    /// - an **extent tree** leaf holding a `BLOCK_GROUP_ITEM` has that
+    /// - a **block group tree** leaf (or an extent tree leaf without
+    ///   that feature) holding a `BLOCK_GROUP_ITEM` has that
     ///   group's `used` moved by what the plan allocates in it less what
     ///   it releases there. The two ends of a move are often in different
     ///   groups, so `bytes_used` can add up while every group's count is
@@ -1249,6 +1250,11 @@ impl Filesystem {
                             generation,
                             &mut applied,
                         )?;
+                    }
+
+                    // Group accounting lives in tree 11 on volumes with
+                    // BLOCK_GROUP_TREE, and in the extent tree otherwise.
+                    if rewrite.owner == self.block_group_tree_id() {
                         apply_block_group_used(&mut owned, &deltas, &mut used_written)?;
                     }
 
@@ -3295,7 +3301,8 @@ impl Filesystem {
         Ok(out)
     }
 
-    /// The extent tree leaf holding the `BLOCK_GROUP_ITEM` of each group
+    /// The leaf holding the `BLOCK_GROUP_ITEM` of each group, in the
+    /// feature-selected block group tree or extent tree,
     /// in `starts`, by group start.
     ///
     /// Found by the item itself rather than by the insert rule
@@ -3306,7 +3313,7 @@ impl Filesystem {
         if starts.is_empty() {
             return Ok(out);
         }
-        let root = self.tree_root(objectid::EXTENT_TREE)?;
+        let root = self.tree_root(self.block_group_tree_id())?;
         self.for_each_tree_block(root, &mut |at, block, _| {
             let Some(items) = block.body.items() else {
                 return;
