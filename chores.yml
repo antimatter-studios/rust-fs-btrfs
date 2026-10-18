@@ -510,6 +510,10 @@ tasks:
       # one of two committed names of a file removed and / alone fsynced,
       # which leaves the file unlogged with one link for replay to drop
       - test-disks/dirtylog/btrfs-dirty-log-linkremoved.img
+      # a file created after the commit and given a second name,
+      # durable by an fsync of / alone, which logs the file only as an
+      # inode that exists
+      - test-disks/dirtylog/btrfs-dirty-log-createdlink.img
       # the volume the command-line tools are tested against, labelled
       # CLITEST, with a manifest of what the kernel wrote into it
       - test-disks/cli/btrfs-cli.img
