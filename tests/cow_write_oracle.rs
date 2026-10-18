@@ -1476,6 +1476,158 @@ fn a_write_that_starts_past_the_end_zeroes_the_rest_of_the_old_last_sector() {
     }
 }
 
+/// Two checksummed files of 40,960 random bytes, each written twice by the
+/// kernel: the copies are the controls, which the kernel cuts to 40,000
+/// bytes and then grows by truncate to the sizes
+/// [`a_truncate_that_grows_a_file_cut_partway_through_a_sector_reads_zeros_past_the_old_end`]
+/// grows the originals to through this driver: `far` several sectors past
+/// the old end, `near` inside the old last sector.
+const CUT_GROW_FILL: &str =
+    "head -c 40960 /dev/urandom | tee \"$MNT/far.bin\" > \"$MNT/far-control.bin\"\n\
+     head -c 40960 /dev/urandom | tee \"$MNT/near.bin\" > \"$MNT/near-control.bin\"\n\
+     sync\n\
+     truncate -s 40000 \"$MNT/far-control.bin\"\n\
+     truncate -s 40000 \"$MNT/near-control.bin\"\n\
+     sync\n\
+     truncate -s 53100 \"$MNT/far-control.bin\"\n\
+     truncate -s 40550 \"$MNT/near-control.bin\"\n\
+     sync";
+
+/// A truncate that grows a file is the other way, beside a write past the
+/// end (#433), to expose the rest of a sector the file once filled (#524).
+/// This driver's truncate keeps an extent's last sector as it was, so
+/// `far.bin` and `near.bin`, cut from 40,960 bytes to 40,000, still hold
+/// random bytes on disk past their end: the test reads that sector raw and
+/// shows them there. Each is then grown by truncate past the old end, and
+/// the bytes from the old end onward must read as zeros through the
+/// kernel, as they do in the controls the kernel cut and grew the same way.
+/// `btrfs check --check-data-csum` and a scrub verify every digest.
+#[test]
+fn a_truncate_that_grows_a_file_cut_partway_through_a_sector_reads_zeros_past_the_old_end() {
+    const FAR: &str = "far.bin";
+    const NEAR: &str = "near.bin";
+    const OLD_END: u64 = 40_000;
+    const SECTOR: u64 = 4096;
+    let control = |name: &str| name.replace(".bin", "-control.bin");
+    let scratch = Scratch::new("truncate-grow-after-cut", CUT_GROW_FILL);
+    let image = scratch.image();
+
+    let mut fs = mount_rw(&image);
+    for name in [FAR, NEAR] {
+        let ino = ino_of(&fs, name);
+        let inode = fs.read_inode(ino).unwrap();
+        assert_eq!(inode.size, 40_960, "{name} is not the size made");
+        assert_eq!(
+            inode.flags & fs_btrfs::write::INODE_NODATASUM,
+            0,
+            "{name} must be checksummed for this to test anything"
+        );
+        fs.truncate(ino, OLD_END)
+            .unwrap_or_else(|e| panic!("cutting {name} to {OLD_END}: {e}"));
+    }
+    drop(fs);
+
+    // Where the kernel says each file's last sector lies, read raw: the
+    // bytes past the old end are the random ones the truncate kept.
+    let last_block = OLD_END / SECTOR;
+    let mapped = kernel_map(&image, "where the old last sectors lie", &[FAR, NEAR]);
+    let mut fs = mount_rw(&image);
+    let mut expected: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
+    for name in [FAR, NEAR] {
+        let extent = mapped[name]
+            .1
+            .iter()
+            .filter(|m| m.logical <= last_block)
+            .max_by_key(|m| m.logical)
+            .unwrap_or_else(|| panic!("{name}: no extent holds block {last_block}"));
+        let logical = (extent.physical + last_block - extent.logical) * SECTOR;
+        let at = fs
+            .chunk_map()
+            .map_mirror(logical, 0)
+            .unwrap_or_else(|e| panic!("{name}: mapping {logical}: {e}"))
+            .physical;
+        let mut raw = vec![0u8; SECTOR as usize];
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = std::fs::File::open(&image).unwrap();
+            file.seek(SeekFrom::Start(at)).unwrap();
+            file.read_exact(&mut raw).unwrap();
+        }
+        let tail = &raw[(OLD_END % SECTOR) as usize..];
+        assert!(
+            tail.iter().any(|&b| b != 0),
+            "{name}: the bytes on disk past the old end are already zeros, so this tests nothing"
+        );
+        let file = fs.read_file(ino_of(&fs, name)).unwrap();
+        assert_eq!(file.len() as u64, OLD_END, "{name} was not cut");
+        expected.insert(name, file);
+    }
+
+    for (name, size) in [(FAR, 53_100u64), (NEAR, 40_550)] {
+        let ino = ino_of(&fs, name);
+        fs.truncate(ino, size)
+            .unwrap_or_else(|e| panic!("growing {name} from {OLD_END} to {size}: {e}"));
+        let file = expected.get_mut(name).unwrap();
+        file.resize(size as usize, 0);
+        assert_eq!(
+            fs.read_inode(ino).unwrap().size,
+            size,
+            "{name}'s size is not the size it was grown to"
+        );
+        // Our own reading of what we committed, before the oracles'.
+        assert_eq!(
+            &fs.read_file(ino).unwrap(),
+            file,
+            "{name} reads back differently through this driver after it was grown"
+        );
+    }
+    drop(fs);
+
+    assert_btrfs_check_clean(&image, "after truncates that grow cut files");
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum finds data that disagrees with its digests:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after truncates that grow cut files",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+
+    let names = [FAR, NEAR, "far-control.bin", "near-control.bin"];
+    let stats = kernel_stats(
+        &image,
+        "the kernel's stat after truncates that grow cut files",
+        &names,
+    );
+    let after = kernel_view(&image, "after truncates that grow cut files", &names);
+    for name in [FAR, NEAR] {
+        assert_eq!(
+            stats[name].0,
+            stats[&control(name)].0,
+            "the kernel's size of {name} differs from its control's"
+        );
+        assert_eq!(
+            after[name].0,
+            sha256_hex(&expected[name]),
+            "the kernel reads back different bytes from {name} than it was cut to and then \
+             zeros: the old last sector's tail must read as zeros"
+        );
+        assert_eq!(
+            after[name].0,
+            after[&control(name)].0,
+            "{name} does not read as the kernel's own cut and growth left its control"
+        );
+    }
+}
+
 /// Without the no-holes feature a gap is an item of its own (#436). The
 /// kernel extends a file a write starts past the end of by inserting a
 /// hole item from the sector after the old end to the sector the write
