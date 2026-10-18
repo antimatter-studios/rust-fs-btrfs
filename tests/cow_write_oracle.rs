@@ -3195,6 +3195,67 @@ fn mapped_ranges(extents: &[Mapped], len: u64) -> Vec<(u64, u64)> {
 /// leaf (about 990 crc32c digests) more than once over.
 const FIRST_LEAF_LEN: u64 = 6 << 20;
 
+/// Emptying every leaf below the checksum root collapses the tree to
+/// the empty level-zero root that mkfs and the kernel use (#548).
+#[test]
+fn truncating_the_only_checksummed_file_collapses_its_checksum_root() {
+    let scratch = Scratch::sized(
+        "truncate-empty-csum-root",
+        "crc32c",
+        "no-holes",
+        "4096",
+        &format!("head -c {FIRST_LEAF_LEN} /dev/urandom > \"$MNT/a.bin\"\nsync"),
+    );
+    let image = scratch.image();
+    let tree = csum_tree(&image);
+    assert!(
+        tree.values().filter(|b| b.leaf).count() >= 2 && tree.values().any(|b| !b.leaf),
+        "the checksum tree must start with a root node over at least two leaves: {tree:?}"
+    );
+
+    let mut fs = mount_rw(&image);
+    let ino = ino_of(&fs, "a.bin");
+    fs.truncate(ino, 0)
+        .expect("truncate all checksummed data in one transaction");
+    assert!(fs.read_file(ino).unwrap().is_empty());
+    drop(fs);
+
+    assert_btrfs_check_clean(&image, "after collapsing the empty checksum root");
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "checksum verification: {}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let tree = csum_tree(&image);
+    assert_eq!(
+        tree.len(),
+        1,
+        "the checksum tree must contain only its root: {tree:?}"
+    );
+    let root = tree.values().next().unwrap();
+    assert!(
+        root.leaf && root.items == 0 && root.ptrs.is_empty() && root.ranges.is_empty(),
+        "the checksum root must be an empty level-zero leaf: {tree:?}"
+    );
+    let after = kernel_view(
+        &image,
+        "read after collapsing the checksum root",
+        &["a.bin"],
+    );
+    assert_eq!(after["a.bin"].0, sha256_hex(&[]));
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after collapsing the checksum root",
+        "test ! -s \"$MNT/a.bin\"\nbtrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+}
+
 /// A write that releases every digest in the checksum tree's first leaf
 /// removes that leaf, its parent's first child, and the key pointer
 /// naming the parent's next child becomes the parent's first (#547).
