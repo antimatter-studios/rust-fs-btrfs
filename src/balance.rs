@@ -254,6 +254,50 @@ impl Filesystem {
         Ok(new)
     }
 
+    /// Copy every tree block in the metadata group at `start` out of it,
+    /// in one committed transaction (#578).
+    ///
+    /// Each tree block reachable from the superblock whose address lies in
+    /// the group is made dirty, with the group kept out of the tree block
+    /// allocator (#574), so the commit's copy-on-write rewrites it and its
+    /// path to its tree's root somewhere else: parents, `ROOT_ITEM`s and
+    /// the superblock's root pointers are re-pointed, each block's
+    /// `METADATA_ITEM` moves, and the free-space tree and both groups'
+    /// `used` follow, as for any commit. The group itself stays, empty of
+    /// tree blocks, for whatever removes it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] unless mounted with [`Filesystem::mount_rw`],
+    /// [`Error::NotFound`] when no block group starts at `start`, and
+    /// [`Error::UnsupportedFeature`] for a group that is not a metadata
+    /// group or is a system one, each before anything is written, and
+    /// when no other metadata group has room for the copies.
+    pub fn copy_tree_blocks_out_of(&mut self, start: u64) -> Result<()> {
+        if self.writable.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        let group = self.block_group_at(start)?;
+        if !group.holds_metadata() || group.flags & bg::SYSTEM != 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "the group at {start} is not a metadata group, so it holds no tree blocks \
+                 to copy out"
+            )));
+        }
+        let dirty = self.tree_blocks_in(start..start + group.length)?;
+        if dirty.is_empty() {
+            return Ok(());
+        }
+        let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
+            Error::UnsupportedFeature("the generation counter is exhausted".into())
+        })?;
+        let was = self.emptying.replace(start);
+        let done = self.commit_dirty_with(&dirty, DataWrite::default(), generation, false);
+        // The commit reopens the mount, which forgets the exclusion.
+        self.emptying = was;
+        done
+    }
+
     /// Move `extents`, one batch of a group's data extents, into the group
     /// at `to` in one committed transaction (#493, #494).
     ///
@@ -1349,6 +1393,91 @@ mod tests {
             assert!(
                 !(old.start..old.start + old.length).contains(&root),
                 "the new root tree block {root} is inside the excluded group"
+            );
+        }
+
+        /// Every tree block in a metadata group is copied-on-write out of
+        /// it in one committed transaction (#578).
+        ///
+        /// A second metadata chunk is allocated beside the one `mkfs.btrfs`
+        /// made, a few files give the trees something to hold, and the pass
+        /// runs on the first group: `btrfs check` must find the volume
+        /// clean, and no tree block `dump-tree` prints may lie in the old
+        /// group's range.
+        #[test]
+        fn every_tree_block_is_copied_out_of_a_metadata_group() {
+            use fs_btrfs_test_support::{oracle, temp_path};
+            use fs_core::{BlockDevice, FileDevice};
+            use std::sync::Arc;
+
+            let dir = std::path::PathBuf::from(temp_path!("metadata-cow-out"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let img = dir.join("fs.img");
+            std::fs::File::create(&img)
+                .unwrap()
+                .set_len(256 * MIB)
+                .unwrap();
+            let made = oracle("mkfs.btrfs")
+                .args(["-q", "-f", "-m", "single", "-d", "single", "-n", "16384"])
+                .arg(&img)
+                .output();
+            assert!(
+                made.status.success(),
+                "{}",
+                String::from_utf8_lossy(&made.stderr)
+            );
+
+            let old = {
+                let dev = Arc::new(FileDevice::open_rw(&img).unwrap());
+                let mut fs = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>).unwrap();
+                for i in 0..8u8 {
+                    fs.create(256, format!("f{i}").as_bytes(), 0o100644, 0, 0)
+                        .expect("a file to hold");
+                }
+                let old = fs
+                    .block_groups()
+                    .unwrap()
+                    .into_iter()
+                    .find(|g| g.holds_metadata() && g.flags & bg::SYSTEM == 0)
+                    .expect("a metadata group");
+                fs.allocate_chunk(old.flags, old.length)
+                    .expect("a second metadata chunk");
+                fs.copy_tree_blocks_out_of(old.start)
+                    .expect("the tree blocks copied out");
+                old
+            };
+
+            let checked = oracle("btrfs")
+                .args(["check", "--readonly"])
+                .arg(&img)
+                .output();
+            let dumped = oracle("btrfs")
+                .args(["inspect-internal", "dump-tree"])
+                .arg(&img)
+                .output();
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(
+                checked.status.success(),
+                "btrfs check: {}{}",
+                String::from_utf8_lossy(&checked.stdout),
+                String::from_utf8_lossy(&checked.stderr)
+            );
+            assert!(dumped.status.success());
+            let range = old.start..old.start + old.length;
+            let inside: Vec<u64> = String::from_utf8_lossy(&dumped.stdout)
+                .lines()
+                .filter_map(|l| {
+                    let mut w = l.split_whitespace();
+                    match w.next() {
+                        Some("leaf" | "node") => w.next()?.parse().ok(),
+                        _ => None,
+                    }
+                })
+                .filter(|b| range.contains(b))
+                .collect();
+            assert!(
+                inside.is_empty(),
+                "tree blocks still in the old group: {inside:?}"
             );
         }
     }
