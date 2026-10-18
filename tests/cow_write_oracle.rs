@@ -2915,3 +2915,195 @@ fn write_keyed_reference(count: usize, another_leaf: bool) {
         "btrfs scrub start -B \"$MNT\" >/dev/null",
     );
 }
+
+/// Two clones into the keyed-reference fill whose references hash alike:
+/// each `(file, offset)` is a reflink `r{i}.bin` cloned into again at a
+/// 4 KiB step past its first 64 KiB. The fill numbers `orig.bin` 257 and
+/// `r{i}.bin` 258 + i, which the test reads back before trusting it.
+fn colliding_clones() -> [(usize, u64); 2] {
+    let mut seen: std::collections::HashMap<u64, (usize, u64)> = Default::default();
+    for step in 0..4096u64 {
+        for i in 0..KEYED_REFLINKS {
+            let offset = 65536 + step * 4096;
+            let hash = fs_btrfs::extent_write::data_ref_hash(5, 258 + i as u64, offset);
+            match seen.get(&hash) {
+                Some(&(j, at)) if j != i => return [(j, at), (i, offset)],
+                Some(_) => {}
+                None => {
+                    seen.insert(hash, (i, offset));
+                }
+            }
+        }
+    }
+    panic!("no two clones within the search hash alike")
+}
+
+/// Every keyed `EXTENT_DATA_REF` of `bytenr`, from the kernel's tools:
+/// `(inode, reference offset)` to its key offset and count.
+fn keyed_refs_by_offset(image: &Path, bytenr: u64) -> BTreeMap<(u64, u64), (u64, u64)> {
+    let extents = dump_tree(image, "2");
+    let lines: Vec<&str> = extents.lines().collect();
+    let keyed_key = format!("key ({bytenr} EXTENT_DATA_REF ");
+    let mut keyed = BTreeMap::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(at) = line.find(&keyed_key) else {
+            continue;
+        };
+        let hash: u64 = line[at + keyed_key.len()..]
+            .split(')')
+            .next()
+            .and_then(|w| w.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no key offset in {line:?}"));
+        let words: Vec<&str> = lines[i + 1].split_whitespace().collect();
+        let field = |name: &str| -> u64 {
+            words
+                .iter()
+                .position(|w| *w == name)
+                .and_then(|j| words.get(j + 1)?.parse().ok())
+                .unwrap_or_else(|| panic!("no {name} in {:?}", lines[i + 1]))
+        };
+        keyed.insert((field("objectid"), field("offset")), (hash, field("count")));
+    }
+    keyed
+}
+
+/// The kernel files a keyed reference whose hash key is taken by another
+/// reference at the next free key offset. A write into the shifted
+/// reference's range finds it by its root, inode and offset, drops it at
+/// its actual key, and leaves the reference at the hash alone (#608).
+/// `dump-tree` shows the shift before the write and the survivors after
+/// it; `btrfs check --check-data-csum`, a kernel scrub and the kernel's
+/// read-back of every file hold the result to account.
+#[test]
+fn a_write_drops_a_keyed_reference_filed_above_its_taken_hash_key() {
+    let clones = colliding_clones();
+    let mut fill = keyed_fill(KEYED_REFLINKS);
+    fill.push_str(
+        "\ncd \"$MNT\"\npython3 - <<'PY'\nimport fcntl, os, struct\nFICLONERANGE = 0x4020940d\n",
+    );
+    for (i, offset) in clones {
+        fill.push_str(&format!(
+            "s = os.open('orig.bin', os.O_RDONLY)\nd = os.open('r{i:02}.bin', os.O_WRONLY)\n\
+             fcntl.ioctl(d, FICLONERANGE, struct.pack('=qQQQ', s, 0, 65536, {offset}))\n\
+             os.close(s)\nos.close(d)\nos.sync()\n"
+        ));
+    }
+    fill.push_str("PY\nsync");
+    let scratch = Scratch::new("cow-write-shifted-ref", &fill);
+    let image = scratch.image();
+    let names: Vec<String> = std::iter::once("orig.bin".to_string())
+        .chain((0..KEYED_REFLINKS).map(|i| format!("r{i:02}.bin")))
+        .collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+
+    let mut fs = mount_rw(&image);
+    let inos: BTreeMap<&str, u64> = refs.iter().map(|n| (*n, ino_of(&fs, n))).collect();
+    for (i, _) in clones {
+        assert_eq!(
+            inos[refs[i + 1]],
+            258 + i as u64,
+            "the collision was searched for under the wrong inode numbers"
+        );
+    }
+    let bytenr = {
+        let tree = dump_tree(&image, "5");
+        let lines: Vec<&str> = tree.lines().collect();
+        let needle = format!("key ({} EXTENT_DATA 0)", inos["orig.bin"]);
+        let at = lines
+            .iter()
+            .position(|l| l.contains(&needle))
+            .unwrap_or_else(|| panic!("orig.bin has no extent item at 0\n{tree}"));
+        lines[at + 1..]
+            .iter()
+            .take_while(|l| !l.contains(" key ("))
+            .find_map(|l| {
+                let words: Vec<&str> = l.split_whitespace().collect();
+                let i = words.iter().position(|w| *w == "byte")?;
+                words.get(i + 1)?.parse::<u64>().ok()
+            })
+            .unwrap_or_else(|| panic!("no disk byte for orig.bin"))
+    };
+
+    // The premise, from the kernel's tools: both clones are keyed, one at
+    // the hash and the other shifted above it.
+    let (total, _) = keyed_refs(&image, bytenr);
+    let keyed = keyed_refs_by_offset(&image, bytenr);
+    let hash = fs_btrfs::extent_write::data_ref_hash(5, 258 + clones[0].0 as u64, clones[0].1);
+    let placed: Vec<((u64, u64), (u64, u64))> = clones
+        .iter()
+        .map(|(i, offset)| {
+            let at = (258 + *i as u64, *offset);
+            (
+                at,
+                *keyed
+                    .get(&at)
+                    .unwrap_or_else(|| panic!("the clone {at:?} is not keyed: {keyed:?}")),
+            )
+        })
+        .collect();
+    let (victim_at, _) = placed
+        .iter()
+        .find(|(_, (key, count))| *key == hash + 1 && *count == 1)
+        .copied()
+        .unwrap_or_else(|| panic!("no clone is shifted to {}: {placed:?}", hash + 1));
+    assert!(
+        placed.iter().any(|(_, (key, _))| *key == hash),
+        "the other clone should hold the hash key: {placed:?}"
+    );
+    let victim = refs[(victim_at.0 - 257) as usize];
+
+    let mut expected: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
+    for name in &refs {
+        expected.insert(name, fs.read_file(inos[name]).unwrap());
+    }
+    let bytes = b"a shifted keyed reference, copied on write ".repeat(100);
+    let at = victim_at.1 + 5000;
+    let n = fs
+        .write(victim_at.0, at, &bytes)
+        .unwrap_or_else(|e| panic!("writing into {victim}, whose reference is shifted: {e}"));
+    assert_eq!(n, bytes.len(), "a short write");
+    expected.get_mut(victim).unwrap()[at as usize..at as usize + bytes.len()]
+        .copy_from_slice(&bytes);
+    drop(fs);
+
+    assert_btrfs_check_clean(&image, "after a write dropping a shifted keyed reference");
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum finds data that disagrees with its digests:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let (after_total, _) = keyed_refs(&image, bytenr);
+    assert_eq!(
+        after_total,
+        total - 1,
+        "the record's total should be one lower"
+    );
+    let mut rest = keyed.clone();
+    rest.remove(&victim_at);
+    assert_eq!(
+        keyed_refs_by_offset(&image, bytenr),
+        rest,
+        "only the shifted reference should be gone"
+    );
+
+    let after = kernel_view(&image, "after the shifted-reference write", &refs);
+    for name in &refs {
+        assert_eq!(
+            after[*name].0,
+            sha256_hex(&expected[name]),
+            "the kernel reads back different bytes from {name} than were written"
+        );
+    }
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after dropping a shifted keyed reference",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+}
