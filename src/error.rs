@@ -25,6 +25,11 @@ pub enum Error {
     /// internally inconsistent. Carries a human-readable description of
     /// the specific field, because a bad geometry value is almost always
     /// the first symptom of reading the wrong offset.
+    ///
+    /// Despite its name the variant covers every metadata structure —
+    /// tree blocks, directory items, inodes, extents, the log tree — so
+    /// its text does not blame the superblock; a message about the
+    /// superblock itself says so in its detail (#473).
     BadSuperblock(String),
 
     /// A metadata block failed the checksum named by `csum_type`. Btrfs
@@ -112,7 +117,7 @@ impl fmt::Display for Error {
             Error::NotBtrfs { magic } => {
                 write!(f, "not a Btrfs volume (magic bytes {magic:02x?})")
             }
-            Error::BadSuperblock(m) => write!(f, "malformed Btrfs superblock: {m}"),
+            Error::BadSuperblock(m) => write!(f, "malformed Btrfs metadata: {m}"),
             Error::ChecksumMismatch { what, offset } => {
                 write!(f, "{what} at offset {offset} failed its checksum")
             }
