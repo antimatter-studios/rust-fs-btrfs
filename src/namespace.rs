@@ -593,7 +593,7 @@ impl Filesystem {
         for (k, data) in self.items_of(ino)? {
             match k.key_type {
                 // A reference already emptied by this change.
-                INODE_REF_KEY if p.get(self, k)?.is_none() => {}
+                INODE_REF_KEY | INODE_EXTREF_KEY if p.get(self, k)?.is_none() => {}
                 INODE_ITEM_KEY | dir::XATTR_ITEM_KEY => p.remove(self, k)?,
                 EXTENT_DATA_KEY if holds_no_extent(&data) => p.remove(self, k)?,
                 // The whole file goes: cut to nothing, as truncate cuts, so
