@@ -752,6 +752,7 @@ impl Filesystem {
         let groups: Vec<_> = self
             .block_groups()?
             .into_iter()
+            .filter(|g| self.block_group_is_writable(g))
             .filter(|g| {
                 if self.emptying == Some(g.start) {
                     false
