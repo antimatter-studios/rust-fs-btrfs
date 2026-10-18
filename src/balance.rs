@@ -271,8 +271,10 @@ impl Filesystem {
     /// [`Error::ReadOnly`] unless mounted with [`Filesystem::mount_rw`],
     /// [`Error::NotFound`] when no block group starts at `start`, and
     /// [`Error::UnsupportedFeature`] for a group that is not a metadata
-    /// group or is a system one, each before anything is written, and
-    /// when no other metadata group has room for the copies.
+    /// group or is a system one, a mixed data and metadata group, a volume
+    /// with a log tree to replay, or a group containing a shared tree
+    /// block, each before anything is written; and when no other metadata
+    /// group has room for the copies.
     pub fn copy_tree_blocks_out_of(&mut self, start: u64) -> Result<()> {
         if self.writable.is_none() {
             return Err(Error::ReadOnly);
@@ -284,7 +286,56 @@ impl Filesystem {
                  to copy out"
             )));
         }
-        let dirty = self.tree_blocks_in(start..start + group.length)?;
+        if group.holds_data() {
+            return Err(Error::UnsupportedFeature(format!(
+                "the group at {start} holds mixed data and metadata; copying only its \
+                 tree blocks cannot empty it"
+            )));
+        }
+        if self.sb.log_root != 0 {
+            return Err(Error::UnsupportedFeature(
+                "the volume has a log tree to replay before metadata tree blocks can be moved"
+                    .into(),
+            ));
+        }
+        // Inspect every extent record in the group, including blocks a
+        // snapshot keeps and the older non-skinny EXTENT_ITEM form. A
+        // copy-on-write would leave a shared block behind, not empty it.
+        let root = self.tree_root(objectid::EXTENT_TREE)?;
+        let from = DiskKey {
+            objectid: start,
+            key_type: 0,
+            offset: 0,
+        };
+        self.pool_reader()
+            .tree()
+            .for_each_from(root, &from, &mut |key, data| {
+                if key.objectid >= group.end() {
+                    return Ok(false);
+                }
+                let tree_block = key.key_type == key_type::METADATA_ITEM
+                    || (key.key_type == key_type::EXTENT_ITEM
+                        && crate::backref::flags(data).is_some_and(|flags| {
+                            flags & crate::extent_write::EXTENT_FLAG_TREE_BLOCK != 0
+                        }));
+                if tree_block {
+                    let refs = data.get(..8).ok_or_else(|| {
+                        Error::UnsupportedFeature(format!(
+                            "the extent record for tree block {} is too short to count references",
+                            key.objectid
+                        ))
+                    })?;
+                    let refs = u64::from_le_bytes(refs.try_into().expect("8 bytes"));
+                    if refs > 1 {
+                        return Err(Error::UnsupportedFeature(format!(
+                            "the group at {start} holds a shared tree block at {} with {refs} references",
+                            key.objectid
+                        )));
+                    }
+                }
+                Ok(true)
+            })?;
+        let dirty = self.tree_blocks_in(start..group.end())?;
         if dirty.is_empty() {
             return Ok(());
         }
@@ -1329,6 +1380,158 @@ mod tests {
     /// Tests that need the oracle VM; the unit tier skips them by name.
     mod needs_host {
         use super::*;
+
+        /// A private copy of an oracle-made image, removed even on a panic.
+        struct RefusalImage(std::path::PathBuf);
+
+        impl RefusalImage {
+            fn new(name: &str, source: &str) -> Self {
+                use fs_btrfs_test_support::{fixture, temp_path};
+                let dir = std::path::PathBuf::from(temp_path!("metadata-refused-{name}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::copy(fixture(source), dir.join("fs.img")).unwrap();
+                Self(dir)
+            }
+
+            fn path(&self) -> std::path::PathBuf {
+                self.0.join("fs.img")
+            }
+
+            fn digest(&self) -> Vec<u8> {
+                use sha2::{Digest, Sha256};
+                use std::io::Read;
+                let mut file = std::fs::File::open(self.path()).unwrap();
+                let mut hash = Sha256::new();
+                let mut buf = vec![0u8; 1 << 20];
+                loop {
+                    let n = file.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    hash.update(&buf[..n]);
+                }
+                hash.finalize().to_vec()
+            }
+
+            fn refused(&self, fs: &mut Filesystem, start: u64, reason: &str) {
+                let before = self.digest();
+                let generation = fs.sb.generation;
+                let emptying = fs.emptying;
+                let result = fs.copy_tree_blocks_out_of(start);
+                assert_eq!(
+                    self.digest(),
+                    before,
+                    "refusal changed the image: {result:?}"
+                );
+                assert_eq!(
+                    fs.sb.generation, generation,
+                    "refusal committed a generation"
+                );
+                assert_eq!(
+                    fs.emptying, emptying,
+                    "refusal changed the allocator exclusion"
+                );
+                assert!(
+                    matches!(&result, Err(Error::UnsupportedFeature(why)) if why.contains(reason)),
+                    "expected UnsupportedFeature naming {reason}: {result:?}"
+                );
+            }
+        }
+
+        impl Drop for RefusalImage {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        #[test]
+        fn metadata_evacuation_refuses_an_unreplayed_log_without_writing() {
+            use fs_core::{BlockDevice, FileDevice};
+            use std::sync::Arc;
+
+            let image = RefusalImage::new("log", "dirtylog/btrfs-dirty-log-inode.img");
+            let device = Arc::new(FileDevice::open_rw(image.path()).unwrap());
+            // mount_rw replays this log. Open the committed trees without
+            // replay, then supply the writer to exercise evacuation itself.
+            let mut fs = Filesystem::mount_ignoring_log(device.clone()).unwrap();
+            assert_ne!(fs.sb.log_root, 0, "the kernel fixture must retain its log");
+            assert!(fs.log().unwrap().is_some(), "the log tree must be readable");
+            fs.writable = Some(device as Arc<dyn BlockDevice>);
+            let group = fs
+                .block_groups()
+                .unwrap()
+                .into_iter()
+                .find(|g| g.holds_metadata() && g.flags & bg::SYSTEM == 0)
+                .unwrap();
+            image.refused(&mut fs, group.start, "log tree");
+        }
+
+        #[test]
+        fn metadata_evacuation_refuses_a_snapshot_shared_tree_block_without_writing() {
+            use fs_btrfs_test_support::dump_tree;
+            use fs_core::{BlockDevice, FileDevice};
+            use std::sync::Arc;
+
+            let image = RefusalImage::new("shared", "snapshot/btrfs-nodatacow-snapshot.img");
+            // btrfs-progs, rather than our extent reader, identifies a
+            // tree block whose extent record counts multiple references.
+            let dump = dump_tree(&image.path(), "extent");
+            let lines: Vec<_> = dump.lines().collect();
+            let shared = lines
+                .windows(2)
+                .find_map(|pair| {
+                    let key = pair[0].split("key (").nth(1)?;
+                    let mut words = key.split_whitespace();
+                    let address = words.next()?.parse::<u64>().ok()?;
+                    if words.next()? != "METADATA_ITEM" {
+                        return None;
+                    }
+                    let refs = pair[1]
+                        .split_whitespace()
+                        .skip_while(|w| *w != "refs")
+                        .nth(1)?
+                        .parse::<u64>()
+                        .ok()?;
+                    (refs > 1).then_some(address)
+                })
+                .expect("the kernel snapshot must share a tree block");
+            let device = Arc::new(FileDevice::open_rw(image.path()).unwrap());
+            let mut fs = Filesystem::mount_rw(device as Arc<dyn BlockDevice>).unwrap();
+            let group = fs
+                .block_groups()
+                .unwrap()
+                .into_iter()
+                .find(|g| g.holds_metadata() && (g.start..g.end()).contains(&shared))
+                .unwrap();
+            image.refused(&mut fs, group.start, "shared tree block");
+        }
+
+        #[test]
+        fn metadata_evacuation_refuses_a_mixed_group_without_writing() {
+            use fs_btrfs_test_support::{dump_tree, guest_kernel_write_ok};
+            use fs_core::{BlockDevice, FileDevice};
+            use std::sync::Arc;
+
+            let image = RefusalImage::new("mixed", "btrfs-mixed.img");
+            guest_kernel_write_ok(
+                &image.path().to_string_lossy(),
+                "populate a mixed data and metadata group",
+                "head -c 8192 /dev/urandom > \"$MNT/payload\"; sync",
+            );
+            assert!(
+                dump_tree(&image.path(), "extent").contains("DATA|METADATA"),
+                "btrfs-progs must confirm the mixed block group"
+            );
+            let device = Arc::new(FileDevice::open_rw(image.path()).unwrap());
+            let mut fs = Filesystem::mount_rw(device as Arc<dyn BlockDevice>).unwrap();
+            let group = fs
+                .block_groups()
+                .unwrap()
+                .into_iter()
+                .find(|g| g.holds_metadata() && g.holds_data())
+                .unwrap();
+            image.refused(&mut fs, group.start, "mixed data and metadata");
+        }
 
         /// While a relocation empties a metadata group, a transaction's
         /// copy-on-write puts no tree block back into it (#574).
