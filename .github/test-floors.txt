@@ -85,7 +85,8 @@ compress_write_kernel     3
 compressed_short_decode   2
 compression_oracle        3
 # Trailing-hole growth adds one twin-file kernel comparison (#602).
-cow_write_oracle          17
+# Sparse EOF growth adds one comparison with four twin-file shapes (#601).
+cow_write_oracle          18
 crash_consistency         3
 csum_oracle               6
 csum_width_populated      1
@@ -128,7 +129,8 @@ leaf_split_oracle         1
 # Two synthetic planner shapes cover a cascade to the root and a cascade
 # stopping at an ancestor with exactly one pointer free (#515).
 # One no-tool trailing-hole growth regression adds three file shapes (#602).
-lib                       355
+# One no-tool EOF planner guard adds four sparse shapes and a data-backed control (#601).
+lib                       356
 link_extref_kernel        1
 log_tree_kernel           31
 lookup_by_name_key        1
