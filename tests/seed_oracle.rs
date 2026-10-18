@@ -14,7 +14,6 @@
 //! manifest is every file's size and SHA-256 as the kernel read it, the
 //! seed's before sprouting and the sprout's after.
 
-use fs_btrfs::error::Error;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs_test_support::{fixture, sha256_hex, temp_path};
 use fs_core::{BlockDevice, BlockRead, FileDevice};
@@ -122,28 +121,31 @@ fn a_device_that_is_not_the_sprouts_seed_is_refused() {
     );
 }
 
-/// The seed and its sprout are one filesystem, which `mount_pool` reads.
-/// Until it is written (#562), `mount_pool_rw` refuses the pair for that
-/// reason, naming the seed, and not as two filesystems (#561).
+/// The seed and its sprout are one filesystem, which `mount_pool` reads,
+/// and `mount_pool_rw` opens it too (#624): the sprout is written, the seed
+/// held read-only beside it. The test keeps the name it had while the pair
+/// was refused (#561); the seed is still named, now as the device left
+/// unwritten.
 #[test]
 fn the_sprouted_filesystem_given_for_writing_is_refused_naming_the_seed() {
-    for (tag, names) in [
-        ("seed-first", ["btrfs-seed.img", "btrfs-sprout.img"]),
-        ("sprout-first", ["btrfs-sprout.img", "btrfs-seed.img"]),
-    ] {
-        let devices = names.iter().map(|n| writable_copy(n, tag)).collect();
-        match Filesystem::mount_pool_rw(devices) {
-            Ok(_) => panic!("{tag}: the sprouted filesystem mounted read-write"),
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(matches!(e, Error::UnsupportedFeature(_)), "{tag}: {msg}");
-                assert!(!msg.contains("different filesystems"), "{tag}: {msg}");
-                assert!(
-                    msg.contains("seed") && msg.contains("sprout"),
-                    "{tag}: {msg}"
-                );
-            }
-        }
+    let fixture_seed = sha256_hex(&std::fs::read(fixture("seed/btrfs-seed.img")).expect("seed"));
+    for (tag, seed_first) in [("seed-first", true), ("sprout-first", false)] {
+        let seed_path = std::path::PathBuf::from(temp_path!("seed-rw-{tag}-btrfs-seed.img"));
+        std::fs::copy(fixture("seed/btrfs-seed.img"), &seed_path).expect("copying the seed");
+        let seed = Arc::new(FileDevice::open_rw(&seed_path).expect("open the seed copy"))
+            as Arc<dyn BlockDevice>;
+        let sprout = writable_copy("btrfs-sprout.img", tag);
+        let devices = if seed_first {
+            vec![seed, sprout]
+        } else {
+            vec![sprout, seed]
+        };
+        let fs = Filesystem::mount_pool_rw(devices)
+            .unwrap_or_else(|e| panic!("{tag}: the sprouted filesystem was refused: {e}"));
+        reads_every_file(&fs, "btrfs-sprout.manifest", tag);
+        drop(fs);
+        let after = sha256_hex(&std::fs::read(&seed_path).expect("reading the seed copy"));
+        assert_eq!(after, fixture_seed, "{tag}: the seed device was written");
     }
 }
 
