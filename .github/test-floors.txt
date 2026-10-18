@@ -90,6 +90,7 @@ device_replace_kernel     4
 docs_describe_the_code    5
 dup_data_writes           1
 dup_mirror_fallback       7
+emptied_leaf_kernel       1
 extent_record_missing     1
 extent_window_read        2
 extent_window_write       3
