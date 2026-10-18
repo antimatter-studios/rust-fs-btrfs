@@ -378,8 +378,10 @@ int fs_btrfs_rename(fs_btrfs_fs_t *fs, const char *from, const char *to);
  * growing records the new range as a hole, an item of its own on a volume
  * without the no-holes feature. Returns 0, or -1: ENOENT
  * for no such path, EISDIR for anything but a regular file, EROFS on a
- * read-only handle, ENOTSUP for an extent a snapshot or reflink shares or
- * for growing a file whose last sector is partly past its end.
+ * read-only handle, ENOTSUP for an extent a snapshot or reflink shares or,
+ * on a volume without the no-holes feature, for growing a file whose last
+ * sector is partly past its end. Elsewhere the rest of that sector is
+ * rewritten with zeros first.
  */
 int fs_btrfs_truncate(fs_btrfs_fs_t *fs, const char *path, uint64_t size);
 
