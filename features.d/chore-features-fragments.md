@@ -9,7 +9,7 @@ rename: A block group tree volume
 | A block group tree volume (`-O block-group-tree`) | Supported: read and written, with group items maintained in tree 11 | Unreleased (#559) | #270 | `block_group_tree_oracle.rs`, `block_group_tree_write_kernel.rs` |
 rename: A volume with simple quotas
 | A volume with simple quotas (`-O squota`) | Supported, read-only; refused read-write, since extents would be allocated without their owner references. Extents with owner references, which a 6.7+ kernel writes, have no fixture yet | Unreleased (#270) | #270 | `simple_quota_oracle.rs` |
-| fs-verity files (`fsverity enable`): every block read checked against the file's Merkle tree and refused when it does not verify, as the kernel refuses it; the descriptor, digest (`fsverity measure`) and Merkle tree read back (`verity`, `verity_merkle_tree`) | Supported, read-only; a volume with verity files is refused read-write, since a data write would leave a sealed file's tree stale. A signed descriptor's signature is read but not checked | Unreleased (#356) | #270 | `verity_oracle.rs` |
+| fs-verity files (`fsverity enable`): every block read checked against the file's Merkle tree and refused when it does not verify, as the kernel refuses it; the descriptor, digest (`fsverity measure`) and Merkle tree read back (`verity`, `verity_merkle_tree`) | Supported: the volume stays writable; sealed files refuse data writes, truncate, clone destinations, unlink and rename replacement by name. A signed descriptor's signature is read but not checked | Unreleased (#356, #560) | #270 | `verity_oracle.rs`, `verity_write_kernel.rs` |
 
 ## Checking
 
