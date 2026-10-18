@@ -14,14 +14,24 @@
 //! manifest is every file's size and SHA-256 as the kernel read it, the
 //! seed's before sprouting and the sprout's after.
 
+use fs_btrfs::error::Error;
 use fs_btrfs::fs::Filesystem;
-use fs_btrfs_test_support::{fixture, sha256_hex};
-use fs_core::{BlockRead, FileDevice};
+use fs_btrfs_test_support::{fixture, sha256_hex, temp_path};
+use fs_core::{BlockDevice, BlockRead, FileDevice};
 use std::sync::Arc;
 
 fn device(name: &str) -> Arc<dyn BlockRead> {
     let path = fixture(&format!("seed/{name}"));
     Arc::new(FileDevice::open(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
+}
+
+/// A writable copy of a fixture in the scratch directory, so the fixture
+/// itself is never opened for writing.
+fn writable_copy(name: &str, tag: &str) -> Arc<dyn BlockDevice> {
+    let copy = std::path::PathBuf::from(temp_path!("seed-{tag}-{name}"));
+    let from = fixture(&format!("seed/{name}"));
+    std::fs::copy(&from, &copy).unwrap_or_else(|e| panic!("copying {}: {e}", from.display()));
+    Arc::new(FileDevice::open_rw(&copy).unwrap_or_else(|e| panic!("{}: {e}", copy.display())))
 }
 
 /// `(path, size, sha256)` for every file in a manifest.
@@ -110,4 +120,42 @@ fn a_device_that_is_not_the_sprouts_seed_is_refused() {
         Filesystem::mount_pool(vec![other, device("btrfs-sprout.img")]).is_err(),
         "an unrelated filesystem's device was accepted as the seed"
     );
+}
+
+/// The seed and its sprout are one filesystem, which `mount_pool` reads.
+/// Until it is written (#562), `mount_pool_rw` refuses the pair for that
+/// reason, naming the seed, and not as two filesystems (#561).
+#[test]
+fn the_sprouted_filesystem_given_for_writing_is_refused_naming_the_seed() {
+    for (tag, names) in [
+        ("seed-first", ["btrfs-seed.img", "btrfs-sprout.img"]),
+        ("sprout-first", ["btrfs-sprout.img", "btrfs-seed.img"]),
+    ] {
+        let devices = names.iter().map(|n| writable_copy(n, tag)).collect();
+        match Filesystem::mount_pool_rw(devices) {
+            Ok(_) => panic!("{tag}: the sprouted filesystem mounted read-write"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(matches!(e, Error::UnsupportedFeature(_)), "{tag}: {msg}");
+                assert!(!msg.contains("different filesystems"), "{tag}: {msg}");
+                assert!(
+                    msg.contains("seed") && msg.contains("sprout"),
+                    "{tag}: {msg}"
+                );
+            }
+        }
+    }
+}
+
+/// Naming the seed does not stop an unrelated filesystem's device from
+/// being refused as one.
+#[test]
+fn an_unrelated_device_given_for_writing_is_still_another_filesystem() {
+    let default = std::path::PathBuf::from(temp_path!("seed-unrelated-btrfs-default.img"));
+    std::fs::copy(fixture("btrfs-default.img"), &default).expect("copying btrfs-default.img");
+    let other = Arc::new(FileDevice::open_rw(&default).expect("open")) as Arc<dyn BlockDevice>;
+    match Filesystem::mount_pool_rw(vec![other, writable_copy("btrfs-sprout.img", "unrelated")]) {
+        Ok(_) => panic!("an unrelated filesystem's device was accepted beside the sprout"),
+        Err(e) => assert!(e.to_string().contains("different filesystems"), "{e}"),
+    }
 }

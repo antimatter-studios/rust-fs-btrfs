@@ -733,7 +733,9 @@ impl Filesystem {
     /// [`Error::ReadOnly`] when a device cannot be written;
     /// [`Error::UnsupportedFeature`] for an incomplete set, devices of
     /// different filesystems or two claiming one devid, as
-    /// [`Filesystem::mount_pool`] refuses them; and for a member whose
+    /// [`Filesystem::mount_pool`] refuses them; for a seed among several
+    /// devices, since a sprouted filesystem is read but not yet written;
+    /// and for a member whose
     /// newest superblock is not its primary copy or is not of the same
     /// generation as the rest. Such a member missed a commit the others
     /// saw, and writing on top of it is a decision for `btrfs check`.
@@ -746,11 +748,24 @@ impl Filesystem {
         if devices.iter().any(|d| !d.is_writable()) {
             return Err(Error::ReadOnly);
         }
+        let several = devices.len() > 1;
         let mut by_id: BTreeMap<u64, Arc<dyn BlockDevice>> = BTreeMap::new();
         let mut first: Option<(crate::superblock::Superblock, usize)> = None;
         for dev in devices {
             let (sb, copy) = crate::superblock::read_superblock(&*dev)?;
             let id = sb.dev_item.devid;
+            // A SEED AND ITS SPROUT ARE ONE FILESYSTEM (#561), which
+            // `mount_pool` reads. The seed's superblock keeps the seed's
+            // own fsid, so the pair is told apart here before the fsids are
+            // compared, and refused for what it is: a sprouted filesystem,
+            // which is not written yet (#562). A seed alone is
+            // `mount_rw`'s, and refused there.
+            if several && sb.is_seeding() {
+                return Err(Error::UnsupportedFeature(format!(
+                    "device {id} is a seed, and a filesystem sprouted from a seed can be read \
+                     but not yet written: mount the seed and its sprout read-only"
+                )));
+            }
             if let Some((seen, _)) = &first {
                 if seen.fsid != sb.fsid {
                     return Err(Error::UnsupportedFeature(
