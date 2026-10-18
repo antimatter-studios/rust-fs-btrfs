@@ -1281,4 +1281,75 @@ mod tests {
             Some(vec![10 * MIB])
         );
     }
+
+    /// Tests that need the oracle VM; the unit tier skips them by name.
+    mod needs_host {
+        use super::*;
+
+        /// While a relocation empties a metadata group, a transaction's
+        /// copy-on-write puts no tree block back into it (#574).
+        ///
+        /// A second metadata chunk is allocated beside the one `mkfs.btrfs`
+        /// made, the first is excluded, and a file is created: every block the
+        /// commit rewrites must land in the second, so the first group's
+        /// `used` cannot grow and the new root tree block is outside it.
+        /// Without the exclusion first fit picks the first group, which has
+        /// room, and the second stays empty.
+        #[test]
+        fn no_tree_block_is_placed_in_the_group_being_emptied() {
+            use fs_btrfs_test_support::{oracle, temp_path};
+            use fs_core::{BlockDevice, FileDevice};
+            use std::sync::Arc;
+
+            let dir = std::path::PathBuf::from(temp_path!("alloc-out-of-emptied"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let img = dir.join("fs.img");
+            std::fs::File::create(&img)
+                .unwrap()
+                .set_len(256 * MIB)
+                .unwrap();
+            let made = oracle("mkfs.btrfs")
+                .args(["-q", "-f", "-m", "single", "-d", "single", "-n", "16384"])
+                .arg(&img)
+                .output();
+            assert!(
+                made.status.success(),
+                "{}",
+                String::from_utf8_lossy(&made.stderr)
+            );
+
+            let dev = Arc::new(FileDevice::open_rw(&img).unwrap());
+            let mut fs = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>).unwrap();
+            let metadata = |fs: &Filesystem| -> Vec<BlockGroup> {
+                fs.block_groups()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|g| g.holds_metadata() && g.flags & bg::SYSTEM == 0)
+                    .collect()
+            };
+            let old = metadata(&fs)[0];
+            let new = fs
+                .allocate_chunk(old.flags, old.length)
+                .expect("a second metadata chunk");
+            fs.emptying = Some(old.start);
+            fs.create(256, b"after", 0o100644, 0, 0)
+                .expect("a file created while the group is excluded");
+
+            let after = metadata(&fs);
+            let _ = std::fs::remove_dir_all(&dir);
+            let used = |start: u64| after.iter().find(|g| g.start == start).unwrap().used;
+            assert!(
+                used(old.start) <= old.used,
+                "the excluded group's used grew from {} to {}",
+                old.used,
+                used(old.start)
+            );
+            assert!(used(new) > 0, "nothing was placed in the new group");
+            let root = fs.sb.root;
+            assert!(
+                !(old.start..old.start + old.length).contains(&root),
+                "the new root tree block {root} is inside the excluded group"
+            );
+        }
+    }
 }
