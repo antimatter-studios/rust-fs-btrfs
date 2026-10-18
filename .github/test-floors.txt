@@ -88,7 +88,7 @@ compression_oracle        3
 # Sparse EOF growth adds one comparison with four twin-file shapes (#601).
 # A cross-leaf keyed-reference case adds one kernel oracle (#607);
 # all 19 cases must execute in the first full CI run.
-cow_write_oracle          19
+cow_write_oracle          20
 crash_consistency         3
 csum_oracle               6
 csum_width_populated      1
@@ -134,7 +134,7 @@ leaf_split_oracle         1
 # One no-tool EOF planner guard adds four sparse shapes and a data-backed control (#601).
 # The cross-leaf routing regression executed 357 library cases locally
 # (356 passed, one failed on the red commit 35946a4) on 2026-10-18 (#607).
-lib                       357
+lib                       358
 link_extref_kernel        1
 log_tree_kernel           31
 lookup_by_name_key        1
