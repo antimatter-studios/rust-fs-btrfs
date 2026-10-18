@@ -186,6 +186,9 @@ subvol_default_kernel     1
 # Two no-tool scope contracts and two independent kernel namespace cases (#518).
 subvol_namespace_contract 2
 subvol_namespace_kernel   2
+# One no-tool scope case and one kernel snapshot-isolation case (#519).
+subvol_truncate_contract  1
+subvol_truncate_kernel    1
 subvol_oracle             12
 subvol_readonly_kernel    1
 superblock_mirrors        4
