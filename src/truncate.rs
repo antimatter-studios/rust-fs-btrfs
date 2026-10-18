@@ -79,6 +79,7 @@ impl Filesystem {
         if !inode.is_regular_file() {
             return Err(Error::NotAFile);
         }
+        crate::verity::refuse_mutation(ino, inode.flags)?;
         if size == inode.size {
             return Ok(());
         }
