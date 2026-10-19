@@ -56,6 +56,14 @@ for tier in test:unit test:images test:oracle test:kernel test:vm test:scripts; 
     else
         fail "$tier carries a non-zero line and byte budget"
     fi
+    # The budget ends at a bare `--`: output-budget.sh runs whatever follows
+    # it, so `151500 --scripts/test.sh` runs a program named
+    # `--scripts/test.sh` and the tier exits 127 having run no test (#645).
+    if printf '%s\n' "$block" | grep -Eq "scripts/tier\.sh +[^ ]+ +[^ ]+ +[0-9]+ +[0-9]+ +--( |$)"; then
+        ok "$tier separates its budget from its command with a bare --"
+    else
+        fail "$tier separates its budget from its command with a bare --"
+    fi
 done
 
 # --- 2. The wrapper a tier uses comes from rust-fs-core. ----------------

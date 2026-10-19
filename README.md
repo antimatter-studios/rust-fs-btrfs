@@ -61,6 +61,7 @@ Metadata is JSON on stdout by default, `--text` for people. A failure is
 | verb | state |
 |---|---|
 | `ls [PATH]` | JSON entries: name, type, size, mode, mtime, inode, `subvolume`, and a symlink's target. A path into a subvolume or a snapshot is followed, as a mount shows it |
+| `ls --recursive [PATH]` (`-R`) | Depth-first entries with absolute `path` (`path_hex` for non-UTF-8 bytes) and `depth` from PATH. Subvolumes and snapshots are entered and marked; symlinks are never followed |
 | `stat PATH` | One path's inode, type, mode, owner, links, size, allocated bytes and all four times as signed seconds plus nanoseconds. A symlink is reported without following it; device nodes include major/minor numbers. `btrfs` holds subvolume id, flags, generation, transid, sequence and the compression property (null when absent) |
 | `read PATH [-o FILE]` | the file's raw bytes: inline, compressed (zlib, LZO, zstd), sparse, inside a subvolume or through a snapshot |
 | `get [KEY]` / `info [KEY]` | `fs`, `label`, `total_bytes`, `free_bytes` (from `bytes_used`), `block_size` (the sector size), `dirty` (a log to replay, or the error flag), and `btrfs.*`: fsid, metadata UUID, node size, checksum type, device count, generation, feature names. From the superblock alone, so a volume that will not mount still answers |
@@ -68,6 +69,18 @@ Metadata is JSON on stdout by default, `--text` for people. A failure is
 | `mkdir` | not implemented (exit 3): needs directory edits, [#262][i262] |
 | `set label VALUE` | writes the label (at most 255 bytes) into every superblock copy, each with a fresh checksum; a pool of several devices is refused |
 | `resize SIZE [--force]` | grows or shrinks a single-device filesystem as one transaction: `20G`, `+1G`, `-512M` or `max` (all of the device). An image file is made longer first and cut after a shrink; a shrink needs `--force`. A chunk past the new end, which only a balance could move, and a pool of several devices are refused with exit 3 ([#264][i264]) |
+
+`fs.btrfs disk.img ls -R --max-depth 8 --limit 1000 /home` walks with
+each directory's names sorted as bytes. Defaults are depth 64 and 100000
+entries; both options require `--recursive`. Plain `ls` lists depth 1.
+A starting file is listed alone at depth 0. A real directory already visited
+by its (subvolume, inode) identity is listed with `"revisited": true` and not
+entered again. A snapshot's copied nested subvolumes remain empty, as the
+kernel shows them. An exact fit succeeds; one more entry past either bound,
+or a directory that cannot be read, exits 1 with the collected entries on
+stdout and the bound or path named on stderr. A missing starting path prints
+no report. Zero bounds allow an empty tree; `--limit 0` allows no entry and
+`--max-depth 0` none below PATH.
 
 `mkfs.btrfs` makes a single-device filesystem with the standard formatter's
 defaults (metadata and system DUP, data single, the free-space tree, skinny

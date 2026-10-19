@@ -609,9 +609,16 @@ tasks:
     # (2026-10-16): every test passed, but the kernel log printed 1172
     # lines and 89022 bytes against 1160 and 86000. About 30% over that
     # is 1520 lines and 116000 bytes.
+    #
+    # Re-measured on #491's merge-queue run 39178585304 (2026-10-19):
+    # every test passed, but the kernel log printed 1453 lines and 116485
+    # bytes against 116000. The growth is kept evidence, the `[oracle vm]`
+    # and `[kernel vm]` line per tool call: the log-replay tests alone
+    # print 19765 bytes, recursive ls 1002. About 30% over that is 1890
+    # lines and 151500 bytes.
     cmds:
       - test-disks/build-fixtures.sh --check
-      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 1520 116000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 1890 151500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
@@ -749,9 +756,11 @@ tasks:
     # BUDGET: 26 lines and 1047 bytes measured with fsck.btrfs's checks in
     # the tier (#260, run 37378163675), so 26 lines and 1200 bytes.
     # test-stat.sh adds exactly three success lines, so 29 lines now.
+    # Recursive ls adds 62 installed assertions (#466) and three success
+    # lines (95 bytes); add them to the existing floor and budget.
     cmds:
-      - '../rust-fs-core/scripts/tier.sh test:cli cli 29 1200 -- scripts/test-cli.sh'
-      - 'bash ../rust-fs-core/scripts/test-floor.sh cli 207'
+      - '../rust-fs-core/scripts/tier.sh test:cli cli 32 1295 -- scripts/test-cli.sh'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh cli 269'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
