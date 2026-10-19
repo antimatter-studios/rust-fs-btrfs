@@ -73,7 +73,7 @@
 //! - a write past the end of a file, on a volume **without the no-holes
 //!   feature**, whose gap an extent item past the end (a preallocated one)
 //!   already reaches into;
-//! - a **preallocated** extent the write covers the middle of, or one
+//! - a **preallocated** extent the write cuts off a sector boundary, or one
 //!   another reference shares, or an **inline** one the write does not
 //!   lie within, or one that is encrypted or encoded: each changes the
 //!   item's kind, not only where it points. A write within inline data
@@ -85,7 +85,7 @@
 //!   covering the whole of a preallocated item is written where its
 //!   extent lies, and the item becomes regular in place (#535); one
 //!   covering its first or last sectors splits it in two over the same
-//!   extent (#536);
+//!   extent (#536), and one strictly inside it splits it in three (#537);
 //! - an extent another reference shares whose reference from this file
 //!   is held anywhere but inline in its record: which entry to count
 //!   down is not known.
@@ -252,7 +252,8 @@ impl Filesystem {
             move_inline || (end > inode.size && self.file_extents(ino)?.iter().any(|p| p.inline));
         // A write over the whole of a preallocated item is written where
         // its extent lies, and the item becomes regular (#535); one over
-        // its first or last sectors splits it in two (#536).
+        // its first or last sectors splits it in two (#536), and one
+        // strictly inside it in three (#537).
         if !move_inline && end <= inode.size {
             if let Some(written) = self.write_prealloc(inode, offset, data, summed)? {
                 return Ok(written);
@@ -707,10 +708,13 @@ impl Filesystem {
     /// sectors and a preallocated one for the rest, each with its own
     /// offset into the extent. Both name the extent at the same reference
     /// offset, so its record's inline `EXTENT_DATA_REF` is counted up by
-    /// one, as a clone's is; only the written sectors gain digests. `None`
-    /// when the write lies in no preallocated item, or in the middle of
-    /// one, or splits it off a sector boundary: the planner then refuses
-    /// it by name.
+    /// one, as a clone's is; only the written sectors gain digests. A
+    /// write touching neither its first nor its last sector splits it in
+    /// three (#537): preallocated before the write, regular for the
+    /// written sectors, preallocated after, and the reference is counted
+    /// up by two. `None` when the write lies in no preallocated item, or
+    /// splits it off a sector boundary: the planner then refuses it by
+    /// name.
     fn write_prealloc(
         &mut self,
         inode: &Inode,
@@ -735,12 +739,12 @@ impl Filesystem {
             return Ok(None);
         };
         let item_end = key.offset + le64(&item, fe::NUM_BYTES);
-        let split_at = match (offset == key.offset, end == item_end) {
-            (true, true) => None,
-            (true, false) if end.is_multiple_of(sector) => Some(end),
-            (false, true) if offset.is_multiple_of(sector) => Some(offset),
-            _ => return Ok(None),
-        };
+        // Each edge of the write that cuts the item must fall on a sector.
+        if (offset != key.offset && !offset.is_multiple_of(sector))
+            || (end != item_end && !end.is_multiple_of(sector))
+        {
+            return Ok(None);
+        }
         if item[fe::COMPRESSION] != 0
             || item[fe::ENCRYPTION] != 0
             || item[fe::OTHER_ENCODING..fe::OTHER_ENCODING + 2] != [0, 0]
@@ -776,14 +780,16 @@ impl Filesystem {
         let now = (now.as_secs(), now.subsec_nanos());
 
         // Each part of the item: its file offset, length, and whether the
-        // write covers it.
-        let parts = match split_at {
-            None => vec![(key.offset, len, true)],
-            Some(at) => vec![
-                (key.offset, at - key.offset, offset == key.offset),
-                (at, item_end - at, offset != key.offset),
-            ],
-        };
+        // write covers it. The preallocated parts before and after the
+        // write exist only where the write leaves some of the item (#537).
+        let parts: Vec<(u64, u64, bool)> = [
+            (key.offset, offset - key.offset, false),
+            (offset, len, true),
+            (end, item_end - end, false),
+        ]
+        .into_iter()
+        .filter(|&(_, num_bytes, written)| written || num_bytes > 0)
+        .collect();
         let mut edits = Vec::new();
         for &(file_offset, num_bytes, written) in &parts {
             let mut part = item.clone();
@@ -802,17 +808,17 @@ impl Filesystem {
                 data: part,
             }));
         }
-        // The second part names the extent at the same reference offset
-        // as the first, so the record counts that reference up (#536).
-        let shares = if split_at.is_some() {
-            vec![DataShare {
+        // Every part after the first names the extent at the same
+        // reference offset as the first, so the record counts that
+        // reference up once for each (#536, #537).
+        let shares = vec![
+            DataShare {
                 bytenr: extent_start,
                 len: extent_len,
                 ref_offset: key.offset.wrapping_sub(le64(&item, fe::OFFSET)),
-            }]
-        } else {
-            Vec::new()
-        };
+            };
+            parts.len() - 1
+        ];
         let mut raw = self.raw_inode(ino)?;
         crate::namespace::touch(&mut raw, generation, now, &[io::CTIME, io::MTIME]);
         edits.push(ItemEdit::Put(OwnedItem {
