@@ -525,6 +525,23 @@ fn a_parent_can_split_into_more_than_two_nodes_in_one_transaction() {
     assert!(plan.split_of(path[2]).unwrap().root.is_some());
 }
 
+/// 4 KiB nodes hold 121 key pointers: a root leaf taking 121 more
+/// one-leaf items splits into 122 parts, one more than a new root node
+/// holds, so the tree grows two levels in one transaction (#649).
+#[test]
+fn a_root_whose_parts_overflow_one_node_grows_two_levels() {
+    let (plan, path) = cascade_with_items(0, 0, 121);
+    let split = plan.split_of(path[0]).unwrap();
+    assert_eq!(split.new.len(), 121);
+    assert!(split.root.is_some());
+    let allocated = plan.allocated();
+    assert_eq!(allocated.len(), plan.rewrites.len() + 121 + 2 + 1);
+    assert_eq!(
+        allocated.iter().copied().collect::<BTreeSet<_>>().len(),
+        allocated.len()
+    );
+}
+
 /// A record and its keyed references can start different leaves with
 /// the same objectid. Address routing must select the record's leaf.
 #[test]
