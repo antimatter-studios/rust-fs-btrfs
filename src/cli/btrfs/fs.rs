@@ -13,8 +13,10 @@
 //! transaction -- a new file, a directory, a different length, an ordinary
 //! file -- is refused, by the library's own reason where it has one.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io::Write;
+use std::sync::Arc;
 
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command as Cmd};
 
@@ -22,7 +24,7 @@ use super::device;
 use fs_btrfs::inode::{FileType, Inode};
 use fs_btrfs::superblock::{compat_ro, incompat};
 use fs_btrfs::{ChecksumType, Error, Filesystem, Superblock};
-use fs_core::cli::{CliError, Json, Outcome, Tool};
+use fs_core::cli::{CliError, Format, Json, Outcome, Tool};
 
 pub const TOOL: Tool = Tool {
     name: "fs.btrfs",
@@ -90,6 +92,15 @@ fn command() -> Cmd {
                     "List a directory: name, type, size, mode, mtime (a symlink's target, \
                      and which entries are subvolumes)",
                 )
+                .arg(Arg::new("recursive").long("recursive").short('R')
+                    .action(ArgAction::SetTrue)
+                    .help("Walk depth first, names sorted as bytes; never follow a symlink"))
+                .arg(Arg::new("max-depth").long("max-depth").value_name("N")
+                    .value_parser(value_parser!(u64)).requires("recursive")
+                    .help("How deep --recursive may go (default: 64); a directory's entries are depth 1"))
+                .arg(Arg::new("limit").long("limit").value_name("N")
+                    .value_parser(value_parser!(u64)).requires("recursive")
+                    .help("How many entries --recursive may list (default: 100000)"))
                 .arg(
                     Arg::new("path")
                         .value_name("PATH")
@@ -99,7 +110,16 @@ fn command() -> Cmd {
                 .after_help(
                     "Examples:\n  fs.btrfs disk.img ls /home\n  \
                      fs.btrfs disk.img ls / | jq -r '.[] | select(.subvolume) | .name'\n  \
-                     fs.btrfs disk.img ls --text /",
+                     fs.btrfs disk.img ls --text /\n  \
+                     fs.btrfs disk.img ls -R --max-depth 8 --limit 1000 /home\n\n\
+                     With --recursive each entry adds its path from the volume's root and \
+                     its depth from PATH. A starting file is listed alone at depth 0. \
+                     Subvolumes and snapshots are entered and marked; a directory whose \
+                     (subvolume, inode) identity was visited is marked revisited: true and \
+                     not entered again. If one more entry would pass either bound, or a \
+                     directory cannot be read, exit 1 keeps the collected entries on stdout \
+                     and names the bound or path on stderr. An exact fit succeeds; \
+                     --limit 0 allows no entry, --max-depth 0 none below PATH.",
                 ),
         )
         .subcommand(
@@ -393,6 +413,12 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         .copied()
         .unwrap_or(0);
     match verb {
+        "ls" if sub.get_flag("recursive") => ls_recursive(
+            device::mount(target, offset)?,
+            path_arg(sub),
+            sub,
+            Format::of(matches, &std::env::args_os().collect::<Vec<_>>()),
+        ),
         "ls" => ls(&device::mount(target, offset)?, path_arg(sub)),
         "stat" => stat(&device::mount(target, offset)?, path_arg(sub)),
         "read" => read(
@@ -761,13 +787,20 @@ fn entry_text(e: &Json) -> String {
         type_char(&field("type")),
         field("mode"),
         field("size"),
-        field("name")
+        if e.get("path").is_some() {
+            field("path")
+        } else {
+            field("name")
+        }
     );
     if e.get("subvolume") == Some(&Json::Bool(true)) {
         line.push_str(" (subvolume)");
     }
     if let Some(target) = e.get("target") {
         line.push_str(&format!(" -> {}", target.to_text()));
+    }
+    if e.get("revisited") == Some(&Json::Bool(true)) {
+        line.push_str(" [revisited]");
     }
     line
 }
@@ -814,6 +847,174 @@ fn ls(root: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
         .collect::<Vec<_>>()
         .join("\n");
     Ok(Outcome::report(Json::Arr(entries)).with_text(text))
+}
+
+/// The shared finite defaults for a recursive listing.
+const MAX_DEPTH: u64 = 64;
+const LIMIT: u64 = 100_000;
+
+fn recursive_entry(
+    fs: &Filesystem,
+    path: &[u8],
+    depth: u64,
+    inode: &Inode,
+    subvolume: bool,
+    revisited: bool,
+) -> Json {
+    let name = path.rsplit(|b| *b == b'/').next().unwrap_or(path);
+    let Json::Obj(mut fields) = entry(fs, name, inode, subvolume) else {
+        unreachable!("an ls entry is an object")
+    };
+    fields.push(("path".into(), Json::from(show(path))));
+    if std::str::from_utf8(path).is_err() {
+        fields.push((
+            "path_hex".into(),
+            Json::from(path.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        ));
+    }
+    fields.push(("depth".into(), Json::from(depth)));
+    if revisited {
+        fields.push(("revisited".into(), Json::from(true)));
+    }
+    Json::Obj(fields)
+}
+
+fn sorted_children(
+    fs: &Filesystem,
+    ino: u64,
+    path: &[u8],
+) -> Result<std::vec::IntoIter<fs_btrfs::dir::DirEntry>, CliError> {
+    // Snapshot copies of nested subvolume entries have no backing tree.
+    let mut children = if ino == fs_btrfs::subvol::EMPTY_SUBVOL_DIR_OBJECTID {
+        Vec::new()
+    } else {
+        fs.read_dir(ino).map_err(|e| btrfs_error(path, e))?
+    };
+    children.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(children.into_iter())
+}
+
+/// One heap frame per directory, with its containing tree kept alive.
+/// Revisit identities include the tree: unrelated subvolume roots all use 256.
+fn walk(
+    root: &Arc<Filesystem>,
+    found: fs_btrfs::subvol::PathTarget,
+    start: Vec<u8>,
+    (max_depth, limit): (u64, u64),
+    entries: &mut Vec<Json>,
+) -> Result<(), CliError> {
+    let reached = |bound: &str, value: u64, at: &[u8]| {
+        CliError::failed(format!("{bound} {value} reached at {}", show(at)))
+    };
+    let fs = found.tree.map(Arc::new).unwrap_or_else(|| Arc::clone(root));
+    if !found.inode.is_dir() {
+        if limit == 0 {
+            return Err(reached("--limit", limit, &start));
+        }
+        entries.push(recursive_entry(&fs, &start, 0, &found.inode, false, false));
+        return Ok(());
+    }
+    let tree = fs.subvolume_at(b"/").map_err(|e| btrfs_error(&start, e))?;
+    let mut visited = HashSet::from([(tree, found.inode.ino)]);
+    let first = sorted_children(&fs, found.inode.ino, &start)?;
+    let mut stack = vec![(fs, tree, start, 0u64, first)];
+    while let Some((fs, tree, parent, parent_depth, children)) = stack.last_mut() {
+        let Some(child) = children.next() else {
+            stack.pop();
+            continue;
+        };
+        let path = child_path(parent, &child.name);
+        let depth = *parent_depth + 1;
+        if entries.len() as u64 >= limit {
+            return Err(reached("--limit", limit, &path));
+        }
+        if depth > max_depth {
+            return Err(reached("--max-depth", max_depth, &path));
+        }
+        let subvolume = !child.is_inode();
+        let (fs, tree, inode) = if subvolume {
+            // ROOT_REF validation makes a snapshot's copied entries empty,
+            // rather than following them back into the ancestor's live tree.
+            let target = root
+                .resolve_path_bytes(&path)
+                .map_err(|e| btrfs_error(&path, e))?;
+            let next = target
+                .tree
+                .map(Arc::new)
+                .unwrap_or_else(|| Arc::clone(root));
+            let id = if target.inode.ino == fs_btrfs::subvol::EMPTY_SUBVOL_DIR_OBJECTID {
+                *tree
+            } else {
+                child.ino // A subvolume entry's location is its tree id.
+            };
+            (next, id, target.inode)
+        } else {
+            (
+                Arc::clone(fs),
+                *tree,
+                fs.read_inode(child.ino)
+                    .map_err(|e| btrfs_error(&path, e))?,
+            )
+        };
+        // Empty inode-2 placeholders are distinct synthetic directories,
+        // with no children and no real inode to put in the revisit set.
+        let revisited = inode.is_dir()
+            && inode.ino != fs_btrfs::subvol::EMPTY_SUBVOL_DIR_OBJECTID
+            && !visited.insert((tree, inode.ino));
+        entries.push(recursive_entry(
+            &fs, &path, depth, &inode, subvolume, revisited,
+        ));
+        if inode.is_dir() && !revisited {
+            let next = sorted_children(&fs, inode.ino, &path)?;
+            stack.push((fs, tree, path, depth, next));
+        }
+    }
+    Ok(())
+}
+
+fn ls_recursive(
+    root: Filesystem,
+    path: &[u8],
+    sub: &ArgMatches,
+    format: Format,
+) -> Result<Outcome, CliError> {
+    let found = root
+        .resolve_path_bytes(path)
+        .map_err(|e| btrfs_error(path, e))?;
+    let bounds = (
+        sub.get_one::<u64>("max-depth")
+            .copied()
+            .unwrap_or(MAX_DEPTH),
+        sub.get_one::<u64>("limit").copied().unwrap_or(LIMIT),
+    );
+    let mut start = Vec::new();
+    for component in path.split(|b| *b == b'/').filter(|c| !c.is_empty()) {
+        start.push(b'/');
+        start.extend_from_slice(component);
+    }
+    if start.is_empty() {
+        start.push(b'/');
+    }
+    let mut entries = Vec::new();
+    let walked = walk(&Arc::new(root), found, start, bounds, &mut entries);
+    let text = entries
+        .iter()
+        .map(entry_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let report = Outcome::report(Json::Arr(entries)).with_text(text);
+    match walked {
+        Ok(()) => Ok(report),
+        Err(error) => {
+            // Preserve a complete partial report through the shared renderer.
+            let partial = fs_core::cli::output::render(TOOL.name, format, Ok(report));
+            let mut out = std::io::stdout().lock();
+            out.write_all(partial.stdout.as_bytes())
+                .and_then(|()| out.flush())
+                .map_err(|e| CliError::failed(format!("write: {e}")))?;
+            Err(CliError::failed(error.message))
+        }
+    }
 }
 
 /// The on-disk inode flags, with unknown bits preserved by `flag_names`.
