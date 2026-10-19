@@ -3684,3 +3684,166 @@ fn a_write_adding_more_than_two_leaves_of_digests_splits_the_checksum_leaf_as_of
         "btrfs scrub start -B \"$MNT\" >/dev/null",
     );
 }
+
+/// A write covering only the leading sectors of a preallocated item in one
+/// checksummed copy-on-write file, and only the trailing sectors in
+/// another, splits each item in two over the same extent (#536): a regular
+/// item for the written sectors and a preallocated one for the rest, the
+/// extent record's inline `EXTENT_DATA_REF` counted up by one, and only the
+/// written sectors gaining digests. The kernel made the same two writes
+/// into controls `fallocate`d alongside, so the item kinds and reference
+/// counts the driver is held to are its own; `btrfs check
+/// --check-data-csum` and a kernel scrub verify the digests, `filefrag`
+/// must report the same unwritten ranges as the controls, and the kernel
+/// must read the written bytes and zeros for the rest.
+#[test]
+fn a_write_at_the_start_or_end_of_a_preallocated_item_splits_it_in_two() {
+    const HEAD: &str = "pre-head.bin";
+    const HEAD_CONTROL: &str = "pre-head-control.bin";
+    const TAIL: &str = "pre-tail.bin";
+    const TAIL_CONTROL: &str = "pre-tail-control.bin";
+    const LEN: usize = 65536;
+    const PART: usize = 16384;
+    let script = format!(
+        "for f in {HEAD} {HEAD_CONTROL} {TAIL} {TAIL_CONTROL}; do \
+         fallocate -l {LEN} \"$MNT/$f\"; done\n\
+         sync\n\
+         head -c {PART} /dev/zero | tr '\\000' '\\132' \
+         | dd of=\"$MNT/{HEAD_CONTROL}\" bs={PART} conv=notrunc status=none\n\
+         head -c {PART} /dev/zero | tr '\\000' '\\132' \
+         | dd of=\"$MNT/{TAIL_CONTROL}\" bs={PART} seek={seek} conv=notrunc status=none\n\
+         sync\n",
+        seek = (LEN - PART) / PART
+    );
+    let scratch = Scratch::new("cow-write-prealloc-split", &script);
+    let image = scratch.image();
+
+    let mut fs = mount_rw(&image);
+    let (head, head_control) = (ino_of(&fs, HEAD), ino_of(&fs, HEAD_CONTROL));
+    let (tail, tail_control) = (ino_of(&fs, TAIL), ino_of(&fs, TAIL_CONTROL));
+    drop(fs);
+    let (kind, head_before, _) = extent_kind_and_refs(&image, head, 0);
+    assert_eq!(kind, "prealloc", "the kernel did not preallocate {HEAD}");
+    let (kind, tail_before, _) = extent_kind_and_refs(&image, tail, 0);
+    assert_eq!(kind, "prealloc", "the kernel did not preallocate {TAIL}");
+
+    fs = mount_rw(&image);
+    let data = vec![0x5au8; PART];
+    for (file, at, name) in [(head, 0, HEAD), (tail, LEN - PART, TAIL)] {
+        assert_eq!(
+            fs.write(file, at as u64, &data)
+                .unwrap_or_else(|e| panic!("writing part of {name}'s preallocated range: {e}")),
+            PART
+        );
+    }
+    let mut head_bytes = vec![0u8; LEN];
+    head_bytes[..PART].copy_from_slice(&data);
+    let mut tail_bytes = vec![0u8; LEN];
+    tail_bytes[LEN - PART..].copy_from_slice(&data);
+    assert_eq!(fs.read_file(head).unwrap(), head_bytes, "{HEAD} reads back");
+    assert_eq!(fs.read_file(tail).unwrap(), tail_bytes, "{TAIL} reads back");
+    for (ours, theirs, name) in [(head, head_control, HEAD), (tail, tail_control, TAIL)] {
+        let (a, b) = (fs.read_inode(ours).unwrap(), fs.read_inode(theirs).unwrap());
+        assert_eq!(
+            (a.size, a.nbytes),
+            (b.size, b.nbytes),
+            "{name}'s size and nbytes are not what the kernel's write gave its control"
+        );
+    }
+    drop(fs);
+
+    let tree = dump_tree(&image, "5");
+    for (ours, theirs, before, name) in [
+        (head, head_control, head_before, HEAD),
+        (tail, tail_control, tail_before, TAIL),
+    ] {
+        let starts = |ino: u64| -> Vec<u64> {
+            [0, PART as u64, (LEN - PART) as u64]
+                .into_iter()
+                .filter(|at| tree.contains(&format!("key ({ino} EXTENT_DATA {at})")))
+                .collect()
+        };
+        assert_eq!(
+            starts(ours),
+            starts(theirs),
+            "{name}'s items do not start where the control's do"
+        );
+        assert_eq!(
+            starts(theirs).len(),
+            2,
+            "the kernel did not split {name}'s control"
+        );
+        for at in starts(theirs) {
+            let (kind, bytenr, refs) = extent_kind_and_refs(&image, ours, at);
+            let (their_kind, _, their_refs) = extent_kind_and_refs(&image, theirs, at);
+            assert_eq!(
+                (kind.as_str(), refs),
+                (their_kind.as_str(), their_refs),
+                "{name}'s item at {at}: kind and reference count differ from the control's"
+            );
+            assert_eq!(
+                bytenr, before,
+                "{name}'s item at {at} left the preallocated extent"
+            );
+        }
+    }
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum after splitting preallocated items:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after splitting preallocated items",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+    let unwritten = guest_kernel_read_ok(
+        &image.to_string_lossy(),
+        "unwritten ranges after splitting preallocated items",
+        &format!(
+            "for f in {HEAD} {HEAD_CONTROL} {TAIL} {TAIL_CONTROL}; do \
+             printf '%s %s\\n' \"$f\" \"$(filefrag -v \"$MNT/$f\" | awk '/unwritten/ {{print $2, $4}}' | tr '\\n' ' ')\"; done\n"
+        ),
+    );
+    let ranges: BTreeMap<&str, &str> = unwritten
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .collect();
+    for (ours, theirs) in [(HEAD, HEAD_CONTROL), (TAIL, TAIL_CONTROL)] {
+        assert!(
+            !ranges
+                .get(theirs)
+                .copied()
+                .unwrap_or_default()
+                .trim()
+                .is_empty(),
+            "the kernel left no unwritten range in {theirs}:\n{unwritten}"
+        );
+        assert_eq!(
+            ranges.get(ours).map(|r| r.trim()),
+            ranges.get(theirs).map(|r| r.trim()),
+            "{ours}'s unwritten ranges differ from {theirs}'s:\n{unwritten}"
+        );
+    }
+    let seen = kernel_view(
+        &image,
+        "after splitting preallocated items",
+        &[HEAD, HEAD_CONTROL, TAIL, TAIL_CONTROL],
+    );
+    assert_eq!(seen[HEAD].0, sha256_hex(&head_bytes), "{HEAD}: wrong bytes");
+    assert_eq!(seen[TAIL].0, sha256_hex(&tail_bytes), "{TAIL}: wrong bytes");
+    assert_eq!(
+        seen[HEAD].0, seen[HEAD_CONTROL].0,
+        "{HEAD} does not read as its control"
+    );
+    assert_eq!(
+        seen[TAIL].0, seen[TAIL_CONTROL].0,
+        "{TAIL} does not read as its control"
+    );
+}
