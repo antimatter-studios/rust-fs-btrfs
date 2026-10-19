@@ -243,6 +243,17 @@ impl Filesystem {
         if self.writable.is_none() {
             return Err(Error::ReadOnly);
         }
+        // Another handle of the same volume may have committed since this
+        // one read the superblock (#599). Its generation and root tree are
+        // then behind the device's, and committing from them would put the
+        // older tree back and use a generation twice.
+        let (on_disk, _) = crate::superblock::read_superblock(&*self.device)?;
+        if on_disk.generation > self.sb.generation {
+            return Err(Error::Stale {
+                handle: self.sb.generation,
+                disk: on_disk.generation,
+            });
+        }
 
         // 0. The superblock images, backup slot included, before anything
         //    is written: their roots are read out of the new root tree, and

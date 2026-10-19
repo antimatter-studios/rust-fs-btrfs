@@ -146,6 +146,11 @@ fs_btrfs_fs_t *fs_btrfs_mount_pool(const char *const *device_paths, size_t count
  * on the subvolume after each. Other writes refuse it, and
  * fs_btrfs_is_writable answers 0 for it. The subvolume of a read-only
  * mount refuses every write with EROFS.
+ *
+ * Each handle keeps its own view of the volume. A write through a handle
+ * after another handle of the same volume (this one, `fs`, or another
+ * subvolume handle) has committed is refused with ESTALE and writes
+ * nothing; release the handle and open it again to write.
  */
 fs_btrfs_fs_t *fs_btrfs_open_subvolume(fs_btrfs_fs_t *fs, uint64_t id);
 
