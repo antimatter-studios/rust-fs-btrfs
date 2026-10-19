@@ -178,6 +178,11 @@ relocate_data_group_kernel 1
 # both copies compared, one corrupted and repaired by a kernel scrub, judged
 # by check --check-data-csum, filesystem df and a manifest read (#586).
 relocate_convert_dup_kernel 1
+# One executed: a DUP data group of the kernel's files converted to single,
+# each extent read from the copy that verifies after one copy of two extents
+# is corrupted, judged by dump-tree, check --check-data-csum, filesystem df
+# and a manifest read (#587).
+relocate_convert_single_kernel 1
 # Two executed: the empty data group relocated and judged by the kernel,
 # and the refusals before anything is written (#397).
 relocate_empty_group_kernel 2
