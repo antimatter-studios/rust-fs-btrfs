@@ -3847,3 +3847,141 @@ fn a_write_at_the_start_or_end_of_a_preallocated_item_splits_it_in_two() {
         "{TAIL} does not read as its control"
     );
 }
+
+/// A write strictly inside a preallocated item in a checksummed
+/// copy-on-write file, touching neither its first nor its last sector,
+/// splits the item in three over the same extent (#537): preallocated
+/// before the write, regular for the written sectors, preallocated after,
+/// the extent record's inline `EXTENT_DATA_REF` counted up by two, and only
+/// the written sectors gaining digests. The kernel made the same write into
+/// a control `fallocate`d alongside, so the item kinds and reference counts
+/// the driver is held to are its own; `btrfs check --check-data-csum` and a
+/// kernel scrub verify the digests, `filefrag` must report the same
+/// unwritten ranges as the control, and the kernel must read the written
+/// bytes and zeros on both sides.
+#[test]
+fn a_write_in_the_middle_of_a_preallocated_item_splits_it_in_three() {
+    const MID: &str = "pre-mid.bin";
+    const MID_CONTROL: &str = "pre-mid-control.bin";
+    const LEN: usize = 65536;
+    const PART: usize = 16384;
+    let script = format!(
+        "for f in {MID} {MID_CONTROL}; do fallocate -l {LEN} \"$MNT/$f\"; done\n\
+         sync\n\
+         head -c {PART} /dev/zero | tr '\\000' '\\132' \
+         | dd of=\"$MNT/{MID_CONTROL}\" bs={PART} seek=1 conv=notrunc status=none\n\
+         sync\n"
+    );
+    let scratch = Scratch::new("cow-write-prealloc-split-middle", &script);
+    let image = scratch.image();
+
+    let mut fs = mount_rw(&image);
+    let (mid, mid_control) = (ino_of(&fs, MID), ino_of(&fs, MID_CONTROL));
+    drop(fs);
+    let (kind, before, _) = extent_kind_and_refs(&image, mid, 0);
+    assert_eq!(kind, "prealloc", "the kernel did not preallocate {MID}");
+
+    fs = mount_rw(&image);
+    let data = vec![0x5au8; PART];
+    assert_eq!(
+        fs.write(mid, PART as u64, &data)
+            .unwrap_or_else(|e| panic!("writing the middle of {MID}'s preallocated range: {e}")),
+        PART
+    );
+    let mut bytes = vec![0u8; LEN];
+    bytes[PART..2 * PART].copy_from_slice(&data);
+    assert_eq!(fs.read_file(mid).unwrap(), bytes, "{MID} reads back");
+    let (a, b) = (
+        fs.read_inode(mid).unwrap(),
+        fs.read_inode(mid_control).unwrap(),
+    );
+    assert_eq!(
+        (a.size, a.nbytes),
+        (b.size, b.nbytes),
+        "{MID}'s size and nbytes are not what the kernel's write gave its control"
+    );
+    drop(fs);
+
+    let tree = dump_tree(&image, "5");
+    let starts = |ino: u64| -> Vec<u64> {
+        [0, PART as u64, 2 * PART as u64]
+            .into_iter()
+            .filter(|at| tree.contains(&format!("key ({ino} EXTENT_DATA {at})")))
+            .collect()
+    };
+    assert_eq!(
+        starts(mid),
+        starts(mid_control),
+        "{MID}'s items do not start where the control's do"
+    );
+    assert_eq!(
+        starts(mid_control).len(),
+        3,
+        "the kernel did not split {MID}'s control in three"
+    );
+    for at in starts(mid_control) {
+        let (kind, bytenr, refs) = extent_kind_and_refs(&image, mid, at);
+        let (their_kind, _, their_refs) = extent_kind_and_refs(&image, mid_control, at);
+        assert_eq!(
+            (kind.as_str(), refs),
+            (their_kind.as_str(), their_refs),
+            "{MID}'s item at {at}: kind and reference count differ from the control's"
+        );
+        assert_eq!(
+            bytenr, before,
+            "{MID}'s item at {at} left the preallocated extent"
+        );
+    }
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum after splitting a preallocated item in three:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after splitting a preallocated item in three",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+    let unwritten = guest_kernel_read_ok(
+        &image.to_string_lossy(),
+        "unwritten ranges after splitting a preallocated item in three",
+        &format!(
+            "for f in {MID} {MID_CONTROL}; do \
+             printf '%s %s\\n' \"$f\" \"$(filefrag -v \"$MNT/$f\" | awk '/unwritten/ {{print $2, $4}}' | tr '\\n' ' ')\"; done\n"
+        ),
+    );
+    let ranges: BTreeMap<&str, &str> = unwritten
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .collect();
+    assert!(
+        !ranges
+            .get(MID_CONTROL)
+            .copied()
+            .unwrap_or_default()
+            .trim()
+            .is_empty(),
+        "the kernel left no unwritten range in {MID_CONTROL}:\n{unwritten}"
+    );
+    assert_eq!(
+        ranges.get(MID).map(|r| r.trim()),
+        ranges.get(MID_CONTROL).map(|r| r.trim()),
+        "{MID}'s unwritten ranges differ from {MID_CONTROL}'s:\n{unwritten}"
+    );
+    let seen = kernel_view(
+        &image,
+        "after splitting a preallocated item in three",
+        &[MID, MID_CONTROL],
+    );
+    assert_eq!(seen[MID].0, sha256_hex(&bytes), "{MID}: wrong bytes");
+    assert_eq!(
+        seen[MID].0, seen[MID_CONTROL].0,
+        "{MID} does not read as its control"
+    );
+}
