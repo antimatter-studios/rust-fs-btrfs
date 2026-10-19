@@ -93,7 +93,8 @@ compression_oracle        3
 # A write inside a preallocated item adds a three-way split oracle (#537).
 # A write spanning a regular and a preallocated item adds one oracle (#638).
 # CI must execute all 27 cases; local oracle runs are not permitted.
-cow_write_oracle          28
+# Appending past compressed inline data adds one kernel oracle (#593).
+cow_write_oracle          29
 crash_consistency         3
 csum_oracle               6
 csum_width_populated      1
