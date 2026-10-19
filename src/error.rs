@@ -105,6 +105,17 @@ pub enum Error {
     /// read-only or the driver has no write path for this structure.
     ReadOnly,
 
+    /// The volume was committed through another handle after this one
+    /// read its superblock (#599). Committing from the older view would
+    /// write over that commit and use its generation again, so nothing
+    /// was written; open the handle again to write.
+    Stale {
+        /// The generation this handle read.
+        handle: u64,
+        /// The generation on the device now.
+        disk: u64,
+    },
+
     /// A format was asked for that cannot be made: a device too small, a
     /// node size out of range, a label too long. Nothing was written.
     InvalidGeometry(String),
@@ -140,6 +151,10 @@ impl fmt::Display for Error {
             Error::NotADirectory => f.write_str("not a directory"),
             Error::NotAFile => f.write_str("not a regular file"),
             Error::ReadOnly => f.write_str("filesystem is read-only"),
+            Error::Stale { handle, disk } => write!(
+                f,
+                "stale handle: read at generation {handle}, another handle has committed generation {disk}"
+            ),
             Error::InvalidGeometry(m) => write!(f, "cannot format: {m}"),
         }
     }

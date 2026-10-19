@@ -247,3 +247,4 @@ write_oracle              3
 xattr_oracle              9
 # Four cases cover kernel file contents, checking and both write mount paths (#454).
 zoned_oracle              4
+capi_two_handle_commit_kernel  1

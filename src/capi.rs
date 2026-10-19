@@ -75,6 +75,15 @@ const fn enotsup() -> c_int {
     }
 }
 
+/// `ESTALE` is 70 on Darwin and 116 on Linux.
+const fn estale() -> c_int {
+    if cfg!(target_os = "macos") {
+        70
+    } else {
+        116
+    }
+}
+
 /// Map a driver error onto the errno a filesystem client expects.
 ///
 /// A client distinguishes "this file is not here" from "this volume is
@@ -86,6 +95,7 @@ fn errno_for(e: &Error) -> c_int {
         Error::NotADirectory => ENOTDIR,
         Error::NotAFile => EISDIR,
         Error::ReadOnly => EROFS_ERRNO,
+        Error::Stale { .. } => estale(),
         // A format the caller asked for that cannot be made.
         Error::InvalidGeometry(_) => EINVAL,
         // A compressed extent, an unsupported profile, or a feature this
