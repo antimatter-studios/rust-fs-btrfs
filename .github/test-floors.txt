@@ -174,6 +174,10 @@ relocate_data_batches_kernel 2
 # One executed: a data group of the kernel's plain checksummed extents
 # relocated, judged by check --check-data-csum, a read and a scrub (#493).
 relocate_data_group_kernel 1
+# One executed: a single data group of the kernel's files converted to DUP,
+# both copies compared, one corrupted and repaired by a kernel scrub, judged
+# by check --check-data-csum, filesystem df and a manifest read (#586).
+relocate_convert_dup_kernel 1
 # Two executed: the empty data group relocated and judged by the kernel,
 # and the refusals before anything is written (#397).
 relocate_empty_group_kernel 2
