@@ -91,8 +91,9 @@ compression_oracle        3
 # Root collapse adds one checksum-tree kernel oracle (#548).
 # One combined overwrite adds leaf removal plus repeated splitting (#616).
 # A write inside a preallocated item adds a three-way split oracle (#537).
-# CI must execute all 26 cases; local oracle runs are not permitted.
-cow_write_oracle          26
+# A write spanning a regular and a preallocated item adds one oracle (#638).
+# CI must execute all 27 cases; local oracle runs are not permitted.
+cow_write_oracle          27
 crash_consistency         3
 csum_oracle               6
 csum_width_populated      1

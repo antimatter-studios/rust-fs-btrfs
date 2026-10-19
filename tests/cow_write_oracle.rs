@@ -3985,3 +3985,150 @@ fn a_write_in_the_middle_of_a_preallocated_item_splits_it_in_three() {
         "{MID} does not read as its control"
     );
 }
+
+/// One write spanning the end of a regular extent and the start of the
+/// preallocated item after it, in a checksummed copy-on-write file, is
+/// written as the kernel writes it (#638): the regular sectors to a new
+/// extent, the preallocated ones where their extent lies, the preallocated
+/// item split at the write's end. The kernel made the same write into a
+/// control built alongside, so the item kinds and reference counts the
+/// driver is held to are its own; `btrfs check --check-data-csum` and a
+/// kernel scrub verify the digests, `filefrag` must report the same
+/// unwritten ranges as the control, and the kernel must read the written
+/// bytes, the untouched regular bytes and zeros past the write.
+#[test]
+fn a_write_spanning_a_regular_extent_and_a_preallocated_item_is_written() {
+    const SPAN: &str = "pre-span.bin";
+    const SPAN_CONTROL: &str = "pre-span-control.bin";
+    const REG: usize = 16384;
+    const PRE: usize = 65536;
+    const HALF: usize = 8192;
+    let script = format!(
+        "for f in {SPAN} {SPAN_CONTROL}; do\n\
+         head -c {REG} /dev/zero | tr '\\000' '\\101' > \"$MNT/$f\"\n\
+         sync\n\
+         fallocate -o {REG} -l {PRE} \"$MNT/$f\"\n\
+         done\n\
+         sync\n\
+         head -c {REG} /dev/zero | tr '\\000' '\\132' \
+         | dd of=\"$MNT/{SPAN_CONTROL}\" bs={HALF} seek=1 conv=notrunc status=none\n\
+         sync\n"
+    );
+    let scratch = Scratch::new("cow-write-prealloc-span-regular", &script);
+    let image = scratch.image();
+
+    let mut fs = mount_rw(&image);
+    let (span, span_control) = (ino_of(&fs, SPAN), ino_of(&fs, SPAN_CONTROL));
+    drop(fs);
+    let (kind, _, _) = extent_kind_and_refs(&image, span, 0);
+    assert_eq!(
+        kind, "regular",
+        "the kernel did not write {SPAN}'s first extent"
+    );
+    let (kind, before, _) = extent_kind_and_refs(&image, span, REG as u64);
+    assert_eq!(kind, "prealloc", "the kernel did not preallocate {SPAN}");
+
+    fs = mount_rw(&image);
+    let data = vec![0x5au8; REG];
+    assert_eq!(
+        fs.write(span, HALF as u64, &data)
+            .unwrap_or_else(|e| panic!(
+                "writing across {SPAN}'s regular extent into its preallocated range: {e}"
+            )),
+        REG
+    );
+    let mut bytes = vec![0u8; REG + PRE];
+    bytes[..HALF].fill(0x41);
+    bytes[HALF..HALF + REG].copy_from_slice(&data);
+    assert_eq!(fs.read_file(span).unwrap(), bytes, "{SPAN} reads back");
+    let (a, b) = (
+        fs.read_inode(span).unwrap(),
+        fs.read_inode(span_control).unwrap(),
+    );
+    assert_eq!(
+        (a.size, a.nbytes),
+        (b.size, b.nbytes),
+        "{SPAN}'s size and nbytes are not what the kernel's write gave its control"
+    );
+    drop(fs);
+
+    let tree = dump_tree(&image, "5");
+    let starts = |ino: u64| -> Vec<u64> {
+        [0, HALF as u64, REG as u64, (HALF + REG) as u64]
+            .into_iter()
+            .filter(|at| tree.contains(&format!("key ({ino} EXTENT_DATA {at})")))
+            .collect()
+    };
+    assert_eq!(
+        starts(span),
+        starts(span_control),
+        "{SPAN}'s items do not start where the control's do"
+    );
+    for at in starts(span_control) {
+        let (kind, bytenr, refs) = extent_kind_and_refs(&image, span, at);
+        let (their_kind, _, their_refs) = extent_kind_and_refs(&image, span_control, at);
+        assert_eq!(
+            (kind.as_str(), refs),
+            (their_kind.as_str(), their_refs),
+            "{SPAN}'s item at {at}: kind and reference count differ from the control's"
+        );
+        if at >= REG as u64 {
+            assert_eq!(
+                bytenr, before,
+                "{SPAN}'s item at {at} left the preallocated extent"
+            );
+        }
+    }
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum after a write spanning a regular and a preallocated item:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after a write spanning a regular and a preallocated item",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+    let unwritten = guest_kernel_read_ok(
+        &image.to_string_lossy(),
+        "unwritten ranges after a write spanning a regular and a preallocated item",
+        &format!(
+            "for f in {SPAN} {SPAN_CONTROL}; do \
+             printf '%s %s\\n' \"$f\" \"$(filefrag -v \"$MNT/$f\" | awk '/unwritten/ {{print $2, $4}}' | tr '\\n' ' ')\"; done\n"
+        ),
+    );
+    let ranges: BTreeMap<&str, &str> = unwritten
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .collect();
+    assert!(
+        !ranges
+            .get(SPAN_CONTROL)
+            .copied()
+            .unwrap_or_default()
+            .trim()
+            .is_empty(),
+        "the kernel left no unwritten range in {SPAN_CONTROL}:\n{unwritten}"
+    );
+    assert_eq!(
+        ranges.get(SPAN).map(|r| r.trim()),
+        ranges.get(SPAN_CONTROL).map(|r| r.trim()),
+        "{SPAN}'s unwritten ranges differ from {SPAN_CONTROL}'s:\n{unwritten}"
+    );
+    let seen = kernel_view(
+        &image,
+        "after a write spanning a regular and a preallocated item",
+        &[SPAN, SPAN_CONTROL],
+    );
+    assert_eq!(seen[SPAN].0, sha256_hex(&bytes), "{SPAN}: wrong bytes");
+    assert_eq!(
+        seen[SPAN].0, seen[SPAN_CONTROL].0,
+        "{SPAN} does not read as its control"
+    );
+}
