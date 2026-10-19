@@ -208,7 +208,9 @@ impl Filesystem {
     /// inline, moving that data into a regular extent at offset 0 that
     /// holds it, the write, and zeros to the end of the sector the write
     /// ends in, as the kernel does when inline data outgrows its item
-    /// (#422). The write must reach past the inline data.
+    /// (#422). A write that starts two sectors or more in moves the data
+    /// into a first-sector extent of its own and leaves a hole before the
+    /// write's extent (#592). The write must reach past the inline data.
     pub(crate) fn write_moving_inline(
         &mut self,
         ino: u64,
@@ -281,13 +283,15 @@ impl Filesystem {
         // the old end (#433). A volume without no-holes records that gap
         // as a hole item, from the sector after the old end to the one the
         // write starts in, as the kernel's extend does (#436).
-        // Moved inline data's copy covers every sector up to the write's,
-        // so it leaves neither.
+        // Moved inline data's copy covers the first sector, so it leaves no
+        // tail; it also covers every sector up to the write's unless the
+        // write starts clear of the sector after it, which leaves a gap
+        // (#592).
+        let sector = u64::from(self.sb.sectorsize);
         let mut tail = None;
         let mut gap = None;
-        if end > inode.size && !move_inline {
-            let sector = u64::from(self.sb.sectorsize);
-            if offset > inode.size && !inode.size.is_multiple_of(sector) {
+        if end > inode.size && (!move_inline || inline_move_leaves_gap(offset, sector)) {
+            if !move_inline && offset > inode.size && !inode.size.is_multiple_of(sector) {
                 tail = Some(inode.size);
             }
             if !self.sb.has_no_holes() {
@@ -1015,7 +1019,17 @@ impl Filesystem {
                     inline.start
                 )));
             }
-            let stop = end.div_ceil(sector).saturating_mul(sector);
+            // A write that starts clear of the sector after the inline
+            // data's leaves the data a first-sector copy of its own, and
+            // the write is planned past it as a hole's is: the kernel
+            // writes the two back as separate ranges, with a hole between
+            // (#592).
+            let gap = inline_move_leaves_gap(offset, sector);
+            let stop = if gap {
+                sector
+            } else {
+                end.div_ceil(sector).saturating_mul(sector)
+            };
             out.push(Target {
                 start: 0,
                 len: stop,
@@ -1026,7 +1040,7 @@ impl Filesystem {
                 hole: true,
                 inline: inline.len,
             });
-            pos = stop;
+            pos = if gap { offset } else { stop };
         }
         // A write past the end of a file whose end is partway through a
         // sector copies the item holding that sector first, which reads as
@@ -1425,6 +1439,16 @@ const MAX_INLINE: usize = 2048;
 
 /// The attribute the kernel keeps the compression property in.
 const COMPRESSION_PROPERTY: &[u8] = b"btrfs.compression";
+
+/// Whether a write at `offset` that moves a file's inline data out of line
+/// starts two sectors or more into the file, clear of the sector after the
+/// inline data's. The kernel zeroes the rest of the inline data's sector as
+/// one range and writes the write's sectors as another; only a write
+/// starting in the very next sector joins the two into one extent, and any
+/// later one leaves the sectors between them a hole (#592).
+fn inline_move_leaves_gap(offset: u64, sector: u64) -> bool {
+    offset / sector > 1
+}
 
 /// A regular `EXTENT_DATA` item referencing the whole of the `len` bytes
 /// stored as `disk_len` at `bytenr`, written in transaction `generation`
