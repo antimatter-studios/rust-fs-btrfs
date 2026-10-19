@@ -4132,3 +4132,161 @@ fn a_write_spanning_a_regular_extent_and_a_preallocated_item_is_written() {
         "{SPAN} does not read as its control"
     );
 }
+
+/// Every `EXTENT_DATA` item of inode `ino`: its offset, its `num_bytes`, and
+/// whether it is a hole item, as `btrfs inspect-internal dump-tree` prints
+/// them. Unlike [`extent_layout_to`] it allows gaps, which a NO_HOLES
+/// volume leaves where a file is sparse.
+fn extent_items(image: &Path, ino: u64) -> Vec<(u64, u64, bool)> {
+    let tree = dump_tree(image, "5");
+    let lines: Vec<&str> = tree.lines().collect();
+    let needle = format!("key ({ino} EXTENT_DATA ");
+    let mut items = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        let Some((_, key)) = line.split_once(&needle) else {
+            continue;
+        };
+        let offset: u64 = key.split(')').next().unwrap().parse().unwrap();
+        let body: Vec<&str> = lines[at + 1..]
+            .iter()
+            .copied()
+            .take_while(|l| !l.contains(" key ("))
+            .collect();
+        assert!(
+            !body.iter().any(|l| l.contains("inline extent data size")),
+            "inode {ino}: an inline item at {offset}\n{tree}"
+        );
+        let field = |phrase: &str, word: &str| -> u64 {
+            let line = body.iter().find(|l| l.contains(phrase)).unwrap();
+            let mut words = line.split_whitespace();
+            assert!(words.any(|w| w == word), "no {word} in {line}");
+            words.next().unwrap().parse().unwrap()
+        };
+        items.push((
+            offset,
+            field("extent data offset", "nr"),
+            field("extent data disk byte", "byte") == 0,
+        ));
+    }
+    items
+}
+
+/// A write that starts a sector or more past the end of an inline file
+/// moves the inline data into an extent of its own and leaves the sectors
+/// between it and the write a hole, as the kernel does, rather than
+/// storing that gap as zeros in one extent from offset 0 (#592). The guest
+/// kernel writes 100-, 700- and 300-byte inline files and makes the same
+/// writes into controls, starting one, two and five sectors past each
+/// end. The driver's files must then hold the controls' items (offsets,
+/// lengths and holes), `size` and `nbytes`, and `btrfs check
+/// --check-data-csum` and a kernel read-back must agree.
+#[test]
+fn a_write_a_sector_or_more_past_an_inline_files_end_leaves_a_hole() {
+    let control = |name: &str| name.replace(".bin", "-control.bin");
+    let files = [("one.bin", 100u64), ("two.bin", 700), ("five.bin", 300)];
+    // (file, offset, length, byte): one, two and five sectors past the end.
+    let writes = [
+        ("one.bin", 100 + 4096u64, 3000usize, 0x5au8),
+        ("two.bin", 700 + 2 * 4096, 5000, 0xa5),
+        ("five.bin", 300 + 5 * 4096, 6000, 0x3c),
+    ];
+    let mut script = String::new();
+    for (name, size) in files {
+        script.push_str(&format!(
+            "head -c {size} /dev/urandom | tee \"$MNT/{name}\" > \"$MNT/{}\"\n",
+            control(name)
+        ));
+    }
+    script.push_str("sync\n");
+    for (name, offset, len, byte) in writes {
+        script.push_str(&format!(
+            "head -c {len} /dev/zero | tr '\\000' '\\{byte:03o}' \
+             | dd of=\"$MNT/{}\" bs=1 seek={offset} conv=notrunc status=none\n\
+             sync\n",
+            control(name)
+        ));
+    }
+    let scratch = Scratch::new("cow-write-past-inline-hole", &script);
+    let image = scratch.image();
+    for (name, size) in files {
+        let fs = mount_rw(&image);
+        let ino = ino_of(&fs, name);
+        drop(fs);
+        assert_eq!(
+            inline_extent(&image, ino),
+            Some((size, size, "0".to_string())),
+            "the kernel did not store {name} inline"
+        );
+    }
+
+    let mut fs = mount_rw(&image);
+    let mut expected = BTreeMap::new();
+    for (name, _) in files {
+        let ino = ino_of(&fs, name);
+        expected.insert(name, fs.read_file(ino).unwrap());
+    }
+    for (name, offset, len, byte) in writes {
+        let ino = ino_of(&fs, name);
+        assert_eq!(
+            fs.write(ino, offset, &vec![byte; len])
+                .unwrap_or_else(|e| panic!("writing {name} at {offset}: {e}")),
+            len
+        );
+        let bytes = expected.get_mut(name).unwrap();
+        bytes.resize(offset as usize + len, 0);
+        bytes[offset as usize..].fill(byte);
+        assert_eq!(&fs.read_file(ino).unwrap(), bytes, "{name} reads back");
+    }
+    for (name, _) in files {
+        let ours = fs.read_inode(ino_of(&fs, name)).unwrap();
+        let theirs = fs.read_inode(ino_of(&fs, &control(name))).unwrap();
+        assert_eq!(
+            (ours.size, ours.nbytes),
+            (theirs.size, theirs.nbytes),
+            "{name}'s size and nbytes are not what the kernel's own writes gave its control"
+        );
+    }
+    let inos: Vec<(&str, u64, u64)> = files
+        .iter()
+        .map(|&(name, _)| (name, ino_of(&fs, name), ino_of(&fs, &control(name))))
+        .collect();
+    drop(fs);
+    for (name, ours, theirs) in inos {
+        assert_eq!(
+            extent_items(&image, ours),
+            extent_items(&image, theirs),
+            "{name}'s items (offset, length, hole) are not the ones the kernel gave {}",
+            control(name)
+        );
+    }
+
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum after writing past inline files:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let names: Vec<String> = files
+        .iter()
+        .flat_map(|&(name, _)| [name.to_string(), control(name)])
+        .collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let seen = kernel_view(&image, "after writing past inline files", &refs);
+    for (name, _) in files {
+        assert_eq!(
+            seen[name].0,
+            sha256_hex(&expected[name]),
+            "{name}: wrong bytes"
+        );
+        assert_eq!(
+            seen[name].0,
+            seen[&control(name)].0,
+            "{name} does not read as the kernel's own writes left its control"
+        );
+    }
+}
