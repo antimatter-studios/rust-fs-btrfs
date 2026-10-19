@@ -72,7 +72,9 @@
 //!   nodes leave their tree, and an empty root becomes a leaf (#546–#548);
 //! - a write past the end of a file, on a volume **without the no-holes
 //!   feature**, whose gap an extent item past the end (a preallocated one)
-//!   already reaches into;
+//!   already reaches into, unless one preallocated item holds the old end,
+//!   the gap and the write, which is then written where its extent lies
+//!   and moves only the size (#603);
 //! - a **preallocated** extent the write cuts off a sector boundary, or one
 //!   another reference shares, or an **inline** one the write does not
 //!   lie within, or one that is encrypted or encoded: each changes the
@@ -262,6 +264,20 @@ impl Filesystem {
         // at that edge, each side taking its own path, as the kernel writes
         // the regular sectors to a new extent and the preallocated ones
         // where their extent lies (#638).
+        // A growing write into space preallocated past the end, with
+        // `fallocate --keep-size`, is written where that extent lies as
+        // one within the size is, when one preallocated item holds the
+        // old end, any gap before the write and the write itself: the gap
+        // stays preallocated, and only the size moves (#603).
+        if !move_inline
+            && end > inode.size
+            && inode.size.is_multiple_of(u64::from(self.sb.sectorsize))
+            && self.prealloc_holds(ino, offset.min(inode.size), end)?
+        {
+            if let Some(written) = self.write_prealloc(inode, offset, data, summed)? {
+                return Ok(written);
+            }
+        }
         if !move_inline && end <= inode.size {
             if let Some(at) = self.prealloc_edge_within(ino, offset, end)? {
                 let first = usize::try_from(at - offset).map_err(|_| {
@@ -754,6 +770,20 @@ impl Filesystem {
             .min())
     }
 
+    /// Whether one preallocated extent item of `ino` holds the whole of
+    /// `[from, end)` (#603).
+    fn prealloc_holds(&self, ino: u64, from: u64, end: u64) -> Result<bool> {
+        use crate::fs::file_extent as fe;
+        use crate::superblock::le64;
+        Ok(self.items_of(ino)?.into_iter().any(|(k, d)| {
+            k.key_type == EXTENT_DATA_KEY
+                && d.len() >= fe::REGULAR_SIZE
+                && d[fe::TYPE] == EXTENT_PREALLOC
+                && k.offset <= from
+                && end <= k.offset.saturating_add(le64(&d, fe::NUM_BYTES))
+        }))
+    }
+
     fn write_prealloc(
         &mut self,
         inode: &Inode,
@@ -860,6 +890,11 @@ impl Filesystem {
         ];
         let mut raw = self.raw_inode(ino)?;
         crate::namespace::touch(&mut raw, generation, now, &[io::CTIME, io::MTIME]);
+        // Preallocated sectors already count in `nbytes`; a write past the
+        // end moves only the size (#603).
+        if end > inode.size {
+            raw[io::SIZE..io::SIZE + 8].copy_from_slice(&end.to_le_bytes());
+        }
         edits.push(ItemEdit::Put(OwnedItem {
             key: DiskKey {
                 objectid: ino,
