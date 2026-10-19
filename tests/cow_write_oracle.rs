@@ -4471,3 +4471,149 @@ fn an_append_outgrowing_compressed_inline_data_moves_it_into_a_regular_extent() 
         );
     }
 }
+
+/// A growing write into space `fallocate --keep-size` preallocated past the
+/// end of a checksummed copy-on-write file is written where that extent
+/// lies, as a write within the size is, and moves the size to where it
+/// stops (#603). One file is written from its old end and one a sector
+/// past it, so the gap before the write stays preallocated rather than
+/// becoming a hole. The kernel made the same writes into controls
+/// preallocated alongside, so the item kinds and offsets, the reference
+/// counts, `size` and `nbytes` the driver is held to are its own; `btrfs
+/// check --check-data-csum` and a kernel scrub verify the digests, and the
+/// kernel must read the old data, zeros in the gap and the written bytes.
+#[test]
+fn a_growing_write_into_space_preallocated_past_the_end_is_written_in_place() {
+    const AT: &str = "keep-at.bin";
+    const AT_CONTROL: &str = "keep-at-control.bin";
+    const PAST: &str = "keep-past.bin";
+    const PAST_CONTROL: &str = "keep-past-control.bin";
+    const OLD: usize = 16384;
+    const KEPT: usize = 49152;
+    const PART: usize = 8192;
+    const PAST_AT: usize = OLD + 16384;
+    let script = format!(
+        "for f in {AT} {AT_CONTROL} {PAST} {PAST_CONTROL}; do \
+         head -c {OLD} /dev/zero | tr '\\000' '\\101' > \"$MNT/$f\"; done\n\
+         sync\n\
+         for f in {AT} {AT_CONTROL} {PAST} {PAST_CONTROL}; do \
+         fallocate -k -o {OLD} -l {KEPT} \"$MNT/$f\"; done\n\
+         sync\n\
+         head -c {PART} /dev/zero | tr '\\000' '\\132' \
+         | dd of=\"$MNT/{AT_CONTROL}\" bs={PART} seek={at_seek} conv=notrunc status=none\n\
+         head -c {PART} /dev/zero | tr '\\000' '\\132' \
+         | dd of=\"$MNT/{PAST_CONTROL}\" bs={PART} seek={past_seek} conv=notrunc status=none\n\
+         sync\n",
+        at_seek = OLD / PART,
+        past_seek = PAST_AT / PART,
+    );
+    let scratch = Scratch::new("cow-write-keep-size-grow", &script);
+    let image = scratch.image();
+
+    let fs = mount_rw(&image);
+    let (at, at_control) = (ino_of(&fs, AT), ino_of(&fs, AT_CONTROL));
+    let (past, past_control) = (ino_of(&fs, PAST), ino_of(&fs, PAST_CONTROL));
+    drop(fs);
+    let (kind, at_before, _) = extent_kind_and_refs(&image, at, OLD as u64);
+    assert_eq!(
+        kind, "prealloc",
+        "the kernel did not preallocate past {AT}'s end"
+    );
+    let (kind, past_before, _) = extent_kind_and_refs(&image, past, OLD as u64);
+    assert_eq!(
+        kind, "prealloc",
+        "the kernel did not preallocate past {PAST}'s end"
+    );
+
+    let mut fs = mount_rw(&image);
+    let data = vec![0x5au8; PART];
+    for (file, from, name) in [(at, OLD, AT), (past, PAST_AT, PAST)] {
+        assert_eq!(
+            fs.write(file, from as u64, &data)
+                .unwrap_or_else(|e| panic!(
+                    "a growing write into {name}'s space preallocated past its end: {e}"
+                )),
+            PART
+        );
+    }
+    let mut at_bytes = vec![0x41u8; OLD];
+    at_bytes.extend_from_slice(&data);
+    let mut past_bytes = vec![0x41u8; OLD];
+    past_bytes.resize(PAST_AT, 0);
+    past_bytes.extend_from_slice(&data);
+    assert_eq!(fs.read_file(at).unwrap(), at_bytes, "{AT} reads back");
+    assert_eq!(fs.read_file(past).unwrap(), past_bytes, "{PAST} reads back");
+    for (ours, theirs, name) in [(at, at_control, AT), (past, past_control, PAST)] {
+        let (a, b) = (fs.read_inode(ours).unwrap(), fs.read_inode(theirs).unwrap());
+        assert_eq!(
+            (a.size, a.nbytes),
+            (b.size, b.nbytes),
+            "{name}'s size and nbytes are not what the kernel's write gave its control"
+        );
+    }
+    drop(fs);
+
+    let tree = dump_tree(&image, "5");
+    for (ours, theirs, before, name) in [
+        (at, at_control, at_before, AT),
+        (past, past_control, past_before, PAST),
+    ] {
+        let starts = |ino: u64| -> Vec<u64> {
+            (0..(OLD + KEPT) as u64)
+                .step_by(4096)
+                .filter(|at| tree.contains(&format!("key ({ino} EXTENT_DATA {at})")))
+                .collect()
+        };
+        assert_eq!(
+            starts(ours),
+            starts(theirs),
+            "{name}'s items do not start where the control's do"
+        );
+        for item in starts(theirs) {
+            let (kind, bytenr, refs) = extent_kind_and_refs(&image, ours, item);
+            let (their_kind, _, their_refs) = extent_kind_and_refs(&image, theirs, item);
+            assert_eq!(
+                (kind.as_str(), refs),
+                (their_kind.as_str(), their_refs),
+                "{name}'s item at {item}: kind and reference count differ from the control's"
+            );
+            if item >= OLD as u64 {
+                assert_eq!(
+                    bytenr, before,
+                    "{name}'s item at {item} left the preallocated extent"
+                );
+            }
+        }
+    }
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum after growing writes into kept preallocation:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after growing writes into kept preallocation",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+    let seen = kernel_view(
+        &image,
+        "after growing writes into kept preallocation",
+        &[AT, AT_CONTROL, PAST, PAST_CONTROL],
+    );
+    assert_eq!(seen[AT].0, sha256_hex(&at_bytes), "{AT}: wrong bytes");
+    assert_eq!(seen[PAST].0, sha256_hex(&past_bytes), "{PAST}: wrong bytes");
+    assert_eq!(
+        seen[AT].0, seen[AT_CONTROL].0,
+        "{AT} does not read as its control"
+    );
+    assert_eq!(
+        seen[PAST].0, seen[PAST_CONTROL].0,
+        "{PAST} does not read as its control"
+    );
+}
