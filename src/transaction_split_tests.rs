@@ -534,12 +534,97 @@ fn a_root_whose_parts_overflow_one_node_grows_two_levels() {
     let split = plan.split_of(path[0]).unwrap();
     assert_eq!(split.new.len(), 121);
     assert!(split.root.is_some());
+    assert_eq!(split.upper.iter().map(Vec::len).collect::<Vec<_>>(), [2]);
+    assert_eq!(split.grown(), 2);
     let allocated = plan.allocated();
     assert_eq!(allocated.len(), plan.rewrites.len() + 121 + 2 + 1);
     assert_eq!(
         allocated.iter().copied().collect::<BTreeSet<_>>().len(),
         allocated.len()
     );
+    assert_eq!(plan.usage_delta(4096), (121 + 2 + 1) * 4096);
+}
+
+/// One part fewer and the new root holds every part, one level up.
+#[test]
+fn a_root_whose_parts_fill_one_node_grows_one_level() {
+    let (plan, path) = cascade_with_items(0, 0, 120);
+    let split = plan.split_of(path[0]).unwrap();
+    assert_eq!(split.new.len(), 120);
+    assert!(split.upper.is_empty());
+    assert_eq!(split.grown(), 1);
+}
+
+/// The render divides 122 parts over two level-one nodes and points the
+/// new level-two root at both, every part once and in key order (#649).
+#[test]
+fn the_levels_above_a_split_root_hold_every_part_in_key_order() {
+    let dev = Arc::new(Sparse::default());
+    crate::mkfs::format(
+        dev.as_ref(),
+        &crate::mkfs::Options {
+            nodesize: 4096,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let fs = Filesystem::mount(dev as Arc<dyn BlockRead>).unwrap();
+    let capacity = tree_write::key_ptr_capacity(&fs.sb);
+    let parts: Vec<_> = (0..capacity as u64 + 1)
+        .map(|i| (key(i + 1), 0x10_0000 + i * 4096))
+        .collect();
+    let split = Split {
+        leaf: 0x10_0000,
+        level: 0,
+        new: parts[1..].iter().map(|p| p.1).collect(),
+        owner: objectid::FS_TREE,
+        root: Some(0x90_0000),
+        upper: vec![vec![0x80_0000, 0x80_1000]],
+    };
+    let id = BlockIdentity {
+        bytenr: parts[0].1,
+        owner: objectid::FS_TREE,
+        generation: fs.sb.generation + 1,
+        level: 0,
+        flags: tree_write::flags_for_new_block(),
+        chunk_tree_uuid: [0; 16],
+    };
+    let mut out = Vec::new();
+    fs.build_upper(id, &split, parts.clone(), id.generation, &mut out)
+        .unwrap();
+    assert_eq!(out.len(), 3);
+    let geom = crate::btree::TreeGeometry::from_superblock(&fs.sb);
+    let node = |at: u64| {
+        let b = out.iter().find(|b| b.logical == at).unwrap();
+        crate::btree::TreeBlock::parse(b.bytes.clone(), at, &geom).unwrap()
+    };
+    let mut seen = Vec::new();
+    for &at in &split.upper[0] {
+        let block = node(at);
+        assert_eq!(block.header.level, 1);
+        let ptrs = block.body.key_ptrs().unwrap();
+        assert!(ptrs.len() <= capacity);
+        seen.extend(ptrs.iter().map(|p| (p.key, p.blockptr)));
+    }
+    assert_eq!(seen, parts);
+    let root = node(0x90_0000);
+    assert_eq!(root.header.level, 2);
+    let tops: Vec<_> = root
+        .body
+        .key_ptrs()
+        .unwrap()
+        .iter()
+        .map(|p| p.blockptr)
+        .collect();
+    assert_eq!(tops, split.upper[0]);
+
+    let wrong = Split {
+        upper: Vec::new(),
+        ..split
+    };
+    assert!(fs
+        .build_upper(id, &wrong, parts, id.generation, &mut Vec::new())
+        .is_err());
 }
 
 /// A record and its keyed references can start different leaves with
