@@ -119,7 +119,7 @@ leaf_split_oracle         1
 # superblock cases raise the floor to 347 (#454).
 lib                       347
 link_extref_kernel        1
-log_tree_kernel           30
+log_tree_kernel           31
 lookup_by_name_key        1
 namespace_kernel          2
 node_split_kernel         1

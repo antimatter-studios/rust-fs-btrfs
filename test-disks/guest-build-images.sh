@@ -1225,6 +1225,7 @@ build_dirtylog() {
     build_dirtylog_refused compressedcut 'compress-force=zlib,max_inline=0' compressedcut
     build_dirtylog_refused rmdir 'compress=no,max_inline=2048' rmdir
     build_dirtylog_refused linkremoved 'compress=no,max_inline=2048' linkremoved
+    build_dirtylog_refused createdlink 'compress=no,max_inline=2048' createdlink
 }
 
 # fsync_path <path> — fsync one file or directory, and nothing else.
@@ -1519,6 +1520,16 @@ if kind == "extrefcreated":
         os.link(d + "/n", d + "/" + ("%03d" % i) * 85)
     dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
     sys.exit(0)
+if kind == "createdlink":
+    # After the commit, n is created empty and given a second name m in
+    # /, and only / is fsynced. The log holds the entries of / naming n
+    # and m, and n only as an inode that exists, though nothing of it is
+    # committed: generation 0, size 0, two links, no data, and its
+    # reference to / holding both names.
+    open(d + "/n", "w").close()
+    os.link(d + "/n", d + "/m")
+    dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    sys.exit(0)
 if kind == "extrefremoved":
     # The last name of f, held in its one INODE_EXTREF item, is removed
     # after the commit, and only / is fsynced. The log holds index ranges
@@ -1667,6 +1678,7 @@ want = {
     'nbytes': r'size 33 nbytes (?!0\n|33\n)\d+\n',
     'extrefexists': r'INODE_REF (?!256\))\d+\)[^\n]*\n\s+index \d+ namelen 1 name: g\n',
     'extrefcreated': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: n\n',
+    'createdlink': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: n\n\s+index \d+ namelen 1 name: m\n',
     'extrefremoved': r'key \(256 DIR_LOG_INDEX \d+\) itemoff \d+ itemsize \d+\n\s+dir log end \d+\n',
     'compressedcut': r'EXTENT_DATA 32768\)',
     'rmdir': r'key \(256 DIR_LOG_INDEX \d+\) itemoff \d+ itemsize \d+\n\s+dir log end \d+\n',
@@ -1885,6 +1897,34 @@ if kind == 'extrefcreated':
         r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
     assert all(any(a <= i <= b for a, b in ranges) for i in entries), \
         (kind, 'an entry of / naming n is outside every logged index range', ranges)
+if kind == 'createdlink':
+    # n, which the log creates, is logged only to say it exists:
+    # generation 0, size 0, two links and no data, and one reference to /
+    # holding n and m. Each name is an entry of / naming n, inside a
+    # logged index range of /, and the log holds no other entry of /.
+    ref = re.search(r'key \((\d+) INODE_REF 256\) itemoff \d+ itemsize \d+\n'
+                    r'\s+index (\d+) namelen 1 name: n\n\s+index (\d+) namelen 1 name: m\n', dump)
+    assert ref, (kind, 'native dump shows no logged reference of n to / naming n and m')
+    n, at_n, at_m = ref.group(1), int(ref.group(2)), int(ref.group(3))
+    item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation (\d+) transid \d+ size (\d+) nbytes \d+\n'
+                     r'\s+block group \d+ mode 100644 links (\d+) ' % n, dump)
+    assert item, (kind, 'native dump shows no logged inode item of n')
+    generation, size, links = map(int, item.groups())
+    assert (generation, size, links) == (0, 0, 2), \
+        (kind, 'n is not logged as an inode that exists with two links', generation, size, links)
+    assert not re.search(r'key \(%s EXTENT_DATA ' % n, dump), (kind, 'the log holds data of n')
+    ranges = [(int(a), int(b)) for a, b in re.findall(
+        r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
+    for at, name in ((at_n, 'n'), (at_m, 'm')):
+        assert re.search(r'key \(256 DIR_INDEX %d\) itemoff \d+ itemsize \d+\n'
+                         r'\s+location key \(%s INODE_ITEM 0\) type FILE\n[^\n]*\n\s+name: %s\n'
+                         % (at, n, name), dump), \
+            (kind, 'native dump shows no logged entry of / naming %s at its index' % name, at)
+        assert any(a <= at <= b for a, b in ranges), \
+            (kind, 'no logged index range of / holds %s' % name, at, ranges)
+    assert len(re.findall(r'key \(256 DIR_INDEX \d+\) itemoff ', dump)) == 2, \
+        (kind, 'the log holds an entry of / other than n and m')
 if kind == 'extrefremoved':
     # Committed, f has 33 bytes, one link, no INODE_REF item and one
     # INODE_EXTREF item, whose one record is its last long name in /,
