@@ -1932,6 +1932,159 @@ fn a_log_whose_inode_holds_a_stale_nbytes_replays_as_the_kernel_does() {
     }
 }
 
+/// The committed file `f`, with 64 more names in `/` of 255 bytes each,
+/// three of them in `INODE_EXTREF` items, given the name `g` in the
+/// committed directory `d` and made durable by an fsync of `d` alone
+/// (#476). The log holds the entry of `d` naming `g`, and `f` only as an
+/// inode that exists: generation 0, 66 links, its `INODE_REF` items to
+/// `/` and to `d`, and none of its extended references, which stay
+/// committed. A replay that names `f` only from its `INODE_REF` items
+/// counts 63 links; the kernel's replay of the same crash image keeps
+/// all 66, and is the oracle.
+#[test]
+fn a_hard_link_of_a_file_with_extended_references_replays_as_the_kernel_does() {
+    const EXTREF_EXISTS_FIXTURE: &str = "dirtylog/btrfs-dirty-log-extrefexists.img";
+    /// `BTRFS_INODE_EXTREF_KEY`.
+    const INODE_EXTREF_KEY: u8 = 13;
+    let long = |i: usize| format!("{i:03}").repeat(85);
+    let image = fixture(EXTREF_EXISTS_FIXTURE);
+    let transcript =
+        std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-extrefexists.logdump"))
+            .expect("the native transcript of the extended-reference hard-link log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the extended-reference hard-link fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        let committed = fs.lookup_path("/f").expect("the committed trees hold /f");
+        assert_eq!(committed.nlink, 65, "/f is committed with 65 names");
+        for i in [0, 61, 63] {
+            let path = format!("/{}", long(i));
+            let ino = fs
+                .lookup_path(&path)
+                .unwrap_or_else(|e| panic!("the committed trees should hold name {i}: {e}"))
+                .ino;
+            assert_eq!(ino, committed.ino, "committed name {i} is f");
+        }
+        let d = fs.lookup_path("/d").expect("the committed trees hold /d");
+        assert!(
+            fs.lookup_path("/d/g").is_err(),
+            "/d/g was made after the commit, so the committed trees should not hold it"
+        );
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        let logged_f = top
+            .inode(committed.ino)
+            .unwrap()
+            .expect("f's logged inode item");
+        assert_eq!(
+            (logged_f.generation, logged_f.nlink),
+            (0, 66),
+            "the log holds f only as an inode that exists, with 66 links: {logged_f:?}"
+        );
+        assert!(
+            !top.items.iter().any(|i| i.key.key_type == INODE_EXTREF_KEY),
+            "the log holds no extended reference: {keys:?}"
+        );
+        assert!(
+            !top.items.iter().any(|i| (i.key.objectid, i.key.key_type)
+                == (committed.ino, fs_btrfs::fs::EXTENT_DATA_KEY)),
+            "the log holds no data of f: {keys:?}"
+        );
+        // f's logged reference to d, read from the raw item: g's index in
+        // d and the name.
+        let reference = top
+            .items
+            .iter()
+            .find(|i| {
+                (i.key.objectid, i.key.key_type, i.key.offset)
+                    == (committed.ino, INODE_REF_KEY, d.ino)
+            })
+            .unwrap_or_else(|| panic!("the log holds no reference of f to d: {keys:?}"));
+        let r = &reference.data;
+        let len = usize::from(u16::from_le_bytes(r[8..10].try_into().unwrap()));
+        assert_eq!(
+            (r.len(), &r[10..10 + len]),
+            (10 + len, &b"g"[..]),
+            "f's logged reference to d holds g alone"
+        );
+        let at_g = u64::from_le_bytes(r[..8].try_into().unwrap());
+        let entry = top
+            .items
+            .iter()
+            .find(|i| {
+                (i.key.objectid, i.key.key_type, i.key.offset) == (d.ino, DIR_INDEX_KEY, at_g)
+            })
+            .unwrap_or_else(|| panic!("the log holds no entry of d at index {at_g}: {keys:?}"));
+        assert_eq!(
+            parse_dir_items(&entry.data)
+                .unwrap()
+                .iter()
+                .map(|e| (e.ino, e.name.clone()))
+                .collect::<Vec<_>>(),
+            vec![(committed.ino, b"g".to_vec())],
+            "the logged entry of d at index {at_g} names f by g"
+        );
+        assert!(
+            top.items
+                .iter()
+                .filter(|i| i.key.objectid == d.ino && i.key.key_type == DIR_LOG_INDEX_KEY)
+                .any(|i| i.key.offset <= at_g
+                    && at_g <= u64::from_le_bytes(i.data[..8].try_into().unwrap())),
+            "no logged index range of d holds g at {at_g}: {keys:?}"
+        );
+        assert!(
+            !top.items.iter().any(|i| i.key.objectid == 256
+                && (i.key.key_type == DIR_INDEX_KEY || i.key.key_type == DIR_LOG_INDEX_KEY)),
+            "only d was fsynced, so the log holds no entry or index range of /: {keys:?}"
+        );
+    }
+    let theirs = replays_as_the_kernel_does(EXTREF_EXISTS_FIXTURE, "dirtylog-extrefexists");
+    // The two replays agree; this is what they agree on, as the kernel
+    // reports it, so a name both left out, or a link count both got
+    // wrong, cannot pass.
+    let get = |kind: &str, name: &str| {
+        theirs
+            .get(&(kind.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("the kernel's replay reports no {kind} for {name}"))
+    };
+    for name in [
+        "f".to_string(),
+        long(0),
+        long(61),
+        long(63),
+        "d/g".to_string(),
+    ] {
+        assert_eq!(
+            get("stat", &name),
+            "f 66 33",
+            "the kernel's replay of {name}"
+        );
+        assert_eq!(
+            get("ino", &name),
+            get("ino", "f"),
+            "the kernel's replay names {name} as f"
+        );
+        assert_eq!(
+            get("sha256", &name),
+            get("sha256", "f"),
+            "{name} reads back differently from f"
+        );
+    }
+}
+
 /// The inline writer's encoding fields are checked against the native
 /// tools, not against our own parser. `dump-tree` prints an inline file
 /// extent's data size, `ram_bytes` and compression; the raw item must hold

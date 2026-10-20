@@ -1219,6 +1219,7 @@ build_dirtylog() {
     build_dirtylog_refused extref 'compress=no,max_inline=2048' extref
     build_dirtylog_refused dirlink 'compress=no,max_inline=2048' dirlink
     build_dirtylog_refused nbytes 'compress=no,max_inline=2048' nbytes
+    build_dirtylog_refused extrefexists 'compress=no,max_inline=2048' extrefexists
 }
 
 # fsync_path <path> — fsync one file or directory, and nothing else.
@@ -1376,6 +1377,14 @@ build_dirtylog_refused() {
             python3 -c 'import os, sys
 for i in range(64):
     os.link(sys.argv[1] + "/f", sys.argv[1] + "/" + ("%03d" % i) * 85)' "$MNT" ;;
+        extrefexists)
+            # f with the same 64 more names in /, three of them committed
+            # as INODE_EXTREF items, and an empty directory d beside it.
+            mkdir "$MNT/d"
+            printf 'committed-inline-bytes-0123456789' > "$MNT/f"
+            python3 -c 'import os, sys
+for i in range(64):
+    os.link(sys.argv[1] + "/f", sys.argv[1] + "/" + ("%03d" % i) * 85)' "$MNT" ;;
         subvol)
             # A file in the top level and one in a subvolume, committed.
             btrfs subvolume create "$MNT/sv" >/dev/null
@@ -1457,6 +1466,15 @@ if kind == "dirlink":
     os.link(d + "/f", d + "/g")
     dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
     sys.exit(0)
+if kind == "extrefexists":
+    # The committed f, with INODE_EXTREF items, is given the name g in the
+    # committed directory d, and only d is fsynced. The log holds the
+    # entry of d naming g, and f only as an inode that exists: generation
+    # 0, its link count raised to 66, and its INODE_REF items to / and to
+    # d, but none of its INODE_EXTREF items, which stay committed.
+    os.link(d + "/f", d + "/d/g")
+    dfd = os.open(d + "/d", os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    sys.exit(0)
 fd = os.open(d + "/f", os.O_WRONLY)
 if kind == "sizechange":
     os.pwrite(fd, b"replayed-and-longer-inline-bytes-0123456789", 0)
@@ -1537,6 +1555,7 @@ want = {
     'extref': r'INODE_EXTREF \d+\) itemoff \d+ itemsize \d+\n\s+index \d+ parent 256 namelen 255 name: (064){85}\n',
     'dirlink': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: f\n\s+index \d+ namelen 1 name: g\n',
     'nbytes': r'size 33 nbytes (?!0\n|33\n)\d+\n',
+    'extrefexists': r'INODE_REF (?!256\))\d+\)[^\n]*\n\s+index \d+ namelen 1 name: g\n',
 }[kind]
 assert re.search(want, dump), (kind, 'native dump does not show the unsupported shape')
 if kind == 'symlink':
@@ -1675,6 +1694,45 @@ if kind == 'nbytes':
         (kind, 'native dump shows no logged inline extent of the 33 rewritten bytes')
     assert not re.search(r'key \(\d+ (DIR_ITEM|DIR_INDEX|DIR_LOG_ITEM|DIR_LOG_INDEX) ', dump), \
         (kind, 'the log holds an entry or index range of a directory')
+if kind == 'extrefexists':
+    # f is logged only to say it exists: generation 0, 66 links, no data,
+    # its INODE_REF items to / and to d, and no INODE_EXTREF item at all,
+    # so the three committed extended references are the replay's to
+    # keep. The entry of d naming g, f's inode, is inside a logged index
+    # range of d, and the log holds no entry or index range of /.
+    ref = re.search(r'key \((\d+) INODE_REF 256\) itemoff \d+ itemsize \d+\n'
+                    r'\s+index \d+ namelen 1 name: f\n', dump)
+    assert ref, (kind, 'native dump shows no logged reference of f to /')
+    f = ref.group(1)
+    sub = re.search(r'key \((\d+) INODE_REF 256\) itemoff \d+ itemsize \d+\n'
+                    r'\s+index \d+ namelen 1 name: d\n', dump)
+    assert sub, (kind, 'native dump shows no logged reference of d to /')
+    dino = sub.group(1)
+    item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation (\d+) transid \d+ size \d+ nbytes \d+\n'
+                     r'\s+block group \d+ mode 100644 links (\d+) ' % f, dump)
+    assert item, (kind, 'native dump shows no logged inode item of f')
+    generation, links = map(int, item.groups())
+    assert (generation, links) == (0, 66), \
+        (kind, 'f is not logged as an inode that exists with 66 links', generation, links)
+    assert not re.search(r'key \(\d+ INODE_EXTREF ', dump), \
+        (kind, 'the log holds an extended reference')
+    assert not re.search(r'key \(%s EXTENT_DATA ' % f, dump), (kind, 'the log holds data of f')
+    at_g = re.search(r'key \(%s INODE_REF %s\) itemoff \d+ itemsize \d+\n'
+                     r'\s+index (\d+) namelen 1 name: g\n' % (f, dino), dump)
+    assert at_g, (kind, 'native dump shows no logged reference of f to d naming g')
+    at_g = int(at_g.group(1))
+    assert re.search(r'key \(%s DIR_INDEX %d\) itemoff \d+ itemsize \d+\n'
+                     r'\s+location key \(%s INODE_ITEM 0\) type FILE\n[^\n]*\n\s+name: g\n'
+                     % (dino, at_g, f), dump), \
+        (kind, 'native dump shows no logged entry of d naming g at its index', at_g)
+    ranges = [(int(a), int(b)) for a, b in re.findall(
+        r'key \(%s DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n'
+        % dino, dump)]
+    assert any(a <= at_g <= b for a, b in ranges), \
+        (kind, 'no logged index range of d holds g', at_g, ranges)
+    assert not re.search(r'key \(256 (DIR_ITEM|DIR_INDEX|DIR_LOG_ITEM|DIR_LOG_INDEX) ', dump), \
+        (kind, 'the log holds an entry or index range of /')
 if kind == 'compressedinline':
     # The native tool must print a compressed inline extent: nonzero
     # compression on the inline line itself, stored smaller than its bytes.
