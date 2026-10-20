@@ -111,16 +111,21 @@ pub struct Plan {
     /// is this tree's own; the old block stays where it is for the other
     /// tree, one reference fewer, and is not released.
     pub kept: BTreeSet<u64>,
+    /// Every leaf the change leaves with no items that is not its tree's
+    /// root (#546): it leaves its tree. Its pointer leaves the parent
+    /// node, and its block is released and given no new home.
+    pub removed: Vec<Rewrite>,
 }
 
 impl Plan {
     /// The addresses this frees: every rewrite's old block but those
-    /// another tree keeps.
+    /// another tree keeps, and every leaf the change removes.
     pub fn released(&self) -> Vec<u64> {
         self.rewrites
             .iter()
             .map(|r| r.old)
             .filter(|old| !self.kept.contains(old))
+            .chain(self.removed.iter().map(|r| r.old))
             .collect()
     }
 
@@ -141,6 +146,7 @@ impl Plan {
         let mut out: BTreeSet<u64> = self.rewrites.iter().map(|r| r.owner).collect();
         out.extend(self.splits.iter().map(|s| s.owner));
         out.extend(self.created.iter().map(|c| c.owner));
+        out.extend(self.removed.iter().map(|r| r.owner));
         out
     }
 
@@ -399,10 +405,12 @@ impl ItemEdit {
 /// A leaf that is its tree's root may be left with no items: that is the
 /// shape of every tree `mkfs.btrfs` makes empty, the checksum tree of a
 /// filesystem holding no data among them. Any other leaf left empty must
-/// leave its tree, which is not implemented.
+/// leave its tree, which the planner arranges (#546) from a dry render,
+/// where `may_empty` is set; a leaf it did not arrange that for is
+/// refused.
 fn apply_item_edits(
     leaf: u64,
-    is_root: bool,
+    may_empty: bool,
     mut items: Vec<crate::leaf_edit::OwnedItem>,
     edits: &[&ItemEdit],
 ) -> Result<Vec<crate::leaf_edit::OwnedItem>> {
@@ -418,10 +426,10 @@ fn apply_item_edits(
             ItemEdit::Delete(key) => items = delete(&items, key)?,
         }
     }
-    if items.is_empty() && !is_root {
+    if items.is_empty() && !may_empty {
         return Err(Error::UnsupportedFeature(format!(
-            "the change empties the tree leaf at {leaf}, and removing a leaf from its \
-             tree is not implemented"
+            "the change empties the tree leaf at {leaf}, and the plan does not remove it \
+             from its tree"
         )));
     }
     Ok(items)
@@ -1065,7 +1073,15 @@ impl Filesystem {
                 .map(|(t, e)| Ok(tree.descend(self.edit_root(*t)?, &e.key())?.header.bytenr))
                 .collect::<Result<_>>()?
         };
-        let mut edits_applied = 0usize;
+        // The leaves the change empties (#546): not rendered, and their
+        // edits, which the planner saw empty them, applied by removing them.
+        let removed: BTreeSet<u64> = plan.removed.iter().map(|r| r.old).collect();
+        let mut edits_applied = edit_leaves
+            .iter()
+            .chain(&csum_edit_leaves)
+            .chain(&tree_edit_leaves)
+            .filter(|leaf| removed.contains(leaf))
+            .count();
         // Each rendered block's first key, by its old address. An edit can
         // change a leaf's first key, and the node above must then carry
         // the new one, so blocks are rendered from the leaves up.
@@ -1110,6 +1126,10 @@ impl Filesystem {
                     let mut gained = 0usize;
                     for p in ptrs {
                         let child = p.blockptr;
+                        // A leaf the change empties leaves its tree (#546).
+                        if removed.contains(&child) {
+                            continue;
+                        }
                         let mut p = *p;
                         if let Some(&key) = first_keys.get(&child) {
                             p.key = key;
@@ -1255,8 +1275,8 @@ impl Filesystem {
                             .map(|(e, _)| e)
                             .collect();
                         if !here.is_empty() {
-                            let is_root = self.is_tree_root(rewrite.owner, rewrite.old)?;
-                            owned = apply_item_edits(rewrite.old, is_root, owned, &here)?;
+                            let may_empty = dry || self.is_tree_root(rewrite.owner, rewrite.old)?;
+                            owned = apply_item_edits(rewrite.old, may_empty, owned, &here)?;
                             edits_applied += here.len();
                         }
                     }
@@ -1271,8 +1291,8 @@ impl Filesystem {
                             .map(|(e, _)| e)
                             .collect();
                         if !here.is_empty() {
-                            let is_root = self.is_tree_root(rewrite.owner, rewrite.old)?;
-                            owned = apply_item_edits(rewrite.old, is_root, owned, &here)?;
+                            let may_empty = dry || self.is_tree_root(rewrite.owner, rewrite.old)?;
+                            owned = apply_item_edits(rewrite.old, may_empty, owned, &here)?;
                             edits_applied += here.len();
                         }
                     }
@@ -1286,8 +1306,8 @@ impl Filesystem {
                         .map(|((_, e), _)| e)
                         .collect();
                     if !here.is_empty() {
-                        let is_root = self.is_tree_root(rewrite.owner, rewrite.old)?;
-                        owned = apply_item_edits(rewrite.old, is_root, owned, &here)?;
+                        let may_empty = dry || self.is_tree_root(rewrite.owner, rewrite.old)?;
+                        owned = apply_item_edits(rewrite.old, may_empty, owned, &here)?;
                         edits_applied += here.len();
                     }
 
@@ -1672,6 +1692,9 @@ impl Filesystem {
             // The leaves the change fills past a block, and the blocks
             // their splits take, whose records are this round's too (#342).
             plan.splits = self.plan_splits(&plan, data)?;
+            // The leaves the change empties leave their trees (#546): no
+            // new home, and their old blocks released.
+            self.plan_removals(&mut plan, data)?;
 
             // Every address whose record changes: the old ones lose a
             // METADATA_ITEM, the new ones gain one -- and each data
@@ -1852,6 +1875,56 @@ impl Filesystem {
         ))
     }
 
+    /// Move each leaf `plan` leaves with no items, other than a tree's
+    /// root, from its rewrites to its removals (#546).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] for a removal this does not make: of a
+    /// leaf that is its parent's first child, whose parent's first key and
+    /// the key pointers above it would change (#547); and of a leaf a
+    /// snapshot shares.
+    fn plan_removals(&self, plan: &mut Plan, data: &DataWrite) -> Result<()> {
+        let generation = self.sb.generation + 1;
+        // A change the render refuses is the render's to report (#87).
+        let Ok(leaves) = self.leaf_contents(plan, data, generation) else {
+            return Ok(());
+        };
+        let places = self.placements()?;
+        for (&old, items) in &leaves {
+            if !items.is_empty() {
+                continue;
+            }
+            let Some(place) = places.get(&old) else {
+                continue;
+            };
+            let Some(parent) = place.parent else {
+                continue;
+            };
+            if plan.kept.contains(&old) {
+                return Err(Error::UnsupportedFeature(format!(
+                    "the change empties the leaf at {old}, which a snapshot shares, and \
+                     removing a shared leaf from its tree is not implemented"
+                )));
+            }
+            let first = self
+                .read_tree_block(parent)?
+                .body
+                .key_ptrs()
+                .and_then(|ptrs| ptrs.first().map(|p| p.blockptr));
+            if first == Some(old) {
+                return Err(Error::UnsupportedFeature(format!(
+                    "the change empties the leaf at {old}, its parent's first child, and \
+                     removing that leaf from its tree is not implemented"
+                )));
+            }
+            if let Some(at) = plan.rewrites.iter().position(|r| r.old == old) {
+                plan.removed.push(plan.rewrites.remove(at));
+            }
+        }
+        Ok(())
+    }
+
     /// A block for the root leaf of each tree `data` makes (#267), after
     /// the rewrites' and never colliding with them.
     ///
@@ -1982,8 +2055,9 @@ impl Filesystem {
 
         // Releases first, so the leaf is at its smallest before
         // anything is added to it. A block a snapshot keeps is not
-        // released; its record is edited below (#262).
-        for rewrite in &moves.plan.rewrites {
+        // released; its record is edited below (#262). A leaf the change
+        // removes is released like any other (#546).
+        for rewrite in moves.plan.rewrites.iter().chain(&moves.plan.removed) {
             if moves.plan.kept.contains(&rewrite.old) || !mine(rewrite.old)? {
                 continue;
             }
