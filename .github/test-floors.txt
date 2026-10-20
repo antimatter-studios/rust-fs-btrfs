@@ -142,7 +142,9 @@ leaf_split_oracle         1
 # (356 passed, one failed on the red commit 35946a4) on 2026-10-18 (#607).
 # Two synthetic removal cases cover recursive nodes and root collapse (#548).
 # Three leaf partition cases and three multi-way planner shapes (#615).
-lib                       366
+# One no-tool mixed-stripe allocation case passed in the local unit tier
+# at 2bfceb1; one seed-pair chunk allocation oracle adds a whole-suite case (#625).
+lib                       368
 link_extref_kernel        1
 log_tree_kernel           31
 lookup_by_name_key        1
@@ -190,7 +192,8 @@ send_stream_kernel        3
 send_stream_kernel        2
 send_stream_kernel        1
 scrub_oracle              2
-seed_oracle               7
+# Eight cases: the allocation regression adds a committed write and a pair check (#625).
+seed_oracle               8
 scrub_parity_oracle       4
 scrub_repair_kernel       7
 resize_kernel             2
