@@ -40,6 +40,8 @@ attrs_kernel              1
 backup_ring               1
 block_group_extents_kernel 1
 block_group_tree_oracle   3
+# Two guest-kernel cases cover file changes and chunk item routing (#451).
+block_group_tree_write_kernel 2
 block_group_used          1
 bootstrap_chain           2
 btree_oracle              4
@@ -114,7 +116,7 @@ leaf_edit_oracle          3
 leaf_split                1
 leaf_split_oracle         1
 # The whole-suite counter includes the CLI inode flag unit case (#412).
-lib                       236
+lib                       237
 link_extref_kernel        1
 log_tree_kernel           30
 lookup_by_name_key        1

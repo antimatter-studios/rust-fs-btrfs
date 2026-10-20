@@ -392,10 +392,10 @@ pub mod compat_ro {
     /// The free-space tree is updated by every transaction beside the
     /// extent tree it complements, and its validity bit is cleared when a
     /// commit could not, which is the state the format defines for that.
-    /// Not `VERITY`, whose Merkle tree a data write invalidates, and not
-    /// `BLOCK_GROUP_TREE`, whose block group items this driver looks for
-    /// in the extent tree and would not find.
-    pub const SUPPORTED: u64 = FREE_SPACE_TREE | FREE_SPACE_TREE_VALID;
+    /// Block group items are maintained in tree 11 when `BLOCK_GROUP_TREE`
+    /// is set, including when chunks are created or removed.
+    /// Not `VERITY`, whose Merkle tree a data write invalidates.
+    pub const SUPPORTED: u64 = FREE_SPACE_TREE | FREE_SPACE_TREE_VALID | BLOCK_GROUP_TREE;
 }
 
 /// Refuse to WRITE a volume carrying a `compat_ro` feature this driver
@@ -455,10 +455,21 @@ mod compat_ro_tests {
     }
 
     #[test]
+    fn a_block_group_tree_is_maintained_when_writing() {
+        assert_ne!(compat_ro::SUPPORTED & compat_ro::BLOCK_GROUP_TREE, 0);
+        refuse_unmaintained_compat_ro(
+            compat_ro::FREE_SPACE_TREE
+                | compat_ro::FREE_SPACE_TREE_VALID
+                | compat_ro::BLOCK_GROUP_TREE,
+        )
+        .expect("block group items in tree 11 are maintained");
+    }
+
+    #[test]
     fn a_volume_with_an_unmaintained_feature_is_refused_by_name() {
         for (flags, needle) in [
             (compat_ro::VERITY, "fs-verity"),
-            (compat_ro::BLOCK_GROUP_TREE, "block group tree"),
+            (compat_ro::BLOCK_GROUP_TREE | compat_ro::VERITY, "fs-verity"),
             (1 << 40, "0x0000010000000000"),
             (
                 compat_ro::FREE_SPACE_TREE | compat_ro::BLOCK_GROUP_TREE | (1 << 7),
