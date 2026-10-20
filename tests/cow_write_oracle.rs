@@ -1760,3 +1760,127 @@ fn a_write_inside_a_compressed_inline_extent_rewrites_it_and_the_file_stays_inli
         );
     }
 }
+
+/// A write that grows a file whose data is all inline, and whose grown
+/// data still fits inline — short of one sector and within the mount's
+/// `max_inline` — rewrites the inline item, longer, and moves the
+/// inode's `size` and `nbytes`; the file stays inline, as the kernel
+/// leaves it (#530). Each file is grown once from inside its data past
+/// its end and once from its end, one transaction per write; the kernel
+/// made the same writes into the controls, so the bytes, `size`, `nbytes`
+/// and the inline item's `ram_bytes` the driver is held to are its own.
+#[test]
+fn a_write_growing_an_inline_file_within_the_inline_limit_keeps_it_inline() {
+    let control = |name: &str| name.replace(".bin", "-control.bin");
+    let files = [("small.bin", 300u64), ("mid.bin", 1000)];
+    // (file, offset, length, byte): across the end, then from the end.
+    let writes = [
+        ("small.bin", 250u64, 100usize, 0x5au8),
+        ("small.bin", 350, 200, 0xa5),
+        ("mid.bin", 900, 300, 0x33),
+        ("mid.bin", 1200, 800, 0x44),
+    ];
+    let mut script = String::new();
+    for (name, size) in files {
+        script.push_str(&format!(
+            "head -c {size} /dev/urandom | tee \"$MNT/{name}\" > \"$MNT/{}\"\n",
+            control(name)
+        ));
+    }
+    script.push_str("sync\n");
+    for (name, offset, len, byte) in writes {
+        script.push_str(&format!(
+            "head -c {len} /dev/zero | tr '\\000' '\\{byte:03o}' \
+             | dd of=\"$MNT/{}\" bs=1 seek={offset} conv=notrunc status=none\n\
+             sync\n",
+            control(name)
+        ));
+    }
+    let scratch = Scratch::new("cow-write-grow-inline", &script);
+    let image = scratch.image();
+    for (name, size) in files {
+        let fs = mount_rw(&image);
+        let (ino, theirs) = (ino_of(&fs, name), ino_of(&fs, &control(name)));
+        drop(fs);
+        let inline = inline_extent(&image, ino)
+            .unwrap_or_else(|| panic!("the kernel did not store {name} inline"));
+        assert_eq!(inline, (size, size, "0".to_string()), "{name} before");
+        assert!(
+            inline_extent(&image, theirs).is_some(),
+            "the kernel's growing writes moved {}'s data out of line",
+            control(name)
+        );
+    }
+
+    let mut fs = mount_rw(&image);
+    let mut expected = BTreeMap::new();
+    for (name, _) in files {
+        let ino = ino_of(&fs, name);
+        expected.insert(name, fs.read_file(ino).unwrap());
+    }
+    for (name, offset, len, byte) in writes {
+        let ino = ino_of(&fs, name);
+        assert_eq!(
+            fs.write(ino, offset, &vec![byte; len])
+                .unwrap_or_else(|e| panic!("growing {name} at {offset}: {e}")),
+            len
+        );
+        let bytes = expected.get_mut(name).unwrap();
+        bytes.resize(bytes.len().max(offset as usize + len), 0);
+        bytes[offset as usize..offset as usize + len].fill(byte);
+        assert_eq!(&fs.read_file(ino).unwrap(), bytes, "{name} reads back");
+    }
+    for (name, _) in files {
+        let ours = fs.read_inode(ino_of(&fs, name)).unwrap();
+        let theirs = fs.read_inode(ino_of(&fs, &control(name))).unwrap();
+        assert_eq!(
+            (ours.size, ours.nbytes),
+            (theirs.size, theirs.nbytes),
+            "{name}'s size and nbytes are not what the kernel's own writes gave its control"
+        );
+    }
+    let inos: Vec<(&str, u64, u64)> = files
+        .iter()
+        .map(|&(name, _)| (name, ino_of(&fs, name), ino_of(&fs, &control(name))))
+        .collect();
+    drop(fs);
+    for (name, ours, theirs) in inos {
+        let theirs = inline_extent(&image, theirs)
+            .unwrap_or_else(|| panic!("{} is not inline", control(name)));
+        assert_eq!(
+            inline_extent(&image, ours),
+            Some(theirs),
+            "{name} is not inline as its control is"
+        );
+    }
+
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum after growing inline files:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let names: Vec<String> = files
+        .iter()
+        .flat_map(|&(name, _)| [name.to_string(), control(name)])
+        .collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let seen = kernel_view(&image, "after growing inline files", &refs);
+    for (name, _) in files {
+        assert_eq!(
+            seen[name].0,
+            sha256_hex(&expected[name]),
+            "{name}: wrong bytes"
+        );
+        assert_eq!(
+            seen[name].0,
+            seen[&control(name)].0,
+            "{name} does not read as the kernel's own writes left its control"
+        );
+    }
+}
