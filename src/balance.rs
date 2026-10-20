@@ -34,14 +34,15 @@
 //! (#397, #493, #580) in committed transactions, each leaving a filesystem the kernel and
 //! `btrfs check` accept on its own:
 //!
-//! 1. **A new chunk** of the group's profile: its `CHUNK_ITEM` in the
-//!    chunk tree, a `DEV_EXTENT` in the device tree for its stripe, an
+//! 1. **A new chunk** of the group's profile, or DUP when a single data
+//!    group is converted (#586): its `CHUNK_ITEM` in the
+//!    chunk tree, a `DEV_EXTENT` in the device tree for each stripe, an
 //!    empty `BLOCK_GROUP_ITEM`, a `FREE_SPACE_INFO` and one free run
 //!    covering it in the free-space tree, and the device's `bytes_used`
 //!    raised in the chunk tree's device item and the superblock's copy.
 //! 2. **The extents move**, when the group holds any (#493), at most 64
 //!    per committed transaction (#494): each one's bytes are read verified
-//!    against their digests and written into the new chunk, then the
+//!    against their digests and written into every copy the new chunk keeps, then the
 //!    batch's commit re-points every file item naming it (#495), each
 //!    keeping its offset into the extent, moves its `EXTENT_ITEM` and
 //!    inline and keyed back references unchanged, files its
@@ -54,7 +55,8 @@
 //!    allocation still excludes it during this final transaction.
 //!
 //! Besides everything above, it refuses a system group, a conversion to
-//! another profile, any profile but single, a volume of more than one
+//! another profile but a single data group's to DUP, a group of any
+//! profile but single, a volume of more than one
 //! device, one with no free-space tree or with a block group tree, and a
 //! group holding an extent with a sector that a checksummed file's
 //! regular item names and that has no checksum, each before anything is
@@ -284,8 +286,9 @@ impl Filesystem {
     }
 
     /// Relocate the data or metadata block group at `start` into a new
-    /// chunk of its own profile, and return where the new group is (#397,
-    /// #493, #580).
+    /// chunk of its own profile, or of `profile` when that converts a
+    /// single data group to DUP, and return where the new group is (#397,
+    /// #493, #580, #586).
     ///
     /// Committed transactions, each leaving a filesystem the kernel
     /// accepts on its own: the new chunk is allocated, the group's extents
@@ -314,7 +317,13 @@ impl Filesystem {
         }
         let group = self.block_group_at(start)?;
         let extents = self.refuse_unrelocatable(&group, profile)?;
-        let new = self.allocate_chunk(group.flags, group.length)?;
+        // The new chunk takes the converted profile, if any; the extents
+        // move through every mirror of it, so a DUP chunk gets both copies.
+        let flags = match profile {
+            Some(p) => group.flags & !bg::PROFILE_MASK | profile_bits(p),
+            None => group.flags,
+        };
+        let new = self.allocate_chunk(flags, group.length)?;
         if group.holds_metadata() {
             // Allocation commits while the old metadata is still in use.
             // Only after that can copy-on-write allocate in the new chunk.
@@ -563,12 +572,22 @@ impl Filesystem {
             self.refuse_unenumerable(group)?;
         }
         let own = ChunkProfile::from_type(group.flags)?;
+        // A single data group converts to DUP (#586); every other
+        // conversion is refused.
         if let Some(p) = profile.filter(|&p| p != own) {
-            return Err(Error::UnsupportedFeature(format!(
-                "converting a {} block group to {} is not implemented",
-                own.name(),
-                p.name()
-            )));
+            if group.holds_metadata() || own != ChunkProfile::Single || p != ChunkProfile::Dup {
+                return Err(Error::UnsupportedFeature(format!(
+                    "converting a {} {} block group to {} is not implemented; only a \
+                     single data group to dup is",
+                    own.name(),
+                    if group.holds_metadata() {
+                        "metadata"
+                    } else {
+                        "data"
+                    },
+                    p.name()
+                )));
+            }
         }
         if own != ChunkProfile::Single {
             return Err(Error::UnsupportedFeature(format!(
