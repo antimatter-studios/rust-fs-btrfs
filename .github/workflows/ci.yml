@@ -338,13 +338,14 @@ jobs:
       - name: The script tests executed their assertions
         run: |
           set -euo pipefail
-          # 53 assertions across four scripts, measured on this branch.
-          # Floor 45: room for a check to be folded into another without
+          # The previous floor of 45 gains the seven host-copy assertions
+          # from tests/scripts/fixture-host-copy.sh (#471).
+          # Floor 52: room for a check to be folded into another without
           # room for a script to stop asserting.
           assertions=$(grep -ac '^ok' tmp/logs/scripts.log || true)
-          echo "script assertions executed: $assertions (floor 45)"
-          if [ "$assertions" -lt 45 ]; then
-            echo "::error::only $assertions script assertions executed, floor is 45 — a run that asserts fewer stopped early rather than passed" >&2
+          echo "script assertions executed: $assertions (floor 52)"
+          if [ "$assertions" -lt 52 ]; then
+            echo "::error::only $assertions script assertions executed, floor is 52 — a run that asserts fewer stopped early rather than passed" >&2
             exit 1
           fi
       # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to
