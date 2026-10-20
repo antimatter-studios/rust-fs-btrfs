@@ -82,6 +82,9 @@
 //!   item's kind, not only where it points. A write within inline data
 //!   rewrites that item, and the file stays inline (#437); compressed
 //!   inline data is decoded, written and encoded again (#438); a write
+//!   that grows the file past what inline data holds, or starts past its
+//!   end, moves that data into a regular extent at offset 0 with the
+//!   write, as the kernel does (#507); a write
 //!   covering the whole of a preallocated item is written where its
 //!   extent lies, and the item becomes regular in place (#535);
 //! - an extent another reference shares whose reference from this file
@@ -242,6 +245,12 @@ impl Filesystem {
                 return Ok(written);
             }
         }
+        // Inline data a growing write outgrows, or starts past, moves into a
+        // regular extent at offset 0 with the write, as the kernel moves it,
+        // rather than the write planning an extent at its unaligned end
+        // (#507).
+        let move_inline =
+            move_inline || (end > inode.size && self.file_extents(ino)?.iter().any(|p| p.inline));
         // A write over the whole of a preallocated item is written where
         // its extent lies, and the item becomes regular (#535).
         if !move_inline && end <= inode.size {
@@ -256,9 +265,11 @@ impl Filesystem {
         // the old end (#433). A volume without no-holes records that gap
         // as a hole item, from the sector after the old end to the one the
         // write starts in, as the kernel's extend does (#436).
+        // Moved inline data's copy covers every sector up to the write's,
+        // so it leaves neither.
         let mut tail = None;
         let mut gap = None;
-        if end > inode.size {
+        if end > inode.size && !move_inline {
             let sector = u64::from(self.sb.sectorsize);
             if offset > inode.size && !inode.size.is_multiple_of(sector) {
                 tail = Some(inode.size);
@@ -551,6 +562,8 @@ impl Filesystem {
     /// A write that starts within inline data holding the whole file and
     /// ends past it grows the item, as long as the grown data still fits
     /// inline, and moves the inode's `size` and `nbytes` with it (#530).
+    /// When it no longer fits, `None`: the caller moves the data into a
+    /// regular extent (#507).
     ///
     /// A compressed inline extent (#438) is decoded, written and stored
     /// inline again: compressed when the file asks for compression and
@@ -558,8 +571,8 @@ impl Filesystem {
     /// The item's size may change with its encoding.
     ///
     /// An encrypted or otherwise encoded inline extent, an uncompressed one
-    /// whose length disagrees with its `ram_bytes`, and a rewrite that
-    /// inline data could no longer hold are refused.
+    /// whose length disagrees with its `ram_bytes`, and a rewrite within
+    /// the file that inline data could no longer hold are refused.
     fn write_inline(&mut self, inode: &Inode, offset: u64, data: &[u8]) -> Result<Option<usize>> {
         use crate::fs::file_extent as fe;
         use crate::inode::offsets as io;
@@ -630,6 +643,11 @@ impl Filesystem {
         } else {
             bytes.len() <= MAX_INLINE
         } && (end <= held || length < sector as u64);
+        // Whole-file inline data a growing write outgrows is the caller's
+        // to move into a regular extent (#507).
+        if !fits && end > inode.size {
+            return Ok(None);
+        }
         if !fits {
             return Err(Error::UnsupportedFeature(format!(
                 "inode {ino}: the write to [{offset}, {end}) leaves {} bytes of inline \
