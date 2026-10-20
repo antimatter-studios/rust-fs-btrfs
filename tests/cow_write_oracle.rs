@@ -803,6 +803,11 @@ fn a_write_into_a_hole_adds_an_extent_the_checker_and_kernel_accept() {
 /// items tile the file without a gap or overlap. Data addresses differ
 /// between the driver's file and the independently written control.
 fn explicit_holes(image: &Path, ino: u64) -> Vec<(u64, u64)> {
+    explicit_holes_to(image, ino, 196_608)
+}
+
+/// As [`explicit_holes`], for a file whose items end at `to`.
+fn explicit_holes_to(image: &Path, ino: u64, to: u64) -> Vec<(u64, u64)> {
     let tree = dump_tree(image, "5");
     let lines: Vec<&str> = tree.lines().collect();
     let needle = format!("key ({ino} EXTENT_DATA ");
@@ -835,10 +840,7 @@ fn explicit_holes(image: &Path, ino: u64) -> Vec<(u64, u64)> {
             holes.push((offset, len));
         }
     }
-    assert_eq!(
-        end, 196_608,
-        "inode {ino}: incomplete extent coverage\n{tree}"
-    );
+    assert_eq!(end, to, "inode {ino}: incomplete extent coverage\n{tree}");
     holes
 }
 
@@ -1338,6 +1340,119 @@ fn a_write_that_starts_past_the_end_zeroes_the_rest_of_the_old_last_sector() {
         assert_eq!(
             after[name].0,
             after[&control(name)].0,
+            "{name} does not read as the kernel's own writes left its control"
+        );
+    }
+}
+
+/// Without the no-holes feature a gap is an item of its own (#436). The
+/// kernel extends a file a write starts past the end of by inserting a
+/// hole item from the sector after the old end to the sector the write
+/// starts in, and an append that starts at the end leaves no hole at all.
+/// `app.bin` is appended to at its end and `far.bin` written several
+/// sectors past it, both checksummed and ending partway through a sector;
+/// the kernel made the same writes into the controls, so the hole items,
+/// `size`, `nbytes` and bytes the driver is held to are its own.
+/// `btrfs check --check-data-csum` and a scrub verify every digest, and
+/// the kernel reads every byte back.
+#[test]
+fn a_write_that_grows_a_file_without_no_holes_records_the_gap_as_a_hole_item() {
+    const APP: &str = "app.bin";
+    const FAR: &str = "far.bin";
+    let control = |name: &str| name.replace(".bin", "-control.bin");
+    let writes = [
+        (APP, 40_000u64, 9000usize, 0xc3u8),
+        (FAR, 70_000, 5000, 0x3c),
+    ];
+    let mut script = String::new();
+    for name in [APP, FAR] {
+        script.push_str(&format!(
+            "head -c 40000 /dev/urandom | tee \"$MNT/{name}\" > \"$MNT/{}\"\n",
+            control(name)
+        ));
+    }
+    script.push_str("sync\n");
+    for (name, offset, len, byte) in writes {
+        script.push_str(&format!(
+            "head -c {len} /dev/zero | tr '\\000' '\\{byte:03o}' \
+             | dd of=\"$MNT/{}\" bs=1 seek={offset} conv=notrunc status=none\n\
+             sync\n",
+            control(name)
+        ));
+    }
+    let scratch = Scratch::made("cow-write-grow-holes", "crc32c", "^no-holes", &script);
+    let image = scratch.image();
+    let mut fs = mount_rw(&image);
+    assert!(!fs.superblock().has_no_holes(), "mkfs enabled NO_HOLES");
+
+    let mut expected = BTreeMap::new();
+    for (name, offset, len, byte) in writes {
+        let ino = ino_of(&fs, name);
+        let mut bytes = fs.read_file(ino).unwrap();
+        assert_eq!(bytes.len(), 40_000, "{name} before the write");
+        assert_eq!(
+            fs.write(ino, offset, &vec![byte; len])
+                .unwrap_or_else(|e| panic!("growing {name} with a write at {offset}: {e}")),
+            len
+        );
+        bytes.resize(offset as usize, 0);
+        bytes.extend(std::iter::repeat_n(byte, len));
+        assert_eq!(fs.read_file(ino).unwrap(), bytes, "{name} reads back");
+        expected.insert(name, bytes);
+    }
+    for (name, offset, len, _) in writes {
+        let ours = fs.read_inode(ino_of(&fs, name)).unwrap();
+        let theirs = fs.read_inode(ino_of(&fs, &control(name))).unwrap();
+        assert_eq!(
+            (ours.size, ours.nbytes),
+            (theirs.size, theirs.nbytes),
+            "{name}'s size and nbytes are not what the kernel's own writes gave its control"
+        );
+        let to = (offset + len as u64).next_multiple_of(4096);
+        assert_eq!(
+            explicit_holes_to(&image, ino_of(&fs, name), to),
+            explicit_holes_to(&image, ino_of(&fs, &control(name)), to),
+            "{name}: hole items differ from the kernel's control"
+        );
+    }
+    assert_eq!(
+        explicit_holes_to(&image, ino_of(&fs, &control(FAR)), 77_824),
+        vec![(40_960, 28_672)],
+        "the kernel must have recorded the gap as one hole item"
+    );
+    drop(fs);
+
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum after writes that grow a file without no-holes:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after writes that grow a file without no-holes",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+    let names = [APP, FAR, "app-control.bin", "far-control.bin"];
+    let seen = kernel_view(
+        &image,
+        "after writes that grow a file without no-holes",
+        &names,
+    );
+    for name in [APP, FAR] {
+        assert_eq!(
+            seen[name].0,
+            sha256_hex(&expected[name]),
+            "{name}: wrong bytes"
+        );
+        assert_eq!(
+            seen[name].0,
+            seen[&control(name)].0,
             "{name} does not read as the kernel's own writes left its control"
         );
     }
