@@ -34,15 +34,16 @@
 //! (#397, #493, #580) in committed transactions, each leaving a filesystem the kernel and
 //! `btrfs check` accept on its own:
 //!
-//! 1. **A new chunk** of the group's profile, or DUP when a single data
-//!    group is converted (#586): its `CHUNK_ITEM` in the
+//! 1. **A new chunk** of the group's profile, DUP when a single data
+//!    group is converted (#586), or single when a DUP data group is
+//!    (#587): its `CHUNK_ITEM` in the
 //!    chunk tree, a `DEV_EXTENT` in the device tree for each stripe, an
 //!    empty `BLOCK_GROUP_ITEM`, a `FREE_SPACE_INFO` and one free run
 //!    covering it in the free-space tree, and the device's `bytes_used`
 //!    raised in the chunk tree's device item and the superblock's copy.
 //! 2. **The extents move**, when the group holds any (#493), at most 64
 //!    per committed transaction (#494): each one's bytes are read verified
-//!    against their digests and written into every copy the new chunk keeps, then the
+//!    against their digests, from whichever copy verifies, and written into every copy the new chunk keeps, then the
 //!    batch's commit re-points every file item naming it (#495), each
 //!    keeping its offset into the extent, moves its `EXTENT_ITEM` and
 //!    inline and keyed back references unchanged, files its
@@ -55,8 +56,9 @@
 //!    allocation still excludes it during this final transaction.
 //!
 //! Besides everything above, it refuses a system group, a conversion to
-//! another profile but a single data group's to DUP, a group of any
-//! profile but single, a volume of more than one
+//! another profile but a single data group's to DUP or a DUP data
+//! group's to single (#587), a group of any other profile but single,
+//! a volume of more than one
 //! device, one with no free-space tree or with a block group tree, and a
 //! group holding an extent with a sector that a checksummed file's
 //! regular item names and that has no checksum, each before anything is
@@ -287,8 +289,8 @@ impl Filesystem {
 
     /// Relocate the data or metadata block group at `start` into a new
     /// chunk of its own profile, or of `profile` when that converts a
-    /// single data group to DUP, and return where the new group is (#397,
-    /// #493, #580, #586).
+    /// single data group to DUP or a DUP data group to single, and return
+    /// where the new group is (#397, #493, #580, #586, #587).
     ///
     /// Committed transactions, each leaving a filesystem the kernel
     /// accepts on its own: the new chunk is allocated, the group's extents
@@ -572,13 +574,15 @@ impl Filesystem {
             self.refuse_unenumerable(group)?;
         }
         let own = ChunkProfile::from_type(group.flags)?;
-        // A single data group converts to DUP (#586); every other
-        // conversion is refused.
+        // A single data group converts to DUP (#586) and a DUP data group
+        // back to single (#587); every other conversion is refused.
+        let converts = |from, to| !group.holds_metadata() && own == from && profile == Some(to);
+        let to_single = converts(ChunkProfile::Dup, ChunkProfile::Single);
         if let Some(p) = profile.filter(|&p| p != own) {
-            if group.holds_metadata() || own != ChunkProfile::Single || p != ChunkProfile::Dup {
+            if !converts(ChunkProfile::Single, ChunkProfile::Dup) && !to_single {
                 return Err(Error::UnsupportedFeature(format!(
                     "converting a {} {} block group to {} is not implemented; only a \
-                     single data group to dup is",
+                     single data group to dup, or a dup one to single, is",
                     own.name(),
                     if group.holds_metadata() {
                         "metadata"
@@ -589,7 +593,9 @@ impl Filesystem {
                 )));
             }
         }
-        if own != ChunkProfile::Single {
+        // A DUP data group moves only into single; the extents are read
+        // from whichever of its two copies verifies.
+        if own != ChunkProfile::Single && !to_single {
             return Err(Error::UnsupportedFeature(format!(
                 "allocating a {} chunk is not implemented; only single is",
                 own.name()
