@@ -4290,3 +4290,184 @@ fn a_write_a_sector_or_more_past_an_inline_files_end_leaves_a_hole() {
         );
     }
 }
+
+/// The compression of each regular `EXTENT_DATA` item of inode `ino`, as
+/// `btrfs inspect-internal dump-tree` prints it: `"0"` for none.
+fn extent_compressions(image: &Path, ino: u64) -> Vec<String> {
+    let tree = dump_tree(image, "5");
+    let lines: Vec<&str> = tree.lines().collect();
+    let needle = format!("key ({ino} EXTENT_DATA ");
+    let mut found = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        if !line.contains(&needle) {
+            continue;
+        }
+        let Some(line) = lines[at + 1..]
+            .iter()
+            .take_while(|l| !l.contains(" key ("))
+            .find(|l| l.contains("extent compression"))
+        else {
+            continue;
+        };
+        let mut words = line.split_whitespace();
+        assert!(
+            words.any(|w| w == "compression"),
+            "no compression in {line}"
+        );
+        found.push(words.next().unwrap().to_string());
+    }
+    found
+}
+
+/// A compressed inline file that a write grows past what an inline extent
+/// holds moves into a regular extent at offset 0, as an uncompressed one
+/// does (#507): the move decodes the inline data before writing it out,
+/// and the new extent's compression follows the file's (#593). The guest
+/// kernel writes compressible files through `compress=zlib`, `lzo` and
+/// `zstd` mounts, which it stores as compressed inline extents, and makes
+/// the same appends into controls. The driver's files must then hold no
+/// inline item, only sector-aligned extents compressed as the controls'
+/// are, the controls' `size` and `nbytes`, and `btrfs check
+/// --check-data-csum` and a kernel read-back must agree.
+#[test]
+fn an_append_outgrowing_compressed_inline_data_moves_it_into_a_regular_extent() {
+    use fs_btrfs::compression::Compression;
+    let control = |name: &str| format!("{name}-control");
+    // (file, mount algorithm, size).
+    let files = [
+        ("zl", "zlib", Compression::Zlib, 2000u64),
+        ("lz", "lzo", Compression::Lzo, 1500),
+        ("zs", "zstd", Compression::Zstd, 2500),
+    ];
+    // (file, offset, length, byte): from the end, and past it.
+    let writes = [
+        ("zl", 2000u64, 5000usize, 0x5au8),
+        ("lz", 1500, 9000, 0xa5),
+        ("zs", 3000, 2000, 0x3c),
+    ];
+    let mut script = String::new();
+    for (name, mount, _, size) in files {
+        script.push_str(&format!(
+            "mount -o remount,compress={mount} \"$MNT\"\n\
+             awk -v size={size} 'BEGIN {{ s = \"a compressible line of text\\n\"; \
+               while (length(s) < size) s = s s; printf \"%s\", substr(s, 1, size) }}' \
+               | tee \"$MNT/{name}\" \
+             > \"$MNT/{}\"\n\
+             sync\n",
+            control(name)
+        ));
+        for (file, offset, len, byte) in writes {
+            if file != name {
+                continue;
+            }
+            script.push_str(&format!(
+                "head -c {len} /dev/zero | tr '\\000' '\\{byte:03o}' \
+                 | dd of=\"$MNT/{}\" bs=1 seek={offset} conv=notrunc status=none\n\
+                 sync\n",
+                control(name)
+            ));
+        }
+    }
+    let scratch = Scratch::new("cow-write-append-compressed-inline", &script);
+    let image = scratch.image();
+    for (name, _, _, size) in files {
+        let fs = mount_rw(&image);
+        let ino = ino_of(&fs, name);
+        drop(fs);
+        let (_, ram, compression) = inline_extent(&image, ino)
+            .unwrap_or_else(|| panic!("the kernel did not store {name} inline"));
+        assert_eq!(ram, size, "{name}'s inline ram_bytes before");
+        assert_ne!(compression, "0", "the kernel did not compress {name}");
+    }
+
+    let mut fs = mount_rw(&image);
+    let mut expected = BTreeMap::new();
+    for (name, _, _, _) in files {
+        let ino = ino_of(&fs, name);
+        expected.insert(name, fs.read_file(ino).unwrap());
+    }
+    for (name, _, algo, _) in files {
+        fs.set_compression(algo);
+        for (file, offset, len, byte) in writes {
+            if file != name {
+                continue;
+            }
+            let ino = ino_of(&fs, name);
+            assert_eq!(
+                fs.write(ino, offset, &vec![byte; len])
+                    .unwrap_or_else(|e| panic!("writing {name} at {offset}: {e}")),
+                len
+            );
+            let bytes = expected.get_mut(name).unwrap();
+            bytes.resize(bytes.len().max(offset as usize + len), 0);
+            bytes[offset as usize..offset as usize + len].fill(byte);
+            assert_eq!(&fs.read_file(ino).unwrap(), bytes, "{name} reads back");
+        }
+    }
+    for (name, _, _, _) in files {
+        let ours = fs.read_inode(ino_of(&fs, name)).unwrap();
+        let theirs = fs.read_inode(ino_of(&fs, &control(name))).unwrap();
+        assert_eq!(
+            (ours.size, ours.nbytes),
+            (theirs.size, theirs.nbytes),
+            "{name}'s size and nbytes are not what the kernel's own writes gave its control"
+        );
+    }
+    let inos: Vec<(&str, u64, u64)> = files
+        .iter()
+        .map(|&(name, _, _, _)| (name, ino_of(&fs, name), ino_of(&fs, &control(name))))
+        .collect();
+    drop(fs);
+    for (name, ours, theirs) in inos {
+        let (_, kernel_inline) = extent_offsets(&image, theirs);
+        assert!(!kernel_inline, "the kernel kept {} inline", control(name));
+        let (offsets, inline) = extent_offsets(&image, ours);
+        assert!(!inline, "{name} still holds an inline item: {offsets:?}");
+        assert!(
+            !offsets.is_empty() && offsets.iter().all(|o| o % 4096 == 0),
+            "{name}'s extents are not sector-aligned: {offsets:?}"
+        );
+        let mut our_kinds = extent_compressions(&image, ours);
+        let mut their_kinds = extent_compressions(&image, theirs);
+        our_kinds.sort();
+        our_kinds.dedup();
+        their_kinds.sort();
+        their_kinds.dedup();
+        assert_eq!(
+            our_kinds,
+            their_kinds,
+            "{name}'s extents are not compressed as the kernel compressed {}'s",
+            control(name)
+        );
+    }
+
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum after appending to compressed inline files:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let names: Vec<String> = files
+        .iter()
+        .flat_map(|&(name, _, _, _)| [name.to_string(), control(name)])
+        .collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let seen = kernel_view(&image, "after appending to compressed inline files", &refs);
+    for (name, _, _, _) in files {
+        assert_eq!(
+            seen[name].0,
+            sha256_hex(&expected[name]),
+            "{name}: wrong bytes"
+        );
+        assert_eq!(
+            seen[name].0,
+            seen[&control(name)].0,
+            "{name} does not read as the kernel's own writes left its control"
+        );
+    }
+}
