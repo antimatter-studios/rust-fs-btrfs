@@ -906,14 +906,25 @@ impl Filesystem {
         })
     }
 
+    /// The tree a write through this handle commits to: the subvolume a
+    /// subvolume handle holds the devices for, or the top level (#445).
+    pub(crate) fn written_tree(&self) -> u64 {
+        self.subvolume_writes
+            .as_ref()
+            .map_or(objectid::FS_TREE, |w| w.id)
+    }
+
     /// Run `write`, a change committed against this subvolume handle's own
     /// tree, with the handle's devices in place (#517).
     ///
     /// A commit reopens the mount, which opens the top level, so whatever
     /// `write` leaves behind is turned back into this subvolume's handle
     /// on the generation it reached, read-only to everything else again.
-    fn writing_subvolume<R>(&mut self, write: impl FnOnce(&mut Self) -> Result<R>) -> Result<R> {
-        let held = self.subvolume_writes.take().ok_or(Error::ReadOnly)?;
+    pub(crate) fn writing_subvolume<R>(
+        &mut self,
+        write: impl FnOnce(&mut Self) -> Result<R>,
+    ) -> Result<R> {
+        let held = self.subvolume_writes.clone().ok_or(Error::ReadOnly)?;
         self.writable = Some(Arc::clone(&held.writable));
         self.writable_pool = held.writable_pool.clone();
         let out = write(self);
