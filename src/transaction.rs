@@ -1922,10 +1922,14 @@ impl Filesystem {
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedFeature`] for a removal this does not make: of a
-    /// leaf that is its parent's first child, whose parent's first key and
-    /// the key pointers above it would change (#547); and of a leaf a
-    /// snapshot shares.
+    /// A leaf that is its parent's first child leaves too (#547): the
+    /// render then gives the parent the first key of its next child left,
+    /// and carries it up through every ancestor whose own first key it
+    /// was.
+    ///
+    /// [`Error::UnsupportedFeature`] for a removal this does not make: of
+    /// every leaf under one node, which would leave the node with no key
+    /// pointers; and of a leaf a snapshot shares.
     fn plan_removals(&self, plan: &mut Plan, data: &DataWrite) -> Result<()> {
         let generation = self.sb.generation + 1;
         // A change the render refuses is the render's to report (#87).
@@ -1949,15 +1953,16 @@ impl Filesystem {
                      removing a shared leaf from its tree is not implemented"
                 )));
             }
-            let first = self
-                .read_tree_block(parent)?
-                .body
-                .key_ptrs()
-                .and_then(|ptrs| ptrs.first().map(|p| p.blockptr));
-            if first == Some(old) {
+            let block = self.read_tree_block(parent)?;
+            let left = block.body.key_ptrs().map_or(0, |ptrs| {
+                ptrs.iter()
+                    .filter(|p| !leaves.get(&p.blockptr).is_some_and(Vec::is_empty))
+                    .count()
+            });
+            if left == 0 {
                 return Err(Error::UnsupportedFeature(format!(
-                    "the change empties the leaf at {old}, its parent's first child, and \
-                     removing that leaf from its tree is not implemented"
+                    "the change empties every leaf under the node at {parent}, the leaf at \
+                     {old} among them, and removing a node from its tree is not implemented"
                 )));
             }
             if let Some(at) = plan.rewrites.iter().position(|r| r.old == old) {
