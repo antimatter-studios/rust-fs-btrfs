@@ -305,7 +305,7 @@ impl Filesystem {
                     // when this change copies it. Either way this item's
                     // reference is dropped and the extent stays for the
                     // rest (#262).
-                    if refs == 1 && !self.leaf_shared(crate::chunk::objectid::FS_TREE, k)? {
+                    if refs == 1 && !self.leaf_shared(self.written_tree(), k)? {
                         releases.push(release);
                     } else {
                         unrefs.push(release);

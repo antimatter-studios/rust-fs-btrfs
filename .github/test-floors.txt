@@ -183,7 +183,9 @@ split_oracle              4
 subvol_cow_write_kernel   1
 subvol_create_kernel      1
 subvol_default_kernel     1
-subvol_namespace_kernel   1
+# Two no-tool scope contracts and two independent kernel namespace cases (#518).
+subvol_namespace_contract 2
+subvol_namespace_kernel   2
 subvol_oracle             12
 subvol_readonly_kernel    1
 superblock_mirrors        4

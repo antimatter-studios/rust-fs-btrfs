@@ -89,3 +89,88 @@ fn names_made_inside_a_subvolume_are_clean_and_the_kernel_lists_them() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Both metadata-only changes and the removal of regular data extents
+/// must name sv's tree, including a replacing rename (#518).
+#[test]
+fn names_changed_inside_a_subvolume_are_clean_and_the_kernel_reads_them() {
+    let dir = std::path::PathBuf::from(temp_path!("subvol-namespace-changes"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("fs.img");
+    std::fs::File::create(&image)
+        .and_then(|f| f.set_len(256 << 20))
+        .unwrap();
+    let made = oracle("mkfs.btrfs")
+        .args(["-q", "-f", "-s", "4096", "-n", "16384"])
+        .arg(&image)
+        .output();
+    assert!(made.status.success(), "{:?}", made.stderr);
+    let img = image.to_string_lossy().into_owned();
+    guest_kernel_write_ok(
+        &img,
+        "subvol-namespace-changes-fill",
+        r#"
+btrfs subvolume create "$MNT/sv" >/dev/null
+printf 'linked payload\n' > "$MNT/sv/source"
+printf 'renamed payload\n' > "$MNT/sv/old"
+printf 'abcdefgh%.0s' $(seq 8192) > "$MNT/sv/delete"
+cp --reflink=never "$MNT/sv/delete" "$MNT/sv/replace"
+mkdir "$MNT/sv/empty" "$MNT/sv/left" "$MNT/sv/right" "$MNT/sv/left/moved"
+printf 'nested payload\n' > "$MNT/sv/left/moved/inner"
+printf 'held at top\n' > "$MNT/top-file"
+mkdir "$MNT/top-dir"
+sync
+"#,
+    );
+    {
+        let dev = Arc::new(FileDevice::open_rw(&image).unwrap());
+        let top = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>).unwrap();
+        let id = top.subvolume_at(b"/sv").unwrap();
+        let mut fs = top.open_subvolume(id).unwrap();
+        let root = fs.lookup_path("/").unwrap().ino;
+        let source = fs.lookup_path("/source").unwrap().ino;
+        fs.link(source, root, b"linked").expect("link inside sv");
+        fs.rename(root, b"old", root, b"renamed")
+            .expect("rename inside sv");
+        fs.unlink(root, b"source").expect("unlink one of two names");
+        fs.unlink(root, b"delete").expect("release data inside sv");
+        fs.rename(root, b"renamed", root, b"replace")
+            .expect("replace a file holding data inside sv");
+        fs.rmdir(root, b"empty").expect("rmdir inside sv");
+        let left = fs.lookup_path("/left").unwrap().ino;
+        let right = fs.lookup_path("/right").unwrap().ino;
+        fs.rename(left, b"moved", right, b"moved")
+            .expect("move a directory between parents inside sv");
+        assert_eq!(fs.subvolume_at(b"/").unwrap(), id);
+        assert_eq!(fs.read_file(source).unwrap(), b"linked payload\n");
+    }
+    assert_btrfs_check_clean(&image, "subvol-namespace-changes");
+    let seen = guest_kernel_read_ok(
+        &img,
+        "subvol-namespace-changes-read",
+        r#"
+src=$(findmnt -no SOURCE "$MNT")
+mkdir -p /tmp/sv-namespace-only
+mount -o ro,subvol=sv "$src" /tmp/sv-namespace-only
+echo names:
+ls -A /tmp/sv-namespace-only
+echo linked:; cat /tmp/sv-namespace-only/linked
+echo links:; stat -c %h /tmp/sv-namespace-only/linked
+echo renamed:; cat /tmp/sv-namespace-only/replace
+echo nested:; cat /tmp/sv-namespace-only/right/moved/inner
+test -z "$(ls -A /tmp/sv-namespace-only/left)"
+umount /tmp/sv-namespace-only
+echo top:; ls -A "$MNT"
+cat "$MNT/top-file"
+test -z "$(ls -A "$MNT/top-dir")"
+"#,
+    );
+    assert_eq!(
+        seen,
+        "names:\nleft\nlinked\nreplace\nright\n\
+         linked:\nlinked payload\nlinks:\n1\n\
+         renamed:\nrenamed payload\nnested:\nnested payload\n\
+         top:\nsv\ntop-dir\ntop-file\nheld at top\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
