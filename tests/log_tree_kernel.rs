@@ -2526,6 +2526,111 @@ fn an_inode_whose_last_name_is_an_extended_reference_is_deleted_as_the_kernel_do
     );
 }
 
+/// A committed empty directory `e` in `/` is replaced by a new directory,
+/// which moves to `replacement` before only `/` is fsynced (#410). This
+/// avoids Debian 6.1's full commit after rmdir. The log holds a range of `/`
+/// covering the removed index and no entry there, and does not hold `e`.
+/// A replay that removes only regular files refuses the log; the kernel's
+/// replay of the same crash image removes the directory with its items,
+/// and is the oracle.
+#[test]
+fn a_directory_whose_name_the_log_removes_is_removed_as_the_kernel_does() {
+    const RMDIR_FIXTURE: &str = "dirtylog/btrfs-dirty-log-rmdir.img";
+    let image = fixture(RMDIR_FIXTURE);
+    let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-rmdir.logdump"))
+        .expect("the native transcript of the removed directory log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    let e = {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the removed directory fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        let committed_e = fs
+            .lookup_path("/e")
+            .expect("the committed trees hold the directory e");
+        assert!(
+            fs.read_dir(committed_e.ino)
+                .expect("e is a committed directory")
+                .is_empty(),
+            "e is committed empty"
+        );
+        let e = committed_e.ino;
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        assert!(
+            !top.items.iter().any(|i| i.key.objectid == e),
+            "the log holds no item of e: {keys:?}"
+        );
+        for entry in top
+            .items
+            .iter()
+            .filter(|i| (i.key.objectid, i.key.key_type) == (256, DIR_INDEX_KEY))
+        {
+            assert!(
+                parse_dir_items(&entry.data)
+                    .unwrap()
+                    .iter()
+                    .all(|d| d.ino != e),
+                "the logged entry of / at index {} names e",
+                entry.key.offset
+            );
+        }
+        assert!(
+            top.items
+                .iter()
+                .any(|i| i.key.objectid == 256 && i.key.key_type == DIR_LOG_INDEX_KEY),
+            "the log holds no index range of /: {keys:?}"
+        );
+        e
+    };
+    // What the kernel's view does not show: every item of e, and every
+    // entry naming it, as the native tool prints each replayed copy.
+    let items_of_e = |image: &Path| -> Vec<String> {
+        dump_tree(image, "5")
+            .lines()
+            .filter(|l| {
+                l.contains(&format!("key ({e} ")) || l.contains(&format!("location key ({e} "))
+            })
+            .map(|l| l.trim().to_string())
+            .collect()
+    };
+    let theirs =
+        replays_as_the_kernel_does_then(RMDIR_FIXTURE, "dirtylog-rmdir", |theirs, ours| {
+            assert_eq!(
+                items_of_e(theirs),
+                Vec::<String>::new(),
+                "the kernel's replay removes e with its items"
+            );
+            assert_eq!(
+                items_of_e(ours),
+                Vec::<String>::new(),
+                "this crate's replay removes e with its items"
+            );
+        });
+    assert_eq!(
+        theirs.get(&("stat".to_string(), "e".to_string())),
+        None,
+        "the kernel's replay removes the name e"
+    );
+    assert_eq!(
+        theirs
+            .get(&("stat".to_string(), "k".to_string()))
+            .map(String::as_str),
+        Some("f 1 4"),
+        "the kernel's replay keeps k"
+    );
+}
+
 /// The inline writer's encoding fields are checked against the native
 /// tools, not against our own parser. `dump-tree` prints an inline file
 /// extent's data size, `ram_bytes` and compression; the raw item must hold

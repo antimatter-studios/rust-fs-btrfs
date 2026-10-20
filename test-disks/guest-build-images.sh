@@ -1223,6 +1223,7 @@ build_dirtylog() {
     build_dirtylog_refused extrefcreated 'compress=no,max_inline=2048' extrefcreated
     build_dirtylog_refused extrefremoved 'compress=no,max_inline=2048' extrefremoved
     build_dirtylog_refused compressedcut 'compress-force=zlib,max_inline=0' compressedcut
+    build_dirtylog_refused rmdir 'compress=no,max_inline=2048' rmdir
 }
 
 # fsync_path <path> — fsync one file or directory, and nothing else.
@@ -1401,6 +1402,10 @@ os.unlink(sys.argv[1] + "/f")
 for i in range(63):
     os.unlink(sys.argv[1] + "/" + ("%03d" % i) * 85)' "$MNT"
             printf 'kept' > "$MNT/k" ;;
+        rmdir)
+            # An empty directory e and a file k, committed in /.
+            mkdir "$MNT/e"
+            printf 'kept' > "$MNT/k" ;;
         compressedcut)
             # 128 KiB of one byte: compress-force stores it as one
             # compressed extent, the largest the kernel makes.
@@ -1517,6 +1522,34 @@ if kind == "extrefremoved":
     os.unlink(d + "/" + "063" * 85)
     dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
     sys.exit(0)
+if kind == "rmdir":
+    # Remove the committed empty directory e through a replacing rename.
+    # On Debian 6.1, rmdir followed by a parent fsync commits the whole
+    # transaction and leaves no log. A new directory replaces e, then moves
+    # away before only / is fsynced: the committed index of e is absent
+    # from the log, and replay must remove its old inode with all its items.
+    # Diagnostic seeds for #654 run only if this recipe fails; each seed
+    # must also satisfy the existing native attestation.
+    seed = os.environ.get("RMDIR_LOG_SEED", "")
+    def fsync_path(path):
+        fd = os.open(path, os.O_RDONLY); os.fsync(fd); os.close(fd)
+    if seed == "parent-chmod":
+        os.chmod(d, 0o700)
+        fsync_path(d)
+    elif seed == "parent-create":
+        open(d + "/new", "w").close()
+        fsync_path(d)
+    elif seed == "child-chmod":
+        os.chmod(d + "/e", 0o700)
+        fsync_path(d + "/e")
+    elif seed == "kept-write":
+        fd = os.open(d + "/k", os.O_WRONLY)
+        os.write(fd, b"kept"); os.fsync(fd); os.close(fd)
+    os.mkdir(d + "/replacement")
+    os.rename(d + "/replacement", d + "/e")
+    os.rename(d + "/e", d + "/replacement")
+    dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    sys.exit(0)
 fd = os.open(d + "/f", os.O_WRONLY)
 if kind == "sizechange":
     os.pwrite(fd, b"replayed-and-longer-inline-bytes-0123456789", 0)
@@ -1570,6 +1603,23 @@ os.close(fd)' "$kind" "$MNT"
     log_root=$(btrfs inspect-internal dump-super "$copy" | awk '$1 == "log_root" { print $2 }')
     if [ -z "$log_root" ] || [ "$log_root" = 0 ]; then
         echo "guest-build-images: $shape fsync left no log; chore fixtures dirtylog must produce one" >&2
+        if [ "$kind" = rmdir ] && [ -z "${RMDIR_LOG_SEED:-}" ]; then
+            # Run native experiments in the CI guest when the original
+            # recipe fails (#654). Keep this failure: no seed substitutes
+            # for the requested fixture, and none bypasses its assertions.
+            local seed pid
+            for seed in parent-chmod parent-create child-chmod kept-write; do
+                echo "[rmdir diagnostic] $seed"
+                ( export RMDIR_LOG_SEED="$seed"
+                  build_dirtylog_refused "rmdir-$seed" "$opts" rmdir ) &
+                pid=$!
+                if wait "$pid"; then
+                    echo "[rmdir diagnostic] $seed: native attestation passed"
+                else
+                    echo "[rmdir diagnostic] $seed: native attestation failed"
+                fi
+            done
+        fi
         exit 1
     fi
     {
@@ -1606,6 +1656,7 @@ want = {
     'extrefcreated': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: n\n',
     'extrefremoved': r'key \(256 DIR_LOG_INDEX \d+\) itemoff \d+ itemsize \d+\n\s+dir log end \d+\n',
     'compressedcut': r'EXTENT_DATA 32768\)',
+    'rmdir': r'key \(256 DIR_LOG_INDEX \d+\) itemoff \d+ itemsize \d+\n\s+dir log end \d+\n',
 }[kind]
 assert re.search(want, dump), (kind, 'native dump does not show the unsupported shape')
 if kind == 'symlink':
@@ -1848,6 +1899,29 @@ if kind == 'extrefremoved':
         (kind, 'no committed entry of / names f at the index of its extended reference', at)
     assert not re.search(r'\bkey \(%s ' % f, dump), (kind, 'the log holds f or an entry naming it')
     assert not re.search(r'key \(\d+ INODE_EXTREF ', dump), (kind, 'the log holds an extended reference')
+    assert not re.search(r'key \(256 DIR_INDEX %d\) ' % at, dump), \
+        (kind, 'the log holds an entry of / at the removed index', at)
+    ranges = [(int(a), int(b)) for a, b in re.findall(
+        r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
+    assert any(a <= at <= b for a, b in ranges), \
+        (kind, 'no logged index range of / holds the removed index', at, ranges)
+if kind == 'rmdir':
+    # Committed, / names one directory, e, empty with one link. The log
+    # does not hold e or any entry naming it, and holds an index range of
+    # / covering e's index with no entry there.
+    import subprocess
+    tree = subprocess.run(['btrfs', 'inspect-internal', 'dump-tree', '-t', '5', sys.argv[3]],
+                          check=True, capture_output=True, text=True).stdout
+    named = re.findall(r'key \(256 DIR_INDEX (\d+)\) itemoff \d+ itemsize \d+\n'
+                       r'\s+location key \((\d+) INODE_ITEM 0\) type DIR\n[^\n]*\n\s+name: e\n', tree)
+    assert len(named) == 1, (kind, 'the committed / does not name one directory e', named)
+    at, e = int(named[0][0]), named[0][1]
+    item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation \d+ transid \d+ size (\d+) nbytes \d+\n'
+                     r'\s+block group \d+ mode 40\d+ links (\d+) ' % e, tree)
+    assert item and item.groups() == ('0', '1'), \
+        (kind, 'e is not committed as an empty directory with one link', item and item.groups())
+    assert not re.search(r'\bkey \(%s ' % e, dump), (kind, 'the log holds e or an item of it')
     assert not re.search(r'key \(256 DIR_INDEX %d\) ' % at, dump), \
         (kind, 'the log holds an entry of / at the removed index', at)
     ranges = [(int(a), int(b)) for a, b in re.findall(
