@@ -64,7 +64,9 @@ pub struct Rewrite {
 /// A leaf the change fills past one block, and the blocks its split takes
 /// (#342, #615). The first part goes where its [`Rewrite`] puts it and
 /// each additional part takes a new block and a pointer in the parent.
-/// A root grows a level: a new root node points at every part.
+/// A root grows a level: a new root node points at every part. Parts
+/// more than one node holds take a level of nodes between them and the
+/// new root, as many levels as it takes (#649).
 ///
 /// A node the split leaves below it fill past its key pointers splits
 /// the same way (#514). When it is the root, its tree grows a level
@@ -81,9 +83,47 @@ pub struct Split {
     pub new: Vec<u64>,
     /// The tree it is in.
     pub owner: u64,
-    /// When the block was its tree's root: where the new root node, one
-    /// level up, goes.
+    /// When the block was its tree's root: where the new root node goes,
+    /// [`Split::grown`] levels up.
     pub root: Option<u64>,
+    /// When the block was its tree's root and its parts overflow one
+    /// node: the nodes between them and the new root, one list per level
+    /// from the lowest up (#649). Empty when the new root holds every part.
+    pub upper: Vec<Vec<u64>>,
+}
+
+impl Split {
+    /// How many levels the split block's tree grows: none below a parent,
+    /// one for the new root and one for each level between them.
+    pub fn grown(&self) -> u8 {
+        if self.root.is_none() {
+            return 0;
+        }
+        u8::try_from(self.upper.len() + 1).unwrap_or(u8::MAX)
+    }
+
+    /// Every block the split adds: each additional part, each node of
+    /// the levels between them and the new root, and the new root.
+    pub fn added(&self) -> impl Iterator<Item = u64> + '_ {
+        self.new
+            .iter()
+            .copied()
+            .chain(self.upper.iter().flatten().copied())
+            .chain(self.root)
+    }
+}
+
+/// How many nodes each level between a split root's parts and its new
+/// root takes, from the lowest up (#649): each level divides the one
+/// below over as few nodes as hold it, until one node holds them all.
+fn upper_counts(parts: usize, capacity: usize) -> Vec<usize> {
+    let mut counts = Vec::new();
+    let mut n = parts;
+    while n > capacity {
+        n = n.div_ceil(capacity);
+        counts.push(n);
+    }
+    counts
 }
 
 /// A tree the change makes, and where its one leaf goes (#267): a new
@@ -142,8 +182,7 @@ impl Plan {
     pub fn allocated(&self) -> Vec<u64> {
         let mut out: Vec<u64> = self.rewrites.iter().map(|r| r.new).collect();
         for s in &self.splits {
-            out.extend(s.new.iter().copied());
-            out.extend(s.root);
+            out.extend(s.added());
         }
         out.extend(self.created.iter().map(|c| c.new));
         out
@@ -1041,6 +1080,78 @@ impl Filesystem {
 
     /// [`Filesystem::render_plan_with`], or with `dry` set, only each
     /// rewritten leaf's items, with no block built and nothing checked.
+    /// The nodes a split root grows above its parts (#513, #649): each
+    /// level divides the pointers below it evenly over its nodes, as a
+    /// node split does, until the new root holds them all. `parts` is
+    /// every part's first key and address, in key order.
+    fn build_upper(
+        &self,
+        id: crate::tree_write::BlockIdentity,
+        split: &Split,
+        parts: Vec<(crate::chunk::DiskKey, u64)>,
+        generation: u64,
+        out: &mut Vec<crate::commit::PlacedBlock>,
+    ) -> Result<()> {
+        use crate::btree::KeyPtr;
+        use crate::commit::PlacedBlock;
+        use crate::tree_write::{build_node, BlockIdentity};
+
+        let Some(root) = split.root else {
+            return Ok(());
+        };
+        let capacity = crate::tree_write::key_ptr_capacity(&self.sb);
+        let counts: Vec<usize> = split.upper.iter().map(Vec::len).collect();
+        if counts != upper_counts(parts.len(), capacity) {
+            return Err(Error::UnsupportedFeature(
+                "the split root's levels differ from its plan".into(),
+            ));
+        }
+        let ptr = |&(key, blockptr): &(crate::chunk::DiskKey, u64)| KeyPtr {
+            key,
+            blockptr,
+            generation,
+        };
+        let mut level = id.level;
+        let mut below = parts;
+        for nodes in &split.upper {
+            level += 1;
+            let count = nodes.len();
+            let mut next = Vec::with_capacity(count);
+            for (i, &at) in nodes.iter().enumerate() {
+                let part = &below[i * below.len() / count..(i + 1) * below.len() / count];
+                let ptrs: Vec<_> = part.iter().map(ptr).collect();
+                out.push(PlacedBlock {
+                    logical: at,
+                    bytes: build_node(
+                        &self.sb,
+                        BlockIdentity {
+                            bytenr: at,
+                            level,
+                            ..id
+                        },
+                        &ptrs,
+                    )?,
+                });
+                next.push((part[0].0, at));
+            }
+            below = next;
+        }
+        let ptrs: Vec<_> = below.iter().map(ptr).collect();
+        out.push(PlacedBlock {
+            logical: root,
+            bytes: build_node(
+                &self.sb,
+                BlockIdentity {
+                    bytenr: root,
+                    level: level + 1,
+                    ..id
+                },
+                &ptrs,
+            )?,
+        });
+        Ok(())
+    }
+
     fn render(
         &self,
         plan: &Plan,
@@ -1223,25 +1334,8 @@ impl Filesystem {
                                     )?,
                                 });
                             }
-                            if let Some(root) = split.root {
-                                let root_id = BlockIdentity {
-                                    bytenr: root,
-                                    level: rewrite.level + 1,
-                                    ..id
-                                };
-                                let ptrs: Vec<_> = std::iter::once((parts[0][0].key, rewrite.new))
-                                    .chain(extra)
-                                    .map(|(key, blockptr)| KeyPtr {
-                                        key,
-                                        blockptr,
-                                        generation,
-                                    })
-                                    .collect();
-                                out.push(PlacedBlock {
-                                    logical: root,
-                                    bytes: build_node(&self.sb, root_id, &ptrs)?,
-                                });
-                            }
+                            let all = std::iter::once((parts[0][0].key, rewrite.new)).chain(extra);
+                            self.build_upper(id, split, all.collect(), generation, &mut out)?;
                             out.push(PlacedBlock {
                                 logical: rewrite.new,
                                 bytes: build_node(&self.sb, id, parts[0])?,
@@ -1418,12 +1512,12 @@ impl Filesystem {
                                     .try_into()
                                     .expect("8 bytes"),
                             );
-                            // A tree whose root leaf split has a new root
-                            // node, a level up (#342).
+                            // A tree whose root split has a new root node,
+                            // one level up or more (#342, #649).
                             let split = plan.split_of(at).filter(|s| s.root.is_some());
                             let grown = split.and_then(|s| s.root);
                             if let Some(split) = split {
-                                item.data[root_item::LEVEL] = split.level + 1;
+                                item.data[root_item::LEVEL] = split.level + split.grown();
                             }
                             if plan.collapsed.contains(&at) {
                                 item.data[root_item::LEVEL] = 0;
@@ -1502,25 +1596,8 @@ impl Filesystem {
                                     )?,
                                 });
                             }
-                            if let Some(root) = split.root {
-                                let root_id = BlockIdentity {
-                                    bytenr: root,
-                                    level: 1,
-                                    ..id
-                                };
-                                let ptrs: Vec<_> = std::iter::once((parts[0][0].key, rewrite.new))
-                                    .chain(extra)
-                                    .map(|(key, blockptr)| KeyPtr {
-                                        key,
-                                        blockptr,
-                                        generation,
-                                    })
-                                    .collect();
-                                out.push(PlacedBlock {
-                                    logical: root,
-                                    bytes: build_node(&self.sb, root_id, &ptrs)?,
-                                });
-                            }
+                            let all = std::iter::once((parts[0][0].key, rewrite.new)).chain(extra);
+                            self.build_upper(id, split, all.collect(), generation, &mut out)?;
                             let borrowed: Vec<_> =
                                 parts[0].iter().map(|i| i.as_leaf_item()).collect();
                             build_leaf(&self.sb, id, &borrowed)?
@@ -1913,10 +1990,18 @@ impl Filesystem {
                     ))
                 })?;
                 let is_root = place.parent.is_none();
-                if is_root && count + 1 > capacity {
+                let between = if is_root {
+                    upper_counts(count + 1, capacity)
+                } else {
+                    Vec::new()
+                };
+                if is_root
+                    && usize::from(place.level) + between.len() + 1
+                        >= usize::from(crate::superblock::MAX_LEVEL)
+                {
                     return Err(Error::UnsupportedFeature(format!(
-                        "the root at {leaf} needs {} child pointers after splitting; \
-                         growing a tree by more than one level in one transaction is not implemented",
+                        "the root at {leaf} needs {} child pointers after splitting, and \
+                         its tree would grow past the tallest a tree can be",
                         count + 1
                     )));
                 }
@@ -1956,6 +2041,16 @@ impl Filesystem {
                     taken.insert(at);
                     new.push(at);
                 }
+                let mut upper = Vec::with_capacity(between.len());
+                for n in between {
+                    let mut nodes = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let at = self.next_free_block_for(place.owner, &taken)?;
+                        taken.insert(at);
+                        nodes.push(at);
+                    }
+                    upper.push(nodes);
+                }
                 let root = if is_root {
                     let r = self.next_free_block_for(place.owner, &taken)?;
                     taken.insert(r);
@@ -1969,6 +2064,7 @@ impl Filesystem {
                     new,
                     owner: place.owner,
                     root,
+                    upper,
                 });
             }
         }
@@ -2553,15 +2649,22 @@ impl Filesystem {
             )?;
         }
 
-        // Each block a split adds (#342, #615): every additional part,
-        // and a new root node when the block was its tree's root.
-        // Ordinary records, as a moved block's are.
+        // Each block a split adds (#342, #615, #649): every additional
+        // part, and when the block was its tree's root, each node between
+        // the parts and the new root, and the new root. Ordinary records,
+        // as a moved block's are.
         for split in &moves.plan.splits {
+            let between = split
+                .upper
+                .iter()
+                .zip(1u8..)
+                .flat_map(|(nodes, up)| nodes.iter().map(move |&at| (at, split.level + up)));
             let blocks = split
                 .new
                 .iter()
                 .map(|&at| (at, split.level))
-                .chain(split.root.map(|r| (r, split.level + 1)));
+                .chain(between)
+                .chain(split.root.map(|r| (r, split.level + split.grown())));
             for (bytenr, level) in blocks {
                 if !mine(bytenr)? {
                     continue;
@@ -3475,7 +3578,7 @@ impl Filesystem {
         // A split's blocks are taken and nothing is given back (#342),
         // and so is a new tree's leaf (#267).
         for split in &plan.splits {
-            for at in split.new.iter().copied().chain(split.root) {
+            for at in split.added() {
                 *out.entry(group_of(at)?).or_default() += nodesize;
             }
         }

@@ -147,7 +147,9 @@ leaf_split_oracle         1
 # Three leaf partition cases and three multi-way planner shapes (#615).
 # One no-tool mixed-stripe allocation case passed in the local unit tier
 # at 2bfceb1; one seed-pair chunk allocation oracle adds a whole-suite case (#625).
-lib                       368
+# Two root-growth planner shapes and one level render case (#649); the
+# local unit tier executed 370 library cases at 727eb39 on 2026-10-19.
+lib                       371
 link_extref_kernel        1
 log_tree_kernel           31
 lookup_by_name_key        1
