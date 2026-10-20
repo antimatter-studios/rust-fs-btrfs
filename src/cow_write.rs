@@ -76,10 +76,10 @@
 //!   feature**, whose gap an extent item past the end (a preallocated one)
 //!   already reaches into;
 //! - a **preallocated** extent, or an **inline** one the write does not
-//!   lie within, or one that is compressed or encoded: each changes the
-//!   item's kind, not only where it points. A write within uncompressed
-//!   inline data rewrites that item in place, and the file stays inline
-//!   (#437);
+//!   lie within, or one that is encrypted or encoded: each changes the
+//!   item's kind, not only where it points. A write within inline data
+//!   rewrites that item, and the file stays inline (#437); compressed
+//!   inline data is decoded, written and encoded again (#438);
 //! - an extent a **snapshot** may share — one from at or before the last
 //!   snapshot, which the snapshot reads through a tree block it shares
 //!   and its record counts once for both;
@@ -528,8 +528,14 @@ impl Filesystem {
     /// or checksum, so nothing else changes. `None` when the file holds no
     /// inline item at offset 0.
     ///
-    /// A compressed, encrypted or otherwise encoded inline extent, or one
-    /// whose length disagrees with its `ram_bytes`, is refused.
+    /// A compressed inline extent (#438) is decoded, written and stored
+    /// inline again: compressed when the file asks for compression and
+    /// the encoding is smaller, as the kernel decides, otherwise as it is.
+    /// The item's size may change with its encoding.
+    ///
+    /// An encrypted or otherwise encoded inline extent, an uncompressed one
+    /// whose length disagrees with its `ram_bytes`, and a rewrite that
+    /// inline data could no longer hold are refused.
     fn write_inline(&mut self, inode: &Inode, offset: u64, data: &[u8]) -> Result<Option<usize>> {
         use crate::fs::file_extent as fe;
         use crate::inode::offsets as io;
@@ -541,17 +547,32 @@ impl Filesystem {
             return Ok(None);
         };
         let end = offset + data.len() as u64;
-        let plain = item.len() >= fe::INLINE_DATA
-            && item[fe::COMPRESSION] == 0
+        let unencoded = item.len() >= fe::INLINE_DATA
             && item[fe::ENCRYPTION] == 0
             && item[fe::OTHER_ENCODING..fe::OTHER_ENCODING + 2] == [0, 0];
-        if !plain || item.len() as u64 != fe::INLINE_DATA as u64 + le64(&item, fe::RAM_BYTES) {
+        let compressed = unencoded && item[fe::COMPRESSION] != 0;
+        if !unencoded
+            || (!compressed
+                && item.len() as u64 != fe::INLINE_DATA as u64 + le64(&item, fe::RAM_BYTES))
+        {
             return Err(Error::UnsupportedFeature(format!(
-                "inode {ino}: the inline extent at 0 is compressed, encrypted or encoded, or \
-                 its length disagrees with its ram_bytes, and writing one is not implemented"
+                "inode {ino}: the inline extent at 0 is encrypted or encoded, or its length \
+                 disagrees with its ram_bytes, and writing one is not implemented"
             )));
         }
-        let held = (item.len() - fe::INLINE_DATA) as u64;
+        let sector = self.sb.sectorsize as usize;
+        let mut plain = if compressed {
+            crate::compression::decompress(
+                Compression::from_byte(item[fe::COMPRESSION])?,
+                &item[fe::INLINE_DATA..],
+                le64(&item, fe::RAM_BYTES) as usize,
+                sector,
+                crate::compression::ShortDecode::Pad,
+            )?
+        } else {
+            item[fe::INLINE_DATA..].to_vec()
+        };
+        let held = plain.len() as u64;
         if end > held {
             return Err(Error::UnsupportedFeature(format!(
                 "inode {ino}: the write to [{offset}, {end}) reaches past the {held} bytes of \
@@ -568,8 +589,32 @@ impl Filesystem {
 
         let mut rewritten = item;
         rewritten[fe::GENERATION..fe::GENERATION + 8].copy_from_slice(&generation.to_le_bytes());
-        let at = fe::INLINE_DATA + offset as usize;
-        rewritten[at..at + data.len()].copy_from_slice(data);
+        if compressed {
+            plain[offset as usize..end as usize].copy_from_slice(data);
+            let (bytes, compression) = self.encode_inline(plain, self.compression_for(inode)?);
+            // The kernel keeps compressed inline data no larger than its
+            // default `max_inline`, and plain inline data short of a
+            // sector, which `btrfs check` requires.
+            let fits = if compression == COMPRESS_NONE {
+                bytes.len() < sector && bytes.len() <= MAX_INLINE
+            } else {
+                bytes.len() <= MAX_INLINE
+            };
+            if !fits {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino}: the write to [{offset}, {end}) leaves {} bytes of inline \
+                     data, more than an inline extent holds, and moving it out of line is \
+                     not implemented",
+                    bytes.len()
+                )));
+            }
+            rewritten.truncate(fe::INLINE_DATA);
+            rewritten[fe::COMPRESSION] = compression;
+            rewritten.extend_from_slice(&bytes);
+        } else {
+            let at = fe::INLINE_DATA + offset as usize;
+            rewritten[at..at + data.len()].copy_from_slice(data);
+        }
         let mut raw = self.raw_inode(ino)?;
         crate::namespace::touch(&mut raw, generation, now, &[io::CTIME, io::MTIME]);
         let edits = vec![
@@ -905,6 +950,16 @@ impl Filesystem {
         (packed, algo.to_byte())
     }
 
+    /// The bytes inline data is stored as, and its compression type:
+    /// `algo`'s encoding when it is smaller than the data, as the kernel
+    /// keeps compressed inline data; otherwise the data as it is (#438).
+    fn encode_inline(&self, plain: Vec<u8>, algo: Compression) -> (Vec<u8>, u8) {
+        match crate::compression::compress(algo, &plain, self.sb.sectorsize as usize) {
+            Some(packed) if packed.len() < plain.len() => (packed, algo.to_byte()),
+            _ => (plain, COMPRESS_NONE),
+        }
+    }
+
     /// The checksum tree edits a write makes (#261), or a truncate
     /// (#262): `released` holds each extent given up, as `[start, end)`.
     ///
@@ -1108,6 +1163,10 @@ const INODE_COMPRESS: u64 = 1 << 11;
 
 /// An extent item's `compression` byte for a copy stored as it is.
 const COMPRESS_NONE: u8 = 0;
+
+/// The most inline data the kernel keeps in an extent item: its default
+/// `max_inline` mount option.
+const MAX_INLINE: usize = 2048;
 
 /// The attribute the kernel keeps the compression property in.
 const COMPRESSION_PROPERTY: &[u8] = b"btrfs.compression";
