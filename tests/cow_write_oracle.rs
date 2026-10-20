@@ -13,9 +13,10 @@
 //! A checksummed file gets a digest for every sector of each copy, and
 //! the digests of the extents it replaced are removed (#261). An extent a
 //! reflink or another item of the file also references is copied and
-//! keeps those references (#261); an extent a snapshot shares is still
-//! refused. A write into a hole adds an extent, and so does one that
-//! starts at or before the end of a file and grows it (#432).
+//! keeps those references (#261), and so is one a snapshot shares, which
+//! the snapshot goes on reading (#443). A write into a hole adds an
+//! extent, and so does one that starts at or before the end of a file
+//! and grows it (#432).
 //!
 //! # The oracles
 //!
@@ -332,36 +333,166 @@ fn a_checksummed_file_is_written_with_digests_the_checker_and_kernel_verify() {
     }
 }
 
-/// An extent a snapshot still reads is refused, and the image is left
-/// byte for byte as it was: releasing it would free what the snapshot
-/// reads.
-#[test]
-fn a_copy_on_write_extent_a_snapshot_shares_is_refused_and_untouched() {
-    let scratch = Scratch::new(
-        "cow-write-snapshot",
-        "mount -o remount,nodatasum \"$MNT\"\n\
-         head -c 65536 /dev/urandom > \"$MNT/one.bin\"\n\
-         sync\n\
-         btrfs subvolume snapshot -r \"$MNT\" \"$MNT/snap\" >/dev/null\n\
-         sync",
-    );
-    let image = scratch.image();
-    let before = std::fs::read(&image).unwrap();
+/// The extent record at `bytenr`: its reference count, the root of each
+/// data reference naming a tree (inline or keyed), and how many name a
+/// parent tree block instead.
+fn data_refs(image: &Path, bytenr: u64) -> (u64, Vec<String>, usize) {
+    let extents = dump_tree(image, "2");
+    let lines: Vec<&str> = extents.lines().collect();
+    let record = format!("key ({bytenr} EXTENT_ITEM ");
+    let at = lines
+        .iter()
+        .position(|l| l.contains(&record))
+        .unwrap_or_else(|| panic!("no extent record at {bytenr}\n{extents}"));
+    let words: Vec<&str> = lines[at + 1].split_whitespace().collect();
+    let refs = words
+        .iter()
+        .position(|w| *w == "refs")
+        .and_then(|i| words.get(i + 1)?.parse().ok())
+        .unwrap_or_else(|| panic!("no refs in {:?}", lines[at + 1]));
+    // The record, then its keyed references: every item keyed by the
+    // extent's address.
+    let own = format!("key ({bytenr} ");
+    let body: Vec<&str> = lines[at + 1..]
+        .iter()
+        .take_while(|l| !l.contains(" key (") || l.contains(&own))
+        .copied()
+        .collect();
+    let roots = body
+        .iter()
+        .filter(|l| l.contains("extent data backref"))
+        .filter_map(|l| {
+            let words: Vec<&str> = l.split_whitespace().collect();
+            let i = words.iter().position(|w| *w == "root")?;
+            Some(words.get(i + 1)?.to_string())
+        })
+        .collect();
+    let shared = body
+        .iter()
+        .filter(|l| l.contains("shared data backref"))
+        .count();
+    (refs, roots, shared)
+}
 
-    let mut fs = mount_rw(&image);
-    let ino = ino_of(&fs, ONE);
-    let err = fs
-        .write(ino, 4096, b"this must not land")
-        .expect_err("an extent a snapshot shares must be refused");
-    assert!(
-        err.to_string().contains("snapshot"),
-        "the refusal should name the snapshot: {err}"
-    );
-    drop(fs);
-    assert!(
-        std::fs::read(&image).unwrap() == before,
-        "a refused write changed the image"
-    );
+/// Whether `root`, as `dump-tree` prints a data reference's root, is the
+/// top-level subvolume.
+fn top_level(root: &str) -> bool {
+    root == "5" || root == "FS_TREE"
+}
+
+/// A write into an extent a snapshot shares copies it (#443): the top
+/// level's item is pointed at the copy, and the old extent keeps the
+/// snapshot's reference and loses only the top level's, so the snapshot
+/// reads its bytes unchanged.
+///
+/// A tree one leaf tall is copied whole by the snapshot, so each tree's
+/// item counts in the extent's record. A taller tree shares its leaves,
+/// and the record counts one reference for both; copying the leaf out of
+/// the snapshot's way gives the extent a reference naming the old leaf,
+/// as the kernel's copy-on-write does. Each is taken read-only and
+/// writable. The kernel made the files and the snapshots; `btrfs check
+/// --check-data-csum`, a kernel scrub and the kernel's reads judge the
+/// result, and `dump-tree` the references.
+#[test]
+fn a_copy_on_write_extent_a_snapshot_shares_is_copied_and_the_snapshot_keeps_it() {
+    const SNAP: &str = "snap/one.bin";
+    for (case, tall, readonly) in [
+        ("leaf-ro", false, true),
+        ("leaf-rw", false, false),
+        ("tall-ro", true, true),
+        ("tall-rw", true, false),
+    ] {
+        let many = if tall {
+            "mkdir \"$MNT/many\"\n\
+             (cd \"$MNT/many\" && seq -f 'f%05g' 1 3000 | xargs touch)\n"
+        } else {
+            ""
+        };
+        let flag = if readonly { "-r " } else { "" };
+        let scratch = Scratch::new(
+            &format!("cow-write-snapshot-{case}"),
+            &format!(
+                "head -c 65536 /dev/urandom > \"$MNT/one.bin\"\n\
+                 {many}sync\n\
+                 btrfs subvolume snapshot {flag}\"$MNT\" \"$MNT/snap\" >/dev/null\n\
+                 sync"
+            ),
+        );
+        let image = scratch.image();
+        let before = kernel_view(&image, case, &[ONE, SNAP]);
+
+        let mut fs = mount_rw(&image);
+        let ino = ino_of(&fs, ONE);
+        let (_, old, _) = extent_kind_and_refs(&image, ino, 0);
+        let (refs, roots, _) = data_refs(&image, old);
+        // THE CASE IS REAL: a leaf tree's snapshot counts its own
+        // reference; a tall tree's shares the leaf, and the record counts
+        // the top level's alone.
+        let want = if tall { 1 } else { 2 };
+        assert_eq!(
+            refs, want,
+            "{case}: the extent at {old} has {refs} references ({roots:?}), so the fixture \
+             no longer holds the case"
+        );
+        let mut expected = fs.read_file(ino).unwrap();
+        let patch = b"written over what the snapshot keeps";
+        fs.write(ino, 4096, patch)
+            .unwrap_or_else(|e| panic!("{case}: a write into a snapshot-shared extent: {e}"));
+        expected[4096..4096 + patch.len()].copy_from_slice(patch);
+        drop(fs);
+
+        assert_btrfs_check_clean(&image, case);
+        let out = oracle("btrfs")
+            .args(["check", "--readonly", "--check-data-csum"])
+            .arg(&image)
+            .output();
+        assert!(
+            out.status.success(),
+            "{case}: btrfs check --check-data-csum finds data that disagrees with its \
+             digests:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let after = kernel_view(&image, case, &[ONE, SNAP]);
+        assert_eq!(
+            after[ONE].0,
+            sha256_hex(&expected),
+            "{case}: the kernel reads back different bytes from the top level than were written"
+        );
+        assert_ne!(
+            after[ONE].1, before[ONE].1,
+            "{case}: the top level's extent is where it was, so the write was not copy-on-write"
+        );
+        assert_eq!(
+            after[SNAP], before[SNAP],
+            "{case}: the snapshot's file changed, in its bytes or where they lie"
+        );
+
+        let (_, new, _) = extent_kind_and_refs(&image, ino, 0);
+        assert_ne!(
+            new, old,
+            "{case}: the top level's item still names the old extent"
+        );
+        let (refs, roots, shared) = data_refs(&image, old);
+        assert!(
+            refs == 1 && !roots.iter().any(|r| top_level(r)),
+            "{case}: the old extent should keep the snapshot's one reference and lose the top \
+             level's: refs {refs}, roots {roots:?}, {shared} by parent"
+        );
+        let (refs, roots, shared) = data_refs(&image, new);
+        assert!(
+            refs == 1 && roots.len() == 1 && top_level(&roots[0]) && shared == 0,
+            "{case}: the copy should hold the top level's reference alone: refs {refs}, roots \
+             {roots:?}, {shared} by parent"
+        );
+
+        guest_kernel_write_ok(
+            &image.to_string_lossy(),
+            &format!("{case}: scrub"),
+            "btrfs scrub start -B \"$MNT\" >/dev/null",
+        );
+    }
 }
 
 /// One extent as the kernel's `FIEMAP` reports it, through `filefrag -v`:
