@@ -44,6 +44,10 @@ use crate::error::{Error, Result};
 use crate::fs::Filesystem;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+#[path = "transaction_split_tests.rs"]
+mod split_tests;
+
 /// One block moving from where it is to where it will be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rewrite {
@@ -1803,24 +1807,25 @@ impl Filesystem {
                 .filter(|(_, items)| !crate::leaf_edit::fit(nodesize, items))
                 .map(|(&old, _)| old)
                 .collect();
-            // A node that the leaves splitting below it fill past its key
-            // pointers splits too: a root grows a level (#513), while a
-            // non-root node adds a pointer in its parent (#514). Cascading
-            // splits of that parent remain the render's refusal (#515).
+            // Each split adds one pointer to its parent. Carry that gain
+            // through every full ancestor, including the root (#515).
+            // Accumulate gains from siblings even when they are reached
+            // in different orders, and propagate each node's split once.
             let mut gained: BTreeMap<u64, usize> = BTreeMap::new();
-            for leaf in &full {
-                if let Some(parent) = places.get(leaf).and_then(|p| p.parent) {
-                    *gained.entry(parent).or_default() += 1;
-                }
-            }
-            for (node, more) in gained {
+            let mut pending: Vec<u64> = full.iter().copied().collect();
+            while let Some(child) = pending.pop() {
+                let Some(node) = places.get(&child).and_then(|p| p.parent) else {
+                    continue;
+                };
+                let more = gained.entry(node).or_default();
+                *more += 1;
                 let held = self
                     .read_tree_block(node)?
                     .body
                     .key_ptrs()
                     .map_or(0, <[_]>::len);
-                if held + more > capacity {
-                    full.insert(node);
+                if held + *more > capacity && full.insert(node) {
+                    pending.push(node);
                 }
             }
             let have: BTreeSet<u64> = splits.iter().map(|s| s.leaf).collect();

@@ -209,3 +209,87 @@ fn a_full_non_root_node_splits_into_a_parent_with_room() {
     let expected: Vec<String> = (0..made).map(|n| format!("{PREFIX}{n:05}")).collect();
     assert_eq!(listed.lines().collect::<Vec<_>>(), expected);
 }
+
+/// Large attributes put pressure on the inode leaves without requiring
+/// hundreds of thousands of names. A level-2 root can grow to level 3
+/// only when a level-1 split below it also overflows that root (#515).
+#[test]
+fn full_ancestors_split_together_up_to_a_new_root() {
+    let dir = Scratch(PathBuf::from(temp_path!("cascade-node-split-kernel")));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let image = dir.0.join("fs.img");
+    std::fs::File::create(&image)
+        .and_then(|f| f.set_len(2 << 30))
+        .unwrap();
+    let dev = Arc::new(FileDevice::open_rw(&image).expect("open the image"));
+    fs_btrfs::mkfs::format(
+        dev.as_ref(),
+        &fs_btrfs::mkfs::Options {
+            nodesize: 4096,
+            ..Default::default()
+        },
+    )
+    .expect("mkfs");
+    drop(dev);
+
+    let fs = unsafe { fs_btrfs_mount_rw(c(image.to_str().unwrap()).as_ptr()) };
+    assert!(!fs.is_null(), "mount_rw: {}", last_error());
+    let padding = vec![0x61u8; 3000];
+    let mut made = 0;
+    let mut saw_level_two = false;
+    while made < 12_000 {
+        for _ in 0..BATCH {
+            let name = c(&format!("/{PREFIX}{made:05}"));
+            let ino = unsafe { fs_btrfs_create(fs, name.as_ptr(), 0o644) };
+            assert_ne!(ino, 0, "create {}: {}", made + 1, last_error());
+            let rc = unsafe {
+                fs_btrfs_setxattr(
+                    fs,
+                    name.as_ptr(),
+                    c("user.padding").as_ptr(),
+                    padding.as_ptr().cast(),
+                    padding.len(),
+                )
+            };
+            assert_eq!(rc, 0, "pad {}: {}", made + 1, last_error());
+            made += 1;
+        }
+        match fs_tree_level(&image) {
+            2 => saw_level_two = true,
+            3 => break,
+            _ => {}
+        }
+    }
+    unsafe { fs_btrfs_umount(fs) };
+    assert!(saw_level_two, "the cascade starts below a level-2 root");
+    assert_eq!(
+        fs_tree_level(&image),
+        3,
+        "{made} padded names must cascade through both node levels"
+    );
+    assert_btrfs_check_clean(&image, "a split cascades through two full ancestors");
+    let dump = dump_tree(&image, "5");
+    for (level, expected) in [(3, 1), (2, 2)] {
+        assert_eq!(
+            dump.lines()
+                .filter(|l| l.starts_with("node ") && l.contains(&format!(" level {level} ")))
+                .count(),
+            expected,
+            "dump-tree must find {expected} level-{level} nodes after the cascade"
+        );
+    }
+    assert!(
+        dump.lines()
+            .filter(|l| l.starts_with("node ") && l.contains(" level 1 "))
+            .count()
+            >= 122,
+        "the former root's full pointer array must have overflowed"
+    );
+    let listed = guest_kernel_read_ok(
+        &image.to_string_lossy(),
+        "cascading node splits",
+        "LC_ALL=C ls -1 \"$MNT\" | LC_ALL=C sort",
+    );
+    let expected: Vec<String> = (0..made).map(|n| format!("{PREFIX}{n:05}")).collect();
+    assert_eq!(listed.lines().collect::<Vec<_>>(), expected);
+}
