@@ -187,7 +187,7 @@ jobs:
         # running this task.
         run: chore test:unit
       - name: The unit tier executed its tests
-        run: bash ../rust-fs-core/scripts/test-floor.sh unit 322
+        run: bash ../rust-fs-core/scripts/test-floor.sh unit 323
       # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to
       # tmp/logs/<tier>.log and prints one line naming it; without this the
       # file goes away with the runner. `if: always()` because the failing
@@ -326,10 +326,10 @@ jobs:
       - name: The tiers executed their tests
         run: |
           set -euo pipefail
-          bash ../rust-fs-core/scripts/test-floor.sh unit 322
+          bash ../rust-fs-core/scripts/test-floor.sh unit 323
           bash ../rust-fs-core/scripts/test-floor.sh oracle 30
-          bash ../rust-fs-core/scripts/test-floor.sh kernel 6
-          bash ../rust-fs-core/scripts/test-floor.sh suite 500
+          bash ../rust-fs-core/scripts/test-floor.sh kernel 8
+          bash ../rust-fs-core/scripts/test-floor.sh suite 503
       # The shell tests are counted by their own `ok` lines rather than
       # by libtest's summary, but the failure is identical in shape:
       # `tests/scripts/*.sh` matching fewer files, or a script that
@@ -407,7 +407,7 @@ jobs:
       - name: Both tiers executed their tests
         run: |
           set -euo pipefail
-          bash ../rust-fs-core/scripts/test-floor.sh unit 322
+          bash ../rust-fs-core/scripts/test-floor.sh unit 323
           bash ../rust-fs-core/scripts/test-floor.sh images 149
       # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to
       # tmp/logs/<tier>.log and prints one line naming it; without this the
@@ -461,7 +461,7 @@ jobs:
       - name: chore vm:status (the VM is down again)
         run: '! chore vm:status'
       - name: The in-guest suite executed its tests
-        run: bash ../rust-fs-core/scripts/test-floor.sh vm 500
+        run: bash ../rust-fs-core/scripts/test-floor.sh vm 503
       # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to
       # tmp/logs/<tier>.log and prints one line naming it; without this the
       # file goes away with the runner. `if: always()` because the failing
