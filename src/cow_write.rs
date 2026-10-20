@@ -73,7 +73,7 @@
 //! - a write past the end of a file, on a volume **without the no-holes
 //!   feature**, whose gap an extent item past the end (a preallocated one)
 //!   already reaches into;
-//! - a **preallocated** extent the write covers only part of, or one
+//! - a **preallocated** extent the write covers the middle of, or one
 //!   another reference shares, or an **inline** one the write does not
 //!   lie within, or one that is encrypted or encoded: each changes the
 //!   item's kind, not only where it points. A write within inline data
@@ -83,7 +83,9 @@
 //!   end, moves that data into a regular extent at offset 0 with the
 //!   write, as the kernel does (#507); a write
 //!   covering the whole of a preallocated item is written where its
-//!   extent lies, and the item becomes regular in place (#535);
+//!   extent lies, and the item becomes regular in place (#535); one
+//!   covering its first or last sectors splits it in two over the same
+//!   extent (#536);
 //! - an extent another reference shares whose reference from this file
 //!   is held anywhere but inline in its record: which entry to count
 //!   down is not known.
@@ -100,7 +102,7 @@ use crate::fs::{Filesystem, EXTENT_DATA_KEY, EXTENT_PREALLOC, EXTENT_REGULAR};
 use crate::inode::{Inode, INODE_ITEM_KEY, INODE_NODATACOW, INODE_NODATASUM};
 use crate::leaf_edit::OwnedItem;
 use crate::super_write::Commit;
-use crate::transaction::{DataAdd, DataMove, DataWrite, ItemEdit};
+use crate::transaction::{DataAdd, DataMove, DataShare, DataWrite, ItemEdit};
 use crate::write::window_inside_extent;
 
 /// How many rounds a write's plan has to close over its own bookkeeping.
@@ -249,7 +251,8 @@ impl Filesystem {
         let move_inline =
             move_inline || (end > inode.size && self.file_extents(ino)?.iter().any(|p| p.inline));
         // A write over the whole of a preallocated item is written where
-        // its extent lies, and the item becomes regular (#535).
+        // its extent lies, and the item becomes regular (#535); one over
+        // its first or last sectors splits it in two (#536).
         if !move_inline && end <= inode.size {
             if let Some(written) = self.write_prealloc(inode, offset, data, summed)? {
                 return Ok(written);
@@ -689,18 +692,25 @@ impl Filesystem {
         Ok(Some(data.len()))
     }
 
-    /// Write `data` at `offset` over the whole of a preallocated extent
-    /// item, the one starting there and covering exactly the write, when
-    /// that item is the extent's only reference (#535). The bytes go where
-    /// the extent lies — they were never readable, and nothing reads them
+    /// Write `data` at `offset` into the preallocated extent item holding
+    /// all of it, when that item is the extent's only reference. A write
+    /// covering the whole item (#535) goes where the extent lies — they were never readable, and nothing reads them
     /// until the commit turns the item regular — and the item, stamped
     /// with the transaction, changes kind in place, as the kernel's
     /// `btrfs_mark_extent_written` does for a write covering the item. No
     /// item is added, so the extent's record, the free space and the
     /// inode's `nbytes` stay; the checksum tree gains the written sectors'
-    /// digests, unless the file is `nodatasum`. `None` when no such item
-    /// starts at `offset` with the write's length: the planner then
-    /// refuses a partial write into one by name.
+    /// digests, unless the file is `nodatasum`.
+    ///
+    /// A write covering only the item's first or last sectors splits it in
+    /// two over the same extent (#536): a regular item for the written
+    /// sectors and a preallocated one for the rest, each with its own
+    /// offset into the extent. Both name the extent at the same reference
+    /// offset, so its record's inline `EXTENT_DATA_REF` is counted up by
+    /// one, as a clone's is; only the written sectors gain digests. `None`
+    /// when the write lies in no preallocated item, or in the middle of
+    /// one, or splits it off a sector boundary: the planner then refuses
+    /// it by name.
     fn write_prealloc(
         &mut self,
         inode: &Inode,
@@ -713,14 +723,23 @@ impl Filesystem {
         use crate::superblock::le64;
         let ino = inode.ino;
         let len = data.len() as u64;
+        let sector = u64::from(self.sb.sectorsize);
+        let end = offset + len;
         let Some((key, item)) = self.items_of(ino)?.into_iter().find(|(k, d)| {
             k.key_type == EXTENT_DATA_KEY
-                && k.offset == offset
                 && d.len() >= fe::REGULAR_SIZE
                 && d[fe::TYPE] == EXTENT_PREALLOC
-                && le64(d, fe::NUM_BYTES) == len
+                && k.offset <= offset
+                && end <= k.offset + le64(d, fe::NUM_BYTES)
         }) else {
             return Ok(None);
+        };
+        let item_end = key.offset + le64(&item, fe::NUM_BYTES);
+        let split_at = match (offset == key.offset, end == item_end) {
+            (true, true) => None,
+            (true, false) if end.is_multiple_of(sector) => Some(end),
+            (false, true) if offset.is_multiple_of(sector) => Some(offset),
+            _ => return Ok(None),
         };
         if item[fe::COMPRESSION] != 0
             || item[fe::ENCRYPTION] != 0
@@ -732,7 +751,7 @@ impl Filesystem {
             )));
         }
         let extent_start = le64(&item, fe::DISK_BYTENR);
-        let at = extent_start + le64(&item, fe::OFFSET);
+        let at = extent_start + le64(&item, fe::OFFSET) + (offset - key.offset);
         let (refs, extent_len, made) = self.extent_item(extent_start)?;
         if !window_inside_extent(at, len, extent_start, extent_len) {
             return Err(Error::UnsupportedFeature(format!(
@@ -756,25 +775,54 @@ impl Filesystem {
             .unwrap_or_default();
         let now = (now.as_secs(), now.subsec_nanos());
 
-        let mut rewritten = item;
-        rewritten[fe::GENERATION..fe::GENERATION + 8].copy_from_slice(&generation.to_le_bytes());
-        rewritten[fe::TYPE] = EXTENT_REGULAR;
+        // Each part of the item: its file offset, length, and whether the
+        // write covers it.
+        let parts = match split_at {
+            None => vec![(key.offset, len, true)],
+            Some(at) => vec![
+                (key.offset, at - key.offset, offset == key.offset),
+                (at, item_end - at, offset != key.offset),
+            ],
+        };
+        let mut edits = Vec::new();
+        for &(file_offset, num_bytes, written) in &parts {
+            let mut part = item.clone();
+            part[fe::GENERATION..fe::GENERATION + 8].copy_from_slice(&generation.to_le_bytes());
+            if written {
+                part[fe::TYPE] = EXTENT_REGULAR;
+            }
+            let into = le64(&item, fe::OFFSET) + (file_offset - key.offset);
+            part[fe::OFFSET..fe::OFFSET + 8].copy_from_slice(&into.to_le_bytes());
+            part[fe::NUM_BYTES..fe::NUM_BYTES + 8].copy_from_slice(&num_bytes.to_le_bytes());
+            edits.push(ItemEdit::Put(OwnedItem {
+                key: DiskKey {
+                    offset: file_offset,
+                    ..key
+                },
+                data: part,
+            }));
+        }
+        // The second part names the extent at the same reference offset
+        // as the first, so the record counts that reference up (#536).
+        let shares = if split_at.is_some() {
+            vec![DataShare {
+                bytenr: extent_start,
+                len: extent_len,
+                ref_offset: key.offset.wrapping_sub(le64(&item, fe::OFFSET)),
+            }]
+        } else {
+            Vec::new()
+        };
         let mut raw = self.raw_inode(ino)?;
         crate::namespace::touch(&mut raw, generation, now, &[io::CTIME, io::MTIME]);
-        let edits = vec![
-            ItemEdit::Put(OwnedItem {
-                key,
-                data: rewritten,
-            }),
-            ItemEdit::Put(OwnedItem {
-                key: DiskKey {
-                    objectid: ino,
-                    key_type: INODE_ITEM_KEY,
-                    offset: 0,
-                },
-                data: raw,
-            }),
-        ];
+        edits.push(ItemEdit::Put(OwnedItem {
+            key: DiskKey {
+                objectid: ino,
+                key_type: INODE_ITEM_KEY,
+                offset: 0,
+            },
+            data: raw,
+        }));
         let csum_edits = self.csum_edits(&[], &[(at, data.to_vec())], summed)?;
 
         // The data, to every mirror, before the commit that makes the
@@ -787,6 +835,7 @@ impl Filesystem {
             time: now,
             edits,
             csum_edits,
+            shares,
             ..Default::default()
         };
         self.commit_write(write, generation)?;

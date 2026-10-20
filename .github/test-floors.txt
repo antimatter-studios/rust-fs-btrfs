@@ -91,7 +91,7 @@ compression_oracle        3
 # Root collapse adds one checksum-tree kernel oracle (#548).
 # One combined overwrite adds leaf removal plus repeated splitting (#616).
 # CI must execute all 24 cases; local oracle runs are not permitted.
-cow_write_oracle          24
+cow_write_oracle          25
 crash_consistency         3
 csum_oracle               6
 csum_width_populated      1
