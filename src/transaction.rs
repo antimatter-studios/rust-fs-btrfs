@@ -63,12 +63,13 @@ pub struct Rewrite {
 /// parent gains a key pointer to it. A leaf that is its tree's root has no
 /// parent, so the tree grows a level: a new root node over the two halves.
 ///
-/// A root node the split leaves below it fill past its key pointers
-/// splits the same way (#513), and its tree grows a level above it.
+/// A node the split leaves below it fill past its key pointers splits
+/// the same way (#514). When it is the root, its tree grows a level
+/// above it (#513); otherwise its parent gains a key pointer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Split {
-    /// The block that splits, by its address before the change: a leaf,
-    /// or a root node.
+    /// The block that splits, by its address before the change: a leaf
+    /// or a node.
     pub leaf: u64,
     /// Its height above the leaves: zero for a leaf.
     pub level: u8,
@@ -1802,9 +1803,10 @@ impl Filesystem {
                 .filter(|(_, items)| !crate::leaf_edit::fit(nodesize, items))
                 .map(|(&old, _)| old)
                 .collect();
-            // A root node that the leaves splitting below it fill past its
-            // key pointers splits too (#513). A full node below the root is
-            // left for the render to refuse by name.
+            // A node that the leaves splitting below it fill past its key
+            // pointers splits too: a root grows a level (#513), while a
+            // non-root node adds a pointer in its parent (#514). Cascading
+            // splits of that parent remain the render's refusal (#515).
             let mut gained: BTreeMap<u64, usize> = BTreeMap::new();
             for leaf in &full {
                 if let Some(parent) = places.get(leaf).and_then(|p| p.parent) {
@@ -1812,15 +1814,13 @@ impl Filesystem {
                 }
             }
             for (node, more) in gained {
-                if places.get(&node).is_some_and(|p| p.parent.is_none()) {
-                    let held = self
-                        .read_tree_block(node)?
-                        .body
-                        .key_ptrs()
-                        .map_or(0, <[_]>::len);
-                    if held + more > capacity {
-                        full.insert(node);
-                    }
+                let held = self
+                    .read_tree_block(node)?
+                    .body
+                    .key_ptrs()
+                    .map_or(0, <[_]>::len);
+                if held + more > capacity {
+                    full.insert(node);
                 }
             }
             let have: BTreeSet<u64> = splits.iter().map(|s| s.leaf).collect();
