@@ -3385,3 +3385,135 @@ fn a_write_emptying_the_checksum_trees_first_leaf_removes_it_and_the_checker_agr
         "btrfs scrub start -B \"$MNT\" >/dev/null",
     );
 }
+
+/// Bytes the multi-way split's write puts in one file: 3072 crc32c
+/// digests on 4 KiB sectors, more than three 4 KiB checksum leaves hold
+/// (about 990 each), so the one leaf they land in divides four ways.
+const MULTI_LEAF_LEN: u64 = 12 << 20;
+
+/// A write whose new digests fill more than two checksum leaves splits
+/// the leaf they land in as many times as it needs, in one transaction
+/// (#615, part of #550).
+///
+/// The kernel writes a small checksummed file and an empty one on 4 KiB
+/// nodes, so the checksum tree is one leaf with room to spare, and this
+/// driver writes 12 MiB into the empty file in one write. Then:
+///
+/// - `btrfs check --readonly --check-data-csum` calls the volume clean
+///   and a kernel scrub passes;
+/// - the kernel reads back exactly the bytes written, in both files;
+/// - `dump-tree -t csum` shows at least four leaves, no empty block,
+///   every sector of the new extents covered by a digest, and each
+///   node's key pointer equal to its child's first key.
+#[test]
+fn a_write_adding_more_than_two_leaves_of_digests_splits_the_checksum_leaf_as_often_as_needed() {
+    let fill = "head -c 262144 /dev/urandom > \"$MNT/b.bin\"\n\
+                : > \"$MNT/c.bin\"\n\
+                sync";
+    let scratch = Scratch::sized("cow-write-multi-split", "crc32c", "no-holes", "4096", fill);
+    let image = scratch.image();
+
+    let tree = csum_tree(&image);
+    assert_eq!(
+        tree.values().filter(|b| b.leaf).count(),
+        1,
+        "the checksum tree must start as one leaf for the write to land in: {tree:?}"
+    );
+
+    let mut fs = mount_rw(&image);
+    let b = ino_of(&fs, "b.bin");
+    let c = ino_of(&fs, "c.bin");
+    let expected_b = fs.read_file(b).unwrap();
+    let bytes: Vec<u8> = (0..MULTI_LEAF_LEN)
+        .map(|i| (i * 13 + i / 4091) as u8)
+        .collect();
+    let n = fs
+        .write(c, 0, &bytes)
+        .unwrap_or_else(|e| panic!("writing 12 MiB into c.bin in one write: {e}"));
+    assert_eq!(n, bytes.len(), "a short write");
+    assert_eq!(
+        fs.read_file(c).unwrap(),
+        bytes,
+        "c.bin reads back differently"
+    );
+    assert_eq!(
+        fs.read_file(b).unwrap(),
+        expected_b,
+        "b.bin reads back differently"
+    );
+    drop(fs);
+
+    assert_btrfs_check_clean(&image, "after splitting the checksum leaf four ways");
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum finds data that disagrees with its digests:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let written = mapped_ranges(
+        &kernel_map(&image, "after the write", &["c.bin"])["c.bin"].1,
+        MULTI_LEAF_LEN,
+    );
+    let tree = csum_tree(&image);
+    assert!(
+        tree.values().filter(|b| b.leaf).count() >= 4,
+        "3072 digests need at least four 4 KiB checksum leaves:\n{tree:?}"
+    );
+    let mut covered: Vec<(u64, u64)> = Vec::new();
+    for (at, block) in &tree {
+        assert!(
+            block.items > 0,
+            "the checksum tree keeps an empty block at {at}:\n{tree:?}"
+        );
+        covered.extend(block.ranges.iter().copied());
+        for &(key, child) in &block.ptrs {
+            let below = tree
+                .get(&child)
+                .unwrap_or_else(|| panic!("the node at {at} points at {child}, not in the tree"));
+            assert_eq!(
+                Some(key),
+                below.first,
+                "the node at {at} names {child} by a key other than its first:\n{tree:?}"
+            );
+        }
+    }
+    covered.sort_unstable();
+    for &(start, end) in &written {
+        let mut at = start;
+        while at < end {
+            let next = covered
+                .iter()
+                .find(|&&(s, e)| s <= at && at < e)
+                .map(|&(_, e)| e)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no digest covers byte {at} of c.bin's extent [{start}, {end}):\n{tree:?}"
+                    )
+                });
+            at = next;
+        }
+    }
+
+    let after = kernel_view(&image, "after the write", &["b.bin", "c.bin"]);
+    assert_eq!(
+        after["c.bin"].0,
+        sha256_hex(&bytes),
+        "the kernel reads back different bytes from c.bin than were written"
+    );
+    assert_eq!(
+        after["b.bin"].0,
+        sha256_hex(&expected_b),
+        "the kernel reads back different bytes from b.bin than it wrote"
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after splitting the checksum leaf four ways",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+}
