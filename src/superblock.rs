@@ -601,6 +601,13 @@ pub struct DevItem {
     pub fsid: [u8; UUID_SIZE],
 }
 
+/// A superblock that is out of range or internally inconsistent.
+/// [`Error::BadSuperblock`] covers every malformed metadata structure,
+/// so the message names the superblock itself (#473).
+fn malformed(m: String) -> Error {
+    Error::BadSuperblock(format!("superblock: {m}"))
+}
+
 impl DevItem {
     /// Parse a device item from `buf`, which must be at least
     /// [`DEV_ITEM_SIZE`] bytes.
@@ -771,7 +778,7 @@ impl Superblock {
     /// a geometry field is out of range or internally inconsistent.
     pub fn parse(buf: &[u8]) -> Result<Self> {
         if buf.len() < SUPER_INFO_SIZE {
-            return Err(Error::BadSuperblock(format!(
+            return Err(malformed(format!(
                 "need {SUPER_INFO_SIZE} bytes, got {}",
                 buf.len()
             )));
@@ -810,7 +817,7 @@ impl Superblock {
 
         let sys_len = le32(buf, offsets::SYS_CHUNK_ARRAY_SIZE) as usize;
         if sys_len > SYS_CHUNK_ARRAY_SIZE {
-            return Err(Error::BadSuperblock(format!(
+            return Err(malformed(format!(
                 "sys_chunk_array_size {sys_len} exceeds the {SYS_CHUNK_ARRAY_SIZE}-byte array"
             )));
         }
@@ -911,7 +918,7 @@ impl Superblock {
     /// Sizes, counts and capacities: the numbers describing the device
     /// itself, independent of any tree it holds.
     fn validate_geometry(&self) -> Result<()> {
-        let bad = |m: String| Err(Error::BadSuperblock(m));
+        let bad = |m: String| Err(malformed(m));
         if !SUPER_OFFSETS.contains(&self.bytenr) {
             return bad(format!(
                 "bytenr {:#x} is not one of the superblock mirror offsets {SUPER_OFFSETS:#x?}",
@@ -972,7 +979,7 @@ impl Superblock {
     /// within the format's maximum tree height, their addresses must be
     /// sector-aligned, and the two that are mandatory must be present.
     fn validate_tree_roots(&self) -> Result<()> {
-        let bad = |m: String| Err(Error::BadSuperblock(m));
+        let bad = |m: String| Err(malformed(m));
         for (name, level) in [
             ("root_level", self.root_level),
             ("chunk_root_level", self.chunk_root_level),
@@ -1009,7 +1016,7 @@ impl Superblock {
     /// least one usable entry the chunk tree cannot be located, and
     /// nothing else on the volume can be read.
     fn validate_sys_chunk_array(&self) -> Result<()> {
-        let bad = |m: String| Err(Error::BadSuperblock(m));
+        let bad = |m: String| Err(malformed(m));
         // The system chunk array must be able to hold at least one
         // (key, chunk item, stripe) triple, otherwise the chunk tree is
         // unreachable. 17 (key) + 48 (chunk header) + 32 (one stripe)
@@ -1027,7 +1034,7 @@ impl Superblock {
 
     /// The device's own record of which filesystem it belongs to.
     fn validate_device_identity(&self) -> Result<()> {
-        let bad = |m: String| Err(Error::BadSuperblock(m));
+        let bad = |m: String| Err(malformed(m));
         // Every device carries the identity of the filesystem it belongs
         // to. Skipped while an fsid change is in flight or when this is a
         // seed device, because in those states the two legitimately
@@ -1434,6 +1441,18 @@ pub(crate) mod tests {
             Superblock::parse(&vec![0u8; SUPER_INFO_SIZE - 1]),
             Err(Error::BadSuperblock(_))
         ));
+    }
+
+    /// [`Error::BadSuperblock`] covers every metadata structure and its
+    /// text no longer names the superblock, so a refusal of the
+    /// superblock itself has to say so in its detail (#473).
+    #[test]
+    fn a_malformed_superblock_still_names_the_superblock() {
+        let e = Superblock::parse(&[0u8; 512]).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "malformed Btrfs metadata: superblock: need 4096 bytes, got 512"
+        );
     }
 
     #[test]
