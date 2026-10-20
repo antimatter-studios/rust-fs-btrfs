@@ -1527,6 +1527,23 @@ if kind == "rmdir":
     # only / is fsynced. The log holds index ranges of / covering the
     # index of e and no entry there, and does not hold e: its replay removes
     # the directory with its items.
+    # Diagnostic seeds for #654: the unchanged recipe below remains the
+    # gate; each seed must also satisfy the existing native attestation.
+    seed = os.environ.get("RMDIR_LOG_SEED", "")
+    def fsync_path(path):
+        fd = os.open(path, os.O_RDONLY); os.fsync(fd); os.close(fd)
+    if seed == "parent-chmod":
+        os.chmod(d, 0o700)
+        fsync_path(d)
+    elif seed == "parent-create":
+        open(d + "/new", "w").close()
+        fsync_path(d)
+    elif seed == "child-chmod":
+        os.chmod(d + "/e", 0o700)
+        fsync_path(d + "/e")
+    elif seed == "kept-write":
+        fd = os.open(d + "/k", os.O_WRONLY)
+        os.write(fd, b"kept"); os.fsync(fd); os.close(fd)
     os.rmdir(d + "/e")
     dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
     sys.exit(0)
@@ -1583,6 +1600,23 @@ os.close(fd)' "$kind" "$MNT"
     log_root=$(btrfs inspect-internal dump-super "$copy" | awk '$1 == "log_root" { print $2 }')
     if [ -z "$log_root" ] || [ "$log_root" = 0 ]; then
         echo "guest-build-images: $shape fsync left no log; chore fixtures dirtylog must produce one" >&2
+        if [ "$kind" = rmdir ] && [ -z "${RMDIR_LOG_SEED:-}" ]; then
+            # Run native experiments in the CI guest when the original
+            # recipe fails (#654). Keep this failure: no seed substitutes
+            # for the requested fixture, and none bypasses its assertions.
+            local seed pid
+            for seed in parent-chmod parent-create child-chmod kept-write; do
+                echo "[rmdir diagnostic] $seed"
+                ( export RMDIR_LOG_SEED="$seed"
+                  build_dirtylog_refused "rmdir-$seed" "$opts" rmdir ) &
+                pid=$!
+                if wait "$pid"; then
+                    echo "[rmdir diagnostic] $seed: native attestation passed"
+                else
+                    echo "[rmdir diagnostic] $seed: native attestation failed"
+                fi
+            done
+        fi
         exit 1
     fi
     {
