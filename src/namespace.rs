@@ -576,6 +576,7 @@ impl Filesystem {
         name: &[u8],
     ) -> Result<(Vec<DataRelease>, Vec<DataRelease>)> {
         let ino = inode.ino;
+        crate::verity::refuse_mutation(ino, inode.flags)?;
         // A directory has one link however many names it has had.
         let nlink = if inode.is_dir() { 1 } else { inode.nlink };
         if nlink > 1 {

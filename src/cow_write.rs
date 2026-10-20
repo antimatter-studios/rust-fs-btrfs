@@ -187,6 +187,7 @@ impl Filesystem {
         if !inode.is_regular_file() {
             return Err(Error::NotAFile);
         }
+        crate::verity::refuse_mutation(ino, inode.flags)?;
         if inode.flags & INODE_NODATACOW != 0 {
             if self.written_tree() != objectid::FS_TREE {
                 return Err(Error::UnsupportedFeature(format!(

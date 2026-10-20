@@ -86,6 +86,7 @@ impl Filesystem {
         if !inode.is_regular_file() {
             return Err(Error::NotAFile);
         }
+        crate::verity::refuse_mutation(ino, inode.flags)?;
         if inode.flags & INODE_NODATACOW == 0 {
             return Err(Error::UnsupportedFeature(format!(
                 "inode {ino} is copy-on-write, so overwriting it in place would leave the \
@@ -151,7 +152,7 @@ impl Filesystem {
     /// reason.
     pub fn can_write_in_place(&self, ino: u64) -> Result<bool> {
         let inode = self.read_inode(ino)?;
-        if !inode.is_regular_file() {
+        if !inode.is_regular_file() || inode.flags & crate::verity::INODE_RO_VERITY != 0 {
             return Ok(false);
         }
         if inode.flags & (INODE_NODATACOW | INODE_NODATASUM) != (INODE_NODATACOW | INODE_NODATASUM)
