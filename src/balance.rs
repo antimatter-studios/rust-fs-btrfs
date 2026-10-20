@@ -685,11 +685,21 @@ impl Filesystem {
         Ok(Inode::parse(&data, ino)?.flags)
     }
 
-    /// Allocate a single chunk of `length` logical bytes and `flags`, with
-    /// its empty block group, in one committed transaction, and return its
-    /// logical address.
+    /// Allocate a single or DUP chunk of `length` logical bytes and
+    /// `flags`, with its empty block group, in one committed transaction,
+    /// and return its logical address. DUP takes two stripes on this device.
     fn allocate_chunk(&mut self, flags: u64, length: u64) -> Result<u64> {
         let devid = self.sb.dev_item.devid;
+        let copies = match ChunkProfile::from_type(flags)? {
+            ChunkProfile::Single => 1,
+            ChunkProfile::Dup => 2,
+            other => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "allocating a {} chunk is not implemented",
+                    other.name()
+                )))
+            }
+        };
         // After every chunk there is, as the kernel places a new one.
         let logical = self
             .map
@@ -707,17 +717,18 @@ impl Filesystem {
             .collect();
         let (dev_item_key, mut dev_item) = self.dev_item(devid)?;
         let total = le64(&dev_item, DEV_ITEM_TOTAL_BYTES);
-        let stripes = place_stripes(&taken, total, length, 1).ok_or_else(|| {
+        let stripes = place_stripes(&taken, total, length, copies).ok_or_else(|| {
             Error::UnsupportedFeature(format!(
-                "device {devid} has no room for a stripe of {length} bytes"
+                "device {devid} has no room for {copies} stripe(s) of {length} bytes"
             ))
         })?;
         let chunk_tree_uuid = extents
             .first()
             .map(|e| e.chunk_tree_uuid)
             .ok_or_else(|| Error::UnsupportedFeature("the device tree has no extents".into()))?;
-        let used = le64(&dev_item, DEV_ITEM_BYTES_USED)
-            .checked_add(length)
+        let used = length
+            .checked_mul(copies as u64)
+            .and_then(|allocated| le64(&dev_item, DEV_ITEM_BYTES_USED).checked_add(allocated))
             .ok_or_else(|| {
                 Error::UnsupportedFeature(format!("device {devid}'s bytes used overflow"))
             })?;
@@ -1438,6 +1449,29 @@ mod tests {
     }
 
     #[test]
+    fn a_dup_chunk_item_maps_both_copies_on_the_same_device() {
+        let uuid = [7u8; 16];
+        let stripes = [(1, 300 * MIB, uuid), (1, 308 * MIB, uuid)];
+        let item = chunk_item(8 * MIB, bg::DATA | bg::DUP, 4096, &stripes);
+        let chunk = Chunk::parse(1 << 30, &item).expect("the DUP item parses");
+        assert_eq!(chunk.profile().unwrap(), ChunkProfile::Dup);
+        assert_eq!(chunk.length, 8 * MIB);
+        assert_eq!(chunk.num_stripes, 2);
+        assert_eq!(chunk.encoded_len(), item.len());
+        for (mirror, &(devid, physical, uuid)) in stripes.iter().enumerate() {
+            let stripe = &chunk.stripes[mirror];
+            assert_eq!(
+                (stripe.devid, stripe.offset, stripe.dev_uuid),
+                (devid, physical, uuid)
+            );
+            assert_eq!(
+                chunk.map_mirror((1 << 30) + 5000, mirror).unwrap().physical,
+                physical + 5000
+            );
+        }
+    }
+
+    #[test]
     fn stripes_go_in_the_first_holes_past_the_first_mib() {
         // An extent at 1 MiB of 8 MiB, and one at 20 MiB of 4 MiB.
         let taken = [(MIB, 8 * MIB), (20 * MIB, 4 * MIB)];
@@ -1552,6 +1586,120 @@ mod tests {
             fn drop(&mut self) {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
+        }
+
+        /// The allocator's DUP chunk is judged before and after removing
+        /// the old empty single data group, so the kernel has to use DUP.
+        #[test]
+        fn an_empty_dup_chunk_has_two_device_extents_and_the_kernel_writes_and_scrubs_it() {
+            use fs_btrfs_test_support::{
+                assert_btrfs_check_clean, dump_tree, guest_kernel_read_ok, guest_kernel_write_ok,
+                oracle, temp_path,
+            };
+            use fs_core::{BlockDevice, FileDevice};
+            use std::sync::Arc;
+
+            let dir = std::path::PathBuf::from(temp_path!("allocate-dup-chunk"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let image = RefusalImage(dir);
+            let img = image.path();
+            std::fs::File::create(&img)
+                .unwrap()
+                .set_len(256 * MIB)
+                .unwrap();
+            let made = oracle("mkfs.btrfs")
+                .args([
+                    "-q", "-f", "-m", "single", "-d", "single", "-s", "4096", "-n", "16384",
+                ])
+                .arg(&img)
+                .output();
+            assert!(made.status.success(), "mkfs.btrfs: {made:?}");
+            guest_kernel_write_ok(
+                &img.to_string_lossy(),
+                "write metadata before DUP allocation",
+                "printf 'before allocation\\n' > \"$MNT/before\"\nsync",
+            );
+
+            let new = {
+                let device = Arc::new(FileDevice::open_rw(&img).unwrap());
+                let mut fs = Filesystem::mount_rw(device as Arc<dyn BlockDevice>).unwrap();
+                let old = fs
+                    .block_groups()
+                    .unwrap()
+                    .into_iter()
+                    .find(|g| g.holds_data() && !g.holds_metadata())
+                    .unwrap();
+                assert_eq!(old.used, 0, "the kernel's small file stays inline");
+                let devid = fs.sb.dev_item.devid;
+                let before = fs.sb.dev_item.bytes_used;
+                let new = fs
+                    .allocate_chunk(bg::DATA | bg::DUP, old.length)
+                    .expect("allocate an empty DUP data chunk");
+                assert_eq!(fs.sb.dev_item.bytes_used, before + 2 * old.length);
+                let (_, item) = fs.dev_item(devid).unwrap();
+                assert_eq!(le64(&item, DEV_ITEM_BYTES_USED), before + 2 * old.length);
+                let group = fs.block_group_at(new).unwrap();
+                assert_eq!(
+                    (group.flags, group.length, group.used),
+                    (bg::DATA | bg::DUP, old.length, 0)
+                );
+                let chunk = fs.map.chunk_for(new).unwrap();
+                assert_eq!(chunk.profile().unwrap(), ChunkProfile::Dup);
+                assert_eq!(chunk.num_stripes, 2);
+                let extents: Vec<_> = fs
+                    .dev_extents()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|e| e.chunk_offset == new)
+                    .collect();
+                assert_eq!(extents.len(), 2);
+                assert_ne!(chunk.stripes[0].offset, chunk.stripes[1].offset);
+                for stripe in &chunk.stripes {
+                    assert_eq!(stripe.devid, devid);
+                    assert!(extents.iter().any(|e| e.devid == devid
+                        && e.physical == stripe.offset
+                        && e.length == old.length));
+                }
+                assert_btrfs_check_clean(&img, "after allocating the empty DUP chunk");
+                fs.remove_block_group(old.start)
+                    .expect("remove the empty single data group");
+                assert_eq!(fs.sb.dev_item.bytes_used, before + old.length);
+                new
+            };
+            let chunks = dump_tree(&img, "chunk");
+            assert!(chunks.contains(&format!("CHUNK_ITEM {new})")), "{chunks}");
+            assert!(chunks.contains("type DATA|DUP"), "{chunks}");
+            assert_btrfs_check_clean(&img, "after removing the single data group");
+            let wrote = guest_kernel_write_ok(
+                &img.to_string_lossy(),
+                "write into the allocated DUP chunk and scrub both copies",
+                "cd \"$MNT\"\n\
+                 test \"$(cat before)\" = 'before allocation'\n\
+                 btrfs filesystem df \"$MNT\"\n\
+                 head -c 1048576 /dev/urandom > after\n\
+                 sync\n\
+                 btrfs scrub start -B \"$MNT\"\n\
+                 sha256sum after",
+            );
+            assert!(
+                wrote.lines().any(|line| line.starts_with("Data, DUP")),
+                "{wrote}"
+            );
+            assert!(
+                !wrote.lines().any(|line| line.starts_with("Data, single")),
+                "{wrote}"
+            );
+            let sum = wrote
+                .lines()
+                .find(|line| line.ends_with("  after"))
+                .expect("the kernel reports the payload's checksum");
+            let read = guest_kernel_read_ok(
+                &img.to_string_lossy(),
+                "read the payload from the allocated DUP chunk",
+                "cd \"$MNT\"\nsha256sum after",
+            );
+            assert!(read.lines().any(|line| line == sum), "{read}");
+            assert_btrfs_check_clean(&img, "after the kernel writes and scrubs the DUP chunk");
         }
 
         #[test]
