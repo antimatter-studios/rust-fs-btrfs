@@ -75,8 +75,11 @@
 //! - a write past the end of a file, on a volume **without the no-holes
 //!   feature**, whose gap an extent item past the end (a preallocated one)
 //!   already reaches into;
-//! - an **inline** or **preallocated** extent: each changes the item's
-//!   kind, not only where it points;
+//! - a **preallocated** extent, or an **inline** one the write does not
+//!   lie within, or one that is compressed or encoded: each changes the
+//!   item's kind, not only where it points. A write within uncompressed
+//!   inline data rewrites that item in place, and the file stays inline
+//!   (#437);
 //! - an extent a **snapshot** may share — one from at or before the last
 //!   snapshot, which the snapshot reads through a tree block it shares
 //!   and its record counts once for both;
@@ -219,6 +222,13 @@ impl Filesystem {
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or_else(|| Error::UnsupportedFeature("write range overflows".into()))?;
+        // Inline data the write lies within is rewritten in its item, and
+        // the file stays inline, as the kernel leaves it (#437).
+        if !move_inline && end <= inode.size {
+            if let Some(written) = self.write_inline(inode, offset, data)? {
+                return Ok(written);
+            }
+        }
         // A write that grows the file plans the sectors past its last
         // extent as a hole is (#432). One that starts past the end leaves a
         // gap, and the kernel zeroes the rest of the old last sector before
@@ -508,6 +518,76 @@ impl Filesystem {
         // The trees this mount holds are the previous generation's.
         *self = self.remount_rw()?;
         Ok(data.len())
+    }
+
+    /// Write `data` at `offset` into the inline extent at the start of
+    /// `inode`'s data, when the write lies within it (#437): the item is
+    /// rewritten with the new bytes, its size unchanged, and stamped with
+    /// the transaction; the inode's times, `transid` and `sequence` move as
+    /// for any write. Inline data has no extent, extent record, free space
+    /// or checksum, so nothing else changes. `None` when the file holds no
+    /// inline item at offset 0.
+    ///
+    /// A compressed, encrypted or otherwise encoded inline extent, or one
+    /// whose length disagrees with its `ram_bytes`, is refused.
+    fn write_inline(&mut self, inode: &Inode, offset: u64, data: &[u8]) -> Result<Option<usize>> {
+        use crate::fs::file_extent as fe;
+        use crate::inode::offsets as io;
+        use crate::superblock::le64;
+        let ino = inode.ino;
+        let Some((key, item)) = self.items_of(ino)?.into_iter().find(|(k, d)| {
+            k.key_type == EXTENT_DATA_KEY && k.offset == 0 && d.get(fe::TYPE) == Some(&0)
+        }) else {
+            return Ok(None);
+        };
+        let end = offset + data.len() as u64;
+        let plain = item.len() >= fe::INLINE_DATA
+            && item[fe::COMPRESSION] == 0
+            && item[fe::ENCRYPTION] == 0
+            && item[fe::OTHER_ENCODING..fe::OTHER_ENCODING + 2] == [0, 0];
+        if !plain || item.len() as u64 != fe::INLINE_DATA as u64 + le64(&item, fe::RAM_BYTES) {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}: the inline extent at 0 is compressed, encrypted or encoded, or \
+                 its length disagrees with its ram_bytes, and writing one is not implemented"
+            )));
+        }
+        let held = (item.len() - fe::INLINE_DATA) as u64;
+        if end > held {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}: the write to [{offset}, {end}) reaches past the {held} bytes of \
+                 inline data at 0"
+            )));
+        }
+        let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
+            Error::UnsupportedFeature("the generation counter is exhausted".into())
+        })?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let now = (now.as_secs(), now.subsec_nanos());
+
+        let mut rewritten = item;
+        rewritten[fe::GENERATION..fe::GENERATION + 8].copy_from_slice(&generation.to_le_bytes());
+        let at = fe::INLINE_DATA + offset as usize;
+        rewritten[at..at + data.len()].copy_from_slice(data);
+        let mut raw = self.raw_inode(ino)?;
+        crate::namespace::touch(&mut raw, generation, now, &[io::CTIME, io::MTIME]);
+        let edits = vec![
+            ItemEdit::Put(OwnedItem {
+                key,
+                data: rewritten,
+            }),
+            ItemEdit::Put(OwnedItem {
+                key: DiskKey {
+                    objectid: ino,
+                    key_type: INODE_ITEM_KEY,
+                    offset: 0,
+                },
+                data: raw,
+            }),
+        ];
+        self.commit_edits(ino, edits, generation, now)?;
+        Ok(Some(data.len()))
     }
 
     /// Refuse a gap past the end of a file that an extent item already
