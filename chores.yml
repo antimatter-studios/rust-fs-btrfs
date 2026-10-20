@@ -538,6 +538,9 @@ tasks:
       - test-disks/scrub/btrfs-scrub-raid6-4.img
       # simple quotas, refused for writing on purpose
       - test-disks/squota/btrfs-squota.img
+      # a volume received through btrfs send --compressed-data, its
+      # compressed extents stored by encoded writes
+      - test-disks/encoded/btrfs-encoded.img
     # A hung boot must not hold the VM and the machine-wide slot for
     # ever. The split fixtures alone mount and unmount up to four hundred
     # times, and the populated pair writes eighty thousand files, so this
@@ -553,7 +556,7 @@ tasks:
     cmds:
       - |
         set -eu
-        rm -rf test-disks/snapshot test-disks/dirtylog test-disks/features test-disks/scrub test-disks/seed test-disks/squota
+        rm -rf test-disks/snapshot test-disks/dirtylog test-disks/features test-disks/scrub test-disks/seed test-disks/squota test-disks/encoded
         rm -f test-disks/btrfs-*.img test-disks/*.superdump test-disks/*.manifest \
               test-disks/*.compression test-disks/*.super test-disks/btrfs-split*.txt
 
