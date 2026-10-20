@@ -2526,8 +2526,9 @@ fn an_inode_whose_last_name_is_an_extended_reference_is_deleted_as_the_kernel_do
     );
 }
 
-/// `e`, a committed empty directory in `/`, is removed after the commit,
-/// and only `/` is fsynced (#410). The log holds an index range of `/`
+/// A committed empty directory `e` in `/` is replaced by a new directory,
+/// which moves to `replacement` before only `/` is fsynced (#410). This
+/// avoids Debian 6.1's full commit after rmdir. The log holds a range of `/`
 /// covering the removed index and no entry there, and does not hold `e`.
 /// A replay that removes only regular files refuses the log; the kernel's
 /// replay of the same crash image removes the directory with its items,

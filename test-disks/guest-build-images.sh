@@ -1523,12 +1523,13 @@ if kind == "extrefremoved":
     dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
     sys.exit(0)
 if kind == "rmdir":
-    # The committed empty directory e is removed after the commit, and
-    # only / is fsynced. The log holds index ranges of / covering the
-    # index of e and no entry there, and does not hold e: its replay removes
-    # the directory with its items.
-    # Diagnostic seeds for #654: the unchanged recipe below remains the
-    # gate; each seed must also satisfy the existing native attestation.
+    # Remove the committed empty directory e through a replacing rename.
+    # On Debian 6.1, rmdir followed by a parent fsync commits the whole
+    # transaction and leaves no log. A new directory replaces e, then moves
+    # away before only / is fsynced: the committed index of e is absent
+    # from the log, and replay must remove its old inode with all its items.
+    # Diagnostic seeds for #654 run only if this recipe fails; each seed
+    # must also satisfy the existing native attestation.
     seed = os.environ.get("RMDIR_LOG_SEED", "")
     def fsync_path(path):
         fd = os.open(path, os.O_RDONLY); os.fsync(fd); os.close(fd)
@@ -1544,7 +1545,9 @@ if kind == "rmdir":
     elif seed == "kept-write":
         fd = os.open(d + "/k", os.O_WRONLY)
         os.write(fd, b"kept"); os.fsync(fd); os.close(fd)
-    os.rmdir(d + "/e")
+    os.mkdir(d + "/replacement")
+    os.rename(d + "/replacement", d + "/e")
+    os.rename(d + "/e", d + "/replacement")
     dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
     sys.exit(0)
 fd = os.open(d + "/f", os.O_WRONLY)
