@@ -80,7 +80,9 @@ enum Mount {
 
 #[track_caller]
 fn run(image: &str, script: &str, mount: Mount) -> Output {
-    let _bracket = GUEST_MOUNT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _bracket = GUEST_MOUNT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     run_locked(image, script, mount, false)
 }
 
@@ -141,7 +143,11 @@ fn guest_script(image: &str, script: &str, mount: Mount, run: &Run, clear_log: b
     // from inside its own script cleared the evidence it was about to go
     // looking for, and reported whatever arrived late.
     let clear = if clear_log { "dmesg -C" } else { "true" };
-    let losetup = if mount == Mount::ReadOnly { "--read-only" } else { "" };
+    let losetup = if mount == Mount::ReadOnly {
+        "--read-only"
+    } else {
+        ""
+    };
     let copy_back = if mount == Mount::ReadWrite {
         "cp --sparse=always \"$work/image\" $IMG"
     } else {
@@ -322,7 +328,9 @@ static GUEST_MOUNT: Mutex<()> = Mutex::new(());
 /// report.
 #[track_caller]
 pub fn guest_kernel_probe(image: &str, payload: &str) -> KernelProbe {
-    let _bracket = GUEST_MOUNT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _bracket = GUEST_MOUNT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let script = format!(
         "printf %s {payload} > \"$MNT/probe.txt\"\n\
          sync\n\
@@ -427,7 +435,9 @@ pub fn guest_kernel_read_variants(
     variants: &[Variant],
     script: &str,
 ) -> Vec<VariantVerdict> {
-    let _bracket = GUEST_MOUNT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _bracket = GUEST_MOUNT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     session();
     let inside = |path: &std::path::Path| {
         assert!(
@@ -448,10 +458,7 @@ pub fn guest_kernel_read_variants(
     let run = Run::new();
     let results = run.dir.join(format!(
         "variants.{}",
-        run.status
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
+        run.status.file_stem().unwrap_or_default().to_string_lossy()
     ));
     let _ = std::fs::remove_dir_all(&results);
 
@@ -459,7 +466,10 @@ pub fn guest_kernel_read_variants(
     for (index, variant) in variants.iter().enumerate() {
         calls.push_str(&format!("variant {index}"));
         for (offset, file) in &variant.patches {
-            calls.push_str(&format!(" {offset} {}", guest_quote(&file.to_string_lossy())));
+            calls.push_str(&format!(
+                " {offset} {}",
+                guest_quote(&file.to_string_lossy())
+            ));
         }
         calls.push('\n');
     }
