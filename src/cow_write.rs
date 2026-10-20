@@ -86,6 +86,8 @@
 //!   extent lies, and the item becomes regular in place (#535); one
 //!   covering its first or last sectors splits it in two over the same
 //!   extent (#536), and one strictly inside it splits it in three (#537);
+//!   a write spanning one of its edges is written in two at that edge
+//!   (#638);
 //! - an extent another reference shares whose reference from this file
 //!   is held anywhere but inline in its record: which entry to count
 //!   down is not known.
@@ -254,7 +256,20 @@ impl Filesystem {
         // its extent lies, and the item becomes regular (#535); one over
         // its first or last sectors splits it in two (#536), and one
         // strictly inside it in three (#537).
+        // One that spans an edge of a preallocated item is written in two
+        // at that edge, each side taking its own path, as the kernel writes
+        // the regular sectors to a new extent and the preallocated ones
+        // where their extent lies (#638).
         if !move_inline && end <= inode.size {
+            if let Some(at) = self.prealloc_edge_within(ino, offset, end)? {
+                let first = usize::try_from(at - offset).map_err(|_| {
+                    Error::UnsupportedFeature(format!("a write of {} bytes", data.len()))
+                })?;
+                let before = self.write_cow(inode, offset, &data[..first], false)?;
+                let inode = self.read_inode(ino)?;
+                let after = self.write_cow(&inode, at, &data[first..], false)?;
+                return Ok(before + after);
+            }
             if let Some(written) = self.write_prealloc(inode, offset, data, summed)? {
                 return Ok(written);
             }
@@ -715,6 +730,26 @@ impl Filesystem {
     /// up by two. `None` when the write lies in no preallocated item, or
     /// splits it off a sector boundary: the planner then refuses it by
     /// name.
+    /// The first edge of a preallocated extent item of `ino` that lies
+    /// strictly inside `[offset, end)`: where a write over that range
+    /// leaves one item for another (#638). `None` when every preallocated
+    /// item the range touches holds the whole of it, or none does.
+    fn prealloc_edge_within(&self, ino: u64, offset: u64, end: u64) -> Result<Option<u64>> {
+        use crate::fs::file_extent as fe;
+        use crate::superblock::le64;
+        Ok(self
+            .items_of(ino)?
+            .into_iter()
+            .filter(|(k, d)| {
+                k.key_type == EXTENT_DATA_KEY
+                    && d.len() >= fe::REGULAR_SIZE
+                    && d[fe::TYPE] == EXTENT_PREALLOC
+            })
+            .flat_map(|(k, d)| [k.offset, k.offset.saturating_add(le64(&d, fe::NUM_BYTES))])
+            .filter(|&at| offset < at && at < end)
+            .min())
+    }
+
     fn write_prealloc(
         &mut self,
         inode: &Inode,
