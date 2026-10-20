@@ -493,11 +493,20 @@ pub unsafe extern "C" fn fs_btrfs_mount_pool(
     })
 }
 
-/// A new handle reading subvolume or snapshot `id` as a filesystem of its
-/// own: paths through it are absolute within the subvolume.
+/// A new handle on subvolume or snapshot `id` as a filesystem of its own:
+/// paths through it are absolute within the subvolume.
 ///
-/// Read-only whatever `fs` is, and released with [`fs_btrfs_umount`]
-/// independently of `fs`. ENOENT when no subvolume has that id.
+/// On a handle from [`fs_btrfs_mount_rw`] it writes that subvolume's tree
+/// (#520): [`fs_btrfs_create`], [`fs_btrfs_mkdir`], [`fs_btrfs_symlink`],
+/// [`fs_btrfs_link`], [`fs_btrfs_unlink`], [`fs_btrfs_rmdir`],
+/// [`fs_btrfs_rename`], [`fs_btrfs_truncate`] and [`fs_btrfs_write_file`]
+/// each commit one transaction against it, and the handle stays on the
+/// subvolume after each. Other writes refuse it, and
+/// [`fs_btrfs_is_writable`] answers 0 for it. The subvolume of a read-only
+/// mount refuses every write with EROFS.
+///
+/// Released with [`fs_btrfs_umount`] independently of `fs`. ENOENT when no
+/// subvolume has that id.
 ///
 /// # Safety
 ///
