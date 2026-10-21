@@ -779,6 +779,19 @@ impl Filesystem {
         generation: u64,
         clear_log: bool,
     ) -> Result<()> {
+        self.commit_dirty_with(&[], write, generation, clear_log)
+    }
+
+    /// [`Filesystem::commit_write_with`], with the tree blocks `extra`
+    /// dirty as well: each is rewritten, with its path to its tree's root,
+    /// whether or not an edit lands in it (#578).
+    pub(crate) fn commit_dirty_with(
+        &mut self,
+        extra: &[u64],
+        write: DataWrite,
+        generation: u64,
+        clear_log: bool,
+    ) -> Result<()> {
         let mut dirty: Vec<u64> = {
             let reader = self.pool_reader();
             let tree = reader.tree();
@@ -799,6 +812,7 @@ impl Filesystem {
                         .bytenr,
                 );
             }
+            leaves.extend(extra);
             leaves.into_iter().collect()
         };
         if dirty.is_empty() && write.records.is_empty() {

@@ -4,4 +4,4 @@
 
 ## Writing
 
-| Device remove of a device holding chunks; balance | Not supported | | #268, #303, #304: #397, #398, #399, #400, #401, #402 | |
+| Device remove of a device holding chunks; balance | Partial: a block group is relocated and a single data group converted to DUP through the library (their own rows); snapshot-shared data, other conversions, the C ABI and a CLI verb, and removing a device that holds chunks are not supported | Unreleased (#304) | #268, #303, #304: #401, #402 | `relocate_data_group_kernel.rs`, `relocate_convert_dup_kernel.rs` |
