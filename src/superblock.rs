@@ -338,10 +338,16 @@ pub fn refuse_unreadable_incompat(incompat_flags: u64) -> Result<()> {
         return Ok(());
     }
     let mut named = Vec::new();
-    for (bit, name) in [(
-        incompat::EXTENT_TREE_V2,
-        "extent-tree-v2 (the second-generation extent tree)",
-    )] {
+    for (bit, name) in [
+        (
+            incompat::EXTENT_TREE_V2,
+            "extent-tree-v2 (the second-generation extent tree)",
+        ),
+        (
+            incompat::REMAP_TREE,
+            "remap-tree (the tree that remaps block addresses)",
+        ),
+    ] {
         if unreadable & bit != 0 {
             named.push(name.to_string());
             unreadable &= !bit;
@@ -1480,24 +1486,32 @@ pub(crate) mod tests {
 
     #[test]
     fn rejects_unknown_incompat_bit() {
-        let mut b = sb_bytes();
-        put64(&mut b, offsets::INCOMPAT_FLAGS, 1 << 40);
-        reseal(&mut b);
-        assert!(matches!(
-            Superblock::parse(&b),
-            Err(Error::UnsupportedFeature(_))
-        ));
+        // Naming a known feature must not hide an unknown bit beside it.
+        for flags in [1 << 40, (1 << 40) | incompat::REMAP_TREE] {
+            let mut b = sb_bytes();
+            put64(&mut b, offsets::INCOMPAT_FLAGS, flags);
+            reseal(&mut b);
+            match Superblock::parse(&b) {
+                Err(Error::UnsupportedFeature(message)) => {
+                    assert!(message.contains("0x0000010000000000"), "{message}");
+                    if flags & incompat::REMAP_TREE != 0 {
+                        assert!(message.contains("remap-tree"), "{message}");
+                    }
+                }
+                other => panic!("unknown bit must be refused: {other:?}"),
+            }
+        }
     }
 
     /// Known features this driver deliberately does not claim. They must
     /// be refused, not ignored.
     #[test]
     fn rejects_known_but_unimplemented_incompat_features() {
-        for bit in [
-            incompat::ZONED,
-            incompat::EXTENT_TREE_V2,
-            incompat::RAID_STRIPE_TREE,
-            incompat::REMAP_TREE,
+        for (bit, name) in [
+            (incompat::ZONED, None),
+            (incompat::EXTENT_TREE_V2, Some("extent-tree-v2")),
+            (incompat::RAID_STRIPE_TREE, None),
+            (incompat::REMAP_TREE, Some("remap-tree")),
         ] {
             let mut b = sb_bytes();
             put64(
@@ -1506,10 +1520,14 @@ pub(crate) mod tests {
                 incompat::MIXED_BACKREF | bit,
             );
             reseal(&mut b);
-            assert!(
-                matches!(Superblock::parse(&b), Err(Error::UnsupportedFeature(_))),
-                "incompat bit {bit:#x} should have been refused"
-            );
+            match Superblock::parse(&b) {
+                Err(Error::UnsupportedFeature(message)) => {
+                    if let Some(name) = name {
+                        assert!(message.contains(name), "{message}");
+                    }
+                }
+                other => panic!("incompat bit {bit:#x} must be refused: {other:?}"),
+            }
         }
     }
 
