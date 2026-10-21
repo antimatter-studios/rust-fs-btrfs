@@ -13,12 +13,16 @@
  * is 0 and the message "no error"; they describe the thread's most
  * recent call, not its most recent failure.
  *
- * The driver reads, and writes within narrow limits: fs_btrfs_mount_rw
+ * The driver reads, and writes within stated limits: fs_btrfs_mount_rw
  * opens a volume for writing, fs_btrfs_write_file overwrites an
  * existing file's bytes -- a nodatacow file in place, any other one
- * copy-on-write -- and fs_btrfs_subvol_set_readonly and
- * fs_btrfs_subvol_set_default change a subvolume's read-only flag and
- * which subvolume a plain mount shows; everything else is refused. It
+ * copy-on-write -- fs_btrfs_create, fs_btrfs_mkdir, fs_btrfs_symlink,
+ * fs_btrfs_link, fs_btrfs_unlink, fs_btrfs_rmdir, fs_btrfs_rename and
+ * fs_btrfs_truncate change names and lengths in the top-level
+ * subvolume, each as one committed transaction, and
+ * fs_btrfs_subvol_set_readonly and fs_btrfs_subvol_set_default change a
+ * subvolume's read-only flag and which subvolume a plain mount shows.
+ * Each function below names what it refuses, with ENOTSUP. It
  * refuses rather than guesses, when reading as well: a compressed extent
  * fails with ENOTSUP rather than returning its undecoded bytes, because a
  * caller cannot distinguish those from a corrupt file.

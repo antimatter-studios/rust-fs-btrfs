@@ -65,8 +65,9 @@ Metadata is JSON on stdout by default, `--text` for people. A failure is
 | `stat PATH` | One path's inode, type, mode, owner, links, size, allocated bytes and all four times as signed seconds plus nanoseconds. A symlink is reported without following it; device nodes include major/minor numbers. `btrfs` holds subvolume id, flags, generation, transid, sequence and the compression property (null when absent) |
 | `read PATH [-o FILE]` | the file's raw bytes: inline, compressed (zlib, LZO, zstd), sparse, inside a subvolume or through a snapshot |
 | `get [KEY]` / `info [KEY]` | `fs`, `label`, `total_bytes`, `free_bytes` (from `bytes_used`), `block_size` (the sector size), `dirty` (a log to replay, or the error flag), and `btrfs.*`: fsid, metadata UUID, node size, checksum type, device count, generation, feature names. From the superblock alone, so a volume that will not mount still answers |
-| `write PATH` | an existing file, overwritten with exactly as many bytes from stdin as it holds: a NODATACOW file (`chattr +C`) in place, any other one copy-on-write into new extents, committed as one transaction. A new file, a different length, a path inside a subvolume, or a snapshotted, inline or preallocated extent is refused with exit 3 and the library's reason; the copy-on-write cases wait on [#261][i261], creating, removing and resizing on [#262][i262] |
-| `mkdir` | not implemented (exit 3): needs directory edits, [#262][i262] |
+| `write PATH` | an existing file, overwritten with at least as many bytes from stdin as it holds: a NODATACOW file (`chattr +C`) in place at the same length, any other one copy-on-write into new extents, growing it where the library can, committed as one transaction. A path that does not exist, or fewer bytes than the file holds, is refused with exit 3 naming `create` or `truncate`, which make that change; a path inside a subvolume, or a snapshotted, inline or preallocated extent, is refused with exit 3 and the library's reason ([#261][i261]) |
+| `mkdir`, `create`, `ln [-s]`, `rm`, `rmdir`, `mv` | each makes, links, removes or moves one name, committed as one transaction (`--mode` for `mkdir` and `create`). A directory that is not empty, the last name of a file whose data a snapshot may share ([#426][i426]), and any subvolume but the top level ([#428][i428]) are refused with exit 3 |
+| `truncate PATH BYTES` | sets a file's length as one transaction: shrinking releases what lies past the new end, growing records a hole. An extent a snapshot may share ([#426][i426]) and growing a file whose last sector is partly past its end ([#421][i421]) are refused with exit 3 |
 | `set label VALUE` | writes the label (at most 255 bytes) into every superblock copy, each with a fresh checksum; a pool of several devices is refused |
 | `resize SIZE [--force]` | grows or shrinks a single-device filesystem as one transaction: `20G`, `+1G`, `-512M` or `max` (all of the device). An image file is made longer first and cut after a shrink; a shrink needs `--force`. A chunk past the new end, which only a balance could move, and a pool of several devices are refused with exit 3 ([#264][i264]) |
 
@@ -138,9 +139,11 @@ as damaged is one `btrfs check --readonly` refuses too; after `fs.btrfs write`,
 `tests/cli_write_kernel.rs` has `btrfs check --readonly` find the volume clean
 and the kernel read back exactly the bytes written.
 
-[i262]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/262
 [i261]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/261
 [i264]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/264
+[i421]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/421
+[i426]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/426
+[i428]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/428
 
 ## Test contract
 

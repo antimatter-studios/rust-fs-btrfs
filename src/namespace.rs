@@ -52,8 +52,8 @@
 //! Renaming is a removal and an addition in one transaction: the old
 //! entries and reference go, new ones are filed under a fresh index in
 //! the destination, and a name already there is removed first, exactly
-//! as an unlink or rmdir would. Truncating is the rest of #262 and not
-//! here yet.
+//! as an unlink or rmdir would. Changing a file's length is
+//! [`crate::truncate`]'s.
 
 use crate::chunk::{objectid, DiskKey};
 use crate::dir::{self, ftype, DIR_INDEX_KEY, DIR_ITEM_KEY, MAX_NAME_LEN};

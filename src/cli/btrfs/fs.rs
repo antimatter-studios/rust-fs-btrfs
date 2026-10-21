@@ -2,16 +2,17 @@
 //! without mounting it.
 //!
 //! The verbs are the shared set: `ls`, `stat`, `read`, `write`, `mkdir`,
-//! `get`/`info`, `set`, `resize`. Metadata is JSON (or `--text`); file
-//! content is raw bytes. A verb the library cannot do yet still exists and
-//! answers `not implemented` with exit status 3, so a script moved between
-//! filesystems fails loudly instead of meaning something else.
+//! `get`/`info`, `set`, `resize`, and the names and lengths this library
+//! can change: `create`, `ln`, `rm`, `rmdir`, `mv`, `truncate`. Metadata is
+//! JSON (or `--text`); file content is raw bytes. A case the library
+//! refuses answers with exit status 3 and its reason, so a script moved
+//! between filesystems fails loudly instead of meaning something else.
 //!
-//! What this library can write is narrow, and `write` says so rather than
-//! pretending otherwise: the bytes of an existing NODATACOW file, in
-//! place, at the same length. Everything that needs a copy-on-write
-//! transaction -- a new file, a directory, a different length, an ordinary
-//! file -- is refused, by the library's own reason where it has one.
+//! `write` changes the bytes of a file that exists, and never shortens it:
+//! a NODATACOW file in place at the same length, any other one
+//! copy-on-write. A new file or a shorter one is refused naming the verb
+//! that makes that change, `create` or `truncate`, and every other refusal
+//! gives the library's own reason.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -47,10 +48,6 @@ pub const KEYS: &[&str] = &[
     "dirty",
     "btrfs",
 ];
-
-/// Why `write` refuses to create a file: making one is `create`'s job,
-/// and `write` only changes the bytes of files that exist.
-const COW_BLOCKED: &str = "not something this library does yet (rust-fs-btrfs#262)";
 
 fn command() -> Cmd {
     Cmd::new("fs.btrfs")
@@ -166,7 +163,7 @@ fn command() -> Cmd {
         .subcommand(
             Cmd::new("write")
                 .about(
-                    "Overwrite an existing file with the same number of bytes from stdin",
+                    "Overwrite an existing file with at least as many bytes as it holds, from stdin",
 
                 )
                 .arg(
@@ -178,11 +175,14 @@ fn command() -> Cmd {
                 .after_help(
                     "Examples:\n  fs.btrfs disk.img write /vm/disk.raw < disk.raw\n  \
                      fs.btrfs disk.img read /db/data | fix-up | fs.btrfs disk.img write /db/data\n\n\
-                     The file must exist and get exactly as many bytes as it already holds. \
-                     A NODATACOW file (chattr +C) is overwritten in place; any other is written \
-                     copy-on-write into new extents and committed as one transaction. A new \
-                     file, a different length, or a snapshotted, inline or preallocated extent \
-                     is refused with exit status 3 and the reason (rust-fs-btrfs#261).",
+                     The file must exist and get at least as many bytes as it already holds. \
+                     A NODATACOW file (chattr +C) is overwritten in place, at the same length; \
+                     any other is written copy-on-write into new extents, growing it where the \
+                     library can, and committed as one transaction. A new file is `create`'s \
+                     to make and a shorter one `truncate`'s to cut, so both are refused with \
+                     exit status 3, as is anything the library cannot write yet, such as a \
+                     snapshotted, inline or preallocated extent, with the reason \
+                     (rust-fs-btrfs#261).",
                 ),
         )
         .subcommand(name_command(
@@ -262,7 +262,7 @@ fn command() -> Cmd {
                      directory by a directory. Committed as one transaction; only the \
                      top-level subvolume is written. A replaced file's last name takes its \
                      data with it; one whose data a snapshot may share is refused with exit \
-                     3 (rust-fs-btrfs#262).",
+                     3 (rust-fs-btrfs#426).",
                 ),
         )
         .subcommand(
@@ -287,7 +287,7 @@ fn command() -> Cmd {
                      the new end, or drops the file's reference of one a reflink shares; \
                      growing records the new range as a hole. An extent a snapshot may \
                      share, and growing a file whose last sector is partly past its end, \
-                     are refused with exit 3 (rust-fs-btrfs#262).",
+                     are refused with exit 3 (rust-fs-btrfs#426, #421).",
                 ),
         )
         .subcommand(key_command(
@@ -373,7 +373,7 @@ fn name_command(
              Committed as one transaction. Only the top-level subvolume is written; a \
              directory whose full leaf cannot be split, and the last name of a \
              file whose data a snapshot may share, are refused with exit 3 \
-             (rust-fs-btrfs#262)."
+             (rust-fs-btrfs#426)."
         ));
     if let Some(default) = mode {
         cmd = cmd.arg(
@@ -1390,9 +1390,9 @@ fn set(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Outcome, CliE
     }
 }
 
-/// Overwrite an existing file with everything on stdin, which must be
-/// exactly as long as the file: a NODATACOW file in place, any other one
-/// copy-on-write through `Filesystem::write`. The whole input is read
+/// Overwrite an existing file with everything on stdin, which must be at
+/// least as long as the file: a NODATACOW file in place, any other one
+/// copy-on-write through `Filesystem::write`, which grows it where it can. The whole input is read
 /// before the image is opened, so a failing producer
 /// (`false | fs.btrfs img write /f`) leaves the image as it was; the
 /// library writes the whole range or none of it.
@@ -1410,8 +1410,9 @@ fn write(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome, CliErro
     let found = match fs.resolve_path_bytes(path) {
         Ok(found) => found,
         Err(Error::NotFound) => {
-            return Err(CliError::not_implemented(format!(
-                "write {}: creating a file is {COW_BLOCKED}",
+            return Err(CliError::refused(format!(
+                "write {}: no such file; write changes the bytes of a file that \
+                 exists, and create makes an empty one",
                 show(path)
             )))
         }
@@ -1435,7 +1436,8 @@ fn write(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome, CliErro
     }
     if (data.len() as u64) < inode.size {
         return Err(CliError::refused(format!(
-            "{}: {} bytes on stdin for a {}-byte file; making it shorter is {COW_BLOCKED}",
+            "{}: {} bytes on stdin for a {}-byte file; write keeps a file's length, \
+             and truncate makes it shorter",
             show(path),
             data.len(),
             inode.size
