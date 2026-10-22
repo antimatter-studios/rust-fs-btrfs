@@ -1,5 +1,5 @@
 //! An incompatible feature this driver cannot read is refused by name
-//! (#270, #447).
+//! (#270, #447, #448).
 //!
 //! The refusal itself was always there: `Superblock::parse` refuses any
 //! incompat bit outside `incompat::SUPPORTED`. What it said was
@@ -103,6 +103,15 @@ fn refused_naming(name: &str, path: &std::path::Path, needle: &str) {
 fn an_extent_tree_v2_volume_is_refused_by_name() {
     let (_scratch, path) = image_with_incompat("etv2", incompat::EXTENT_TREE_V2);
     refused_naming("extent-tree-v2", &path, "extent-tree-v2");
+}
+
+/// The remap tree moves where block addresses resolve (#448). Neither the
+/// guest kernel nor its btrfs-progs can make a volume that uses it, so the
+/// bit is set on one btrfs-progs made, as for extent-tree-v2 above.
+#[test]
+fn a_remap_tree_volume_is_refused_by_name() {
+    let (_scratch, path) = image_with_incompat("remap", incompat::REMAP_TREE);
+    refused_naming("remap-tree", &path, "remap-tree");
 }
 
 /// A bit no feature is known by is still refused, by its value: naming

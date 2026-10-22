@@ -114,11 +114,18 @@ chore_min_version: 0.10.0
 #                                                    run 38099812942, over
 #                                                    the old 18,000 bytes;
 #                                                    was 296 / 13,865
-#     oracle      472 /  24,733      615 /  32,500   ~30%. --show-output is
+#     oracle      596 /  32,601      775 /  42,500   ~30%. --show-output is
 #                                                    most of it, and it is
 #                                                    the evidence, so it
 #                                                    stays -- in the log.
-#                                                    472 / 24,733 on CI with
+#                                                    596 / 32,601 is #660's
+#                                                    queue run 39807751082,
+#                                                    every test passing;
+#                                                    main was already 591 /
+#                                                    32,328 (run
+#                                                    39787952792) against
+#                                                    the old 615 / 32,500.
+#                                                    Was 472 / 24,733 on CI with
 #                                                    #225's cli_oracle.rs,
 #                                                    cold (51 lines of
 #                                                    cargo), run 36616794750;
@@ -576,7 +583,7 @@ tasks:
     cmds:
       - scripts/tools.sh --check
       - test-disks/build-fixtures.sh --check
-      - '../rust-fs-core/scripts/tier.sh test:oracle oracle 615 32500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
+      - '../rust-fs-core/scripts/tier.sh test:oracle oracle 775 42500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
 
   test:kernel:
     desc: 'The driver writes, THE KERNEL reads back: our images loop-mounted by Linux in the guest'
