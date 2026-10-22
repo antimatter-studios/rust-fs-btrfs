@@ -148,6 +148,8 @@ relocate_prealloc_nodatasum_kernel 1
 # overwritten extents relocated, judged by check --check-data-csum, a
 # read and a scrub (#495).
 relocate_shared_data_kernel 1
+# One kernel case relocates extents shared by a source subvolume and snapshot.
+relocate_shared_snapshot_data_kernel 1
 rename_kernel             2
 render_plan               4
 send_stream_kernel        3

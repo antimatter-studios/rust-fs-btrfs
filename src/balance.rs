@@ -9,22 +9,20 @@
 //! items naming it through its back references: each keyed data
 //! reference, inline in the extent item or an item of its own, names a
 //! tree, an inode, the file offset of the extent's first byte and how
-//! many of that inode's items name the extent there. The items are looked
-//! up in that tree, and the extent's own reference count must equal what
-//! its references add up to, and each reference's count what the tree
-//! holds. Nothing is guessed: a reference that cannot be followed, or a
-//! count that does not add up, is refused rather than skipped, because a
-//! relocation that missed an item would leave it pointing at freed space.
+//! many of that inode's items name the extent there. A shared reference
+//! names its parent leaf instead; the leaf is located across live
+//! subvolumes, and its file items become ordinary data references when
+//! copy-on-write separates the roots. Nothing is guessed: a reference
+//! that cannot be followed, or a count that does not add up, is refused
+//! rather than skipped, because a relocation that missed an item would
+//! leave it pointing at freed space.
 //!
 //! # What data enumeration refuses
 //!
 //! - a group that holds **tree blocks**, or is not a data group at all;
-//! - a **shared** data reference, one naming the tree block that holds
-//!   the pointer rather than the tree, which snapshots and the kernel's
-//!   own balance leave;
-//! - a volume where a subvolume **has been snapshotted**: a tree block the
-//!   snapshot shares holds items naming extents, and the snapshot's tree
-//!   is recorded by no reference, so the items it names would be missed;
+//! - a shared data reference whose parent leaf cannot be found in a live
+//!   subvolume, or whose recorded count disagrees with the file items in
+//!   that leaf;
 //! - references whose counts do not add up to the extent's, or name file
 //!   items that are not there.
 //!
@@ -44,8 +42,8 @@
 //!    per committed transaction (#494): each one's bytes are read verified
 //!    against their digests and written into every copy the new chunk keeps, then the
 //!    batch's commit re-points every file item naming it (#495), each
-//!    keeping its offset into the extent, moves its `EXTENT_ITEM` and
-//!    inline and keyed back references unchanged, files its
+//!    keeping its offset into the extent, moves its `EXTENT_ITEM`, expands
+//!    snapshot-shared references into per-subvolume data references, files its
 //!    checksums under the new sectors, and carries the free-space tree and
 //!    both groups' `used` with it.
 //!    For metadata, every tree block is copied out of the old group in
@@ -73,10 +71,7 @@ use crate::chunk::{
     block_group as bg, key_type, objectid, ChunkProfile, DiskKey, DEFAULT_STRIPE_LEN,
 };
 use crate::error::{Error, Result};
-use crate::fs::{
-    file_extent as fe, root_item, Filesystem, EXTENT_DATA_KEY, EXTENT_PREALLOC, EXTENT_REGULAR,
-    ROOT_ITEM_KEY,
-};
+use crate::fs::{file_extent as fe, Filesystem, EXTENT_DATA_KEY, EXTENT_PREALLOC, EXTENT_REGULAR};
 use crate::inode::{Inode, INODE_ITEM_KEY, INODE_NODATASUM};
 use crate::leaf_edit::OwnedItem;
 use crate::super_write::Commit;
@@ -237,11 +232,23 @@ struct DataExtent {
     len: u64,
     /// Its `EXTENT_ITEM`'s body.
     body: Vec<u8>,
+    /// The original extent item, for the transaction's compare-before-write.
+    original_body: Vec<u8>,
     /// Its back references filed as items of their own, under its
     /// address.
     keyed: Vec<OwnedItem>,
+    /// Shared data back references filed under their parent leaves.
+    shared_keyed: Vec<OwnedItem>,
+    /// Keyed ordinary data references expanded from shared leaves.
+    expanded_keyed: Vec<OwnedItem>,
     /// Every file item naming it, with the tree each is in.
     items: Vec<(u64, OwnedItem)>,
+}
+
+struct FileItemsNaming {
+    items: Vec<(u64, OwnedItem)>,
+    body: Vec<u8>,
+    expanded_keyed: Vec<OwnedItem>,
 }
 
 impl DataExtent {
@@ -466,8 +473,8 @@ impl Filesystem {
     /// re-points every file item naming each extent — reflinks, clones
     /// and a partial overwrite's bookends alike — with its offset into the
     /// extent unchanged, so each reference's tree, inode and file offset
-    /// still add up; moves its `EXTENT_ITEM` and keyed back references
-    /// unchanged; and files its
+    /// still add up; expands snapshot-shared references as copy-on-write
+    /// gives each subvolume its own leaf; and files its
     /// checksums under the new sectors; the records' release and
     /// allocation carry the free-space tree and both groups' `used`.
     fn move_data_extents(&mut self, extents: &[DataExtent], to: u64) -> Result<()> {
@@ -496,7 +503,7 @@ impl Filesystem {
             records.push(RecordEdit {
                 bytenr: e.at,
                 len: e.len,
-                before: Some(e.body.clone()),
+                before: Some(e.original_body.clone()),
                 after: None,
             });
             records.push(RecordEdit {
@@ -508,7 +515,26 @@ impl Filesystem {
             // A keyed reference's offset is a hash of what it names, not of
             // where the extent is, so it moves as it is.
             for item in &e.keyed {
+                if e.expanded_keyed.iter().any(|x| x.key == item.key) {
+                    deletes.push((extent_tree, ItemEdit::Delete(item.key)));
+                    continue;
+                }
                 deletes.push((extent_tree, ItemEdit::Delete(item.key)));
+                puts.push((
+                    extent_tree,
+                    ItemEdit::Put(OwnedItem {
+                        key: DiskKey {
+                            objectid: new,
+                            ..item.key
+                        },
+                        data: item.data.clone(),
+                    }),
+                ));
+            }
+            for item in &e.shared_keyed {
+                deletes.push((extent_tree, ItemEdit::Delete(item.key)));
+            }
+            for item in &e.expanded_keyed {
                 puts.push((
                     extent_tree,
                     ItemEdit::Put(OwnedItem {
@@ -1102,50 +1128,7 @@ impl Filesystem {
                 group.start
             )));
         }
-        if let Some((subvolume, generation)) = self.snapshotted_subvolume()? {
-            return Err(Error::UnsupportedFeature(format!(
-                "subvolume {subvolume} was snapshotted in generation {generation}: a tree \
-                 block the snapshot shares names extents from a tree no reference records, \
-                 and following those is not implemented"
-            )));
-        }
         Ok(())
-    }
-
-    /// The first subvolume the root tree records as snapshotted, and the
-    /// generation it last was, if any was.
-    ///
-    /// A deleted snapshot leaves its subvolume's `last_snapshot` behind,
-    /// so this also refuses a volume where nothing is shared any more:
-    /// the cautious side of a field that cannot tell the two apart.
-    fn snapshotted_subvolume(&self) -> Result<Option<(u64, u64)>> {
-        let reader = self.pool_reader();
-        let mut found = None;
-        let mut short = None;
-        reader
-            .tree()
-            .for_each(self.sb.root, &mut |k: &DiskKey, d: &[u8]| {
-                if k.key_type != ROOT_ITEM_KEY || !crate::subvol::is_subvolume_id(k.objectid) {
-                    return Ok(true);
-                }
-                let Some(field) = d.get(root_item::LAST_SNAPSHOT..root_item::LAST_SNAPSHOT + 8)
-                else {
-                    short = Some(k.objectid);
-                    return Ok(false);
-                };
-                let last = le64(field, 0);
-                if last != 0 {
-                    found = Some((k.objectid, last));
-                    return Ok(false);
-                }
-                Ok(true)
-            })?;
-        if let Some(id) = short {
-            return Err(Error::UnsupportedFeature(format!(
-                "subvolume {id}'s root item is too short to say whether it was snapshotted"
-            )));
-        }
-        Ok(found)
     }
 
     /// Every data extent of `group`, in address order, each with every
@@ -1154,7 +1137,7 @@ impl Filesystem {
     /// # Errors
     ///
     /// [`Error::UnsupportedFeature`] for anything in the group but data
-    /// extents and their keyed references, for a shared reference, and
+    /// extents and their references, or for a shared reference that cannot be expanded, and
     /// for references that do not add up to the extent's count or name
     /// file items that are not there.
     fn data_extents_in(&self, group: &BlockGroup) -> Result<Vec<DataExtent>> {
@@ -1189,7 +1172,10 @@ impl Filesystem {
                             at: k.objectid,
                             len: k.offset,
                             body: data.to_vec(),
+                            original_body: data.to_vec(),
                             keyed: Vec::new(),
+                            shared_keyed: Vec::new(),
+                            expanded_keyed: Vec::new(),
                             items: Vec::new(),
                         });
                     }
@@ -1207,10 +1193,20 @@ impl Filesystem {
                             return Ok(false);
                         }
                     },
-                    SHARED_DATA_REF => {
-                        refused = Some(shared(k.objectid));
-                        return Ok(false);
-                    }
+                    SHARED_DATA_REF => match out.last_mut() {
+                        Some(e) if e.at == k.objectid => e.shared_keyed.push(OwnedItem {
+                            key: *k,
+                            data: data.to_vec(),
+                        }),
+                        _ => {
+                            refused = Some(format!(
+                                "the extent tree holds a shared data reference at {} with no \
+                                 extent item before it",
+                                k.objectid
+                            ));
+                            return Ok(false);
+                        }
+                    },
                     other => {
                         refused = Some(format!(
                             "the data block group at {} holds an item of type {other} at {}, \
@@ -1227,24 +1223,32 @@ impl Filesystem {
             return Err(Error::UnsupportedFeature(why));
         }
         for extent in &mut out {
-            extent.items = self.file_items_naming(extent)?;
+            let naming = self.file_items_naming(extent)?;
+            extent.items = naming.items;
+            extent.body = naming.body;
+            extent.expanded_keyed = naming.expanded_keyed;
         }
         Ok(out)
     }
 
     /// Every file item naming `extent`, found through its references, and
     /// refused unless they account for every one of them.
-    fn file_items_naming(&self, extent: &DataExtent) -> Result<Vec<(u64, OwnedItem)>> {
+    fn file_items_naming(&self, extent: &DataExtent) -> Result<FileItemsNaming> {
         // Each keyed data reference, inline or an item of its own: the
         // tree, the inode, the file offset of the extent's first byte, and
         // how many of that inode's items name it there.
         let mut refs: Vec<(u64, u64, u64, u32)> = Vec::new();
+        let mut shared_refs: Vec<(u64, u32)> = Vec::new();
+        let mut body = extent.body.clone();
         for r in crate::backref::inline_refs(key_type::EXTENT_ITEM, &extent.body)? {
             match r.kind {
                 EXTENT_DATA_REF if r.payload.len() >= DATA_REF_SIZE => {
                     refs.push(data_ref(&r.payload));
                 }
-                SHARED_DATA_REF => return Err(Error::UnsupportedFeature(shared(extent.at))),
+                SHARED_DATA_REF if r.payload.len() >= 12 => shared_refs.push((
+                    r.offset(),
+                    u32::from_le_bytes(r.payload[8..12].try_into().expect("12 bytes")),
+                )),
                 kind => {
                     return Err(Error::UnsupportedFeature(format!(
                         "the data extent at {} carries a reference of type {kind}, which is \
@@ -1265,7 +1269,30 @@ impl Filesystem {
             }
             refs.push(data_ref(&item.data));
         }
-        let total: u64 = refs.iter().map(|r| u64::from(r.3)).sum();
+        for item in &extent.shared_keyed {
+            if item.data.len() < 4 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "the shared data reference of the extent at {} is shorter than its count",
+                    extent.at
+                )));
+            }
+            shared_refs.push((
+                item.key.offset,
+                u32::from_le_bytes(item.data[..4].try_into().expect("4 bytes")),
+            ));
+        }
+        let mut shared_parents = std::collections::BTreeSet::new();
+        if shared_refs
+            .iter()
+            .any(|(parent, _)| !shared_parents.insert(*parent))
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "the data extent at {} records the same shared parent more than once",
+                extent.at
+            )));
+        }
+        let total: u64 = refs.iter().map(|r| u64::from(r.3)).sum::<u64>()
+            + shared_refs.iter().map(|r| u64::from(r.1)).sum::<u64>();
         let count = extent.body.get(..8).map(|b| le64(b, 0));
         if count != Some(total) {
             return Err(Error::UnsupportedFeature(format!(
@@ -1279,6 +1306,7 @@ impl Filesystem {
         let reader = self.pool_reader();
         let tree = reader.tree();
         let mut out: Vec<(u64, OwnedItem)> = Vec::new();
+        let mut seen = std::collections::BTreeSet::<(u64, u64, u8, u64)>::new();
         for (root, ino, offset, want) in refs {
             let at = self.tree_root(root)?;
             // An item naming the extent at reference offset `offset` sits
@@ -1300,13 +1328,13 @@ impl Filesystem {
                     && k.offset.checked_sub(le64(d, fe::OFFSET)) == Some(offset);
                 if names_it {
                     found += 1;
-                    out.push((
-                        root,
-                        OwnedItem {
-                            key: *k,
-                            data: d.to_vec(),
-                        },
-                    ));
+                    let found_item = OwnedItem {
+                        key: *k,
+                        data: d.to_vec(),
+                    };
+                    if seen.insert((root, k.objectid, k.key_type, k.offset)) {
+                        out.push((root, found_item));
+                    }
                 }
                 Ok(true)
             })?;
@@ -1318,17 +1346,176 @@ impl Filesystem {
                 )));
             }
         }
-        Ok(out)
+        // A shared reference names the leaf, not the roots that currently
+        // point at it. Find each physical item once for its recorded count,
+        // then expand it once per live subvolume that shares that leaf.
+        let roots = if shared_refs.is_empty() {
+            Vec::new()
+        } else {
+            self.subvolumes()?
+                .into_iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>()
+        };
+        let mut expanded = std::collections::BTreeMap::<(u64, u64, u64), u32>::new();
+        for (parent, want) in &shared_refs {
+            let mut physical = std::collections::BTreeMap::<
+                (u64, u8, u64, Vec<u8>),
+                std::collections::BTreeSet<u64>,
+            >::new();
+            for &root in &roots {
+                let at = self.tree_root(root)?;
+                let from = DiskKey {
+                    objectid: 0,
+                    key_type: 0,
+                    offset: 0,
+                };
+                tree.for_each_from(at, &from, &mut |k: &DiskKey, d: &[u8]| {
+                    if k.key_type != EXTENT_DATA_KEY
+                        || d.len() < fe::REGULAR_SIZE
+                        || !matches!(d[fe::TYPE], EXTENT_REGULAR | EXTENT_PREALLOC)
+                        || le64(d, fe::DISK_BYTENR) != extent.at
+                    {
+                        return Ok(true);
+                    }
+                    if tree.descend(at, k)?.header.bytenr == *parent {
+                        physical
+                            .entry((k.objectid, k.key_type, k.offset, d.to_vec()))
+                            .or_default()
+                            .insert(root);
+                    }
+                    Ok(true)
+                })?;
+            }
+            if physical.len() != *want as usize {
+                return Err(Error::UnsupportedFeature(format!(
+                    "the shared data reference of the extent at {} records {want} file item(s) \
+                     in leaf {parent}, and {found} were found",
+                    extent.at,
+                    found = physical.len()
+                )));
+            }
+            for ((objectid, key_type, key_offset, data), sharing_roots) in physical {
+                let key = DiskKey {
+                    objectid,
+                    key_type,
+                    offset: key_offset,
+                };
+                let offset = key.offset.checked_sub(le64(&data, fe::OFFSET)).ok_or_else(|| {
+                    Error::UnsupportedFeature(format!(
+                        "the file extent at {} in shared leaf {parent} starts before its data extent",
+                        key.offset
+                    ))
+                })?;
+                for root in sharing_roots {
+                    if seen.insert((root, key.objectid, key.key_type, key.offset)) {
+                        out.push((
+                            root,
+                            OwnedItem {
+                                key,
+                                data: data.clone(),
+                            },
+                        ));
+                    }
+                    *expanded.entry((root, key.objectid, offset)).or_default() += 1;
+                }
+            }
+            if let Some((without, _)) = crate::backref::take_inline_shared(
+                key_type::EXTENT_ITEM,
+                &body,
+                SHARED_DATA_REF,
+                *parent,
+            )? {
+                body = without;
+            }
+        }
+        let shared_total: u64 = shared_refs.iter().map(|r| u64::from(r.1)).sum();
+        let body_refs = le64(&body, 0).checked_sub(shared_total).ok_or_else(|| {
+            Error::UnsupportedFeature(format!(
+                "the data extent at {} has fewer references than its shared items",
+                extent.at
+            ))
+        })?;
+        body[..8].copy_from_slice(&body_refs.to_le_bytes());
+        let mut expanded_keyed = Vec::<OwnedItem>::new();
+        for ((root, ino, offset), add) in expanded {
+            let inline = crate::backref::inline_refs(key_type::EXTENT_ITEM, &body)?;
+            let inline_same = inline.iter().any(|r| {
+                r.kind == EXTENT_DATA_REF
+                    && r.payload.len() >= DATA_REF_SIZE
+                    && data_ref(&r.payload).0 == root
+                    && data_ref(&r.payload).1 == ino
+                    && data_ref(&r.payload).2 == offset
+            });
+            if inline_same {
+                for _ in 0..add {
+                    body = crate::backref::add_inline_data_ref(
+                        key_type::EXTENT_ITEM,
+                        &body,
+                        root,
+                        ino,
+                        offset,
+                    )?;
+                }
+                continue;
+            }
+            let key = DiskKey {
+                objectid: extent.at,
+                key_type: EXTENT_DATA_REF,
+                offset: crate::extent_write::data_ref_hash(root, ino, offset),
+            };
+            let mut data = Vec::with_capacity(DATA_REF_SIZE);
+            data.extend_from_slice(&root.to_le_bytes());
+            data.extend_from_slice(&ino.to_le_bytes());
+            data.extend_from_slice(&offset.to_le_bytes());
+            data.extend_from_slice(&add.to_le_bytes());
+            if let Some(prior) = extent.keyed.iter().find(|i| i.key == key) {
+                if prior.data.len() < DATA_REF_SIZE || prior.data[..24] != data[..24] {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "a data-reference hash collision at extent {} prevents expanding a shared reference",
+                        extent.at
+                    )));
+                }
+                let count = u32::from_le_bytes(prior.data[24..28].try_into().expect("4 bytes"));
+                data[24..28].copy_from_slice(
+                    &count
+                        .checked_add(add)
+                        .ok_or_else(|| {
+                            Error::UnsupportedFeature("data-reference count overflowed".into())
+                        })?
+                        .to_le_bytes(),
+                );
+            }
+            let count = le64(&body, 0).checked_add(u64::from(add)).ok_or_else(|| {
+                Error::UnsupportedFeature("extent reference count overflowed".into())
+            })?;
+            body[..8].copy_from_slice(&count.to_le_bytes());
+            if let Some(existing) = expanded_keyed.iter_mut().find(|item| item.key == key) {
+                if existing.data[..24] != data[..24] {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "a data-reference hash collision at extent {} prevents expanding shared references",
+                        extent.at
+                    )));
+                }
+                let had = u32::from_le_bytes(existing.data[24..28].try_into().expect("4 bytes"));
+                let added = u32::from_le_bytes(data[24..28].try_into().expect("4 bytes"));
+                existing.data[24..28].copy_from_slice(
+                    &had.checked_add(added)
+                        .ok_or_else(|| {
+                            Error::UnsupportedFeature("data-reference count overflowed".into())
+                        })?
+                        .to_le_bytes(),
+                );
+            } else {
+                expanded_keyed.push(OwnedItem { key, data });
+            }
+        }
+        Ok(FileItemsNaming {
+            items: out,
+            body,
+            expanded_keyed,
+        })
     }
-}
-
-/// The refusal of a data extent named by a shared reference.
-fn shared(at: u64) -> String {
-    format!(
-        "the data extent at {at} is named by a shared reference, through the tree block \
-         holding the pointer rather than its tree, as snapshots and the kernel's balance \
-         leave; following those is not implemented"
-    )
 }
 
 /// A keyed data reference's tree, inode, offset and count.
