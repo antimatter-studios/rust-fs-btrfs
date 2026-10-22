@@ -287,17 +287,50 @@ fn a_data_groups_extents_and_their_file_items_are_what_the_kernel_resolves() {
     drop(fs);
 
     // A snapshot shares the tree blocks holding the file items, so the
-    // extents are named from a tree no reference records: refused.
+    // extents are named from a tree no reference records. They are now
+    // enumerated with the snapshot's items too (#401): the same extents,
+    // each named as the kernel's back-reference walk names it.
     guest_kernel_write_ok(
         &image.to_string_lossy(),
         "the kernel snapshots the volume",
         "btrfs subvolume snapshot \"$MNT\" \"$MNT/snap\" >/dev/null\nsync",
     );
     let fs = mount(&image);
+    let mut snapped: Vec<GroupExtent> = Vec::new();
     for group in data_groups(&fs) {
-        match fs.block_group_extents(group.start) {
-            Err(Error::UnsupportedFeature(why)) => assert!(why.contains("snapshot"), "{why}"),
-            other => panic!("a snapshotted volume's data group was enumerated: {other:?}"),
-        }
+        snapped.extend(fs.block_group_extents(group.start).unwrap_or_else(|e| {
+            panic!(
+                "the data group at {} of the snapshotted volume: {e}",
+                group.start
+            )
+        }));
+    }
+    let extents = |v: &[GroupExtent]| -> BTreeSet<(u64, u64)> {
+        v.iter().map(|e| (e.start, e.len)).collect()
+    };
+    assert_eq!(
+        extents(&snapped),
+        extents(&all),
+        "the snapshot changed which extents the data groups hold"
+    );
+    let trees_before: BTreeSet<u64> = all
+        .iter()
+        .flat_map(|e| e.items.iter().map(|r| r.tree))
+        .collect();
+    assert!(
+        snapped
+            .iter()
+            .flat_map(|e| &e.items)
+            .any(|r| !trees_before.contains(&r.tree)),
+        "no extent is named from the snapshot's tree"
+    );
+    let kernel = kernel_resolve(&image, &at);
+    for (&l, said) in &kernel {
+        assert_eq!(
+            &covering(&snapped, l),
+            said,
+            "after the snapshot, at logical {l}, as (tree, inode, file offset): the \
+             enumeration, then the kernel"
+        );
     }
 }
