@@ -18,6 +18,7 @@
 //! image's raw bytes: a SHA-256 of the whole device before and after.
 
 use fs_btrfs::block_group::BlockGroup;
+use fs_btrfs::chunk::ChunkProfile;
 use fs_btrfs::error::Error;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs_test_support::{
@@ -193,15 +194,15 @@ fn a_refused_relocation_leaves_the_device_byte_identical() {
     let scratch = Scratch::new("relocate-data-refused");
     let image = scratch.image();
 
-    // A reflinked copy names its extent from two file items, which the
-    // relocation refuses before anything is written.
+    // A shared extent no longer makes a refusal: this pull request
+    // relocates them (#495). Converting a single data group to raid1 is
+    // still refused, before anything is written; only single to dup is
+    // converted (#586).
     let wrote = guest_kernel_write_ok(
         &image.to_string_lossy(),
-        "write a file and a reflinked copy of it",
+        "write a file",
         "cd \"$MNT\"\n\
          head -c 65536 /dev/urandom > a\n\
-         sync\n\
-         cp --reflink=always a b\n\
          sync\n\
          echo written",
     );
@@ -212,10 +213,10 @@ fn a_refused_relocation_leaves_the_device_byte_identical() {
         let mut fs = mount_rw(&image);
         let groups = data_groups(&fs);
         assert_eq!(groups.len(), 1, "one data group: {groups:?}");
-        let refused = fs.relocate_block_group(groups[0].start, None);
+        let refused = fs.relocate_block_group(groups[0].start, Some(ChunkProfile::Raid1));
         assert!(
-            matches!(refused, Err(Error::UnsupportedFeature(_))),
-            "a group with a shared extent is refused: {refused:?}"
+            matches!(&refused, Err(Error::UnsupportedFeature(m)) if m.contains("raid1")),
+            "a conversion of a single data group to raid1 is refused: {refused:?}"
         );
     }
     assert_eq!(
