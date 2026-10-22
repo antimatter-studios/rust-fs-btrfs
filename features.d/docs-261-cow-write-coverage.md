@@ -1,0 +1,5 @@
+## Writing
+
+| Copy-on-write writes: overwrites inside a file's existing extents | Partial: written inside an extent compressed or not, in a checksummed or `nodatasum` file, and inside an extent a reflink or another item of the file shares; each refusal has its own row | 0.8.1 (#61); compressed extents Unreleased (#325) | #261 | `cow_write_oracle.rs`, `compress_write_kernel.rs` |
+| A write into an inline or preallocated extent, or one a snapshot may share | Refused: an uncompressed or compressed inline extent, growing an inline file, a preallocated extent, and an extent from at or before the last snapshot | 0.7.0 (#74); copy-on-write 0.8.1 | #437, #438, #439, #441, #443 | `prealloc_extent_write.rs`, `snapshot_shared_write.rs`, `shared_tree_block_release.rs`, `cow_write_oracle.rs` |
+| A copy-on-write write that drops a reference held as a keyed `EXTENT_DATA_REF` item, empties a checksum-tree leaf other than the root, or reaches a file outside the top-level subvolume | Refused: the reference is refused by name, the emptied leaf by the transaction, and a handle on another subvolume is read-only | | #442, #444, #445 | |
