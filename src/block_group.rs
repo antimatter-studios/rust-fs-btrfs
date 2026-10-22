@@ -545,7 +545,8 @@ impl Filesystem {
     /// of work and not this one.
     ///
     /// It also does not allocate a new block group when every existing
-    /// one is full; it reports that instead.
+    /// one is full; it reports that instead. A group a relocation is
+    /// emptying is never offered (#574).
     ///
     /// # Errors
     ///
@@ -562,7 +563,7 @@ impl Filesystem {
         let groups: Vec<BlockGroup> = self
             .block_groups()?
             .into_iter()
-            .filter(|g| g.holds_metadata())
+            .filter(|g| g.holds_metadata() && self.emptying != Some(g.start))
             .collect();
         for runs in self.free_extents_by_group(&groups)? {
             for run in runs {
@@ -612,14 +613,25 @@ impl Filesystem {
     /// any data group's free space. Allocating a new block group is not
     /// implemented.
     pub(crate) fn find_data_extents(&self, lens: &[u64]) -> Result<Vec<u64>> {
-        let sectorsize = u64::from(self.sb.sectorsize).max(1);
         let groups: Vec<BlockGroup> = self
             .block_groups()?
             .into_iter()
             .filter(|g| g.holds_data() && !g.holds_metadata())
             .collect();
+        self.find_extents_in(&groups, lens)
+    }
+
+    /// [`Filesystem::find_data_extents`] in `groups` and no others: a
+    /// relocation fills the group it allocated for the purpose, and only
+    /// that one (#493).
+    ///
+    /// # Errors
+    ///
+    /// As [`Filesystem::find_data_extents`].
+    pub(crate) fn find_extents_in(&self, groups: &[BlockGroup], lens: &[u64]) -> Result<Vec<u64>> {
+        let sectorsize = u64::from(self.sb.sectorsize).max(1);
         let mut runs: Vec<FreeExtent> = self
-            .free_extents_by_group(&groups)?
+            .free_extents_by_group(groups)?
             .into_iter()
             .flatten()
             .collect();

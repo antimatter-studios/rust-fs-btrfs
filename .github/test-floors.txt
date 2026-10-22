@@ -102,7 +102,10 @@ leaf_edit_oracle          3
 leaf_split                1
 leaf_split_oracle         1
 # The whole-suite counter includes the CLI inode flag unit case (#412).
-lib                       234
+# Balance adds thirteen library cases (#304): chunk item and DUP stripe
+# placement, the balance filter and profile bits, and on kernel-made
+# volumes a DUP chunk, metadata evacuation and its three refusals.
+lib                       247
 log_tree_kernel           21
 lookup_by_name_key        1
 namespace_kernel          2
@@ -119,6 +122,31 @@ read_file_huge_size       1
 read_path_cost            1
 readlink_kernel_oracle    1
 release_attestation       2
+# Two executed: a data group of more extents than one batch relocated a
+# batch per transaction and judged by the kernel, and a refused relocation
+# that leaves the device byte-identical (#494).
+relocate_data_batches_kernel 2
+# One executed: a data group of the kernel's plain checksummed extents
+# relocated, judged by check --check-data-csum, a read and a scrub (#493).
+relocate_data_group_kernel 1
+# One executed: a single data group of the kernel's files converted to DUP,
+# both copies compared, one corrupted and repaired by a kernel scrub, judged
+# by check --check-data-csum, filesystem df and a manifest read (#586).
+relocate_convert_dup_kernel 1
+# Two executed: the empty data group relocated and judged by the kernel,
+# and the refusals before anything is written (#397).
+relocate_empty_group_kernel 2
+# Two cases cover kernel-written metadata evacuation and profile refusal (#580).
+# CI must execute both; no local oracle run is permitted by the issue-agent brief.
+relocate_metadata_group_kernel 2
+# One executed: a data group of preallocated, partly written preallocated
+# and nodatasum extents relocated, judged by check --check-data-csum, a
+# read and a scrub, then written by the kernel and checked again (#496).
+relocate_prealloc_nodatasum_kernel 1
+# One executed: a data group of reflinked, self-cloned and partially
+# overwritten extents relocated, judged by check --check-data-csum, a
+# read and a scrub (#495).
+relocate_shared_data_kernel 1
 rename_kernel             2
 render_plan               4
 send_stream_kernel        3
