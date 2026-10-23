@@ -1,4 +1,4 @@
-//! A transaction refuses to release a tree block a snapshot still shares
+//! A transaction preserves a tree block a snapshot still shares
 //! (#178).
 //!
 //! `apply_records` released each block a plan rewrites by deleting its
@@ -7,8 +7,13 @@
 //! by both trees. Rewriting one deleted its record outright, so the
 //! snapshot's tree pointed at a block the allocator then considered free.
 //! Dropping one reference, and adding explicit ones for a shared block's
-//! children when it's copied, is what the kernel does. Until this driver
-//! does the same, the plan must be refused.
+//! children when it's copied, is what the kernel does. The plan now keeps
+//! the old block and renders that reference bookkeeping (#262).
+//!
+//! The second test is #426's: the file a snapshot shares is truncated,
+//! unlinked and replaced by a rename through the C ABI, and its extent must
+//! stay, referenced once, explicitly, by the snapshot -- clean to `btrfs
+//! check`, read back by the kernel and scrubbed.
 //!
 //! The image is `snapshot/btrfs-nodatacow-snapshot.img` from `chore
 //! fixtures`, a read-only snapshot the kernel took of the top-level
@@ -16,11 +21,29 @@
 //! names a tree block the extent tree records with two references, and
 //! the planner and renderer are asked to move it.
 
+use fs_btrfs::capi::{
+    fs_btrfs_create, fs_btrfs_last_error, fs_btrfs_mount_rw, fs_btrfs_rename, fs_btrfs_truncate,
+    fs_btrfs_umount, fs_btrfs_unlink,
+};
 use fs_btrfs::fs::Filesystem;
-use fs_btrfs_test_support::{dump_tree, fixture};
+use fs_btrfs_test_support::{
+    assert_btrfs_check_clean, dump_tree, fixture, guest_kernel_read_ok, guest_kernel_write_ok,
+    sha256_hex, temp_path,
+};
 use fs_core::FileDevice;
-use std::path::Path;
+use std::ffi::{CStr, CString};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+fn c(s: &str) -> CString {
+    CString::new(s).unwrap()
+}
+
+fn last_error() -> String {
+    unsafe { CStr::from_ptr(fs_btrfs_last_error()) }
+        .to_string_lossy()
+        .into_owned()
+}
 
 /// A tree block the extent tree records with more than one reference.
 fn shared_tree_block(image: &Path) -> u64 {
@@ -45,6 +68,20 @@ fn shared_tree_block(image: &Path) -> u64 {
     panic!("the fixture holds no tree block with more than one reference, so it no longer holds the case");
 }
 
+fn extent_record(dump: &str, bytenr: u64) -> String {
+    let lines: Vec<_> = dump.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.contains(&format!("key ({bytenr} EXTENT_ITEM ")))
+        .expect("the data extent's record");
+    lines[at + 1..]
+        .iter()
+        .take_while(|line| !line.contains("key ("))
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn a_plan_that_releases_a_shared_tree_block_is_refused() {
     let image = fixture("snapshot/btrfs-nodatacow-snapshot.img");
@@ -53,15 +90,111 @@ fn a_plan_that_releases_a_shared_tree_block_is_refused() {
     let generation = fs.superblock().generation + 1;
     let rendered = fs.plan_transaction_closed(&[shared], 8).and_then(|plan| {
         assert!(
-            plan.released().contains(&shared),
-            "the plan does not move the shared block, so it tests nothing"
+            plan.kept.contains(&shared) && !plan.released().contains(&shared),
+            "the plan must move the shared block while keeping its old address"
         );
         fs.render_plan(&plan, generation)
     });
     assert!(
-        rendered.is_err(),
-        "a transaction moving the tree block at {shared}, which a snapshot shares, \
-         was rendered: its extent record would be deleted while the snapshot still \
-         points at it"
+        rendered.is_ok(),
+        "snapshot-aware reference bookkeeping failed: {rendered:?}"
     );
+}
+
+#[test]
+fn snapshot_data_survives_truncate_unlink_and_replacing_rename() {
+    for operation in ["truncate", "unlink", "rename"] {
+        let image = PathBuf::from(temp_path!("snapshot-unref-{operation}.img"));
+        std::fs::copy(fixture("snapshot/btrfs-nodatacow-snapshot.img"), &image).unwrap();
+        let original;
+        let bytenr;
+        {
+            let fs = Filesystem::mount(Arc::new(FileDevice::open(&image).unwrap())).unwrap();
+            let ino = fs.lookup_path("/nc/inplace.bin").unwrap().ino;
+            original = fs.read_file(ino).unwrap();
+            assert!(!original.is_empty(), "fixture must hold external data");
+            let tree = dump_tree(&image, "5");
+            let file = tree
+                .split(&format!("key ({ino} EXTENT_DATA 0)"))
+                .nth(1)
+                .expect("the file's first extent");
+            bytenr = file
+                .lines()
+                .find(|line| line.contains("disk byte"))
+                .unwrap()
+                .split("disk byte ")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            let before = extent_record(&dump_tree(&image, "extent"), bytenr);
+            assert!(
+                before.contains("refs 1 "),
+                "fixture no longer has implicitly shared data: {before}"
+            );
+            assert!(
+                before.contains("extent data backref"),
+                "missing original keyed reference: {before}"
+            );
+        }
+        // Through the C ABI, as a consumer reaches each operation.
+        let fs = unsafe { fs_btrfs_mount_rw(c(&image.to_string_lossy()).as_ptr()) };
+        assert!(!fs.is_null(), "{operation}: mount_rw: {}", last_error());
+        let path = c("/nc/inplace.bin");
+        let (rc, error) = unsafe {
+            let rc = match operation {
+                "truncate" => fs_btrfs_truncate(fs, path.as_ptr(), 0),
+                "unlink" => fs_btrfs_unlink(fs, path.as_ptr()),
+                "rename" => {
+                    let made = fs_btrfs_create(fs, c("/nc/replacement").as_ptr(), 0o644);
+                    assert_ne!(made, 0, "rename: create /nc/replacement: {}", last_error());
+                    fs_btrfs_rename(fs, c("/nc/replacement").as_ptr(), path.as_ptr())
+                }
+                _ => unreachable!(),
+            };
+            let error = last_error();
+            fs_btrfs_umount(fs);
+            (rc, error)
+        };
+        assert_eq!(rc, 0, "{operation} through the C ABI: {error}");
+        assert_btrfs_check_clean(&image, operation);
+        let extents = extent_record(&dump_tree(&image, "extent"), bytenr);
+        assert!(
+            extents.contains("shared data backref"),
+            "no explicit snapshot data reference after {operation}: {extents}"
+        );
+        assert!(
+            extents.contains("refs 1 "),
+            "snapshot should retain exactly one data reference: {extents}"
+        );
+        assert!(
+            !extents.contains("extent data backref"),
+            "removed file's keyed reference remains: {extents}"
+        );
+        let live = if operation == "unlink" {
+            "test ! -e nc/inplace.bin"
+        } else {
+            "test -f nc/inplace.bin; test ! -s nc/inplace.bin"
+        };
+        let seen = guest_kernel_read_ok(
+            &image.to_string_lossy(),
+            operation,
+            &format!("cd \"$MNT\"\nsha256sum snap/nc/inplace.bin | cut -d' ' -f1\n{live}"),
+        );
+        assert_eq!(
+            seen.trim(),
+            sha256_hex(&original),
+            "snapshot changed after {operation}"
+        );
+        // Every copy of every block the kernel can reach, against its digest.
+        guest_kernel_write_ok(
+            &image.to_string_lossy(),
+            &format!("{operation}: scrub"),
+            "btrfs scrub start -B \"$MNT\" >/dev/null",
+        );
+        let _ = std::fs::remove_file(&image);
+    }
 }
