@@ -49,8 +49,8 @@
 //! # What it refuses
 //!
 //! - an extent from at or before the last snapshot of the subvolume,
-//!   which the snapshot may still be reading: the copy-on-write write
-//!   refuses the same extent, for the same reason;
+//!   which the snapshot may still be reading (a copy-on-write write
+//!   copies such an extent and drops only this tree's reference, #443);
 //! - every refusal of the transaction it commits through: a reference to
 //!   a shared extent held other than inline in its record, a tree leaf
 //!   the change would empty, a free-space tree recorded as bitmaps, and a

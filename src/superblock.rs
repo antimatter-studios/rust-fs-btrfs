@@ -284,9 +284,13 @@ pub mod incompat {
     ///
     /// The exclusions are deliberate, not accidental:
     ///
-    /// - [`ZONED`], [`EXTENT_TREE_V2`], [`RAID_STRIPE_TREE`],
+    /// - [`EXTENT_TREE_V2`], [`RAID_STRIPE_TREE`],
     ///   [`REMAP_TREE`] — each restructures something the read path
     ///   depends on. [`super::refuse_unreadable_incompat`] refuses them.
+    ///
+    /// [`ZONED`] is readable on a regular device with fixed-offset
+    /// superblocks. `read_superblock` refuses a real zoned device's
+    /// superblock log, and `mount_rw` refuses all zoned writes (#454).
     ///
     /// [`SIMPLE_QUOTA`] IS accepted (#270): it adds an owner reference to
     /// each data extent item and keeps usage in the quota tree, neither of
@@ -321,6 +325,7 @@ pub mod incompat {
         // kernel wrote. Never written: `mount_rw` takes one device, and a
         // parity chunk spans several.
         | RAID56
+        | ZONED
         | SIMPLE_QUOTA;
 }
 
@@ -342,6 +347,10 @@ pub fn refuse_unreadable_incompat(incompat_flags: u64) -> Result<()> {
         (
             incompat::EXTENT_TREE_V2,
             "extent-tree-v2 (the second-generation extent tree)",
+        ),
+        (
+            incompat::RAID_STRIPE_TREE,
+            "raid-stripe-tree (the tree that records data stripe placement)",
         ),
         (
             incompat::REMAP_TREE,
@@ -388,10 +397,11 @@ pub mod compat_ro {
     /// The free-space tree is updated by every transaction beside the
     /// extent tree it complements, and its validity bit is cleared when a
     /// commit could not, which is the state the format defines for that.
-    /// Not `VERITY`, whose Merkle tree a data write invalidates, and not
-    /// `BLOCK_GROUP_TREE`, whose block group items this driver looks for
-    /// in the extent tree and would not find.
-    pub const SUPPORTED: u64 = FREE_SPACE_TREE | FREE_SPACE_TREE_VALID;
+    /// Block group items are maintained in tree 11 when `BLOCK_GROUP_TREE`
+    /// is set, including when chunks are created or removed.
+    /// Verity metadata stays unchanged because sealed inodes refuse data
+    /// mutations and removal.
+    pub const SUPPORTED: u64 = FREE_SPACE_TREE | FREE_SPACE_TREE_VALID | BLOCK_GROUP_TREE | VERITY;
 }
 
 /// Refuse to WRITE a volume carrying a `compat_ro` feature this driver
@@ -400,27 +410,13 @@ pub mod compat_ro {
 /// Reading such a volume is sound, which is what the bit's class says, so
 /// this is checked at `mount_rw` and not at parse.
 pub fn refuse_unmaintained_compat_ro(compat_ro_flags: u64) -> Result<()> {
-    let mut unmaintained = compat_ro_flags & !compat_ro::SUPPORTED;
+    let unmaintained = compat_ro_flags & !compat_ro::SUPPORTED;
     if unmaintained == 0 {
         return Ok(());
     }
-    let mut named = Vec::new();
-    for (bit, name) in [
-        (compat_ro::VERITY, "fs-verity"),
-        (compat_ro::BLOCK_GROUP_TREE, "the block group tree"),
-    ] {
-        if unmaintained & bit != 0 {
-            named.push(name.to_string());
-            unmaintained &= !bit;
-        }
-    }
-    if unmaintained != 0 {
-        named.push(format!("unknown bits {unmaintained:#018x}"));
-    }
     Err(Error::UnsupportedFeature(format!(
         "this volume uses read-only-compatible features this driver does not maintain \
-         ({}), so it can be read but not written",
-        named.join(", ")
+         (unknown bits {unmaintained:#018x}), so it can be read but not written"
     )))
 }
 
@@ -444,6 +440,8 @@ mod compat_ro_tests {
             0,
             compat_ro::FREE_SPACE_TREE,
             compat_ro::FREE_SPACE_TREE | compat_ro::FREE_SPACE_TREE_VALID,
+            compat_ro::VERITY,
+            compat_ro::SUPPORTED | compat_ro::VERITY,
         ] {
             refuse_unmaintained_compat_ro(flags)
                 .unwrap_or_else(|e| panic!("{flags:#x} must be writable: {e:?}"));
@@ -451,15 +449,21 @@ mod compat_ro_tests {
     }
 
     #[test]
+    fn a_block_group_tree_is_maintained_when_writing() {
+        assert_ne!(compat_ro::SUPPORTED & compat_ro::BLOCK_GROUP_TREE, 0);
+        refuse_unmaintained_compat_ro(
+            compat_ro::FREE_SPACE_TREE
+                | compat_ro::FREE_SPACE_TREE_VALID
+                | compat_ro::BLOCK_GROUP_TREE,
+        )
+        .expect("block group items in tree 11 are maintained");
+    }
+
+    #[test]
     fn a_volume_with_an_unmaintained_feature_is_refused_by_name() {
         for (flags, needle) in [
-            (compat_ro::VERITY, "fs-verity"),
-            (compat_ro::BLOCK_GROUP_TREE, "block group tree"),
             (1 << 40, "0x0000010000000000"),
-            (
-                compat_ro::FREE_SPACE_TREE | compat_ro::BLOCK_GROUP_TREE | (1 << 7),
-                "0x0000000000000080",
-            ),
+            (compat_ro::SUPPORTED | (1 << 7), "0x0000000000000080"),
         ] {
             match refuse_unmaintained_compat_ro(flags) {
                 Err(Error::UnsupportedFeature(m)) => {
@@ -595,6 +599,13 @@ pub struct DevItem {
     /// The owning filesystem's UUID. Holds `metadata_uuid` rather than
     /// `fsid` when the `METADATA_UUID` incompatible feature is set.
     pub fsid: [u8; UUID_SIZE],
+}
+
+/// A superblock that is out of range or internally inconsistent.
+/// [`Error::BadSuperblock`] covers every malformed metadata structure,
+/// so the message names the superblock itself (#473).
+fn malformed(m: String) -> Error {
+    Error::BadSuperblock(format!("superblock: {m}"))
 }
 
 impl DevItem {
@@ -767,7 +778,7 @@ impl Superblock {
     /// a geometry field is out of range or internally inconsistent.
     pub fn parse(buf: &[u8]) -> Result<Self> {
         if buf.len() < SUPER_INFO_SIZE {
-            return Err(Error::BadSuperblock(format!(
+            return Err(malformed(format!(
                 "need {SUPER_INFO_SIZE} bytes, got {}",
                 buf.len()
             )));
@@ -806,7 +817,7 @@ impl Superblock {
 
         let sys_len = le32(buf, offsets::SYS_CHUNK_ARRAY_SIZE) as usize;
         if sys_len > SYS_CHUNK_ARRAY_SIZE {
-            return Err(Error::BadSuperblock(format!(
+            return Err(malformed(format!(
                 "sys_chunk_array_size {sys_len} exceeds the {SYS_CHUNK_ARRAY_SIZE}-byte array"
             )));
         }
@@ -907,7 +918,7 @@ impl Superblock {
     /// Sizes, counts and capacities: the numbers describing the device
     /// itself, independent of any tree it holds.
     fn validate_geometry(&self) -> Result<()> {
-        let bad = |m: String| Err(Error::BadSuperblock(m));
+        let bad = |m: String| Err(malformed(m));
         if !SUPER_OFFSETS.contains(&self.bytenr) {
             return bad(format!(
                 "bytenr {:#x} is not one of the superblock mirror offsets {SUPER_OFFSETS:#x?}",
@@ -968,7 +979,7 @@ impl Superblock {
     /// within the format's maximum tree height, their addresses must be
     /// sector-aligned, and the two that are mandatory must be present.
     fn validate_tree_roots(&self) -> Result<()> {
-        let bad = |m: String| Err(Error::BadSuperblock(m));
+        let bad = |m: String| Err(malformed(m));
         for (name, level) in [
             ("root_level", self.root_level),
             ("chunk_root_level", self.chunk_root_level),
@@ -1005,7 +1016,7 @@ impl Superblock {
     /// least one usable entry the chunk tree cannot be located, and
     /// nothing else on the volume can be read.
     fn validate_sys_chunk_array(&self) -> Result<()> {
-        let bad = |m: String| Err(Error::BadSuperblock(m));
+        let bad = |m: String| Err(malformed(m));
         // The system chunk array must be able to hold at least one
         // (key, chunk item, stripe) triple, otherwise the chunk tree is
         // unreachable. 17 (key) + 48 (chunk header) + 32 (one stripe)
@@ -1023,7 +1034,7 @@ impl Superblock {
 
     /// The device's own record of which filesystem it belongs to.
     fn validate_device_identity(&self) -> Result<()> {
-        let bad = |m: String| Err(Error::BadSuperblock(m));
+        let bad = |m: String| Err(malformed(m));
         // Every device carries the identity of the filesystem it belongs
         // to. Skipped while an fsid change is in flight or when this is a
         // seed device, because in those states the two legitimately
@@ -1151,12 +1162,34 @@ impl Superblock {
 ///
 /// # Errors
 ///
-/// [`Error::UnsupportedFeature`] when an intact copy declares an
-/// incompatible feature this driver cannot read. Otherwise, when no copy
+/// [`Error::UnsupportedFeature`] when a zoned superblock log is detected
+/// at zero, or an intact copy declares an incompatible feature this
+/// driver cannot read. Otherwise, when no copy
 /// is valid, the primary's own error -- the one a caller would have seen
 /// before.
 pub fn read_superblock(dev: &dyn fs_core::BlockRead) -> Result<(Superblock, usize)> {
     let size = dev.size_bytes();
+    // Real zoned devices keep a superblock log starting at zero. An
+    // image has no zone write pointers, so a fixed-offset copy could be
+    // stale even when its checksum verifies. Inspect the first record
+    // before selecting any conventional mirror (#454). Its geometry is
+    // deliberately not parsed as a conventional superblock.
+    // Format reference: https://btrfs.readthedocs.io/en/latest/Zoned-mode.html
+    if size >= SUPER_INFO_SIZE as u64 {
+        let mut log = [0u8; SUPER_INFO_SIZE];
+        dev.read_at(0, &mut log)?;
+        if log[offsets::MAGIC..offsets::MAGIC + BTRFS_MAGIC.len()] == BTRFS_MAGIC
+            && le64(&log, offsets::INCOMPAT_FLAGS) & incompat::ZONED != 0
+            && ChecksumType::from_raw(le16(&log, offsets::CSUM_TYPE))
+                .is_ok_and(|kind| kind.verify(&log[CSUM_SIZE..], &log[..CSUM_SIZE]))
+        {
+            return Err(Error::UnsupportedFeature(
+                "this zoned device uses a superblock log; its latest superblock cannot be \
+                 located without zone write pointers, so fixed-offset copies cannot be read"
+                    .into(),
+            ));
+        }
+    }
     let mut best: Option<(Superblock, usize)> = None;
     let mut primary_error = None;
     for (copy, &offset) in SUPER_OFFSETS.iter().enumerate() {
@@ -1410,6 +1443,18 @@ pub(crate) mod tests {
         ));
     }
 
+    /// [`Error::BadSuperblock`] covers every metadata structure and its
+    /// text no longer names the superblock, so a refusal of the
+    /// superblock itself has to say so in its detail (#473).
+    #[test]
+    fn a_malformed_superblock_still_names_the_superblock() {
+        let e = Superblock::parse(&[0u8; 512]).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "malformed Btrfs metadata: superblock: need 4096 bytes, got 512"
+        );
+    }
+
     #[test]
     fn rejects_a_corrupt_checksum() {
         let mut b = sb_bytes();
@@ -1503,8 +1548,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// Known features this driver deliberately does not claim. They must
-    /// be refused, not ignored.
+    /// Keep the original refusal cases: zoned regular-device layouts
+    /// are now accepted; the remaining unsupported features are refused.
     #[test]
     fn rejects_known_but_unimplemented_incompat_features() {
         for (bit, name) in [
@@ -1520,6 +1565,10 @@ pub(crate) mod tests {
                 incompat::MIXED_BACKREF | bit,
             );
             reseal(&mut b);
+            if bit == incompat::ZONED {
+                assert!(Superblock::parse(&b).is_ok(), "zoned regular-device layout");
+                continue;
+            }
             match Superblock::parse(&b) {
                 Err(Error::UnsupportedFeature(message)) => {
                     if let Some(name) = name {
@@ -1569,6 +1618,76 @@ pub(crate) mod tests {
         b[offsets::METADATA_UUID..offsets::METADATA_UUID + UUID_SIZE].copy_from_slice(&TEST_FSID);
         reseal(&mut b);
         assert!(Superblock::parse(&b).is_ok());
+    }
+
+    #[test]
+    fn a_fixed_offset_zoned_superblock_is_readable() {
+        let mut raw = sb_bytes();
+        let flags = le64(&raw, offsets::INCOMPAT_FLAGS) | incompat::ZONED;
+        put64(&mut raw, offsets::INCOMPAT_FLAGS, flags);
+        reseal(&mut raw);
+        assert!(Superblock::parse_at(&raw, SUPER_INFO_OFFSET).is_ok());
+    }
+
+    /// A real zoned device's first log record must not be passed over
+    /// for a stale, ordinary superblock at 64 KiB (#454).
+    struct ZonedLog {
+        damaged: bool,
+        zoned: bool,
+    }
+
+    impl fs_core::BlockRead for ZonedLog {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+            let mut raw = sb_bytes();
+            put64(&mut raw, offsets::BYTENR, offset);
+            if offset == 0 && self.zoned {
+                put64(&mut raw, offsets::INCOMPAT_FLAGS, incompat::ZONED);
+            }
+            reseal(&mut raw);
+            if offset == 0 && self.damaged {
+                raw[CSUM_SIZE - 1] ^= 1;
+                raw[offsets::LABEL] ^= 1;
+            }
+            buf.copy_from_slice(&raw);
+            Ok(())
+        }
+
+        fn size_bytes(&self) -> u64 {
+            256 << 20
+        }
+    }
+
+    #[test]
+    fn a_zoned_superblock_log_is_refused_before_a_stale_fixed_copy() {
+        let dev = ZonedLog {
+            damaged: false,
+            zoned: true,
+        };
+        match read_superblock(&dev) {
+            Err(Error::UnsupportedFeature(message)) => {
+                assert!(message.contains("zoned"), "{message}");
+                assert!(message.contains("superblock log"), "{message}");
+            }
+            other => panic!("a zoned log was read around: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_damaged_zoned_header_at_zero_is_not_a_superblock_log() {
+        let dev = ZonedLog {
+            damaged: true,
+            zoned: true,
+        };
+        assert_eq!(read_superblock(&dev).unwrap().1, 0);
+    }
+
+    #[test]
+    fn a_non_zoned_header_at_zero_does_not_block_a_fixed_copy() {
+        let dev = ZonedLog {
+            damaged: false,
+            zoned: false,
+        };
+        assert_eq!(read_superblock(&dev).unwrap().1, 0);
     }
 
     /// Read-only-compatible bits never block a read-only mount, however

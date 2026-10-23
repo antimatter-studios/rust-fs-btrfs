@@ -27,20 +27,23 @@
 //!
 //! # What it refuses
 //!
-//! - anything outside the top-level subvolume (tree 5), which is the
-//!   only tree a mount writes;
-//! - a full leaf that cannot be split: one a snapshot shares, or one
+//! - a name belonging to another subvolume: inode numbers and parent
+//!   directories are scoped to the tree this handle reads;
+//! - a full leaf that cannot be split: one flagged full backrefs, or one
 //!   whose parent node has no room for another pointer. A full leaf is
 //!   otherwise split in the same transaction, so a large directory goes
 //!   on taking names; a refused one has nothing written;
 //! - a hard link to a directory, and a link whose `INODE_REF` item for
-//!   that parent would outgrow a leaf;
+//!   that parent would outgrow a leaf on a volume without the
+//!   `EXTENDED_IREF` feature, or whose `INODE_EXTREF` item would outgrow
+//!   one. With the feature, a name past a full `INODE_REF` is filed in an
+//!   `INODE_EXTREF` item, as the kernel files it (#425);
 //! - a symbolic link whose target does not fit inline in one sector.
 //!
-//! - removing the last name of a file whose data extents a snapshot may
-//!   share, which truncate refuses too; otherwise the file's data is
-//!   released with its last name, in the same transaction, and an extent a
-//!   reflink shares loses the file's reference and stays (#262);
+//! - removing the last name of a file whose data reference is not inline;
+//!   otherwise the file's data is released with its last name, in the same
+//!   transaction, and an extent a reflink or snapshot shares loses the
+//!   file's reference and stays (#262);
 //! - removing a directory that is not empty;
 //! - moving a directory into itself or below itself.
 //!
@@ -53,19 +56,23 @@
 //! entries and reference go, new ones are filed under a fresh index in
 //! the destination, and a name already there is removed first, exactly
 //! as an unlink or rmdir would. Changing a file's length is
-//! [`crate::truncate`]'s.
+//! [`crate::truncate`]'s, through the same reference-release machinery.
 
 use crate::chunk::{objectid, DiskKey};
 use crate::dir::{self, ftype, DIR_INDEX_KEY, DIR_ITEM_KEY, MAX_NAME_LEN};
 use crate::error::{Error, Result};
-use crate::fs::{Filesystem, EXTENT_DATA_KEY};
+use crate::fs::{Filesystem, SubvolumeWrites, EXTENT_DATA_KEY};
 use crate::inode::{
     offsets as io, Inode, FIRST_FREE_OBJECTID, INODE_ITEM_KEY, INODE_ITEM_SIZE, INODE_NODATACOW,
     INODE_NODATASUM, INODE_REF_KEY,
 };
 use crate::leaf_edit::OwnedItem;
+use crate::log_tree::{extref_hash, INODE_EXTREF_KEY};
 use crate::super_write::Commit;
+use crate::superblock::incompat::EXTENDED_IREF;
 use crate::transaction::{DataRelease, DataWrite, ItemEdit};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// How many rounds a change's plan has to close over its own bookkeeping.
 const PLAN_ROUNDS: usize = 64;
@@ -91,6 +98,9 @@ const INODE_COMPRESS: u64 = 1 << 11;
 
 /// The fixed part of an `INODE_REF`: the index and the name's length.
 const INODE_REF_HEADER: usize = 8 + 2;
+/// `sizeof(struct btrfs_inode_extref)` before the name: parent, index,
+/// name length.
+const INODE_EXTREF_HEADER: usize = 8 + 8 + 2;
 
 /// What a new inode is.
 #[derive(Debug, Clone, Copy)]
@@ -159,7 +169,13 @@ impl Filesystem {
     /// As [`Filesystem::create`], and [`Error::NotAFile`] for a
     /// directory.
     pub fn link(&mut self, ino: u64, parent: u64, name: &[u8]) -> Result<()> {
-        self.require_writable_top_level()?;
+        if self.writable.is_none() && self.subvolume_writes.is_some() {
+            return self.writing_subvolume(|fs| fs.link(ino, parent, name));
+        }
+        if self.writable.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        let root = self.written_tree();
         let dir = self.writable_parent(parent, name)?;
         let target = self.read_inode(ino)?;
         if target.is_dir() {
@@ -181,16 +197,18 @@ impl Filesystem {
         raw[io::NLINK..io::NLINK + 4].copy_from_slice(&(nlink + 1).to_le_bytes());
         touch(&mut raw, generation, now, &[io::CTIME]);
         edits.push(put(ino, INODE_ITEM_KEY, 0, raw));
-        // Its reference back to this parent, joining any it has there.
+        // Its reference back to this parent, joining any it has there,
+        // or an extended reference once that is full.
         let ref_key = key(ino, INODE_REF_KEY, parent);
         let mut refs = self.item_bytes(ref_key)?.unwrap_or_default();
         refs.extend(inode_ref(index, name));
-        if refs.len() > self.max_item_size() {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino}'s references from directory {parent} would outgrow a leaf, and \
-                 extended references are not written"
-            )));
-        }
+        let (ref_key, refs) = if refs.len() > self.max_item_size() {
+            let ext_key = key(ino, INODE_EXTREF_KEY, extref_hash(parent, name));
+            let held = self.item_bytes(ext_key)?;
+            (ext_key, self.extref_with(ino, parent, index, name, held)?)
+        } else {
+            (ref_key, refs)
+        };
         edits.push(ItemEdit::Put(OwnedItem {
             key: ref_key,
             data: refs,
@@ -205,7 +223,7 @@ impl Filesystem {
             generation,
             now,
         )?;
-        self.commit_edits(ino, edits, generation, now)
+        self.commit_edits_in(root, ino, edits, generation, now)
     }
 
     /// Remove the name `name` from directory `parent`. When it was the
@@ -237,7 +255,13 @@ impl Filesystem {
     }
 
     fn remove_name(&mut self, parent: u64, name: &[u8], want_dir: bool) -> Result<()> {
-        self.require_writable_top_level()?;
+        if self.writable.is_none() && self.subvolume_writes.is_some() {
+            return self.writing_subvolume(|fs| fs.remove_name(parent, name, want_dir));
+        }
+        if self.writable.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        let root = self.written_tree();
         check_name(name)?;
         let dir = self.read_inode(parent)?;
         if !dir.is_dir() {
@@ -260,7 +284,7 @@ impl Filesystem {
         let (releases, unrefs) = self.drop_link(&mut p, &child, name)?;
         let edits = p.into_edits(self, generation, now)?;
         if releases.is_empty() && unrefs.is_empty() {
-            return self.commit_edits(child.ino, edits, generation, now);
+            return self.commit_edits_in(root, child.ino, edits, generation, now);
         }
         // The file's data goes with its last name: each extent, its back
         // reference, its checksums and its block group's count, in the
@@ -270,7 +294,7 @@ impl Filesystem {
             .map(|r| (r.old, r.old + r.old_len))
             .collect();
         let write = DataWrite {
-            root: objectid::FS_TREE,
+            root,
             ino: child.ino,
             moves: Vec::new(),
             adds: Vec::new(),
@@ -306,8 +330,8 @@ impl Filesystem {
     /// replace something else, [`Error::NotAFile`] when something else
     /// would replace a directory, and [`Error::UnsupportedFeature`] for a
     /// directory moved into itself or below itself, a replaced directory
-    /// that is not empty, and a replaced file whose data extents a
-    /// snapshot may share, as unlink refuses. A replaced file's
+    /// that is not empty, and a replaced file whose data references cannot
+    /// be released, as unlink refuses. A replaced file's
     /// last name otherwise takes its data with it, in the same
     /// transaction. Nothing is written unless everything is.
     pub fn rename(
@@ -317,7 +341,14 @@ impl Filesystem {
         new_parent: u64,
         new_name: &[u8],
     ) -> Result<()> {
-        self.require_writable_top_level()?;
+        if self.writable.is_none() && self.subvolume_writes.is_some() {
+            return self
+                .writing_subvolume(|fs| fs.rename(old_parent, old_name, new_parent, new_name));
+        }
+        if self.writable.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        let root = self.written_tree();
         check_name(old_name)?;
         check_name(new_name)?;
         for d in [old_parent, new_parent] {
@@ -378,14 +409,14 @@ impl Filesystem {
         p.touch(child.ino, &[io::CTIME]);
         let edits = p.into_edits(self, generation, now)?;
         let Some((ino, releases, unrefs)) = replaced else {
-            return self.commit_edits(child.ino, edits, generation, now);
+            return self.commit_edits_in(root, child.ino, edits, generation, now);
         };
         let released: Vec<(u64, u64)> = releases
             .iter()
             .map(|r| (r.old, r.old + r.old_len))
             .collect();
         let write = DataWrite {
-            root: objectid::FS_TREE,
+            root,
             ino,
             moves: Vec::new(),
             adds: Vec::new(),
@@ -468,20 +499,31 @@ impl Filesystem {
         // The child's reference to this parent loses the name, and gives
         // up the index the parent filed it under.
         let ref_key = key(ino, INODE_REF_KEY, parent);
-        let refs = p.get(self, ref_key)?.ok_or_else(|| {
-            Error::UnsupportedFeature(format!(
-                "inode {ino} has no reference item from directory {parent}; a name held in \
-                 an extended reference is not removed"
-            ))
-        })?;
-        let (index, rest) = without_ref(&refs, name).ok_or_else(|| {
-            Error::UnsupportedFeature(format!(
-                "inode {ino}'s reference from directory {parent} does not hold {:?}; a name \
-                 held in an extended reference is not removed",
-                String::from_utf8_lossy(name)
-            ))
-        })?;
-        p.set(ref_key, non_empty(rest));
+        let held = p.get(self, ref_key)?;
+        let index = match held.as_deref().and_then(|refs| without_ref(refs, name)) {
+            Some((index, rest)) => {
+                p.set(ref_key, non_empty(rest));
+                index
+            }
+            // A name past what the `INODE_REF` item holds lives in an
+            // extended reference, filed under a hash of the parent and
+            // the name (#424).
+            None => {
+                let ext_key = key(ino, INODE_EXTREF_KEY, extref_hash(parent, name));
+                let (index, rest) = p
+                    .get(self, ext_key)?
+                    .and_then(|refs| without_extref(&refs, parent, name))
+                    .ok_or_else(|| {
+                        Error::UnsupportedFeature(format!(
+                            "inode {ino} holds no reference to {:?} from directory {parent}, \
+                             in a reference item or an extended reference",
+                            String::from_utf8_lossy(name)
+                        ))
+                    })?;
+                p.set(ext_key, non_empty(rest));
+                index
+            }
+        };
 
         // The parent's two entries.
         let hash_key = key(parent, DIR_ITEM_KEY, dir::name_hash(name));
@@ -517,12 +559,13 @@ impl Filesystem {
         let mut refs = p.get(self, ref_key)?.unwrap_or_default();
         refs.extend(inode_ref(index, name));
         if refs.len() > self.max_item_size() {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino}'s references from directory {parent} would outgrow a leaf, and \
-                 extended references are not written"
-            )));
+            let ext_key = key(ino, INODE_EXTREF_KEY, extref_hash(parent, name));
+            let held = p.get(self, ext_key)?;
+            let refs = self.extref_with(ino, parent, index, name, held)?;
+            p.set(ext_key, Some(refs));
+        } else {
+            p.set(ref_key, Some(refs));
         }
-        p.set(ref_key, Some(refs));
 
         let entry = dir_entry(ino, generation, ft, name);
         let hash_key = key(parent, DIR_ITEM_KEY, dir::name_hash(name));
@@ -552,6 +595,7 @@ impl Filesystem {
         name: &[u8],
     ) -> Result<(Vec<DataRelease>, Vec<DataRelease>)> {
         let ino = inode.ino;
+        crate::verity::refuse_mutation(ino, inode.flags)?;
         // A directory has one link however many names it has had.
         let nlink = if inode.is_dir() { 1 } else { inode.nlink };
         if nlink > 1 {
@@ -565,34 +609,24 @@ impl Filesystem {
         }
         let mut releases = Vec::new();
         let mut unrefs = Vec::new();
-        let last_snapshot = self.fs_tree_last_snapshot()?;
         for (k, data) in self.items_of(ino)? {
             match k.key_type {
                 // A reference already emptied by this change.
-                INODE_REF_KEY if p.get(self, k)?.is_none() => {}
+                INODE_REF_KEY | INODE_EXTREF_KEY if p.get(self, k)?.is_none() => {}
                 INODE_ITEM_KEY | dir::XATTR_ITEM_KEY => p.remove(self, k)?,
                 EXTENT_DATA_KEY if holds_no_extent(&data) => p.remove(self, k)?,
                 // The whole file goes: cut to nothing, as truncate cuts, so
                 // its extent is released and the item deleted.
                 EXTENT_DATA_KEY => {
-                    self.shrink_item(
-                        ino,
-                        0,
-                        0,
-                        last_snapshot,
-                        &k,
-                        &data,
-                        &mut releases,
-                        &mut unrefs,
-                    )
-                    .map_err(|e| match e {
-                        Error::UnsupportedFeature(why) => Error::UnsupportedFeature(format!(
-                            "{:?} is the last name of inode {ino}, and its data cannot \
+                    self.shrink_item(ino, 0, 0, &k, &data, &mut releases, &mut unrefs)
+                        .map_err(|e| match e {
+                            Error::UnsupportedFeature(why) => Error::UnsupportedFeature(format!(
+                                "{:?} is the last name of inode {ino}, and its data cannot \
                                  be released: {why}",
-                            String::from_utf8_lossy(name)
-                        )),
-                        other => other,
-                    })?;
+                                String::from_utf8_lossy(name)
+                            )),
+                            other => other,
+                        })?;
                     p.remove(self, k)?;
                 }
                 other => {
@@ -636,7 +670,30 @@ impl Filesystem {
         uid: u32,
         gid: u32,
     ) -> Result<u64> {
-        self.require_writable_top_level()?;
+        match self.subvolume_writes.as_ref().map(|w| w.id) {
+            Some(id) => {
+                self.writing_subvolume(|fs| fs.add_inode_in(id, parent, name, kind, mode, uid, gid))
+            }
+            None => {
+                self.require_writable_top_level()?;
+                self.add_inode_in(objectid::FS_TREE, parent, name, kind, mode, uid, gid)
+            }
+        }
+    }
+
+    /// [`Filesystem::add_inode`] in the tree `root`, which this handle
+    /// reads.
+    #[allow(clippy::too_many_arguments)]
+    fn add_inode_in(
+        &mut self,
+        root: u64,
+        parent: u64,
+        name: &[u8],
+        kind: NewKind,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<u64> {
         let dir = self.writable_parent(parent, name)?;
         if let NewKind::Symlink(target) = kind {
             let limit = (self.sb.sectorsize as usize - 1).min(self.max_item_size() - INLINE_HEADER);
@@ -691,7 +748,7 @@ impl Filesystem {
             ));
         }
         self.entry_edits(&mut edits, &dir, name, ino, ft, index, generation, now)?;
-        self.commit_edits(ino, edits, generation, now)?;
+        self.commit_edits_in(root, ino, edits, generation, now)?;
         Ok(ino)
     }
 
@@ -744,8 +801,21 @@ impl Filesystem {
         generation: u64,
         now: (u64, u32),
     ) -> Result<()> {
+        self.commit_edits_in(objectid::FS_TREE, ino, edits, generation, now)
+    }
+
+    /// [`Filesystem::commit_edits`] to the tree `root`, which this handle
+    /// reads (#517).
+    pub(crate) fn commit_edits_in(
+        &mut self,
+        root: u64,
+        ino: u64,
+        edits: Vec<ItemEdit>,
+        generation: u64,
+        now: (u64, u32),
+    ) -> Result<()> {
         let write = DataWrite {
-            root: objectid::FS_TREE,
+            root,
             ino,
             moves: Vec::new(),
             adds: Vec::new(),
@@ -853,6 +923,62 @@ impl Filesystem {
         // (#298): `mount_rw` opens one device and refuses a pool (#336).
         *self = self.remount_rw()?;
         Ok(())
+    }
+
+    /// The devices this handle writes through, its own or those a
+    /// subvolume handle holds aside, held for the subvolume `id` (#517).
+    pub(crate) fn writes_for_subvolume(&self, id: u64) -> Option<SubvolumeWrites> {
+        let (writable, writable_pool) = match (&self.writable, &self.subvolume_writes) {
+            (Some(device), _) => (Arc::clone(device), self.writable_pool.clone()),
+            (None, Some(w)) => (Arc::clone(&w.writable), w.writable_pool.clone()),
+            (None, None) => return None,
+        };
+        Some(SubvolumeWrites {
+            id,
+            writable,
+            writable_pool,
+        })
+    }
+
+    /// The tree a write through this handle commits to: the subvolume a
+    /// subvolume handle holds the devices for, or the top level (#445).
+    pub(crate) fn written_tree(&self) -> u64 {
+        self.subvolume_writes
+            .as_ref()
+            .map_or(objectid::FS_TREE, |w| w.id)
+    }
+
+    /// Run `write`, a change committed against this subvolume handle's own
+    /// tree, with the handle's devices in place (#517).
+    ///
+    /// A commit reopens the mount, which opens the top level, so whatever
+    /// `write` leaves behind is turned back into this subvolume's handle
+    /// on the generation it reached, read-only to everything else again.
+    pub(crate) fn writing_subvolume<R>(
+        &mut self,
+        write: impl FnOnce(&mut Self) -> Result<R>,
+    ) -> Result<R> {
+        let held = self.subvolume_writes.clone().ok_or(Error::ReadOnly)?;
+        self.writable = Some(Arc::clone(&held.writable));
+        self.writable_pool = held.writable_pool.clone();
+        let out = write(self);
+        let reopened = self.tree_root(held.id).and_then(|root| self.reroot(root));
+        match reopened {
+            Ok(mut fs) => {
+                fs.subvolume_writes = Some(held);
+                *self = fs;
+            }
+            Err(e) => {
+                // Read-only again whatever happened: the handle must never
+                // be left writing the top level.
+                self.writable = None;
+                self.writable_pool = BTreeMap::new();
+                self.subvolume_writes = Some(held);
+                out?;
+                return Err(e);
+            }
+        }
+        out
     }
 
     /// Refuse a read-only mount, and one whose tree is not tree 5.
@@ -965,6 +1091,38 @@ impl Filesystem {
     /// one item header.
     pub(crate) fn max_item_size(&self) -> usize {
         self.sb.nodesize as usize - LEAF_HEADER - ITEM_HEADER
+    }
+
+    /// The `INODE_EXTREF` item filing `name` in `parent` under `index`,
+    /// for a link whose `INODE_REF` item for that parent is full: `held`,
+    /// what the item under the hash of the parent and the name holds
+    /// already, with the record appended. The kernel files such a name
+    /// the same way on a volume with the `EXTENDED_IREF` feature, and
+    /// refuses it on one without (#425).
+    fn extref_with(
+        &self,
+        ino: u64,
+        parent: u64,
+        index: u64,
+        name: &[u8],
+        held: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        if self.sb.incompat_flags & EXTENDED_IREF == 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}'s references from directory {parent} would outgrow a leaf, and \
+                 the volume has no extended references (EXTENDED_IREF) to hold more"
+            )));
+        }
+        let mut refs = held.unwrap_or_default();
+        refs.extend(inode_extref(parent, index, name));
+        if refs.len() > self.max_item_size() {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}'s extended references sharing the hash of {:?} in directory \
+                 {parent} would outgrow a leaf",
+                String::from_utf8_lossy(name)
+            )));
+        }
+        Ok(refs)
     }
 }
 
@@ -1243,6 +1401,28 @@ fn without_ref(data: &[u8], name: &[u8]) -> Option<(u64, Vec<u8>)> {
     None
 }
 
+/// An `INODE_EXTREF` item without the record naming `name` in `parent`:
+/// that record's index, and the bytes left. `None` when no record holds
+/// the name or the records do not parse.
+fn without_extref(data: &[u8], parent: u64, name: &[u8]) -> Option<(u64, Vec<u8>)> {
+    let mut pos = 0;
+    while pos + INODE_EXTREF_HEADER <= data.len() {
+        let len = usize::from(u16::from_le_bytes([data[pos + 16], data[pos + 17]]));
+        let end = pos + INODE_EXTREF_HEADER + len;
+        if end > data.len() {
+            return None;
+        }
+        if le64(data, pos) == parent && &data[pos + INODE_EXTREF_HEADER..end] == name {
+            let index = le64(data, pos + 8);
+            let mut rest = data[..pos].to_vec();
+            rest.extend_from_slice(&data[end..]);
+            return Some((index, rest));
+        }
+        pos = end;
+    }
+    None
+}
+
 /// A `DIR_ITEM` without the record naming `name`, or `None` when no
 /// record holds it.
 pub(crate) fn without_dir_record(data: &[u8], name: &[u8]) -> Option<Vec<u8>> {
@@ -1281,6 +1461,16 @@ fn holds_no_extent(data: &[u8]) -> bool {
 /// One `INODE_REF` record: the name's index in the parent, and the name.
 fn inode_ref(index: u64, name: &[u8]) -> Vec<u8> {
     let mut b = Vec::with_capacity(INODE_REF_HEADER + name.len());
+    b.extend_from_slice(&index.to_le_bytes());
+    b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    b.extend_from_slice(name);
+    b
+}
+
+/// One `INODE_EXTREF` record: the parent, the index there, and the name.
+fn inode_extref(parent: u64, index: u64, name: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(INODE_EXTREF_HEADER + name.len());
+    b.extend_from_slice(&parent.to_le_bytes());
     b.extend_from_slice(&index.to_le_bytes());
     b.extend_from_slice(&(name.len() as u16).to_le_bytes());
     b.extend_from_slice(name);

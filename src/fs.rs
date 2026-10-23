@@ -390,11 +390,23 @@ pub(crate) struct FileExtent {
     /// Where this reference starts within the extent's bytes — decoded
     /// bytes, for a compressed one: the item's `offset`.
     pub ref_offset: u64,
+    /// Whether its bytes are inline in the item rather than in an extent.
+    pub inline: bool,
 }
 
 /// One piece of a write: the device, the physical offset on it, and
 /// the `[from, from + length)` of the caller's buffer that goes there.
 pub(crate) type WriteSpan = (Arc<dyn BlockDevice>, u64, usize, usize);
+
+/// The devices a subvolume handle writes through, and the subvolume
+/// (#517). See [`Filesystem::subvolume_writes`].
+#[derive(Clone)]
+pub(crate) struct SubvolumeWrites {
+    /// The subvolume's id: the objectid its `ROOT_ITEM` is filed under.
+    pub(crate) id: u64,
+    pub(crate) writable: Arc<dyn BlockDevice>,
+    pub(crate) writable_pool: BTreeMap<u64, Arc<dyn BlockDevice>>,
+}
 
 /// A mounted Btrfs filesystem.
 pub struct Filesystem {
@@ -421,9 +433,25 @@ pub struct Filesystem {
     /// here, which is the whole difference between writing a pool and
     /// writing the same offsets of one of its disks.
     pub(crate) writable_pool: BTreeMap<u64, Arc<dyn BlockDevice>>,
+    /// The seed devices of a sprouted filesystem opened for writing, by
+    /// devid (#624).
+    ///
+    /// Read through [`Self::devices`] like any member and never written:
+    /// they are not in [`Self::writable_pool`], so a commit writes them no
+    /// superblock and a stripe on one is refused. Kept so that a remount
+    /// after a commit opens the same pair.
+    pub(crate) seed_pool: BTreeMap<u64, Arc<dyn BlockDevice>>,
     pub(crate) sb: Superblock,
     pub(crate) map: ChunkMap,
     pub(crate) fs_tree_root: u64,
+    /// A subvolume handle's write capability, held aside (#517).
+    ///
+    /// `None` for a mount, which writes through `writable`. A handle from
+    /// [`Filesystem::open_subvolume`] on a writable mount keeps `writable`
+    /// empty, so every write that only knows the top level still refuses
+    /// it as read-only, and holds the devices here for the operations
+    /// that commit against the subvolume's own tree.
+    pub(crate) subvolume_writes: Option<SubvolumeWrites>,
     /// The csum tree's root, when the filesystem has one.
     ///
     /// `None` only for a filesystem whose root tree holds no ROOT_ITEM
@@ -660,6 +688,15 @@ impl Filesystem {
 
     /// What every read-write mount refuses, a pool's as one device's.
     fn refuse_unwritable(&self) -> Result<()> {
+        // Emulated zones on regular devices have ordinary read mappings,
+        // but writes must obey zone append and reset rules (#454).
+        if self.sb.incompat_flags & crate::superblock::incompat::ZONED != 0 {
+            return Err(Error::UnsupportedFeature(
+                "this volume uses zoned mode, which can be read but not written: writes \
+                 require sequential zone allocation and zone reset support"
+                    .into(),
+            ));
+        }
         // Simple quotas are read and not maintained: an extent this driver
         // allocated would carry no owner reference and charge no quota
         // group, and the kernel's accounting would then be wrong (#270).
@@ -710,14 +747,17 @@ impl Filesystem {
     /// each chunk stripe names, every copy of a mirrored chunk on its own
     /// disk, and a commit writes every device's superblocks, each keeping
     /// its own `dev_item` (#298). A single device is accepted, and is
-    /// [`Filesystem::mount_rw`].
+    /// [`Filesystem::mount_rw`]. A seed given with the filesystem sprouted
+    /// from it is read and never written (#624): it need not be writable,
+    /// gets no superblock from a commit, and a stripe on it is refused.
     ///
     /// # Errors
     ///
     /// [`Error::ReadOnly`] when a device cannot be written;
     /// [`Error::UnsupportedFeature`] for an incomplete set, devices of
     /// different filesystems or two claiming one devid, as
-    /// [`Filesystem::mount_pool`] refuses them; and for a member whose
+    /// [`Filesystem::mount_pool`] refuses them; for devices that are all
+    /// seeds; and for a member whose
     /// newest superblock is not its primary copy or is not of the same
     /// generation as the rest. Such a member missed a commit the others
     /// saw, and writing on top of it is a decision for `btrfs check`.
@@ -727,14 +767,33 @@ impl Filesystem {
                 "a pool needs at least one device".to_string(),
             ));
         }
-        if devices.iter().any(|d| !d.is_writable()) {
-            return Err(Error::ReadOnly);
-        }
+        let several = devices.len() > 1;
         let mut by_id: BTreeMap<u64, Arc<dyn BlockDevice>> = BTreeMap::new();
+        let mut seeds: BTreeMap<u64, Arc<dyn BlockDevice>> = BTreeMap::new();
+        let mut seed_items = Vec::new();
         let mut first: Option<(crate::superblock::Superblock, usize)> = None;
         for dev in devices {
             let (sb, copy) = crate::superblock::read_superblock(&*dev)?;
             let id = sb.dev_item.devid;
+            // A SEED AND ITS SPROUT ARE ONE FILESYSTEM (#561), written
+            // through the sprout (#624). The seed's superblock keeps the
+            // seed's own fsid and the generation it was frozen at, so it
+            // is set aside before either is compared, held for reading
+            // only, and checked against the sprout's chunk tree once that
+            // is read, as `mount_pool` checks it. A seed alone is
+            // `mount_rw`'s, and refused there.
+            if several && sb.is_seeding() {
+                seed_items.push(sb.dev_item.clone());
+                if seeds.insert(id, dev).is_some() {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "two devices both claim to be device {id}"
+                    )));
+                }
+                continue;
+            }
+            if !dev.is_writable() {
+                return Err(Error::ReadOnly);
+            }
             if let Some((seen, _)) = &first {
                 if seen.fsid != sb.fsid {
                     return Err(Error::UnsupportedFeature(
@@ -764,21 +823,36 @@ impl Filesystem {
                 )));
             }
         }
-        let (lowest, primary) = by_id
-            .iter()
-            .next()
-            .map(|(id, d)| (*id, Arc::clone(d)))
-            .expect("at least one device, checked above");
-        if by_id.len() == 1 {
+        let Some((lowest, primary)) = by_id.iter().next().map(|(id, d)| (*id, Arc::clone(d)))
+        else {
+            return Err(Error::UnsupportedFeature(
+                "these devices are all seeds, which can be read but not written; write to \
+                 the filesystem sprouted from them"
+                    .into(),
+            ));
+        };
+        if by_id.len() == 1 && seeds.is_empty() {
             return Self::mount_rw(primary);
         }
-        let readers: BTreeMap<u64, Arc<dyn BlockRead>> = by_id
+        let mut readers: BTreeMap<u64, Arc<dyn BlockRead>> = by_id
             .iter()
             .map(|(id, d)| (*id, Arc::clone(d) as Arc<dyn BlockRead>))
             .collect();
+        for (id, seed) in &seeds {
+            if readers
+                .insert(*id, Arc::clone(seed) as Arc<dyn BlockRead>)
+                .is_some()
+            {
+                return Err(Error::UnsupportedFeature(format!(
+                    "two devices both claim to be device {id}"
+                )));
+            }
+        }
         let mut fs = Self::open_pool(Arc::clone(&readers[&lowest]), readers, Some(primary), None)?;
+        fs.verify_seed_members(&seed_items)?;
         fs.refuse_unwritable()?;
         fs.writable_pool = by_id;
+        fs.seed_pool = seeds;
         Ok(fs)
     }
 
@@ -787,7 +861,13 @@ impl Filesystem {
     /// mount was set to do, its compression, carries over.
     pub(crate) fn remount_rw(&self) -> Result<Self> {
         let mut fs = if !self.writable_pool.is_empty() {
-            Self::mount_pool_rw(self.writable_pool.values().cloned().collect())?
+            Self::mount_pool_rw(
+                self.writable_pool
+                    .values()
+                    .chain(self.seed_pool.values())
+                    .cloned()
+                    .collect(),
+            )?
         } else {
             let device = self.writable.as_ref().ok_or(Error::ReadOnly)?;
             Self::mount_rw(Arc::clone(device))?
@@ -1389,9 +1469,11 @@ impl Filesystem {
             devices,
             writable,
             writable_pool: BTreeMap::new(),
+            seed_pool: BTreeMap::new(),
             sb,
             map,
             fs_tree_root,
+            subvolume_writes: None,
             csum_tree_root,
             nodes: std::sync::Mutex::new(NodeCache::new(NODE_CACHE_BLOCKS)),
             compression: crate::compression::Compression::None,
@@ -1852,9 +1934,11 @@ impl Filesystem {
             devices: self.devices.clone(),
             writable: None,
             writable_pool: BTreeMap::new(),
+            seed_pool: self.seed_pool.clone(),
             sb: self.sb.clone(),
             map: self.map.clone(),
             fs_tree_root,
+            subvolume_writes: None,
             // A subvolume is another tree on the same volume, so its
             // data is checksummed by the same csum tree.
             csum_tree_root: self.csum_tree_root,
@@ -2437,6 +2521,7 @@ impl Filesystem {
                     extent_start: 0,
                     compressed: false,
                     ref_offset: 0,
+                    inline: true,
                 }),
                 Piece::Preallocated { logical, len } => out.push(FileExtent {
                     start,
@@ -2445,6 +2530,7 @@ impl Filesystem {
                     extent_start: logical,
                     compressed: false,
                     ref_offset: 0,
+                    inline: false,
                 }),
                 Piece::Hole => {}
                 Piece::Regular { logical, len } => out.push(FileExtent {
@@ -2456,6 +2542,7 @@ impl Filesystem {
                     extent_start: le64(data, file_extent::DISK_BYTENR),
                     compressed: false,
                     ref_offset: logical - le64(data, file_extent::DISK_BYTENR),
+                    inline: false,
                 }),
                 Piece::Compressed { len, offset, .. } => out.push(FileExtent {
                     start,
@@ -2464,6 +2551,7 @@ impl Filesystem {
                     extent_start: le64(data, file_extent::DISK_BYTENR),
                     compressed: true,
                     ref_offset: offset,
+                    inline: false,
                 }),
             }
         }

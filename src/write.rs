@@ -86,6 +86,7 @@ impl Filesystem {
         if !inode.is_regular_file() {
             return Err(Error::NotAFile);
         }
+        crate::verity::refuse_mutation(ino, inode.flags)?;
         if inode.flags & INODE_NODATACOW == 0 {
             return Err(Error::UnsupportedFeature(format!(
                 "inode {ino} is copy-on-write, so overwriting it in place would leave the \
@@ -151,7 +152,7 @@ impl Filesystem {
     /// reason.
     pub fn can_write_in_place(&self, ino: u64) -> Result<bool> {
         let inode = self.read_inode(ino)?;
-        if !inode.is_regular_file() {
+        if !inode.is_regular_file() || inode.flags & crate::verity::INODE_RO_VERITY != 0 {
             return Ok(false);
         }
         if inode.flags & (INODE_NODATACOW | INODE_NODATASUM) != (INODE_NODATACOW | INODE_NODATASUM)
@@ -313,20 +314,25 @@ impl Filesystem {
         })
     }
 
-    /// The generation the default subvolume was last snapshotted at, or
+    /// The generation this handle's subvolume was last snapshotted at, or
     /// zero if it never was.
     ///
-    /// A writable mount writes only the default subvolume (a subvolume
-    /// handle never carries the write capability), so this is the tree
-    /// every write edits.
+    /// Match the root's address so a read-only subvolume handle gets the
+    /// same sharing answer as one carrying its tree's write capability.
     pub(crate) fn fs_tree_last_snapshot(&self) -> Result<u64> {
-        use crate::fs::{root_item, FS_TREE_OBJECTID, ROOT_ITEM_KEY};
+        use crate::fs::{root_item, ROOT_ITEM_KEY};
         let reader = self.pool_reader();
         let mut found = None;
         reader
             .tree()
             .for_each(self.sb.root, &mut |key: &DiskKey, data: &[u8]| {
-                if key.objectid == FS_TREE_OBJECTID && key.key_type == ROOT_ITEM_KEY {
+                if key.key_type == ROOT_ITEM_KEY
+                    && data
+                        .get(root_item::BYTENR..root_item::BYTENR + 8)
+                        .is_some_and(|b| {
+                            u64::from_le_bytes(b.try_into().expect("8 bytes")) == self.fs_tree_root
+                        })
+                {
                     found = data
                         .get(root_item::LAST_SNAPSHOT..root_item::LAST_SNAPSHOT + 8)
                         .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")));
@@ -339,7 +345,7 @@ impl Filesystem {
         // into a write over shared data.
         found.ok_or_else(|| {
             Error::UnsupportedFeature(
-                "the root tree holds no readable ROOT_ITEM for the default subvolume, so \
+                "the root tree holds no readable ROOT_ITEM for this subvolume, so \
                  whether a snapshot shares its extents cannot be established"
                     .into(),
             )

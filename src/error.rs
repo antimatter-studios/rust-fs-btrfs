@@ -25,6 +25,11 @@ pub enum Error {
     /// internally inconsistent. Carries a human-readable description of
     /// the specific field, because a bad geometry value is almost always
     /// the first symptom of reading the wrong offset.
+    ///
+    /// Despite its name the variant covers every metadata structure —
+    /// tree blocks, directory items, inodes, extents, the log tree — so
+    /// its text does not blame the superblock; a message about the
+    /// superblock itself says so in its detail (#473).
     BadSuperblock(String),
 
     /// A metadata block failed the checksum named by `csum_type`. Btrfs
@@ -100,6 +105,17 @@ pub enum Error {
     /// read-only or the driver has no write path for this structure.
     ReadOnly,
 
+    /// The volume was committed through another handle after this one
+    /// read its superblock (#599). Committing from the older view would
+    /// write over that commit and use its generation again, so nothing
+    /// was written; open the handle again to write.
+    Stale {
+        /// The generation this handle read.
+        handle: u64,
+        /// The generation on the device now.
+        disk: u64,
+    },
+
     /// A format was asked for that cannot be made: a device too small, a
     /// node size out of range, a label too long. Nothing was written.
     InvalidGeometry(String),
@@ -112,7 +128,7 @@ impl fmt::Display for Error {
             Error::NotBtrfs { magic } => {
                 write!(f, "not a Btrfs volume (magic bytes {magic:02x?})")
             }
-            Error::BadSuperblock(m) => write!(f, "malformed Btrfs superblock: {m}"),
+            Error::BadSuperblock(m) => write!(f, "malformed Btrfs metadata: {m}"),
             Error::ChecksumMismatch { what, offset } => {
                 write!(f, "{what} at offset {offset} failed its checksum")
             }
@@ -135,6 +151,10 @@ impl fmt::Display for Error {
             Error::NotADirectory => f.write_str("not a directory"),
             Error::NotAFile => f.write_str("not a regular file"),
             Error::ReadOnly => f.write_str("filesystem is read-only"),
+            Error::Stale { handle, disk } => write!(
+                f,
+                "stale handle: read at generation {handle}, another handle has committed generation {disk}"
+            ),
             Error::InvalidGeometry(m) => write!(f, "cannot format: {m}"),
         }
     }

@@ -361,6 +361,7 @@ impl Filesystem {
                         Arc::clone(d)
                     }
                 })
+                .chain(self.seed_pool.values().cloned())
                 .collect()
         };
         *self = Filesystem::mount_pool_rw(members)?;

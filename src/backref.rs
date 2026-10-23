@@ -23,11 +23,22 @@
 //!
 //! References live inline in the extent item when there is room, as a
 //! type byte followed by a payload, and otherwise as items of their own
-//! keyed `(extent, type, parent)`. Inline ones are ordered by type and
-//! then by their offset field. A keyed DATA reference is ordered among
-//! its kind by a hash of its fields, which this driver does not compute;
-//! a conversion that would have to place one among others is refused by
-//! name rather than written in a guessed order.
+//! keyed `(extent, type, parent)`. Inline ones are ordered by type and,
+//! within a type, from the largest offset field down: the kernel's
+//! `lookup_inline_extent_backref` scans them in that order, stops at the
+//! first one smaller than what it wants, and inserts a new one there. So
+//! an edit here takes references out and puts new ones in where that scan
+//! would, and never re-sorts the rest. A keyed DATA reference is ordered
+//! among its kind by a hash of its fields, which this driver does not
+//! compute; a conversion that would have to place one among others is
+//! refused by name rather than written in a guessed order.
+//!
+//! A snapshot shares tree blocks rather than copying them. When a tree
+//! copies a block that another tree still reaches, the old block keeps
+//! that other tree's reference and becomes `FULL_BACKREF`, and each of its
+//! children gains a shared reference naming it -- the old block's own
+//! pointers, which the snapshot still reads (#262): [`add_inline_shared`]
+//! and [`drop_inline_tree_ref`].
 
 use crate::chunk::key_type;
 use crate::error::{Error, Result};
@@ -75,19 +86,22 @@ impl InlineRef {
                 .expect("every payload has 8 bytes"),
         )
     }
+}
 
-    /// The key inline references are ordered by. A keyed data reference
-    /// is ordered by a hash of its fields, which this code does not
-    /// compute: [`add_inline_keyed`] only adds one where it is the only
-    /// one of its kind, so those already there keep the order they were
-    /// found in.
-    fn order(&self) -> (u8, u64) {
-        if self.kind == EXTENT_DATA_REF {
-            (self.kind, 0)
-        } else {
-            (self.kind, self.offset())
-        }
-    }
+/// Where the kernel puts a new inline reference of type `kind` and offset
+/// field `offset` among `refs`: past every reference of a lower type, and
+/// among its own type before the first whose offset is smaller. That is
+/// where `lookup_inline_extent_backref`'s scan stops, and where it would
+/// look for the reference again. An owner reference, which simple quotas
+/// put first, is passed over as the scan passes over it. A keyed data
+/// reference is ordered by a hash this does not compute, so the callers
+/// place one only where it is the only one of its kind.
+fn insert_position(refs: &[InlineRef], kind: u8, offset: u64) -> usize {
+    refs.iter()
+        .position(|r| {
+            r.kind != EXTENT_OWNER_REF && (kind < r.kind || (kind == r.kind && r.offset() < offset))
+        })
+        .unwrap_or(refs.len())
 }
 
 /// How long an inline reference's payload is.
@@ -204,11 +218,10 @@ fn shared_count(r: &InlineRef) -> u32 {
     }
 }
 
-/// Rebuild an item body from its fixed part and `refs`, in the order the
-/// format keeps them.
-fn rebuild(body: &[u8], start: usize, mut refs: Vec<InlineRef>) -> Vec<u8> {
-    // Stable, so keyed data references keep the order they were in.
-    refs.sort_by_key(InlineRef::order);
+/// Rebuild an item body from its fixed part and `refs`, in the order
+/// given: each edit keeps the others where they were and puts a new one
+/// where the kernel would ([`insert_position`]).
+fn rebuild(body: &[u8], start: usize, refs: Vec<InlineRef>) -> Vec<u8> {
     let mut out = body[..start].to_vec();
     for r in &refs {
         out.push(r.kind);
@@ -267,10 +280,14 @@ pub fn add_inline_keyed(item_type: u8, body: &[u8], keyed: Keyed, count: u32) ->
                      converting its shared reference would count that tree twice"
                 )));
             }
-            refs.push(InlineRef {
-                kind: TREE_BLOCK_REF,
-                payload: tree.to_le_bytes().to_vec(),
-            });
+            let at = insert_position(&refs, TREE_BLOCK_REF, tree);
+            refs.insert(
+                at,
+                InlineRef {
+                    kind: TREE_BLOCK_REF,
+                    payload: tree.to_le_bytes().to_vec(),
+                },
+            );
         }
         Keyed::Data {
             tree,
@@ -307,10 +324,16 @@ pub fn add_inline_keyed(item_type: u8, body: &[u8], keyed: Keyed, count: u32) ->
             } else {
                 let mut payload = fields;
                 payload.extend_from_slice(&count.to_le_bytes());
-                refs.push(InlineRef {
-                    kind: EXTENT_DATA_REF,
-                    payload,
-                });
+                // The only one of its kind, so its hash places it nowhere
+                // in particular: after the lower types, before the higher.
+                let at = insert_position(&refs, EXTENT_DATA_REF, 0);
+                refs.insert(
+                    at,
+                    InlineRef {
+                        kind: EXTENT_DATA_REF,
+                        payload,
+                    },
+                );
             }
         }
     }
@@ -366,6 +389,69 @@ pub fn drop_inline_data_ref(
     let mut head = body[..start].to_vec();
     head[..8].copy_from_slice(&(total - 1).to_le_bytes());
     Ok(Some(rebuild(&head, start, refs)))
+}
+
+/// The body of a keyed `EXTENT_DATA_REF` item -- a data reference the
+/// kernel filed as an item of its own once its record had no room inline
+/// (#442) -- with one reference dropped: its count down by one, or `None`
+/// when its count was one and the item goes.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] when the item is not 28 bytes naming
+/// `tree`, `objectid` and `offset` (a hash collision files the reference
+/// under another key, which is not searched here) or counts nothing.
+pub fn drop_keyed_data_ref(
+    item: &[u8],
+    tree: u64,
+    objectid: u64,
+    offset: u64,
+) -> Result<Option<Vec<u8>>> {
+    let mut fields = Vec::with_capacity(24);
+    for v in [tree, objectid, offset] {
+        fields.extend_from_slice(&v.to_le_bytes());
+    }
+    if item.len() != 28 || item[..24] != fields[..] {
+        return Err(Error::UnsupportedFeature(format!(
+            "the keyed data reference where inode {objectid} in tree {tree} at {offset} \
+             hashes is {} bytes naming something else",
+            item.len()
+        )));
+    }
+    let count = u32::from_le_bytes(item[24..28].try_into().expect("28 bytes"));
+    match count {
+        0 => Err(Error::UnsupportedFeature(format!(
+            "the keyed data reference of inode {objectid} in tree {tree} at {offset} counts \
+             nothing"
+        ))),
+        1 => Ok(None),
+        _ => {
+            let mut kept = item.to_vec();
+            kept[24..28].copy_from_slice(&(count - 1).to_le_bytes());
+            Ok(Some(kept))
+        }
+    }
+}
+
+/// An extent record's `body` with one from its total, for a reference
+/// dropped from a keyed item rather than inline (#442).
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] when the total is one or less: dropping
+/// the last reference is releasing the extent, which is not this edit.
+/// And as [`refs_start`].
+pub fn lower_total(item_type: u8, body: &[u8]) -> Result<Vec<u8>> {
+    refs_start(item_type, body)?;
+    let total = u64::from_le_bytes(body[..8].try_into().expect("a fixed part"));
+    if total <= 1 {
+        return Err(Error::UnsupportedFeature(
+            "the reference is its extent's last, and dropping it is releasing the extent".into(),
+        ));
+    }
+    let mut out = body.to_vec();
+    out[..8].copy_from_slice(&(total - 1).to_le_bytes());
+    Ok(out)
 }
 
 /// `body` with one more reference from the file item of inode `objectid`
@@ -456,6 +542,115 @@ pub fn add_inline_data_ref(
         out.push(r.kind);
         out.extend_from_slice(&r.payload);
     }
+    Ok(out)
+}
+
+/// `body` with `count` shared references of type `kind` naming `parent`
+/// added inline, and the item's total up by `count` (#262): what a child
+/// of a block a snapshot shares gains when its tree copies that block. A
+/// data extent the block's items point at more than once takes all of them
+/// in one `SHARED_DATA_REF`, and one already naming `parent` takes the
+/// count. The new reference goes where the kernel's scan would put it.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] for a tree block `parent` already names,
+/// which would count one pointer twice, a count other than one for a tree
+/// block, and a `kind` that is not a shared reference. And as
+/// [`inline_refs`].
+pub fn add_inline_shared(
+    item_type: u8,
+    body: &[u8],
+    kind: u8,
+    parent: u64,
+    count: u32,
+) -> Result<Vec<u8>> {
+    let start = refs_start(item_type, body)?;
+    let mut refs = inline_refs(item_type, body)?;
+    let existing = refs
+        .iter()
+        .position(|r| r.kind == kind && r.offset() == parent);
+    match (kind, existing) {
+        (SHARED_DATA_REF, Some(at)) => {
+            let had = shared_count(&refs[at]);
+            refs[at].payload[8..12].copy_from_slice(&(had + count).to_le_bytes());
+        }
+        (SHARED_DATA_REF, None) => {
+            let mut payload = parent.to_le_bytes().to_vec();
+            payload.extend_from_slice(&count.to_le_bytes());
+            let at = insert_position(&refs, kind, parent);
+            refs.insert(at, InlineRef { kind, payload });
+        }
+        (SHARED_BLOCK_REF, Some(_)) => {
+            return Err(Error::UnsupportedFeature(format!(
+                "the tree block is already referred to by the block at {parent}, so another \
+                 reference from it would count one pointer twice"
+            )))
+        }
+        (SHARED_BLOCK_REF, None) if count == 1 => {
+            let at = insert_position(&refs, kind, parent);
+            refs.insert(
+                at,
+                InlineRef {
+                    kind,
+                    payload: parent.to_le_bytes().to_vec(),
+                },
+            );
+        }
+        _ => {
+            return Err(Error::UnsupportedFeature(format!(
+                "{count} shared reference(s) of type {kind} from the block at {parent} is not \
+                 a reference copy-on-write adds"
+            )))
+        }
+    }
+    let total = u64::from_le_bytes(body[..8].try_into().expect("a fixed part"));
+    let mut head = body[..start].to_vec();
+    head[..8].copy_from_slice(&(total + u64::from(count)).to_le_bytes());
+    Ok(rebuild(&head, start, refs))
+}
+
+/// `body` without its inline `TREE_BLOCK_REF` naming `tree`, and the
+/// item's total down by one (#262): a tree block that tree has copied, and
+/// that another tree still points at. `None` when the item holds no such
+/// reference inline.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] when the reference is the item's last:
+/// dropping it is releasing the block, which is not this edit. And as
+/// [`inline_refs`].
+pub fn drop_inline_tree_ref(item_type: u8, body: &[u8], tree: u64) -> Result<Option<Vec<u8>>> {
+    let start = refs_start(item_type, body)?;
+    let mut refs = inline_refs(item_type, body)?;
+    let Some(at) = refs
+        .iter()
+        .position(|r| r.kind == TREE_BLOCK_REF && r.offset() == tree)
+    else {
+        return Ok(None);
+    };
+    let total = u64::from_le_bytes(body[..8].try_into().expect("a fixed part"));
+    if total <= 1 {
+        return Err(Error::UnsupportedFeature(format!(
+            "the reference from tree {tree} is its tree block's last, and dropping it is \
+             releasing the block"
+        )));
+    }
+    refs.remove(at);
+    let mut head = body[..start].to_vec();
+    head[..8].copy_from_slice(&(total - 1).to_le_bytes());
+    Ok(Some(rebuild(&head, start, refs)))
+}
+
+/// `body` with `flags` set besides those it has.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] for a body too short to have flags.
+pub fn with_flags(body: &[u8], set: u64) -> Result<Vec<u8>> {
+    let had = flags(body).ok_or_else(|| short(body.len()))?;
+    let mut out = body.to_vec();
+    out[FLAGS..FLAGS + 8].copy_from_slice(&(had | set).to_le_bytes());
     Ok(out)
 }
 
@@ -608,6 +803,30 @@ mod tests {
     }
 
     #[test]
+    fn a_keyed_data_reference_counts_down_and_goes_at_one() {
+        let mut item = Vec::new();
+        for v in [5u64, 257, 0] {
+            item.extend_from_slice(&v.to_le_bytes());
+        }
+        item.extend_from_slice(&2u32.to_le_bytes());
+        let kept = drop_keyed_data_ref(&item, 5, 257, 0).unwrap().unwrap();
+        assert_eq!(u32::from_le_bytes(kept[24..28].try_into().unwrap()), 1);
+        assert_eq!(drop_keyed_data_ref(&kept, 5, 257, 0).unwrap(), None);
+        assert!(drop_keyed_data_ref(&item, 5, 258, 0).is_err());
+        assert!(drop_keyed_data_ref(&item[..27], 5, 257, 0).is_err());
+    }
+
+    #[test]
+    fn a_record_total_is_lowered_but_never_past_its_last_reference() {
+        let body = header(3, crate::extent_write::EXTENT_FLAG_DATA);
+        let lowered = lower_total(key_type::EXTENT_ITEM, &body).unwrap();
+        assert_eq!(u64::from_le_bytes(lowered[..8].try_into().unwrap()), 2);
+        assert_eq!(lowered[8..], body[8..]);
+        let last = header(1, crate::extent_write::EXTENT_FLAG_DATA);
+        assert!(lower_total(key_type::EXTENT_ITEM, &last).is_err());
+    }
+
+    #[test]
     fn a_tree_block_extent_item_skips_its_tree_block_info() {
         let mut body = header(1, crate::extent_write::EXTENT_FLAG_TREE_BLOCK);
         body.extend([0xAB; TREE_BLOCK_INFO]);
@@ -752,5 +971,130 @@ mod tests {
         want.extend(shared_data(12288, 1));
         want.extend(shared_data(4096, 1));
         assert_eq!(added, want);
+    }
+
+    /// A tree block reference: the tree's objectid.
+    fn tree_ref(tree: u64) -> Vec<u8> {
+        let mut b = vec![TREE_BLOCK_REF];
+        b.extend_from_slice(&tree.to_le_bytes());
+        b
+    }
+
+    fn shared_block(parent: u64) -> Vec<u8> {
+        let mut b = vec![SHARED_BLOCK_REF];
+        b.extend_from_slice(&parent.to_le_bytes());
+        b
+    }
+
+    const BLOCK: u64 = crate::extent_write::EXTENT_FLAG_TREE_BLOCK;
+    const DATA: u64 = crate::extent_write::EXTENT_FLAG_DATA;
+
+    #[test]
+    fn a_copied_shared_block_keeps_the_other_trees_reference_alone() {
+        // As the kernel leaves a leaf a snapshot of tree 5 shares: the
+        // larger root first.
+        let mut body = header(2, BLOCK);
+        body.extend(tree_ref(256));
+        body.extend(tree_ref(5));
+        let dropped = drop_inline_tree_ref(key_type::METADATA_ITEM, &body, 5)
+            .unwrap()
+            .expect("tree 5's reference is there");
+        let mut want = header(1, BLOCK);
+        want.extend(tree_ref(256));
+        assert_eq!(dropped, want);
+        // Put back, it goes where the kernel's scan finds it again.
+        let back = add_inline_keyed(
+            key_type::METADATA_ITEM,
+            &header(1, BLOCK)
+                .into_iter()
+                .chain(tree_ref(256))
+                .collect::<Vec<_>>(),
+            Keyed::Block { tree: 5 },
+            1,
+        )
+        .unwrap();
+        assert_eq!(back[ITEM_HEADER..], body[ITEM_HEADER..]);
+        let flagged = with_flags(&dropped, BLOCK_FLAG_FULL_BACKREF).unwrap();
+        assert_eq!(flags(&flagged), Some(BLOCK | BLOCK_FLAG_FULL_BACKREF));
+        assert_eq!(flagged[ITEM_HEADER..], dropped[ITEM_HEADER..]);
+    }
+
+    #[test]
+    fn a_tree_reference_absent_or_last_is_not_dropped() {
+        let mut body = header(2, BLOCK);
+        body.extend(tree_ref(256));
+        body.extend(shared_block(4096));
+        assert_eq!(
+            drop_inline_tree_ref(key_type::METADATA_ITEM, &body, 5).unwrap(),
+            None
+        );
+        let mut last = header(1, BLOCK);
+        last.extend(tree_ref(5));
+        assert!(drop_inline_tree_ref(key_type::METADATA_ITEM, &last, 5).is_err());
+    }
+
+    #[test]
+    fn a_child_of_a_copied_shared_block_gains_a_reference_naming_it() {
+        let mut body = header(1, BLOCK);
+        body.extend(tree_ref(5));
+        let out =
+            add_inline_shared(key_type::METADATA_ITEM, &body, SHARED_BLOCK_REF, 8192, 1).unwrap();
+        let mut want = header(2, BLOCK);
+        want.extend(tree_ref(5));
+        want.extend(shared_block(8192));
+        assert_eq!(out, want);
+        // Twice from one parent is one pointer counted twice.
+        assert!(
+            add_inline_shared(key_type::METADATA_ITEM, &out, SHARED_BLOCK_REF, 8192, 1).is_err()
+        );
+    }
+
+    #[test]
+    fn shared_references_of_one_type_run_from_the_largest_parent_down() {
+        let mut body = header(2, DATA);
+        body.extend(keyed_data(5, 257, 0));
+        body.extend(shared_data(4096, 1));
+        let out =
+            add_inline_shared(key_type::EXTENT_ITEM, &body, SHARED_DATA_REF, 12288, 1).unwrap();
+        let mut want = header(3, DATA);
+        want.extend(keyed_data(5, 257, 0));
+        want.extend(shared_data(12288, 1));
+        want.extend(shared_data(4096, 1));
+        assert_eq!(out, want);
+        let smaller =
+            add_inline_shared(key_type::EXTENT_ITEM, &body, SHARED_DATA_REF, 1024, 2).unwrap();
+        let mut want = header(4, DATA);
+        want.extend(keyed_data(5, 257, 0));
+        want.extend(shared_data(4096, 1));
+        want.extend(shared_data(1024, 2));
+        assert_eq!(smaller, want);
+    }
+
+    #[test]
+    fn a_shared_data_reference_from_the_same_parent_takes_the_count() {
+        let mut body = header(2, DATA);
+        body.extend(keyed_data(5, 257, 0));
+        body.extend(shared_data(4096, 1));
+        let out =
+            add_inline_shared(key_type::EXTENT_ITEM, &body, SHARED_DATA_REF, 4096, 2).unwrap();
+        let mut want = header(4, DATA);
+        want.extend(keyed_data(5, 257, 0));
+        want.extend(shared_data(4096, 3));
+        assert_eq!(out, want);
+    }
+
+    #[test]
+    fn removing_a_reference_leaves_the_others_in_the_order_found() {
+        let mut body = header(3, DATA);
+        body.extend(keyed_data(5, 257, 0));
+        body.extend(shared_data(12288, 1));
+        body.extend(shared_data(4096, 1));
+        let dropped = drop_inline_data_ref(key_type::EXTENT_ITEM, &body, 5, 257, 0)
+            .unwrap()
+            .unwrap();
+        let mut want = header(2, DATA);
+        want.extend(shared_data(12288, 1));
+        want.extend(shared_data(4096, 1));
+        assert_eq!(dropped, want);
     }
 }
