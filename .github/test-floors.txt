@@ -259,3 +259,6 @@ xattr_oracle              9
 # Four cases cover kernel file contents, checking and both write mount paths (#454).
 zoned_oracle              4
 capi_two_handle_commit_kernel  1
+# Two executed: evidence lines name scratch files by $TMP, the full path
+# printed once (#635).
+evidence_paths 2
