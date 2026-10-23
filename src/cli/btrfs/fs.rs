@@ -172,9 +172,22 @@ fn command() -> Cmd {
                         .required(true)
                         .value_parser(value_parser!(OsString)),
                 )
+                .arg(
+                    Arg::new("at")
+                        .long("at")
+                        .value_name("BYTES")
+                        .value_parser(value_parser!(u64))
+                        .help(
+                            "Write at this byte of the file: not implemented here, \
+                             answered with exit status 3",
+                        ),
+                )
                 .after_help(
                     "Examples:\n  fs.btrfs disk.img write /vm/disk.raw < disk.raw\n  \
                      fs.btrfs disk.img read /db/data | fix-up | fs.btrfs disk.img write /db/data\n\n\
+                     --at BYTES, a write at a position inside a file, is not implemented: \
+                     this driver has no positioned write, and says so with exit status 3 \
+                     before it reads stdin or opens the image.\n\n\
                      The file must exist and get at least as many bytes as it already holds. \
                      A NODATACOW file (chattr +C) is overwritten in place, at the same length; \
                      any other is written copy-on-write into new extents, growing it where the \
@@ -426,6 +439,12 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
             path_arg(sub),
             sub.get_one("output"),
         ),
+        // Refused before stdin is read or the image opened: there is no
+        // positioned write to reach (#415).
+        "write" if sub.get_one::<u64>("at").is_some() => Err(CliError::not_implemented(
+            "write --at: this driver has no positioned write; plain write replaces a \
+             file's bytes from its start",
+        )),
         "write" => write(target, offset, path_arg(sub)),
         "mkdir" | "create" | "rm" | "rmdir" | "ln" | "mv" => names(target, offset, verb, sub),
         "truncate" => truncate(target, offset, sub),
