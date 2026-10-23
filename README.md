@@ -56,7 +56,10 @@ installed. `--version` prints `<name> (rust-fs-btrfs) <version>`.
 
 Metadata is JSON on stdout by default, `--text` for people. A failure is
 `{"error": "...", "code": N}` on stderr and `N` is the exit status: 1 failed,
-2 the command line was wrong, 3 the verb exists and this library cannot do it.
+2 the command line was wrong, 3 the verb exists and this library cannot do it,
+4 the volume's state refused it (`rm`, `rmdir`, `mv`, `ln`, `mkdir` or
+`truncate` meeting a directory that is not empty, a name already there, a
+missing target or a part of the path that is not a directory).
 
 | verb | state |
 |---|---|
