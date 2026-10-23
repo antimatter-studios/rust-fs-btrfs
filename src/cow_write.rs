@@ -1554,7 +1554,28 @@ fn kept_runs(
 
 #[cfg(test)]
 mod tests {
-    use super::kept_runs;
+    use super::{kept_runs, prealloc_end_split};
+
+    /// A growing write that starts in a preallocated item and runs past its
+    /// end is cut at that end (#639); every other write is not cut there.
+    /// The kernel's account of the result is in cow_write_oracle.rs.
+    #[test]
+    fn a_growing_write_is_cut_at_the_end_of_the_preallocated_item_it_starts_in() {
+        // One item kept past a 16 KiB file: [16 KiB, 32 KiB).
+        let kept = [(16384, 16384)];
+        assert_eq!(prealloc_end_split(&kept, 24576, 40960), Some(32768));
+        assert_eq!(prealloc_end_split(&kept, 16384, 40960), Some(32768));
+        // Inside the item, or ending exactly at its end: nothing to cut.
+        assert_eq!(prealloc_end_split(&kept, 24576, 32768), None);
+        assert_eq!(prealloc_end_split(&kept, 16384, 24576), None);
+        // Starting before the item, or past it, is not this write.
+        assert_eq!(prealloc_end_split(&kept, 8192, 40960), None);
+        assert_eq!(prealloc_end_split(&kept, 32768, 40960), None);
+        // The item the write starts in decides, not a later one.
+        let two = [(16384, 8192), (32768, 8192)];
+        assert_eq!(prealloc_end_split(&two, 20480, 49152), Some(24576));
+        assert_eq!(prealloc_end_split(&[], 0, 4096), None);
+    }
 
     /// The independent comparison is the sparse EOF case in
     /// cow_write_oracle.rs; this checks the planner before it allocates.
