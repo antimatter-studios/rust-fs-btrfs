@@ -661,7 +661,7 @@ impl Filesystem {
             .filter(|g| self.block_group_is_writable(g))
             .collect();
         let mut runs: Vec<FreeExtent> = self
-            .free_extents_by_group(groups)?
+            .free_extents_by_group(&groups)?
             .into_iter()
             .flatten()
             .collect();
