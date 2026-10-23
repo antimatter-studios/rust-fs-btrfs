@@ -69,7 +69,6 @@ head -c "$random_size" /dev/urandom >"$SANDBOX/random-sized.bin"
 
 refused 3 "grow the file" /nocow/data.bin "$SANDBOX/longer.bin"
 refused 3 "keeps a file.s length, and truncate makes it shorter" /nocow/data.bin "$SANDBOX/shorter.bin"
-refused 3 "copy-on-write|inline" /hello.txt "$SANDBOX/hello-sized.bin"
 refused 3 "no such file; .*create makes an empty one" /new.txt "$SANDBOX/shorter.bin"
 refused 3 "no such file; .*create makes an empty one" /dir/new.txt "$SANDBOX/shorter.bin"
 refused 3 "subvolume or snapshot" /vol/inside.txt "$SANDBOX/shorter.bin"
@@ -84,6 +83,15 @@ fs.btrfs "$img" write /dir/random.bin <"$SANDBOX/random-sized.bin" >/dev/null 2>
 check "write /dir/random.bin, a checksummed file, exits 0, not $status ($(cat "$SANDBOX/c.err"))" test "$status" -eq 0
 check "read /dir/random.bin is what was written" \
     cmp -s "$SANDBOX/random-sized.bin" <(fs.btrfs "$img" read /dir/random.bin)
+
+# An inline file is overwritten copy-on-write as well, and stored inline
+# again (#438); tests/cow_write_oracle.rs has btrfs check and the kernel
+# judge inline writes.
+status=0
+fs.btrfs "$img" write /hello.txt <"$SANDBOX/hello-sized.bin" >/dev/null 2>"$SANDBOX/i.err" || status=$?
+check "write /hello.txt, an inline file, exits 0, not $status ($(cat "$SANDBOX/i.err"))" test "$status" -eq 0
+check "read /hello.txt is what was written" \
+    cmp -s "$SANDBOX/hello-sized.bin" <(fs.btrfs "$img" read /hello.txt)
 
 # Names (#262): each verb commits one transaction; tests/namespace_kernel.rs
 # has btrfs check and the kernel judge the same changes through the C ABI.

@@ -77,11 +77,14 @@ fn received_files_match_what_the_kernel_recorded() {
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount the received volume");
 
     for want in &expected {
-        let inode = fs
-            .lookup_path(&want.path)
+        // The received files sit in the `sent` subvolume, which the path
+        // crosses into.
+        let target = fs
+            .resolve_path(&want.path)
             .unwrap_or_else(|e| panic!("{} not found: {e}", want.path));
-        let got = fs
-            .read_file(inode.ino)
+        let got = target
+            .fs(&fs)
+            .read_file(target.inode.ino)
             .unwrap_or_else(|e| panic!("{} failed to read: {e}", want.path));
         assert_eq!(
             got.len() as u64,

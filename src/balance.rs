@@ -57,7 +57,7 @@
 //! another profile but a single data group's to DUP or a DUP data
 //! group's to single (#587), a group of any other profile but single,
 //! a volume of more than one
-//! device, one with no free-space tree or with a block group tree, and a
+//! device, one with no free-space tree, and a
 //! group holding an extent with a sector that a checksummed file's
 //! regular item names and that has no checksum, each before anything is
 //! written. Preallocated extents and those of `NODATASUM` files move with
@@ -641,13 +641,9 @@ impl Filesystem {
                     .into(),
             ));
         }
-        if self.sb.has_block_group_tree() {
-            return Err(Error::UnsupportedFeature(
-                "this volume keeps its block group items in a block group tree, and \
-                 allocating a chunk there is not implemented"
-                    .into(),
-            ));
-        }
+        // A block group tree volume keeps its group items in tree 11, where
+        // the new group's item is put and the old one's deleted
+        // (`block_group_tree_id`, #559).
         if group.holds_metadata() {
             return Ok(Vec::new());
         }
