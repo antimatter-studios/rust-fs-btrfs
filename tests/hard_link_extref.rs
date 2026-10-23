@@ -33,9 +33,11 @@
 //!   count, every name listed, every path resolving to the same inode, and
 //!   the same bytes read through each of them.
 //!
-//! This crate cannot create or remove a link (its only write path is
-//! in-place `nodatacow`, #61), so the kernel does the writing and the
-//! direction checked is the read.
+//! In the sweeps the kernel does the writing and the direction checked is
+//! the read. The last test turns it round (#424): the kernel spills names to
+//! `INODE_EXTREF` items, this crate removes one of them through
+//! `fs_btrfs_unlink` and renames another through `fs_btrfs_rename`, and the
+//! kernel, `btrfs check`, `inode-resolve` and `dump-tree` judge what is left.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -43,7 +45,8 @@ use std::sync::Arc;
 
 use fs_btrfs::Filesystem;
 use fs_btrfs_test_support::{
-    assert_btrfs_check_clean, dump_tree, guest_kernel_write_ok, oracle, sha256_hex, temp_path,
+    assert_btrfs_check_clean, dump_tree, guest_kernel_read_ok, guest_kernel_write_ok, oracle,
+    sha256_hex, temp_path,
 };
 use fs_core::FileDevice;
 
@@ -405,6 +408,124 @@ fn links_across_the_spill_with_4k_nodes_and_64_byte_names() {
 #[test]
 fn links_across_the_spill_with_16k_nodes_and_255_byte_names() {
     sweep(16384, 255);
+}
+
+/// The names `ino` holds in `INODE_EXTREF` items, as `dump-tree` shows them.
+fn spilled(image: &std::path::Path, ino: u64) -> BTreeSet<String> {
+    back_refs(&dump_tree(image, "5"), ino)
+        .into_iter()
+        .filter(|r| r.extref)
+        .map(|r| r.name)
+        .collect()
+}
+
+/// This crate removes a name the kernel spilled to an `INODE_EXTREF` item,
+/// through `fs_btrfs_unlink`, and renames another spilled name into a
+/// second directory through `fs_btrfs_rename` (#424). The volume must stay
+/// clean to `btrfs check`, the kernel must list exactly the names left with
+/// the link count they add up to, `inode-resolve` must resolve each of
+/// them, and `dump-tree` must show the one spilled name still in its item.
+#[test]
+fn a_spilled_name_is_unlinked_and_another_renamed_through_the_abi() {
+    use fs_btrfs::capi::{
+        fs_btrfs_last_error, fs_btrfs_mount_rw, fs_btrfs_rename, fs_btrfs_umount, fs_btrfs_unlink,
+    };
+    use std::ffi::{CStr, CString};
+
+    let (node_size, name_len) = (4096, 255);
+    let fit = names_that_fit(node_size, name_len);
+    let tag = "an INODE_EXTREF name unlinked and another renamed";
+    let image = PathBuf::from(temp_path!("hard-link-extref-write.img"));
+    std::fs::File::create(&image)
+        .and_then(|f| f.set_len(256 * 1024 * 1024))
+        .expect("creating the image");
+    let made = oracle("mkfs.btrfs")
+        .args(["-q", "-f", "-O", "extref", "-n", &node_size.to_string()])
+        .arg(&image)
+        .output();
+    assert!(
+        made.status.success(),
+        "[{tag}] mkfs.btrfs: {}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let img = image.to_string_lossy().into_owned();
+
+    // The kernel fills the INODE_REF and spills three names past it.
+    let script = format!(
+        "LEN={name_len}\n{GUEST_PRELUDE}mkdir {DIR} other\n\
+         seq 1 1500 > \"{DIR}/$(nm 0)\"\nln \"{DIR}/$(nm 0)\" {OTHER}\n{}{GUEST_REPORT}",
+        link(1..fit + 3)
+    );
+    let made = parse_kernel(&guest_kernel_write_ok(&img, tag, &script));
+    let ino = made.links[0].1;
+    let all_spilled: BTreeSet<String> = (fit..fit + 3).map(|i| name(i, name_len)).collect();
+    assert_eq!(
+        spilled(&image, ino),
+        all_spilled,
+        "[{tag}] the names dump-tree shows in INODE_EXTREF items before"
+    );
+
+    let c = |s: &str| CString::new(s).unwrap();
+    let last_error = || {
+        unsafe { CStr::from_ptr(fs_btrfs_last_error()) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let gone = format!("/{DIR}/{}", name(fit, name_len));
+    let from = format!("/{DIR}/{}", name(fit + 1, name_len));
+    let fs = unsafe { fs_btrfs_mount_rw(c(&img).as_ptr()) };
+    assert!(!fs.is_null(), "[{tag}] mount_rw: {}", last_error());
+    let unlinked = unsafe { fs_btrfs_unlink(fs, c(&gone).as_ptr()) };
+    let unlink_error = last_error();
+    let renamed = unsafe { fs_btrfs_rename(fs, c(&from).as_ptr(), c("/other/moved").as_ptr()) };
+    let rename_error = last_error();
+    unsafe { fs_btrfs_umount(fs) };
+    assert_eq!(
+        unlinked, 0,
+        "[{tag}] unlink of a spilled name: {unlink_error}"
+    );
+    assert_eq!(
+        renamed, 0,
+        "[{tag}] rename of a spilled name: {rename_error}"
+    );
+    assert_btrfs_check_clean(&image, tag);
+
+    // What the kernel sees now, and what inode-resolve resolves.
+    let script = format!(
+        "LEN={name_len}\n{GUEST_PRELUDE}{GUEST_REPORT}\
+         btrfs inspect-internal inode-resolve {ino} \"$MNT\" | sed \"s|^$MNT/|resolved\t|\"\n"
+    );
+    let report = guest_kernel_read_ok(&img, tag, &script);
+    let after = parse_kernel(&report);
+    let left: BTreeSet<String> = (0..fit + 3)
+        .filter(|&i| i != fit && i != fit + 1)
+        .map(|i| format!("{DIR}/{}", name(i, name_len)))
+        .chain([OTHER.to_string(), "other/moved".to_string()])
+        .collect();
+    let listed: BTreeSet<String> = after.links.iter().map(|(p, _, _)| p.clone()).collect();
+    assert_eq!(listed, left, "[{tag}] the kernel's listing after");
+    let n = u32::try_from(left.len()).unwrap();
+    for (path, link_ino, nlink) in &after.links {
+        assert_eq!(
+            (*link_ino, *nlink),
+            (ino, n),
+            "[{tag}] the kernel's stat of {path}"
+        );
+    }
+    let resolved: BTreeSet<String> = report
+        .lines()
+        .filter_map(|l| l.strip_prefix("resolved\t"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(resolved, left, "[{tag}] inode-resolve of inode {ino}");
+    assert_eq!(after.sha, made.sha, "[{tag}] the file's bytes");
+    assert_eq!(
+        spilled(&image, ino),
+        BTreeSet::from([name(fit + 2, name_len)]),
+        "[{tag}] the names dump-tree shows in INODE_EXTREF items after"
+    );
+    println!("[kernel vm] {tag}: btrfs check clean, {n} links listed and resolved by the kernel");
+    let _ = std::fs::remove_file(&image);
 }
 
 #[test]

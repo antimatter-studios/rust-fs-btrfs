@@ -1353,6 +1353,44 @@ mod tests {
         assert!(without_ref(&rest, b"two").is_none());
     }
 
+    /// One `INODE_EXTREF` record: the parent, the index in it, the name's
+    /// length and the name (#424).
+    fn extref_record(parent: u64, index: u64, name: &[u8]) -> Vec<u8> {
+        let mut r = parent.to_le_bytes().to_vec();
+        r.extend(index.to_le_bytes());
+        r.extend(u16::try_from(name.len()).unwrap().to_le_bytes());
+        r.extend_from_slice(name);
+        r
+    }
+
+    #[test]
+    fn an_extended_reference_loses_one_record_and_keeps_the_others() {
+        // One name can sit in two parents, and an extref item holds names
+        // of any parent whose hash collides, so the record is the one in
+        // this parent with this name.
+        let mut item = extref_record(256, 2, b"one");
+        item.extend(extref_record(300, 7, b"two"));
+        item.extend(extref_record(256, 9, b"two"));
+        let (index, rest) = without_extref(&item, 256, b"two").unwrap();
+        assert_eq!(index, 9);
+        let mut kept = extref_record(256, 2, b"one");
+        kept.extend(extref_record(300, 7, b"two"));
+        assert_eq!(rest, kept);
+        assert!(without_extref(&rest, 256, b"two").is_none());
+
+        let (index, rest) = without_extref(&rest, 300, b"two").unwrap();
+        assert_eq!(index, 7);
+        let (index, rest) = without_extref(&rest, 256, b"one").unwrap();
+        assert_eq!(index, 2);
+        assert!(rest.is_empty(), "the last record leaves nothing");
+
+        // A record that runs past the end of the item is not one.
+        let mut torn = extref_record(256, 2, b"one");
+        torn.truncate(torn.len() - 1);
+        assert!(without_extref(&torn, 256, b"one").is_none());
+        assert!(without_extref(&[], 256, b"one").is_none());
+    }
+
     #[test]
     fn a_new_inode_parses_back_as_what_was_written() {
         let raw = new_inode(NewInode {
