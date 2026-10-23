@@ -49,7 +49,10 @@
 //! 6. **The inode** is stamped with the transaction, a new change count
 //!    and new change and modification times. A write into a hole, or past
 //!    the end of the file, adds the sectors it allocates to `nbytes`; one
-//!    past the end moves `size` to where it stops (#432). Without the
+//!    past the end moves `size` to where it stops (#432). One that starts
+//!    past the end first copies the old last sector, its bytes past the old
+//!    end as zeros, as the kernel zeroes them, and leaves the gap an
+//!    implicit hole (#433). Without the
 //!    no-holes feature, explicit hole items keep the ranges before and
 //!    after each fill, trimmed or split in the same transaction (#434).
 //!
@@ -66,9 +69,6 @@
 //!   root, or a full one that cannot be split (its parent node has no
 //!   room for another pointer): removing a leaf and splitting a node are
 //!   not written yet;
-//! - a write that starts **past the end** of the file, leaving a gap: the
-//!   kernel zeroes the rest of the old last sector first (#433). One that
-//!   starts at or before the end and grows the file is written;
 //! - a write that grows a file on a volume **without the no-holes
 //!   feature**, where the hole a file ends with is an item of its own
 //!   (#436);
@@ -185,30 +185,34 @@ impl Filesystem {
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or_else(|| Error::UnsupportedFeature("write range overflows".into()))?;
-        // A write that grows the file starts at or before its end, so the
-        // sectors past its last extent are planned as a hole is (#432).
-        // One that starts past the end leaves a gap, and the kernel zeroes
-        // the rest of the old last sector before it makes one (#433). A
-        // volume without no-holes records the hole a file ends with as an
-        // item the hole fill does not maintain (#436).
-        if end > inode.size {
-            if offset > inode.size {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino}: writing at {offset} starts past the file's end at {}, and \
-                     a write that leaves a gap is not implemented",
-                    inode.size
-                )));
-            }
-            if !self.sb.has_no_holes() {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino}: growing a file on a volume without the no-holes feature \
-                     means keeping its hole items, which is not implemented"
-                )));
-            }
+        // A write that grows the file has the sectors past its last extent
+        // planned as a hole is (#432). A volume without no-holes records
+        // the hole a file ends with as an item the hole fill does not
+        // maintain (#436).
+        if end > inode.size && !self.sb.has_no_holes() {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}: growing a file on a volume without the no-holes feature \
+                 means keeping its hole items, which is not implemented"
+            )));
         }
 
-        // Every refusal before anything is allocated.
-        let targets = self.plan_cow_targets(ino, offset, end)?;
+        // Every refusal before anything is allocated. A write that starts
+        // past the end leaves a gap, and the kernel zeroes the rest of the
+        // old last sector before it makes one (#433). One that starts
+        // inside that sector copies it anyway, as the item it lands in. One
+        // that starts beyond it copies it too, when an extent holds it, its
+        // bytes past the old end reading as zeros; the gap between them is
+        // an implicit hole and gets no item.
+        let sector = u64::from(self.sb.sectorsize);
+        let mut targets = Vec::new();
+        if inode.size % sector != 0 && offset >= inode.size.next_multiple_of(sector) {
+            targets.extend(
+                self.plan_cow_targets(ino, inode.size - 1, inode.size)?
+                    .into_iter()
+                    .filter(|t| !t.hole && t.start + t.len <= offset),
+            );
+        }
+        targets.extend(self.plan_cow_targets(ino, offset, end)?);
 
         // Each copy: the item's bytes as they read now, with the write
         // laid over them. Past the end of the file the last sector reads
@@ -230,10 +234,14 @@ impl Filesystem {
                 .map_err(|_| Error::UnsupportedFeature(format!("an extent of {} bytes", t.len)))?;
             let mut buf = vec![0u8; size];
             self.read_at(ino, t.start, &mut buf)?;
+            // The old last sector copied for a write that starts past it
+            // takes none of the write (#433).
             let from = offset.max(t.start);
             let to = end.min(t.start + t.len);
-            buf[(from - t.start) as usize..(to - t.start) as usize]
-                .copy_from_slice(&data[(from - offset) as usize..(to - offset) as usize]);
+            if from < to {
+                buf[(from - t.start) as usize..(to - t.start) as usize]
+                    .copy_from_slice(&data[(from - offset) as usize..(to - offset) as usize]);
+            }
             let mut at = t.start;
             for chunk in buf.chunks(unit) {
                 let (bytes, compression) = self.encode_copy(chunk.to_vec(), algo);
