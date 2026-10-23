@@ -115,14 +115,14 @@ fn run_locked(image: &str, script: &str, mount: Mount, clear_log: bool) -> Outpu
         );
     };
     let (stdout, stderr) = run.streams();
-    println!(
+    crate::evidence(&format!(
         "[kernel vm] mount -t btrfs -o {} {image} -> {code}",
         match mount {
             Mount::ReadOnly => "ro",
             Mount::ReadWrite => "rw",
             Mount::Scratch => "rw (discarded)",
         }
-    );
+    ));
     Output {
         status: std::os::unix::process::ExitStatusExt::from_raw(code << 8),
         stdout,
@@ -573,13 +573,13 @@ echo done > "$res/finished""#,
         })
         .collect();
     let _ = std::fs::remove_dir_all(&results);
-    println!(
+    crate::evidence(&format!(
         "[kernel vm] mount -t btrfs -o ro + btrfs check --readonly, {} variants of {} -> \
          {} mounted",
         verdicts.len(),
         base.display(),
         verdicts.iter().filter(|v| v.mounted).count()
-    );
+    ));
     verdicts
 }
 
@@ -710,12 +710,12 @@ printf %s "$status" > {status}"#,
         .expect("the guest ran btrfs check over the pool, and recorded its status");
     let _ = std::fs::remove_file(&check);
     let _ = std::fs::remove_file(&check_status);
-    println!(
+    crate::evidence(&format!(
         "[kernel vm] btrfs check + mount -t btrfs -o {}, a pool of {} -> check {check_code}, \
          script {code}",
         if writable { "rw" } else { "ro" },
         images.len()
-    );
+    ));
     PoolRead {
         check_status: check_code,
         check: check_text,
