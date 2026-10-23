@@ -606,7 +606,7 @@ fn names(
     let (parent, name) = split_parent(&fs, path)?;
     let mode = mode_arg(sub)?;
     // What the volume's state refuses is decided first, as the C ABI
-    // decides it, so it is exit 4 (diskjockey#413): the library reports a
+    // decides it, so it is exit 4 (EXIT_REFUSED): the library reports a
     // name already there and a directory with entries as
     // `UnsupportedFeature`, which is exit 3.
     match verb {
@@ -1137,7 +1137,7 @@ fn btrfs_error(what: &[u8], e: Error) -> CliError {
 
 /// A namespace verb's library error: a name that is not there, or a part of
 /// the path that is not a directory, is the volume's state refusing it, the
-/// CLI contract's exit 4 (diskjockey#413); every other error is
+/// CLI contract's exit 4 (EXIT_REFUSED); every other error is
 /// [`btrfs_error`]'s.
 fn state_error(what: &[u8], e: Error) -> CliError {
     match e {

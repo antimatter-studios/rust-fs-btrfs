@@ -118,7 +118,7 @@ name_ok rmdir /newdir
 fs.btrfs "$names" ls / >"$SANDBOX/ls.json" 2>/dev/null
 jq_check "the directory is gone again" 'all(.[]; .name != "newdir")' "$SANDBOX/ls.json"
 # What the volume's state refuses is exit 4, `refused`, in the CLI contract
-# (diskjockey#413): a directory that is not empty, a name already there, a
+# (EXIT_REFUSED): a directory that is not empty, a name already there, a
 # missing name. Each leaves the image byte-identical.
 sparse_copy "$names" "$SANDBOX/before-n.img"
 state_refused() {
@@ -203,7 +203,7 @@ check "mkdir -p --text says when nothing was made" \
 check "a chain already there was not written to" cmp -s "$parents" "$SANDBOX/chain.img"
 
 # Refusals: anything but a directory on the way, a name already there or an
-# empty path exits 4, the volume's state refusing it (diskjockey#413); a
+# empty path exits 4, the volume's state refusing it (EXIT_REFUSED); a
 # name too long exits 1, and a directory inside a subvolume other than the
 # top level, which only the kernel writes, exits 3. Each is decided before
 # anything is made, so no partial chain is left and the image is
