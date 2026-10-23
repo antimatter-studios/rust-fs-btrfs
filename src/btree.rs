@@ -912,6 +912,14 @@ impl<'a> Tree<'a> {
     /// below its parent's, plus anything [`TreeBlock::parse`] can
     /// report for each block along the way.
     pub fn descend(&self, root: u64, key: &DiskKey) -> Result<TreeBlock> {
+        let mut path = self.descend_path(root, key)?;
+        Ok(path.pop().expect("a descent reads at least the root"))
+    }
+
+    /// Every block a descent from `root` towards `key` reads, the root
+    /// first and the leaf last. As [`Tree::descend`].
+    pub fn descend_path(&self, root: u64, key: &DiskKey) -> Result<Vec<TreeBlock>> {
+        let mut path = Vec::new();
         let mut logical = root;
         let mut expected_level: Option<u8> = None;
         let mut expected_generation: Option<u64> = None;
@@ -932,12 +940,14 @@ impl<'a> Tree<'a> {
                 }
             }
             let Some(ptrs) = block.body.key_ptrs() else {
-                return Ok(block);
+                path.push(block);
+                return Ok(path);
             };
             let slot = node_slot(ptrs, key);
             expected_level = Some(block.header.level - 1);
             expected_generation = Some(ptrs[slot].generation);
             logical = ptrs[slot].blockptr;
+            path.push(block);
         }
         Err(bad_block(
             root,
