@@ -218,7 +218,7 @@ fn extref_records(data: &[u8]) -> Option<Vec<(u64, u64, &[u8])>> {
 /// under: the kernel's `btrfs_extref_hash`, a CRC-32C of the name seeded
 /// with the parent's low 32 bits, with no inversion at either end (see
 /// [`dir::name_hash`]).
-fn extref_hash(parent: u64, name: &[u8]) -> u64 {
+pub(crate) fn extref_hash(parent: u64, name: &[u8]) -> u64 {
     u64::from(!crc32c::crc32c_append(!(parent as u32), name))
 }
 

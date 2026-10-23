@@ -64,6 +64,7 @@ use crate::inode::{
     INODE_NODATASUM, INODE_REF_KEY,
 };
 use crate::leaf_edit::OwnedItem;
+use crate::log_tree::{extref_hash, INODE_EXTREF_KEY};
 use crate::super_write::Commit;
 use crate::transaction::{DataRelease, DataWrite, ItemEdit};
 
@@ -466,22 +467,34 @@ impl Filesystem {
     /// to it, and shrink `parent`'s size by the name.
     fn drop_entry(&self, p: &mut Pending, parent: u64, name: &[u8], ino: u64) -> Result<()> {
         // The child's reference to this parent loses the name, and gives
-        // up the index the parent filed it under.
+        // up the index the parent filed it under. Past what one INODE_REF
+        // item holds, the kernel files a name in an INODE_EXTREF item under
+        // a hash of its parent and name instead (#424).
         let ref_key = key(ino, INODE_REF_KEY, parent);
-        let refs = p.get(self, ref_key)?.ok_or_else(|| {
-            Error::UnsupportedFeature(format!(
-                "inode {ino} has no reference item from directory {parent}; a name held in \
-                 an extended reference is not removed"
-            ))
-        })?;
-        let (index, rest) = without_ref(&refs, name).ok_or_else(|| {
-            Error::UnsupportedFeature(format!(
-                "inode {ino}'s reference from directory {parent} does not hold {:?}; a name \
-                 held in an extended reference is not removed",
-                String::from_utf8_lossy(name)
-            ))
-        })?;
-        p.set(ref_key, non_empty(rest));
+        let in_ref = p
+            .get(self, ref_key)?
+            .and_then(|refs| without_ref(&refs, name));
+        let index = match in_ref {
+            Some((index, rest)) => {
+                p.set(ref_key, non_empty(rest));
+                index
+            }
+            None => {
+                let extref_key = key(ino, INODE_EXTREF_KEY, extref_hash(parent, name));
+                let (index, rest) = p
+                    .get(self, extref_key)?
+                    .and_then(|extrefs| without_extref(&extrefs, parent, name))
+                    .ok_or_else(|| {
+                        Error::UnsupportedFeature(format!(
+                            "inode {ino} has no reference from directory {parent} holding \
+                             {:?}, in its INODE_REF item or an INODE_EXTREF item",
+                            String::from_utf8_lossy(name)
+                        ))
+                    })?;
+                p.set(extref_key, non_empty(rest));
+                index
+            }
+        };
 
         // The parent's two entries.
         let hash_key = key(parent, DIR_ITEM_KEY, dir::name_hash(name));
@@ -1234,6 +1247,30 @@ fn without_ref(data: &[u8], name: &[u8]) -> Option<(u64, Vec<u8>)> {
         }
         if &data[pos + INODE_REF_HEADER..end] == name {
             let index = le64(data, pos);
+            let mut rest = data[..pos].to_vec();
+            rest.extend_from_slice(&data[end..]);
+            return Some((index, rest));
+        }
+        pos = end;
+    }
+    None
+}
+
+/// An `INODE_EXTREF` item without the record naming `name` in `parent`,
+/// and that record's index, or `None` when no record does. Each record is
+/// the parent (8 bytes), the index in it (8), the name's length (2) and the
+/// name; an item holds the names of every parent and name that hash alike.
+fn without_extref(data: &[u8], parent: u64, name: &[u8]) -> Option<(u64, Vec<u8>)> {
+    const HEADER: usize = 18;
+    let mut pos = 0;
+    while pos + HEADER <= data.len() {
+        let len = usize::from(u16::from_le_bytes([data[pos + 16], data[pos + 17]]));
+        let end = pos + HEADER + len;
+        if end > data.len() {
+            return None;
+        }
+        if le64(data, pos) == parent && &data[pos + HEADER..end] == name {
+            let index = le64(data, pos + 8);
             let mut rest = data[..pos].to_vec();
             rest.extend_from_slice(&data[end..]);
             return Some((index, rest));
