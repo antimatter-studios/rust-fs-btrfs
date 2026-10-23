@@ -166,6 +166,61 @@ fn what_is_refused_before_the_image_is_opened_answers_by_name() {
     );
 }
 
+#[test]
+fn a_positioned_write_answers_not_implemented_before_the_image_is_opened() {
+    // The other writable tools take `write --at BYTES` for a write at a
+    // position inside a file. This driver has no positioned write, so the
+    // parser takes the option and the answer is status 3, `not
+    // implemented`, naming it, rather than a usage error that reads as a
+    // typo (#415). Neither stdin nor the image is read first.
+    let dir = scratch_dir("write-at");
+    let missing = dir.join("never-opened.img");
+    for at in ["0", "4096"] {
+        let message = refused(
+            tool("fs.btrfs")
+                .arg(&missing)
+                .args(["write", "--at", at, "/f"])
+                .stdin(std::process::Stdio::null()),
+            3,
+        );
+        assert!(
+            message.starts_with("not implemented") && message.contains("--at"),
+            "write --at {at}: {message}"
+        );
+    }
+    assert!(
+        !missing.exists(),
+        "write --at created {}",
+        missing.display()
+    );
+
+    // An image that exists is left byte-identical.
+    let img = dir.join("untouched.img");
+    let bytes: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&img, &bytes).unwrap();
+    refused(
+        tool("fs.btrfs")
+            .arg(&img)
+            .args(["write", "--at", "0", "/f"])
+            .stdin(std::process::Stdio::null()),
+        3,
+    );
+    assert!(
+        std::fs::read(&img).unwrap() == bytes,
+        "write --at changed the image"
+    );
+
+    // A position that is not a number of bytes is a wrong command line.
+    refused(
+        tool("fs.btrfs")
+            .arg(&missing)
+            .args(["write", "--at", "x", "/f"])
+            .stdin(std::process::Stdio::null()),
+        2,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------------
 // doctor
 // ---------------------------------------------------------------------------

@@ -35,6 +35,12 @@ refused 2 resize 20Q -- "not a size"
 refused 2 resize 0 --force -- "not a size"
 refused 2 resize -x -- "not a size"
 
+# A positioned write, `write --at BYTES`, is what the other writable tools
+# take for a write inside a file; this driver has none, so it answers
+# status 3, not implemented, before stdin or the image is read (#415).
+refused 3 write --at 0 /f -- "not implemented" </dev/null
+check "write --at leaves no image behind" test ! -e "$img"
+
 # --text: `fs.btrfs: <message>`, for a person.
 fs.btrfs --text "$img" set total_bytes 1 >/dev/null 2>"$SANDBOX/t.err"
 check "set total_bytes --text exits 3" test $? -eq 3
