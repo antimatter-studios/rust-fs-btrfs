@@ -767,9 +767,11 @@ tasks:
     # lines (95 bytes); add them to the existing floor and budget.
     # write --at's refusal adds four assertions to test-blocked.sh (#415),
     # and no line: raise the floor by four.
+    # test-xattr.sh adds twelve assertions and two success lines, 67 bytes
+    # (#416): raise the floor by twelve and the budget by those lines.
     cmds:
-      - '../rust-fs-core/scripts/tier.sh test:cli cli 32 1295 -- scripts/test-cli.sh'
-      - 'bash ../rust-fs-core/scripts/test-floor.sh cli 273'
+      - '../rust-fs-core/scripts/tier.sh test:cli cli 34 1362 -- scripts/test-cli.sh'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh cli 285'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
