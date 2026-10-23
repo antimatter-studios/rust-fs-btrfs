@@ -161,6 +161,41 @@ fn command() -> Cmd {
                 ),
         )
         .subcommand(
+            Cmd::new("xattr")
+                .about("List a path's extended attributes, or write one value's raw bytes to stdout")
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .arg(
+                    Arg::new("name")
+                        .value_name("NAME")
+                        .value_parser(value_parser!(OsString))
+                        .help("One attribute, by its full name: its value's raw bytes"),
+                )
+                .arg(
+                    Arg::new("output")
+                        .short('o')
+                        .long("output")
+                        .value_name("FILE")
+                        .value_parser(value_parser!(OsString))
+                        .requires("name")
+                        .help("Write the value here instead of stdout"),
+                )
+                .after_help(
+                    "Examples:\n  fs.btrfs disk.img xattr /etc/shadow\n  \
+                     fs.btrfs disk.img xattr /usr/bin/ping security.capability -o caps.bin\n  \
+                     fs.btrfs disk.img xattr --text /home/notes.txt\n\n\
+                     The listing is each attribute's full name, namespace prefix included, \
+                     with its value's size in bytes, sorted by name; a name that is not UTF-8 \
+                     is shown lossily, its bytes in name_hex. With NAME, the value's raw bytes. \
+                     A symlink's own attributes are listed, not its target's. Inspection only: \
+                     the image is never opened for writing.",
+                ),
+        )
+        .subcommand(
             Cmd::new("write")
                 .about(
                     "Overwrite an existing file with at least as many bytes as it holds, from stdin",
@@ -434,6 +469,12 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         ),
         "ls" => ls(&device::mount(target, offset)?, path_arg(sub)),
         "stat" => stat(&device::mount(target, offset)?, path_arg(sub)),
+        "xattr" => xattr(
+            &device::mount(target, offset)?,
+            path_arg(sub),
+            sub.get_one::<OsString>("name"),
+            sub.get_one("output"),
+        ),
         "read" => read(
             &device::mount(target, offset)?,
             path_arg(sub),
@@ -1167,6 +1208,82 @@ fn stat(root: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
 /// refused up front (no such path, a directory, a symlink) is refused
 /// before a byte is written. `-o FILE` writes `FILE.partial` and renames
 /// it, so FILE is never left half written.
+/// `xattr PATH`: the path's extended attributes, each by its full name
+/// (`name_hex` for one that is not UTF-8) with its value's size, sorted by
+/// name as bytes. `xattr PATH NAME`: that value's raw bytes, on stdout or in
+/// `-o FILE` as `read` delivers a file. A symlink's own attributes are
+/// reported, not its target's, and nothing is opened for writing (#416).
+fn xattr(
+    root: &Filesystem,
+    path: &[u8],
+    name: Option<&OsString>,
+    output: Option<&OsString>,
+) -> Result<Outcome, CliError> {
+    let found = root
+        .resolve_path_bytes(path)
+        .map_err(|e| btrfs_error(path, e))?;
+    let fs = found.fs(root);
+    let ino = found.inode.ino;
+    let Some(name) = name else {
+        let mut attrs = fs.list_xattrs(ino).map_err(|e| btrfs_error(path, e))?;
+        attrs.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut entries = Vec::with_capacity(attrs.len());
+        let mut lines = Vec::with_capacity(attrs.len());
+        for a in &attrs {
+            let mut fields = vec![("name", Json::from(show(&a.name)))];
+            if std::str::from_utf8(&a.name).is_err() {
+                fields.push((
+                    "name_hex",
+                    Json::from(
+                        a.name
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>(),
+                    ),
+                ));
+            }
+            fields.push(("size", Json::from(a.value.len() as u64)));
+            entries.push(Json::object(fields));
+            lines.push(format!("{} ({} bytes)", show(&a.name), a.value.len()));
+        }
+        return Ok(Outcome::report(Json::Arr(entries)).with_text(lines.join("\n")));
+    };
+    let name = os_bytes(name);
+    let value = fs
+        .get_xattr(ino, name)
+        .map_err(|e| btrfs_error(path, e))?
+        .ok_or_else(|| CliError::failed(format!("{}: no attribute {}", show(path), show(name))))?;
+    deliver(&value, output)?;
+    Ok(Outcome::done())
+}
+
+/// `bytes` on stdout, or in `output` through `<output>.partial` renamed
+/// into place, so a failed write never leaves a short FILE behind.
+fn deliver(bytes: &[u8], output: Option<&OsString>) -> Result<(), CliError> {
+    let write = |sink: &mut dyn Write| -> Result<(), CliError> {
+        sink.write_all(bytes)
+            .map_err(|e| CliError::failed(format!("write: {e}")))?;
+        sink.flush()
+            .map_err(|e| CliError::failed(format!("write: {e}")))
+    };
+    let Some(file) = output else {
+        return write(&mut std::io::stdout().lock());
+    };
+    let dest = std::path::Path::new(file);
+    let mut partial = dest.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = std::path::PathBuf::from(partial);
+    let mut f = std::fs::File::create(&partial)
+        .map_err(|e| CliError::failed(format!("create {}: {e}", partial.display())))?;
+    if let Err(e) = write(&mut f) {
+        drop(f);
+        let _ = std::fs::remove_file(&partial);
+        return Err(e);
+    }
+    std::fs::rename(&partial, dest)
+        .map_err(|e| CliError::failed(format!("rename to {}: {e}", dest.display())))
+}
+
 fn read(root: &Filesystem, path: &[u8], output: Option<&OsString>) -> Result<Outcome, CliError> {
     let found = root
         .resolve_path_bytes(path)
