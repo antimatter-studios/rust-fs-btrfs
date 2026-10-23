@@ -632,12 +632,16 @@ impl Filesystem {
             if !touched.insert(at) {
                 continue;
             }
-            let place = places.get(&at).ok_or_else(|| {
-                Error::UnsupportedFeature(format!(
+            let Some(place) = places.get(&at) else {
+                // A handle another one has committed past reads blocks that
+                // commit freed or moved: that is the handle's staleness,
+                // reported as such, not an unreachable block (#599).
+                self.refuse_stale()?;
+                return Err(Error::UnsupportedFeature(format!(
                     "the block at {at} is not reachable from any tree, so there is nothing \
                      above it to rewrite"
-                ))
-            })?;
+                )));
+            };
 
             match place.parent {
                 // Not a root: its parent points at it and must change.
