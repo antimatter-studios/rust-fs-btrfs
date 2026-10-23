@@ -1,5 +1,5 @@
 //! An incompatible feature this driver cannot read is refused by name
-//! (#270, #447, #448).
+//! (#270, #447, #448, #449).
 //!
 //! The refusal itself was always there: `Superblock::parse` refuses any
 //! incompat bit outside `incompat::SUPPORTED`. What it said was
@@ -112,6 +112,15 @@ fn an_extent_tree_v2_volume_is_refused_by_name() {
 fn a_remap_tree_volume_is_refused_by_name() {
     let (_scratch, path) = image_with_incompat("remap", incompat::REMAP_TREE);
     refused_naming("remap-tree", &path, "remap-tree");
+}
+
+/// The RAID stripe tree records data stripe placement (#449). The guest
+/// kernel predates the feature, so the bit is set on one btrfs-progs
+/// made, as for extent-tree-v2 above.
+#[test]
+fn a_raid_stripe_tree_volume_is_refused_by_name() {
+    let (_scratch, path) = image_with_incompat("raid-stripe", incompat::RAID_STRIPE_TREE);
+    refused_naming("raid-stripe-tree", &path, "raid-stripe-tree");
 }
 
 /// A bit no feature is known by is still refused, by its value: naming

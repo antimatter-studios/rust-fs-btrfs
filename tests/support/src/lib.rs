@@ -12,9 +12,9 @@ mod kernel;
 mod oracle;
 
 pub use kernel::{
-    guest_kernel_pool_read, guest_kernel_pool_write, guest_kernel_probe, guest_kernel_read, guest_kernel_read_ok,
-    guest_kernel_read_variants, guest_kernel_report, guest_kernel_write, guest_kernel_write_ok,
-    KernelProbe, PoolRead, Variant, VariantVerdict,
+    guest_kernel_pool_read, guest_kernel_pool_write, guest_kernel_probe, guest_kernel_read,
+    guest_kernel_read_ok, guest_kernel_read_variants, guest_kernel_report, guest_kernel_write,
+    guest_kernel_write_ok, KernelProbe, PoolRead, Variant, VariantVerdict,
 };
 pub use oracle::{guest_base64, guest_quote, oracle, Oracle};
 
@@ -279,7 +279,11 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Whether an image's superblock says the filesystem spans more than one
@@ -371,13 +375,15 @@ impl Image {
         if offset.saturating_add(buf.len() as u64) > self.len() {
             return false;
         }
-        self.file.read_exact_at(buf, offset).unwrap_or_else(|error| {
-            panic!(
-                "cannot read {} bytes at {offset} of {}: {error}",
-                buf.len(),
-                self.path.display()
-            )
-        });
+        self.file
+            .read_exact_at(buf, offset)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "cannot read {} bytes at {offset} of {}: {error}",
+                    buf.len(),
+                    self.path.display()
+                )
+            });
         true
     }
 

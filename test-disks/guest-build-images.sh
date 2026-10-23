@@ -39,7 +39,7 @@ set -euo pipefail
 OUT="$1"
 shift
 
-TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog cli features scrub seed squota"
+TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog cli features scrub seed squota encoded"
 
 # ARGUMENTS FIRST, ENVIRONMENT SECOND. A misspelt target is the caller's
 # mistake and should be named as one wherever it is made; the root and
@@ -334,6 +334,88 @@ build_compression() {
         publish "$img" "${img%.img}.superdump" "$manifest" "$record"
         note "built btrfs-comp-$algo"
     done
+}
+
+# ---------------------------------------------------------------------
+# encoded — a volume whose compressed extents were stored through the
+# kernel's encoded-write path rather than compressed by the kernel (#556).
+#
+# The files are written on a compressing mount: zstd from the mount
+# option, zlib and lzo per file from the compression property, and one
+# incompressible file that stays plain. A read-only snapshot of them is
+# sent with `btrfs send --compressed-data`, which carries the extents
+# still compressed, and received onto a second volume mounted WITHOUT a
+# compression option. Every compressed extent on that volume was
+# therefore handed to the kernel already compressed, through the
+# encoded-write ioctl receive uses.
+#
+# If receive fell back to decompressing (an old kernel, a refused ioctl),
+# the received volume would hold only plain extents and the dump-tree
+# check below fails the build, rather than a test passing over a fixture
+# that does not hold what it claims to.
+#
+# In its own directory, so the suites that walk every image in
+# test-disks/ do not take it up; its own suite is the one that reads it.
+# ---------------------------------------------------------------------
+build_encoded() {
+    local src="$WORK/btrfs-encoded-source.img" img="$WORK/btrfs-encoded.img"
+    local manifest="$WORK/btrfs-encoded.manifest" record="$WORK/btrfs-encoded.compression"
+    local stream="$WORK/btrfs-encoded.stream" algo
+    rm -f "$src" "$img" "$manifest" "$record" "$stream"
+    truncate -s 400M "$src"
+    mkfs.btrfs -f "$src" >/dev/null
+    mount -o loop,compress=zstd "$src" "$MNT"
+    btrfs subvolume create "$MNT/vol" >/dev/null
+    python3 -c "print('the quick brown fox jumps over the lazy dog '*40000)" > "$MNT/vol/big-zstd.txt"
+    for algo in zlib lzo; do
+        touch "$MNT/vol/big-$algo.txt"
+        btrfs property set "$MNT/vol/big-$algo.txt" compression "$algo"
+        python3 -c "print('pack my box with five dozen liquor jugs $algo '*40000)" > "$MNT/vol/big-$algo.txt"
+    done
+    dd if=/dev/urandom of="$MNT/vol/plain.bin" bs=1M count=2 status=none
+    echo 'inline and compressible aaaaaaaaaaaaaaaaaaaaaaaa' > "$MNT/vol/inline.txt"
+    sync
+    btrfs subvolume snapshot -r "$MNT/vol" "$MNT/sent" >/dev/null
+    sync
+    btrfs send --proto 2 --compressed-data -f "$stream" "$MNT/sent" >/dev/null
+    umount "$MNT"
+    rm -f "$src"
+
+    truncate -s 400M "$img"
+    mkfs.btrfs -f "$img" >/dev/null
+    mount -o loop "$img" "$MNT"
+    btrfs receive -f "$stream" "$MNT" >/dev/null
+    sync
+    umount "$MNT"
+    rm -f "$stream"
+
+    # What the kernel says each received file holds, read back through
+    # its own driver on a read-only mount so the image is not disturbed.
+    mount -o loop,ro "$img" "$MNT"
+    ( cd "$MNT"
+      find . -mindepth 1 -type f | sort | while read -r p; do
+          printf '%s\t%s\t%s\n' "${p#.}" "$(stat -c%s "$p")" \
+              "$(sha256sum "$p" | cut -d' ' -f1)"
+      done
+    ) > "$manifest"
+    umount "$MNT"
+
+    btrfs inspect-internal dump-tree "$img" 2>/dev/null |
+        grep -o 'extent compression [0-9]* ([a-z]*)' | sort -u > "$record"
+    for algo in zstd zlib lzo none; do
+        grep -q "($algo)" "$record" || {
+            echo "guest-build-images: btrfs-encoded has no ($algo) extent after the receive: $(tr '\n' ' ' < "$record")" >&2
+            exit 1
+        }
+    done
+    mkdir -p "$OUT/encoded"
+    local f
+    for f in "$img" "$manifest" "$record"; do
+        cp --sparse=always "$f" "$OUT/encoded/$(basename "$f").partial"
+        mv -f "$OUT/encoded/$(basename "$f").partial" "$OUT/encoded/$(basename "$f")"
+        rm -f "$f"
+    done
+    note "built encoded/btrfs-encoded (received through encoded writes)"
 }
 
 # ---------------------------------------------------------------------
@@ -1217,6 +1299,15 @@ build_dirtylog() {
     build_dirtylog_refused special 'compress=no,max_inline=2048' special
     build_dirtylog_refused hardlink 'compress=no,max_inline=2048' hardlink
     build_dirtylog_refused extref 'compress=no,max_inline=2048' extref
+    build_dirtylog_refused dirlink 'compress=no,max_inline=2048' dirlink
+    build_dirtylog_refused nbytes 'compress=no,max_inline=2048' nbytes
+    build_dirtylog_refused extrefexists 'compress=no,max_inline=2048' extrefexists
+    build_dirtylog_refused extrefcreated 'compress=no,max_inline=2048' extrefcreated
+    build_dirtylog_refused extrefremoved 'compress=no,max_inline=2048' extrefremoved
+    build_dirtylog_refused compressedcut 'compress-force=zlib,max_inline=0' compressedcut
+    build_dirtylog_refused rmdir 'compress=no,max_inline=2048' rmdir
+    build_dirtylog_refused linkremoved 'compress=no,max_inline=2048' linkremoved
+    build_dirtylog_refused createdlink 'compress=no,max_inline=2048' createdlink
 }
 
 # fsync_path <path> — fsync one file or directory, and nothing else.
@@ -1362,11 +1453,11 @@ build_dirtylog_refused() {
     mkfs.btrfs -f "$img" >/dev/null
     mount -o "loop,commit=300,$opts" "$img" "$MNT"
     case "$kind" in
-        mixedlog|sizechange|compressedinline|newdir|symlink|special|hardlink)
+        mixedlog|sizechange|compressedinline|newdir|symlink|special|hardlink|dirlink)
             printf 'committed-inline-bytes-0123456789' > "$MNT/f" ;;
         externalextent)
             head -c 8192 /dev/zero | tr '\0' 'c' > "$MNT/f" ;;
-        extref)
+        extref|nbytes)
             # f with 64 more names in /, each 255 bytes: the first 61 fill
             # its INODE_REF to the largest item a 16 KiB leaf holds, and
             # the rest are committed as INODE_EXTREF items.
@@ -1374,6 +1465,39 @@ build_dirtylog_refused() {
             python3 -c 'import os, sys
 for i in range(64):
     os.link(sys.argv[1] + "/f", sys.argv[1] + "/" + ("%03d" % i) * 85)' "$MNT" ;;
+        extrefexists)
+            # f with the same 64 more names in /, three of them committed
+            # as INODE_EXTREF items, and an empty directory d beside it.
+            mkdir "$MNT/d"
+            printf 'committed-inline-bytes-0123456789' > "$MNT/f"
+            python3 -c 'import os, sys
+for i in range(64):
+    os.link(sys.argv[1] + "/f", sys.argv[1] + "/" + ("%03d" % i) * 85)' "$MNT" ;;
+        extrefremoved)
+            # f with the same 64 more names in /, then every name but the
+            # last of them removed, f itself among them: f is committed
+            # with one link, no INODE_REF item and one INODE_EXTREF item.
+            # k is committed beside it.
+            printf 'committed-inline-bytes-0123456789' > "$MNT/f"
+            python3 -c 'import os, sys
+for i in range(64):
+    os.link(sys.argv[1] + "/f", sys.argv[1] + "/" + ("%03d" % i) * 85)
+os.unlink(sys.argv[1] + "/f")
+for i in range(63):
+    os.unlink(sys.argv[1] + "/" + ("%03d" % i) * 85)' "$MNT"
+            printf 'kept' > "$MNT/k" ;;
+        rmdir)
+            # An empty directory e and a file k, committed in /.
+            mkdir "$MNT/e"
+            printf 'kept' > "$MNT/k" ;;
+        linkremoved)
+            # A file f with a second name g, both committed in /.
+            printf 'kept' > "$MNT/f"
+            ln "$MNT/f" "$MNT/g" ;;
+        compressedcut)
+            # 128 KiB of one byte: compress-force stores it as one
+            # compressed extent, the largest the kernel makes.
+            head -c 131072 /dev/zero | tr '\0' 'c' > "$MNT/f" ;;
         subvol)
             # A file in the top level and one in a subvolume, committed.
             btrfs subvolume create "$MNT/sv" >/dev/null
@@ -1446,11 +1570,102 @@ if kind == "extref":
     os.link(d + "/f", d + "/" + "064" * 85)
     dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
     sys.exit(0)
+if kind == "dirlink":
+    # The committed f is given a second name g after the commit, and only
+    # / is fsynced. The log holds the entry of / naming g, in a range
+    # that starts past the committed index of f, and f only as an inode
+    # that exists: generation 0, its link count raised, and its reference
+    # to / holding both names. The data of f is not logged.
+    os.link(d + "/f", d + "/g")
+    dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    sys.exit(0)
+if kind == "extrefexists":
+    # The committed f, with INODE_EXTREF items, is given the name g in the
+    # committed directory d, and only d is fsynced. The log holds the
+    # entry of d naming g, and f only as an inode that exists: generation
+    # 0, its link count raised to 66, and its INODE_REF items to / and to
+    # d, but none of its INODE_EXTREF items, which stay committed.
+    os.link(d + "/f", d + "/d/g")
+    dfd = os.open(d + "/d", os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    sys.exit(0)
+if kind == "extrefcreated":
+    # After the commit, n is created empty and given 64 more names in /,
+    # each 255 bytes: the first 61 fill its INODE_REF to the largest item
+    # a 16 KiB leaf holds, and the last three are INODE_EXTREF items. Only
+    # / is fsynced. The log holds the entries of / for all 65 names, and
+    # n only as an inode that exists, though nothing of it is committed:
+    # generation 0, size 0, 65 links, its INODE_REF and its three
+    # INODE_EXTREF items. An fsync of n itself would fall back to a full
+    # commit and leave no log.
+    open(d + "/n", "w").close()
+    for i in range(64):
+        os.link(d + "/n", d + "/" + ("%03d" % i) * 85)
+    dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    sys.exit(0)
+if kind == "createdlink":
+    # After the commit, n is created empty and given a second name m in
+    # /, and only / is fsynced. The log holds the entries of / naming n
+    # and m, and n only as an inode that exists, though nothing of it is
+    # committed: generation 0, size 0, two links, no data, and its
+    # reference to / holding both names.
+    open(d + "/n", "w").close()
+    os.link(d + "/n", d + "/m")
+    dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    sys.exit(0)
+if kind == "extrefremoved":
+    # The last name of f, held in its one INODE_EXTREF item, is removed
+    # after the commit, and only / is fsynced. The log holds index ranges
+    # of / covering the removed index and no entry there, and does not
+    # hold f: its replay deletes f with its extended reference and data.
+    os.unlink(d + "/" + "063" * 85)
+    dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    sys.exit(0)
+if kind == "rmdir":
+    # Remove the committed empty directory e through a replacing rename.
+    # On Debian 6.1, rmdir followed by a parent fsync commits the whole
+    # transaction and leaves no log. A new directory replaces e, then moves
+    # away before only / is fsynced: the committed index of e is absent
+    # from the log, and replay must remove its old inode with all its items.
+    # Diagnostic seeds for #654 run only if this recipe fails; each seed
+    # must also satisfy the existing native attestation.
+    seed = os.environ.get("RMDIR_LOG_SEED", "")
+    def fsync_path(path):
+        fd = os.open(path, os.O_RDONLY); os.fsync(fd); os.close(fd)
+    if seed == "parent-chmod":
+        os.chmod(d, 0o700)
+        fsync_path(d)
+    elif seed == "parent-create":
+        open(d + "/new", "w").close()
+        fsync_path(d)
+    elif seed == "child-chmod":
+        os.chmod(d + "/e", 0o700)
+        fsync_path(d + "/e")
+    elif seed == "kept-write":
+        fd = os.open(d + "/k", os.O_WRONLY)
+        os.write(fd, b"kept"); os.fsync(fd); os.close(fd)
+    os.mkdir(d + "/replacement")
+    os.rename(d + "/replacement", d + "/e")
+    os.rename(d + "/e", d + "/replacement")
+    dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    sys.exit(0)
+if kind == "linkremoved":
+    # The committed name g of f is removed after the commit, and only / is
+    # fsynced. The log holds index ranges of / covering the index of g and
+    # no entry there, and does not hold f: its replay removes the name g
+    # and its reference, and leaves f with one link.
+    os.unlink(d + "/g")
+    dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    sys.exit(0)
 fd = os.open(d + "/f", os.O_WRONLY)
 if kind == "sizechange":
     os.pwrite(fd, b"replayed-and-longer-inline-bytes-0123456789", 0)
 elif kind == "externalextent":
     os.pwrite(fd, b"r" * 8192, 0)
+elif kind == "compressedcut":
+    # One sector inside the committed compressed extent: the kernel
+    # writes it uncompressed, and the committed extent keeps its head
+    # and its tail as windows into the whole compressed extent.
+    os.pwrite(fd, b"r" * 4096, 32768)
 elif kind == "subvol":
     # Both subvolumes change after the commit, so the log root tree names
     # a log tree for each: f in the top level and g in the subvolume are
@@ -1474,6 +1689,12 @@ elif kind == "compressedinline":
     # compress-force stores it as a compressed inline extent. The earlier
     # text payload did not shrink and fell back to an uncompressed one.
     os.pwrite(fd, b"z" * 33, 0)
+elif kind == "nbytes":
+    # The committed f, with INODE_EXTREF items, rewritten in place with
+    # 33 other bytes and made durable by an fsync of f alone. The log
+    # holds f in full, and the kernel leaves its nbytes holding stale
+    # bytes of a long name rather than a count.
+    os.pwrite(fd, b"replayed-inline-bytes-ABCDEFGHIJK", 0)
 else:
     os.pwrite(fd, b"replayed-inline-bytes-ABCDEFGHIJK", 0)
 if kind == "mixedlog":
@@ -1488,6 +1709,23 @@ os.close(fd)' "$kind" "$MNT"
     log_root=$(btrfs inspect-internal dump-super "$copy" | awk '$1 == "log_root" { print $2 }')
     if [ -z "$log_root" ] || [ "$log_root" = 0 ]; then
         echo "guest-build-images: $shape fsync left no log; chore fixtures dirtylog must produce one" >&2
+        if [ "$kind" = rmdir ] && [ -z "${RMDIR_LOG_SEED:-}" ]; then
+            # Run native experiments in the CI guest when the original
+            # recipe fails (#654). Keep this failure: no seed substitutes
+            # for the requested fixture, and none bypasses its assertions.
+            local seed pid
+            for seed in parent-chmod parent-create child-chmod kept-write; do
+                echo "[rmdir diagnostic] $seed"
+                ( export RMDIR_LOG_SEED="$seed"
+                  build_dirtylog_refused "rmdir-$seed" "$opts" rmdir ) &
+                pid=$!
+                if wait "$pid"; then
+                    echo "[rmdir diagnostic] $seed: native attestation passed"
+                else
+                    echo "[rmdir diagnostic] $seed: native attestation failed"
+                fi
+            done
+        fi
         exit 1
     fi
     {
@@ -1503,7 +1741,7 @@ print(roots[0])
 PY2
     )
     btrfs inspect-internal dump-tree --follow -b "$log_tree" "$copy" >> "$out.logdump.partial"
-    python3 - "$out.logdump.partial" "$kind" <<'PY2'
+    python3 - "$out.logdump.partial" "$kind" "$copy" <<'PY2'
 import re, sys
 dump, kind = open(sys.argv[1]).read(), sys.argv[2]
 want = {
@@ -1518,6 +1756,15 @@ want = {
     'special': r'location key \(\d+ INODE_ITEM 0\) type CHRDEV',
     'hardlink': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: f\n\s+index \d+ namelen 1 name: g\n',
     'extref': r'INODE_EXTREF \d+\) itemoff \d+ itemsize \d+\n\s+index \d+ parent 256 namelen 255 name: (064){85}\n',
+    'dirlink': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: f\n\s+index \d+ namelen 1 name: g\n',
+    'nbytes': r'size 33 nbytes (?!0\n|33\n)\d+\n',
+    'extrefexists': r'INODE_REF (?!256\))\d+\)[^\n]*\n\s+index \d+ namelen 1 name: g\n',
+    'extrefcreated': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: n\n',
+    'createdlink': r'INODE_REF 256\)[^\n]*\n\s+index \d+ namelen 1 name: n\n\s+index \d+ namelen 1 name: m\n',
+    'extrefremoved': r'key \(256 DIR_LOG_INDEX \d+\) itemoff \d+ itemsize \d+\n\s+dir log end \d+\n',
+    'compressedcut': r'EXTENT_DATA 32768\)',
+    'rmdir': r'key \(256 DIR_LOG_INDEX \d+\) itemoff \d+ itemsize \d+\n\s+dir log end \d+\n',
+    'linkremoved': r'key \(256 DIR_LOG_INDEX \d+\) itemoff \d+ itemsize \d+\n\s+dir log end \d+\n',
 }[kind]
 assert re.search(want, dump), (kind, 'native dump does not show the unsupported shape')
 if kind == 'symlink':
@@ -1600,13 +1847,272 @@ if kind == 'extref':
         r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
     assert any(a <= index <= b for a, b in ranges), \
         (kind, 'no logged index range of / holds the new name', index, ranges)
+if kind == 'dirlink':
+    # f is logged only to say it exists: generation 0, two links, no data,
+    # and one reference to / holding f at its committed index and g at a
+    # later one. The entry of / naming g, f's inode, is inside a logged
+    # index range of /; f's committed index is outside every one, and the
+    # log holds no entry of / there.
+    ref = re.search(r'key \((\d+) INODE_REF 256\) itemoff \d+ itemsize \d+\n'
+                    r'\s+index (\d+) namelen 1 name: f\n\s+index (\d+) namelen 1 name: g\n', dump)
+    assert ref, (kind, 'native dump shows no logged reference of f to / naming f and g')
+    f, at_f, at_g = ref.group(1), int(ref.group(2)), int(ref.group(3))
+    item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation (\d+) transid \d+ size \d+ nbytes \d+\n'
+                     r'\s+block group \d+ mode 100644 links (\d+) ' % f, dump)
+    assert item, (kind, 'native dump shows no logged inode item of f')
+    generation, links = map(int, item.groups())
+    assert (generation, links) == (0, 2), \
+        (kind, 'f is not logged as an inode that exists with two links', generation, links)
+    assert not re.search(r'key \(%s EXTENT_DATA ' % f, dump), (kind, 'the log holds data of f')
+    assert re.search(r'key \(256 DIR_INDEX %d\) itemoff \d+ itemsize \d+\n'
+                     r'\s+location key \(%s INODE_ITEM 0\) type FILE\n[^\n]*\n\s+name: g\n'
+                     % (at_g, f), dump), \
+        (kind, 'native dump shows no logged entry of / naming g at its index', at_g)
+    assert not re.search(r'key \(256 DIR_INDEX %d\)' % at_f, dump), \
+        (kind, 'the log holds an entry of / at the committed index of f', at_f)
+    ranges = [(int(a), int(b)) for a, b in re.findall(
+        r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
+    assert any(a <= at_g <= b for a, b in ranges), \
+        (kind, 'no logged index range of / holds g', at_g, ranges)
+    assert not any(a <= at_f <= b for a, b in ranges), \
+        (kind, 'a logged index range of / holds the committed name f', at_f, ranges)
+if kind == 'nbytes':
+    # f is logged in full: at the generation it was committed with, older
+    # than the transaction that logged it, with its 65 links and its
+    # rewritten 33 bytes in one plain inline extent of that transaction.
+    # Its logged nbytes is neither 0 nor the 33 bytes committed: stale
+    # bytes the kernel's own replay does not read. Only f was fsynced, so
+    # the log holds no entry or index range of a directory.
+    ext = re.search(r'key \((\d+) INODE_EXTREF \d+\) itemoff \d+ itemsize \d+\n'
+                    r'\s+index \d+ parent 256 namelen 255 name: ', dump)
+    assert ext, (kind, 'native dump shows no logged extended reference of f to /')
+    f = ext.group(1)
+    item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation (\d+) transid (\d+) size 33 nbytes (\d+)\n'
+                     r'\s+block group \d+ mode 100644 links (\d+) ' % f, dump)
+    assert item, (kind, 'native dump shows no logged inode item of f')
+    generation, transid, nbytes, links = map(int, item.groups())
+    assert links == 65 and 0 < generation < transid, \
+        (kind, 'f is not logged as a committed inode with 65 links', generation, transid, links)
+    assert nbytes not in (0, 33), (kind, 'f is logged with a counted nbytes', nbytes)
+    assert re.search(r'key \(%s EXTENT_DATA 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation %d type 0 \(inline\)\n'
+                     r'\s+inline extent data size 33 ram_bytes 33 compression 0\b'
+                     % (f, transid), dump), \
+        (kind, 'native dump shows no logged inline extent of the 33 rewritten bytes')
+    assert not re.search(r'key \(\d+ (DIR_ITEM|DIR_INDEX|DIR_LOG_ITEM|DIR_LOG_INDEX) ', dump), \
+        (kind, 'the log holds an entry or index range of a directory')
+if kind == 'extrefexists':
+    # f is logged only to say it exists: generation 0, 66 links, no data,
+    # its INODE_REF items to / and to d, and no INODE_EXTREF item at all,
+    # so the three committed extended references are the replay's to
+    # keep. The entry of d naming g, f's inode, is inside a logged index
+    # range of d, and the log holds no entry or index range of /.
+    ref = re.search(r'key \((\d+) INODE_REF 256\) itemoff \d+ itemsize \d+\n'
+                    r'\s+index \d+ namelen 1 name: f\n', dump)
+    assert ref, (kind, 'native dump shows no logged reference of f to /')
+    f = ref.group(1)
+    sub = re.search(r'key \((\d+) INODE_REF 256\) itemoff \d+ itemsize \d+\n'
+                    r'\s+index \d+ namelen 1 name: d\n', dump)
+    assert sub, (kind, 'native dump shows no logged reference of d to /')
+    dino = sub.group(1)
+    item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation (\d+) transid \d+ size \d+ nbytes \d+\n'
+                     r'\s+block group \d+ mode 100644 links (\d+) ' % f, dump)
+    assert item, (kind, 'native dump shows no logged inode item of f')
+    generation, links = map(int, item.groups())
+    assert (generation, links) == (0, 66), \
+        (kind, 'f is not logged as an inode that exists with 66 links', generation, links)
+    assert not re.search(r'key \(\d+ INODE_EXTREF ', dump), \
+        (kind, 'the log holds an extended reference')
+    assert not re.search(r'key \(%s EXTENT_DATA ' % f, dump), (kind, 'the log holds data of f')
+    at_g = re.search(r'key \(%s INODE_REF %s\) itemoff \d+ itemsize \d+\n'
+                     r'\s+index (\d+) namelen 1 name: g\n' % (f, dino), dump)
+    assert at_g, (kind, 'native dump shows no logged reference of f to d naming g')
+    at_g = int(at_g.group(1))
+    assert re.search(r'key \(%s DIR_INDEX %d\) itemoff \d+ itemsize \d+\n'
+                     r'\s+location key \(%s INODE_ITEM 0\) type FILE\n[^\n]*\n\s+name: g\n'
+                     % (dino, at_g, f), dump), \
+        (kind, 'native dump shows no logged entry of d naming g at its index', at_g)
+    ranges = [(int(a), int(b)) for a, b in re.findall(
+        r'key \(%s DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n'
+        % dino, dump)]
+    assert any(a <= at_g <= b for a, b in ranges), \
+        (kind, 'no logged index range of d holds g', at_g, ranges)
+    assert not re.search(r'key \(256 (DIR_ITEM|DIR_INDEX|DIR_LOG_ITEM|DIR_LOG_INDEX) ', dump), \
+        (kind, 'the log holds an entry or index range of /')
+if kind == 'extrefcreated':
+    # n, which the log creates, is logged only to say it exists:
+    # generation 0, size 0, 65 links and no data, its INODE_REF to / and
+    # three INODE_EXTREF items, whose records are 65 names between them.
+    # Every one of them is an entry of / naming n, inside a logged index
+    # range of /, and the log holds no other entry of / and no other
+    # extended reference.
+    ref = re.search(r'key \((\d+) INODE_REF 256\) itemoff \d+ itemsize \d+\n'
+                    r'([ \t]+index \d+ namelen 1 name: n\n'
+                    r'(?:[ \t]+index \d+ namelen \d+ name: [^\n]*\n)*)', dump)
+    assert ref, (kind, 'native dump shows no logged reference of n to /')
+    n = ref.group(1)
+    item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation (\d+) transid \d+ size (\d+) nbytes \d+\n'
+                     r'\s+block group \d+ mode 100644 links (\d+) ' % n, dump)
+    assert item, (kind, 'native dump shows no logged inode item of n')
+    generation, size, links = map(int, item.groups())
+    assert (generation, size, links) == (0, 0, 65), \
+        (kind, 'n is not logged as an inode that exists with 65 links', generation, size, links)
+    assert not re.search(r'key \(%s EXTENT_DATA ' % n, dump), (kind, 'the log holds data of n')
+    extrefs = re.findall(r'key \(%s INODE_EXTREF \d+\) itemoff \d+ itemsize \d+\n'
+                         r'((?:[ \t]+index \d+ parent 256 namelen 255 name: [^\n]*\n)+)' % n, dump)
+    assert len(extrefs) == 3, (kind, 'n is not logged with three INODE_EXTREF items', len(extrefs))
+    assert len(re.findall(r'key \(\d+ INODE_EXTREF \d+\) itemoff ', dump)) == 3, \
+        (kind, 'the log holds an extended reference of another inode')
+    named = len(re.findall(r'index \d+ namelen', ref.group(2)))
+    extended = sum(len(re.findall(r'index \d+ parent', e)) for e in extrefs)
+    assert named + extended == 65, (kind, 'the references of n are not its 65 names', named, extended)
+    entries = [int(i) for i in re.findall(
+        r'key \(256 DIR_INDEX (\d+)\) itemoff \d+ itemsize \d+\n'
+        r'\s+location key \(%s INODE_ITEM 0\) type FILE\n' % n, dump)]
+    assert len(entries) == 65 == len(re.findall(r'key \(256 DIR_INDEX \d+\) itemoff ', dump)), \
+        (kind, 'the logged entries of / are not the 65 names of n', len(entries))
+    ranges = [(int(a), int(b)) for a, b in re.findall(
+        r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
+    assert all(any(a <= i <= b for a, b in ranges) for i in entries), \
+        (kind, 'an entry of / naming n is outside every logged index range', ranges)
+if kind == 'createdlink':
+    # n, which the log creates, is logged only to say it exists:
+    # generation 0, size 0, two links and no data, and one reference to /
+    # holding n and m. Each name is an entry of / naming n, inside a
+    # logged index range of /, and the log holds no other entry of /.
+    ref = re.search(r'key \((\d+) INODE_REF 256\) itemoff \d+ itemsize \d+\n'
+                    r'\s+index (\d+) namelen 1 name: n\n\s+index (\d+) namelen 1 name: m\n', dump)
+    assert ref, (kind, 'native dump shows no logged reference of n to / naming n and m')
+    n, at_n, at_m = ref.group(1), int(ref.group(2)), int(ref.group(3))
+    item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation (\d+) transid \d+ size (\d+) nbytes \d+\n'
+                     r'\s+block group \d+ mode 100644 links (\d+) ' % n, dump)
+    assert item, (kind, 'native dump shows no logged inode item of n')
+    generation, size, links = map(int, item.groups())
+    assert (generation, size, links) == (0, 0, 2), \
+        (kind, 'n is not logged as an inode that exists with two links', generation, size, links)
+    assert not re.search(r'key \(%s EXTENT_DATA ' % n, dump), (kind, 'the log holds data of n')
+    ranges = [(int(a), int(b)) for a, b in re.findall(
+        r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
+    for at, name in ((at_n, 'n'), (at_m, 'm')):
+        assert re.search(r'key \(256 DIR_INDEX %d\) itemoff \d+ itemsize \d+\n'
+                         r'\s+location key \(%s INODE_ITEM 0\) type FILE\n[^\n]*\n\s+name: %s\n'
+                         % (at, n, name), dump), \
+            (kind, 'native dump shows no logged entry of / naming %s at its index' % name, at)
+        assert any(a <= at <= b for a, b in ranges), \
+            (kind, 'no logged index range of / holds %s' % name, at, ranges)
+    assert len(re.findall(r'key \(256 DIR_INDEX \d+\) itemoff ', dump)) == 2, \
+        (kind, 'the log holds an entry of / other than n and m')
+if kind == 'extrefremoved':
+    # Committed, f has 33 bytes, one link, no INODE_REF item and one
+    # INODE_EXTREF item, whose one record is its last long name in /,
+    # named by an entry of / at that record's index. The log does not
+    # hold f or any entry naming it, holds no extended reference, and
+    # holds an index range of / covering that index with no entry there.
+    import subprocess
+    tree = subprocess.run(['btrfs', 'inspect-internal', 'dump-tree', '-t', '5', sys.argv[3]],
+                          check=True, capture_output=True, text=True).stdout
+    ext = re.findall(r'key \((\d+) INODE_EXTREF \d+\) itemoff \d+ itemsize \d+\n'
+                     r'((?:[ \t]+index \d+ parent \d+ namelen \d+ name: [^\n]*\n)+)', tree)
+    assert len(ext) == 1, (kind, 'the committed trees do not hold one extended reference', len(ext))
+    f, records = ext[0]
+    named = re.findall(r'index (\d+) parent (\d+) namelen \d+ name: ([^\n]*)\n', records)
+    assert len(named) == 1 and named[0][1:] == ('256', '063' * 85), \
+        (kind, 'the extended reference of f is not one record of its last name in /', named)
+    at = int(named[0][0])
+    item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation \d+ transid \d+ size (\d+) nbytes \d+\n'
+                     r'\s+block group \d+ mode 100644 links (\d+) ' % f, tree)
+    assert item and item.groups() == ('33', '1'), \
+        (kind, 'f is not committed with 33 bytes and one link', item and item.groups())
+    assert not re.search(r'key \(%s INODE_REF ' % f, tree), (kind, 'f is committed with an INODE_REF item')
+    assert re.search(r'key \(256 DIR_INDEX %d\) itemoff \d+ itemsize \d+\n'
+                     r'\s+location key \(%s INODE_ITEM 0\) type FILE\n' % (at, f), tree), \
+        (kind, 'no committed entry of / names f at the index of its extended reference', at)
+    assert not re.search(r'\bkey \(%s ' % f, dump), (kind, 'the log holds f or an entry naming it')
+    assert not re.search(r'key \(\d+ INODE_EXTREF ', dump), (kind, 'the log holds an extended reference')
+    assert not re.search(r'key \(256 DIR_INDEX %d\) ' % at, dump), \
+        (kind, 'the log holds an entry of / at the removed index', at)
+    ranges = [(int(a), int(b)) for a, b in re.findall(
+        r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
+    assert any(a <= at <= b for a, b in ranges), \
+        (kind, 'no logged index range of / holds the removed index', at, ranges)
+if kind == 'rmdir':
+    # Committed, / names one directory, e, empty with one link. The log
+    # does not hold e or any entry naming it, and holds an index range of
+    # / covering e's index with no entry there.
+    import subprocess
+    tree = subprocess.run(['btrfs', 'inspect-internal', 'dump-tree', '-t', '5', sys.argv[3]],
+                          check=True, capture_output=True, text=True).stdout
+    named = re.findall(r'key \(256 DIR_INDEX (\d+)\) itemoff \d+ itemsize \d+\n'
+                       r'\s+location key \((\d+) INODE_ITEM 0\) type DIR\n[^\n]*\n\s+name: e\n', tree)
+    assert len(named) == 1, (kind, 'the committed / does not name one directory e', named)
+    at, e = int(named[0][0]), named[0][1]
+    item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation \d+ transid \d+ size (\d+) nbytes \d+\n'
+                     r'\s+block group \d+ mode 40\d+ links (\d+) ' % e, tree)
+    assert item and item.groups() == ('0', '1'), \
+        (kind, 'e is not committed as an empty directory with one link', item and item.groups())
+    assert not re.search(r'\bkey \(%s ' % e, dump), (kind, 'the log holds e or an item of it')
+    assert not re.search(r'key \(256 DIR_INDEX %d\) ' % at, dump), \
+        (kind, 'the log holds an entry of / at the removed index', at)
+    ranges = [(int(a), int(b)) for a, b in re.findall(
+        r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
+    assert any(a <= at <= b for a, b in ranges), \
+        (kind, 'no logged index range of / holds the removed index', at, ranges)
+if kind == 'linkremoved':
+    # Committed, / names one regular file twice, f and g, with two links
+    # and both names in one INODE_REF. The log does not hold that inode or
+    # any entry naming it, and holds an index range of / covering g's
+    # index with no entry there.
+    import subprocess
+    tree = subprocess.run(['btrfs', 'inspect-internal', 'dump-tree', '-t', '5', sys.argv[3]],
+                          check=True, capture_output=True, text=True).stdout
+    named = {n: (int(i), o) for i, o, n in re.findall(
+        r'key \(256 DIR_INDEX (\d+)\) itemoff \d+ itemsize \d+\n'
+        r'\s+location key \((\d+) INODE_ITEM 0\) type FILE\n[^\n]*\n\s+name: ([fg])\n', tree)}
+    assert set(named) == {'f', 'g'} and named['f'][1] == named['g'][1], \
+        (kind, 'the committed / does not name one file as f and g', named)
+    at, f = named['g'][0], named['f'][1]
+    item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                     r'\s+generation \d+ transid \d+ size \d+ nbytes \d+\n'
+                     r'\s+block group \d+ mode 100\d+ links (\d+) ' % f, tree)
+    assert item and item.group(1) == '2', \
+        (kind, 'f is not committed with two links', item and item.group(1))
+    refs = re.findall(r'key \(%s INODE_REF 256\) itemoff \d+ itemsize \d+\n'
+                      r'((?:\s+index \d+ namelen \d+ name: \S+\n)+)' % f, tree)
+    assert len(refs) == 1 and sorted(re.findall(r'name: (\S+)', refs[0])) == ['f', 'g'], \
+        (kind, 'f is not committed with one INODE_REF holding f and g', refs)
+    assert not re.search(r'\bkey \(%s ' % f, dump), (kind, 'the log holds f or an item of it')
+    assert not re.search(r'key \(256 DIR_INDEX %d\) ' % at, dump), \
+        (kind, 'the log holds an entry of / at the removed index', at)
+    ranges = [(int(a), int(b)) for a, b in re.findall(
+        r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
+    assert any(a <= at <= b for a, b in ranges), \
+        (kind, 'no logged index range of / holds the removed index', at, ranges)
 if kind == 'compressedinline':
     # The native tool must print a compressed inline extent: nonzero
     # compression on the inline line itself, stored smaller than its bytes.
     inline = [(int(n), int(r)) for n, r in re.findall(
         r'inline extent data size (\d+) ram_bytes (\d+) compression [1-3]\b', dump)]
     assert any(n < r for n, r in inline), (kind, 'native dump shows no compressed inline extent', inline)
+if kind == 'compressedcut':
+    # The logged write is its own uncompressed sector at 32768.
+    logged = re.search(r'EXTENT_DATA 32768\)[\s\S]*?extent compression (\d+)', dump)
+    assert logged and logged.group(1) == '0', (kind, 'native dump shows no plain logged sector at 32768')
 PY2
+    if [ "$kind" = compressedcut ]; then
+        # The committed file is one compressed extent, read from the
+        # native dump of the committed subvolume tree, not ours.
+        btrfs inspect-internal dump-tree -t 5 "$copy" | grep -Ec 'extent compression [1-3] ' >/dev/null || {
+            echo "guest-build-images: compressedcut committed no compressed extent" >&2
+            exit 1
+        }
+    fi
     mv -f "$out.logdump.partial" "$out.logdump"
     cp --sparse=always "$copy" "$out.img.partial"
     mv -f "$out.img.partial" "$out.img"
@@ -1870,6 +2376,42 @@ build_features() {
     note "built features/btrfs-bgt"
 
     build_feature_verity
+    build_feature_zoned
+}
+
+# Emulated zones on a regular file retain conventional superblock
+# offsets. The kernel supplies the file bytes and manifest; btrfs-progs
+# supplies an independent consistency verdict before publication (#454).
+build_feature_zoned() {
+    local img="$WORK/btrfs-zoned.img" manifest="$WORK/btrfs-zoned.manifest" i f
+    truncate -s 2G "$img"
+    "$STATIC_PROGS/mkfs.btrfs" -f -d single -m single -O zoned "$img" >/dev/null
+    mount -o loop "$img" "$MNT"
+    mkdir -p "$MNT/dir"
+    for i in 1 2 3; do
+        echo "zoned file $i" > "$MNT/dir/file-$i.txt"
+    done
+    dd if=/dev/urandom of="$MNT/big.bin" bs=1M count=4 status=none
+    : > "$MNT/empty"
+    sync
+    manifest_of "$MNT" > "$manifest"
+    umount "$MNT"
+    "$STATIC_PROGS/btrfs" inspect-internal dump-super "$img" > "$WORK/zoned.superdump"
+    grep -q 'ZONED' "$WORK/zoned.superdump" || {
+        echo "guest-build-images: btrfs-zoned does not carry ZONED" >&2
+        exit 1
+    }
+    "$STATIC_PROGS/btrfs" check --readonly "$img" >/dev/null 2>&1 || {
+        echo "guest-build-images: btrfs check does not find btrfs-zoned clean" >&2
+        "$STATIC_PROGS/btrfs" check --readonly "$img" >&2 || true
+        exit 1
+    }
+    mkdir -p "$OUT/features"
+    for f in "$img" "$manifest"; do
+        cp --sparse=always "$f" "$OUT/features/$(basename "$f").partial"
+        mv -f "$OUT/features/$(basename "$f").partial" "$OUT/features/$(basename "$f")"
+    done
+    note "built features/btrfs-zoned"
 }
 
 # ---------------------------------------------------------------------

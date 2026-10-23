@@ -2,8 +2,8 @@
 //! mounts read-only and refuses to mount read-write (#72).
 //!
 //! `mount_rw` consulted `compat_ro_flags` for nothing, and this driver
-//! writes: a block group tree volume would be written by code that looks
-//! for block group items in the extent tree and finds none. The image is
+//! writes: unmaintained feature bits must block writes even when combined
+//! with the now-maintained block group tree feature (#451). The image is
 //! made fresh by `mkfs.btrfs` on a plain file -- no mount, no root. The
 //! tool runs in the harness VM, which is where this suite's btrfs-progs
 //! lives, so it is always there: a run either has the VM or fails saying
@@ -51,9 +51,9 @@ fn image_with_compat_ro(name: &str, bits: u64) -> std::path::PathBuf {
 #[test]
 fn an_unmaintained_compat_ro_feature_mounts_read_only_and_refuses_read_write() {
     for (name, bits) in [
-        ("bgt", compat_ro::BLOCK_GROUP_TREE),
-        ("verity", compat_ro::VERITY),
         ("future", 1 << 40),
+        ("bgt-future", compat_ro::BLOCK_GROUP_TREE | (1 << 40)),
+        ("verity-future", compat_ro::VERITY | (1 << 40)),
     ] {
         let path = image_with_compat_ro(name, bits);
         let ro = FileDevice::open(&path).unwrap();
@@ -76,9 +76,11 @@ fn an_unmaintained_compat_ro_feature_mounts_read_only_and_refuses_read_write() {
 /// this driver maintains, still mounts read-write.
 #[test]
 fn a_fresh_image_still_mounts_read_write() {
-    let path = image_with_compat_ro("fresh", 0);
-    let rw = FileDevice::open_rw(&path).unwrap();
-    Filesystem::mount_rw(Arc::new(rw) as Arc<dyn BlockDevice>)
-        .unwrap_or_else(|e| panic!("a fresh image must mount read-write: {e:?}"));
-    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    for (name, flags) in [("fresh", 0), ("verity", compat_ro::VERITY)] {
+        let path = image_with_compat_ro(name, flags);
+        let rw = FileDevice::open_rw(&path).unwrap();
+        Filesystem::mount_rw(Arc::new(rw) as Arc<dyn BlockDevice>)
+            .unwrap_or_else(|e| panic!("{name} must mount read-write: {e:?}"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 }
