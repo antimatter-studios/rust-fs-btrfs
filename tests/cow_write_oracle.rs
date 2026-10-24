@@ -4508,7 +4508,7 @@ fn a_write_spanning_a_kept_preallocated_items_end_and_the_files_end_is_written()
          head -c {OLD} /dev/zero | tr '\\000' '\\101' > \"$MNT/$f\"; done\n\
          sync\n\
          for f in {OURS} {THEIRS}; do \
-         fallocate -k -o {OLD} -l {KEPT} \"$MNT/$f\"; done\n\
+         fallocate -n -o {OLD} -l {KEPT} \"$MNT/$f\"; done\n\
          sync\n\
          head -c {PART} /dev/zero | tr '\\000' '\\132' \
          | dd of=\"$MNT/{THEIRS}\" bs=4096 seek={seek} conv=notrunc status=none\n\
