@@ -441,6 +441,11 @@ pub struct Filesystem {
     /// superblock and a stripe on one is refused. Kept so that a remount
     /// after a commit opens the same pair.
     pub(crate) seed_pool: BTreeMap<u64, Arc<dyn BlockDevice>>,
+    /// The fsids a sprouted filesystem's seed devices stamp their tree
+    /// blocks with (#679). Its blocks from before it sprouted are on the
+    /// seeds and carry the seed's fsid, not the sprout's, and every pool
+    /// read accepts them. Empty for any other filesystem.
+    pub(crate) seed_fsids: Vec<[u8; 16]>,
     pub(crate) sb: Superblock,
     pub(crate) map: ChunkMap,
     pub(crate) fs_tree_root: u64,
@@ -771,6 +776,7 @@ impl Filesystem {
         let mut by_id: BTreeMap<u64, Arc<dyn BlockDevice>> = BTreeMap::new();
         let mut seeds: BTreeMap<u64, Arc<dyn BlockDevice>> = BTreeMap::new();
         let mut seed_items = Vec::new();
+        let mut seed_fsids: Vec<[u8; 16]> = Vec::new();
         let mut first: Option<(crate::superblock::Superblock, usize)> = None;
         for dev in devices {
             let (sb, copy) = crate::superblock::read_superblock(&*dev)?;
@@ -784,6 +790,9 @@ impl Filesystem {
             // `mount_rw`'s, and refused there.
             if several && sb.is_seeding() {
                 seed_items.push(sb.dev_item.clone());
+                if !seed_fsids.contains(&sb.node_uuid()) {
+                    seed_fsids.push(sb.node_uuid());
+                }
                 if seeds.insert(id, dev).is_some() {
                     return Err(Error::UnsupportedFeature(format!(
                         "two devices both claim to be device {id}"
@@ -853,6 +862,7 @@ impl Filesystem {
         fs.refuse_unwritable()?;
         fs.writable_pool = by_id;
         fs.seed_pool = seeds;
+        fs.seed_fsids = seed_fsids;
         Ok(fs)
     }
 
@@ -1187,10 +1197,14 @@ impl Filesystem {
         // device uuid; see `verify_seed_members`.
         let mut by_id: BTreeMap<u64, Arc<dyn BlockRead>> = BTreeMap::new();
         let mut seeds: Vec<(u64, crate::superblock::DevItem, Arc<dyn BlockRead>)> = Vec::new();
+        let mut seed_fsids: Vec<[u8; 16]> = Vec::new();
         let mut fsid: Option<[u8; 16]> = None;
         for dev in devices {
             let (sb, _) = crate::superblock::read_superblock(&*dev)?;
             if sb.is_seeding() {
+                if !seed_fsids.contains(&sb.node_uuid()) {
+                    seed_fsids.push(sb.node_uuid());
+                }
                 seeds.push((sb.dev_item.devid, sb.dev_item.clone(), dev));
                 continue;
             }
@@ -1256,8 +1270,9 @@ impl Filesystem {
             }
             seed_items.push(item);
         }
-        let fs = Self::open_pool_with(first, by_id, None, None, degraded)?;
+        let mut fs = Self::open_pool_with(first, by_id, None, None, degraded)?;
         fs.verify_seed_members(&seed_items)?;
+        fs.seed_fsids = seed_fsids;
         Ok(fs)
     }
 
@@ -1470,6 +1485,7 @@ impl Filesystem {
             writable,
             writable_pool: BTreeMap::new(),
             seed_pool: BTreeMap::new(),
+            seed_fsids: Vec::new(),
             sb,
             map,
             fs_tree_root,
@@ -1524,6 +1540,7 @@ impl Filesystem {
     pub(crate) fn pool_reader(&self) -> PoolReader<'_> {
         PoolReader {
             geom: crate::btree::TreeGeometry::from_superblock(&self.sb),
+            seeds: &self.seed_fsids,
             read: Box::new(move |logical, buf| {
                 Self::read_logical_pool(&self.device, &self.devices, &self.map, logical, buf)
             }),
@@ -1935,6 +1952,7 @@ impl Filesystem {
             writable: None,
             writable_pool: BTreeMap::new(),
             seed_pool: self.seed_pool.clone(),
+            seed_fsids: self.seed_fsids.clone(),
             sb: self.sb.clone(),
             map: self.map.clone(),
             fs_tree_root,
@@ -1977,7 +1995,8 @@ impl Filesystem {
         };
         let tree = Tree::new(TreeGeometry::from_superblock(&self.sb), &read)
             .with_redundancy(&mirrors, &read_mirror)
-            .with_cache(&get, &put);
+            .with_cache(&get, &put)
+            .with_seed_fsids(&self.seed_fsids);
         f(&tree, self.fs_tree_root)
     }
 
@@ -3012,6 +3031,8 @@ type ElementRead<'a> = &'a dyn Fn(u64, u64, &mut [u8]) -> Result<()>;
 /// see [`Filesystem::pool_reader`] for why the two cannot be one value.
 pub(crate) struct PoolReader<'a> {
     geom: crate::btree::TreeGeometry,
+    /// The pool's seed fsids; see [`Filesystem::seed_fsids`].
+    seeds: &'a [[u8; 16]],
     read: OwnedReadBlock<'a>,
     mirrors: OwnedMirrorCount<'a>,
     read_mirror: OwnedReadMirror<'a>,
@@ -3041,6 +3062,7 @@ impl PoolReader<'_> {
     pub(crate) fn tree(&self) -> crate::btree::Tree<'_> {
         crate::btree::Tree::new(self.geom, &*self.read)
             .with_redundancy(&*self.mirrors, &*self.read_mirror)
+            .with_seed_fsids(self.seeds)
     }
 }
 

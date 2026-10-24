@@ -429,6 +429,24 @@ impl TreeBlock {
     /// the fsid is foreign or the block's internal geometry does not
     /// hold up.
     pub fn parse(bytes: Vec<u8>, logical: u64, geom: &TreeGeometry) -> Result<Self> {
+        Self::parse_accepting(bytes, logical, geom, &[])
+    }
+
+    /// [`TreeBlock::parse`], also accepting a header stamped with any of
+    /// `seeds`. A sprouted filesystem's blocks from before it sprouted
+    /// are on its seed devices and carry the seed's fsid, which the
+    /// kernel's `check_tree_block_fsid` accepts too (#679).
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeBlock::parse`]; a foreign fsid is one that is neither
+    /// the geometry's nor a seed's.
+    pub fn parse_accepting(
+        bytes: Vec<u8>,
+        logical: u64,
+        geom: &TreeGeometry,
+        seeds: &[[u8; UUID_SIZE]],
+    ) -> Result<Self> {
         let nodesize = geom.nodesize as usize;
         if bytes.len() != nodesize {
             return Err(bad_block(
@@ -464,7 +482,7 @@ impl TreeBlock {
                 found: header.bytenr,
             });
         }
-        if header.fsid != geom.fsid {
+        if header.fsid != geom.fsid && !seeds.contains(&header.fsid) {
             // Not BlockIdentityMismatch: that variant carries u64
             // addresses, and squeezing a UUID into one would produce an
             // error message that reads like nonsense.
@@ -723,6 +741,9 @@ pub struct Tree<'a> {
     redundancy: Option<(MirrorCount<'a>, ReadMirror<'a>)>,
     /// Verified blocks kept between walks, where the caller keeps them.
     cache: Option<(CacheGet<'a>, CachePut<'a>)>,
+    /// Fsids a block may carry besides the geometry's: a sprouted
+    /// filesystem's seeds' (#679). Empty for every other volume.
+    seeds: &'a [[u8; UUID_SIZE]],
 }
 
 impl<'a> Tree<'a> {
@@ -736,6 +757,7 @@ impl<'a> Tree<'a> {
             read,
             redundancy: None,
             cache: None,
+            seeds: &[],
         }
     }
 
@@ -753,6 +775,14 @@ impl<'a> Tree<'a> {
     /// changes.
     pub fn with_redundancy(mut self, mirrors: MirrorCount<'a>, read: ReadMirror<'a>) -> Self {
         self.redundancy = Some((mirrors, read));
+        self
+    }
+
+    /// Also accept blocks stamped with any of `seeds`: the fsids of a
+    /// sprouted filesystem's seed devices, which hold its blocks from
+    /// before it sprouted (#679). See [`TreeBlock::parse_accepting`].
+    pub fn with_seed_fsids(mut self, seeds: &'a [[u8; UUID_SIZE]]) -> Self {
+        self.seeds = seeds;
         self
     }
 
@@ -858,7 +888,7 @@ impl<'a> Tree<'a> {
 
     fn read_uncached(&self, logical: u64, generation: Option<u64>) -> Result<TreeBlock> {
         let parse = |buf: Vec<u8>| {
-            let block = TreeBlock::parse(buf, logical, &self.geom)?;
+            let block = TreeBlock::parse_accepting(buf, logical, &self.geom, self.seeds)?;
             match generation {
                 Some(want) if block.header.generation != want => Err(bad_block(
                     logical,
