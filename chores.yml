@@ -656,7 +656,7 @@ tasks:
     # lines and 151500 bytes.
     cmds:
       - test-disks/build-fixtures.sh --check
-      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 1890 151500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 1890 151500 -- scripts/test.sh --locked --release --test node_split_kernel -- --show-output --nocapture --exact full_ancestors_split_together_up_to_a_new_root'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'

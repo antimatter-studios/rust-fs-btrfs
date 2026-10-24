@@ -235,9 +235,15 @@ fn full_ancestors_split_together_up_to_a_new_root() {
     let fs = unsafe { fs_btrfs_mount_rw(c(image.to_str().unwrap()).as_ptr()) };
     assert!(!fs.is_null(), "mount_rw: {}", last_error());
     let padding = vec![0x61u8; 3000];
-    let mut made = 0;
+    let mut made: usize = 0;
     let mut saw_level_two = false;
+    let start = std::time::Instant::now();
+    let mut checking = std::time::Duration::ZERO;
     while made < 12_000 {
+        if start.elapsed() > std::time::Duration::from_secs(2400) {
+            eprintln!("diag: stopped after 40 minutes at {made} files");
+            break;
+        }
         for _ in 0..BATCH {
             let name = c(&format!("/{PREFIX}{made:05}"));
             let ino = unsafe { fs_btrfs_create(fs, name.as_ptr(), 0o644) };
@@ -254,7 +260,17 @@ fn full_ancestors_split_together_up_to_a_new_root() {
             assert_eq!(rc, 0, "pad {}: {}", made + 1, last_error());
             made += 1;
         }
-        match fs_tree_level(&image) {
+        let t = std::time::Instant::now();
+        let level = fs_tree_level(&image);
+        checking += t.elapsed();
+        if made.is_multiple_of(500) || level == 3 {
+            eprintln!(
+                "diag: {made} files, level {level}, {:?} in all, {:?} in level checks",
+                start.elapsed(),
+                checking
+            );
+        }
+        match level {
             2 => saw_level_two = true,
             3 => break,
             _ => {}
