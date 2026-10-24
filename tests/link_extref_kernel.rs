@@ -14,8 +14,11 @@
 //! - `btrfs inspect-internal dump-tree` shows the spilled names in
 //!   extended references from the directory;
 //! - the guest kernel lists the directory, reports the link count,
-//!   resolves every name through `inode-resolve`, and removes some names
-//!   itself, after which `btrfs check` looks again.
+//!   counts every back-reference through `inode-resolve` (the paths it
+//!   fits, `cnt`, plus those its 4 KiB buffer leaves out, `missed`: about
+//!   nineteen 255-byte names fit, #681) with every path it does print a
+//!   listed name, and removes some names itself, after which `btrfs
+//!   check` looks again.
 
 use fs_btrfs::capi::*;
 use fs_btrfs_test_support::{
@@ -240,14 +243,17 @@ fn links_past_a_full_inode_ref_are_extended_references_the_kernel_reads() {
              ls d | wc -l\n\
              cat \"d/$(nm {total})\"\n\
              test -e \"d/$(nm {})\" && echo old-present || echo old-absent\n\
-             btrfs inspect-internal inode-resolve \"$(stat -c %i \"d/$(nm 0)\")\" \"$MNT\" \
-               | sed \"s|^$MNT/||\" | LC_ALL=C sort > /tmp/resolved\n\
-             ls d | sed 's|^|d/|' | LC_ALL=C sort \
-               | cmp -s - /tmp/resolved && echo resolve-matches || cat /tmp/resolved\n",
+             btrfs -v inspect-internal inode-resolve \"$(stat -c %i \"d/$(nm 0)\")\" \"$MNT\" \
+               > /tmp/raw 2>&1\n\
+             sed -n 's/.*cnt=\\([0-9]*\\), missed=\\([0-9]*\\).*/\\1 \\2/p' /tmp/raw \
+               | {{ read cnt missed; echo $((cnt + missed)); }}\n\
+             grep \"^$MNT/\" /tmp/raw | sed \"s|^$MNT/||\" | LC_ALL=C sort > /tmp/resolved\n\
+             ls d | sed 's|^|d/|' | LC_ALL=C sort > /tmp/listed\n\
+             LC_ALL=C comm -23 /tmp/resolved /tmp/listed | wc -l\n",
             total - 1
         ),
     );
-    let want = format!("{total}\n{total}\nhello\nold-absent\nresolve-matches\n");
+    let want = format!("{total}\n{total}\nhello\nold-absent\n{total}\n0\n");
     let seen: String = seen.lines().map(|l| format!("{}\n", l.trim())).collect();
     assert_eq!(seen, want, "the kernel sees a different namespace");
 

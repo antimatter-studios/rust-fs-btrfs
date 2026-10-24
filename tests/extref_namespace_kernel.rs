@@ -12,7 +12,9 @@
 //!   reference item and both directory entries of every name;
 //! - the guest kernel lists the directory and reports the link count;
 //! - `btrfs inspect-internal inode-resolve`, the kernel's own walk of the
-//!   back-references, resolves exactly the names that remain.
+//!   back-references, counts exactly the names that remain (`cnt` paths
+//!   printed plus `missed` ones its 4 KiB buffer has no room for, #681),
+//!   and every path it prints is one of them.
 
 use fs_btrfs::capi::*;
 use fs_btrfs_test_support::{
@@ -223,17 +225,19 @@ fn spilled_names_are_unlinked_and_renamed_and_the_kernel_agrees() {
              cat other/moved\n\
              test -e \"d/$(nm {})\" && echo gone-present || echo gone-absent\n\
              test -e \"d/$(nm {})\" && echo moved-present || echo moved-absent\n\
-             btrfs inspect-internal inode-resolve \"$(stat -c %i other/moved)\" \"$MNT\" \
-               | sed \"s|^$MNT/||\" | LC_ALL=C sort > /tmp/resolved\n\
-             wc -l < /tmp/resolved\n\
-             {{ ls d | sed 's|^|d/|'; echo other/moved; }} | LC_ALL=C sort \
-               | cmp -s - /tmp/resolved && echo resolve-matches || cat /tmp/resolved\n",
+             btrfs -v inspect-internal inode-resolve \"$(stat -c %i other/moved)\" \"$MNT\" \
+               > /tmp/raw 2>&1\n\
+             sed -n 's/.*cnt=\\([0-9]*\\), missed=\\([0-9]*\\).*/\\1 \\2/p' /tmp/raw \
+               | {{ read cnt missed; echo $((cnt + missed)); }}\n\
+             grep \"^$MNT/\" /tmp/raw | sed \"s|^$MNT/||\" | LC_ALL=C sort > /tmp/resolved\n\
+             {{ ls d | sed 's|^|d/|'; echo other/moved; }} | LC_ALL=C sort > /tmp/listed\n\
+             LC_ALL=C comm -23 /tmp/resolved /tmp/listed | wc -l\n",
             total - 2,
             total - 1
         ),
     );
     let want = format!(
-        "{remain}\n{in_d}\nmoved\nhello\ngone-absent\nmoved-absent\n{remain}\nresolve-matches\n",
+        "{remain}\n{in_d}\nmoved\nhello\ngone-absent\nmoved-absent\n{remain}\n0\n",
         remain = total - 1,
         in_d = total - 2,
     );
