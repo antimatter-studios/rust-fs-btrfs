@@ -71,7 +71,7 @@ done
 fs.btrfs "$img" ls -R /missing >"$SANDBOX/missing.out" 2>"$SANDBOX/missing.err"
 check "missing start exits 1" test $? -eq 1
 check "missing start has no report" test ! -s "$SANDBOX/missing.out"
-jq_check "missing start says no such file" '.code==1 and (.error|contains("no such file"))' "$SANDBOX/missing.err"
+jq_check "missing start is the not_found kind" '.code==1 and .kind=="not_found"' "$SANDBOX/missing.err"
 { head -c 1048576 /dev/zero; cat "$img"; } >"$SANDBOX/offset.img"
 fs.btrfs --offset 1048576 "$SANDBOX/offset.img" ls -R / >"$SANDBOX/offset.json" 2>/dev/null
 check "offset walk succeeds" test $? -eq 0
