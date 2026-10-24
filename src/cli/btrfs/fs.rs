@@ -15,9 +15,10 @@
 //! that makes that change, `create` or `truncate`, and every other refusal
 //! gives the library's own reason.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command as Cmd};
@@ -163,16 +164,28 @@ fn command() -> Cmd {
         )
         .subcommand(
             Cmd::new("export")
-                .about("Copy a regular file out through the shared bounded transfer")
-                .args(transfer::export_args())
+                .about("Copy a regular file, or with --recursive a directory tree")
+                .args(transfer::export_args_with_times())
                 .after_help(
                     "Examples:\n  fs.btrfs disk.img export /backup.tar backup.tar\n  \
                      fs.btrfs disk.img export --replace /etc/hostname hostname\n  \
-                     fs.btrfs disk.img export /backup.tar - | tar tf -\n\n\
+                     fs.btrfs disk.img export /backup.tar - | tar tf -\n  \
+                     fs.btrfs disk.img export --recursive /etc etc\n  \
+                     fs.btrfs disk.img export --recursive --preserve=links,times /etc etc\n\n\
                      Files are copied in fixed chunks. A local destination is published only \
                      when complete; an existing name is refused unless --replace is given. \
                      The report includes the byte count and SHA-256; DEST - writes only raw \
-                     bytes to stdout. Directories, symlinks and special files are refused.",
+                     bytes to stdout. Without --recursive directories, symlinks and special \
+                     files are refused.\n\n\
+                     Recursive export uses the shared tree transfer and reports every item; \
+                     subvolumes and snapshots are entered as ls --recursive enters them. \
+                     Existing directories are merged into; existing files require --replace. \
+                     --max-depth bounds the walk. Special files are skipped. Symlinks require \
+                     --preserve=links, which recreates their targets without following them \
+                     and copies each regular inode once; a snapshot's files are never linked \
+                     to its source's. --preserve=times sets the stored access and modification \
+                     times. Symlink times are not set. --verify reads each staged file back \
+                     before publication.",
                 ),
         )
         .subcommand(
@@ -510,7 +523,24 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         ),
         "export" => {
             let request = transfer::ExportRequest::from_matches(sub)?;
-            export(&device::mount(target, offset)?, &request)
+            let tree = transfer::TreeOptions::from_matches(sub)?;
+            let root = device::mount(target, offset)?;
+            if tree.recursive {
+                transfer::export_tree_with_times(
+                    &request,
+                    &mut TreeExport {
+                        root: &root,
+                        image: Path::new(target),
+                        ids: HashMap::new(),
+                        last: None,
+                    },
+                    tree,
+                    transfer::LinkOptions::from_matches(sub)?,
+                    transfer::TimeOptions::from_matches(sub)?,
+                )
+            } else {
+                export(&root, &request, transfer::ExportOptions::from_matches(sub)?)
+            }
         }
         "write" if sub.get_one::<u64>("at").is_some() => Err(CliError::not_implemented(
             "positioned write (--at) is not supported",
@@ -1582,7 +1612,11 @@ impl transfer::FileSource for ExportSource<'_> {
 }
 
 /// Resolve the source here; core owns copying, digesting and publication.
-fn export(root: &Filesystem, request: &transfer::ExportRequest) -> Result<Outcome, CliError> {
+fn export(
+    root: &Filesystem,
+    request: &transfer::ExportRequest,
+    options: transfer::ExportOptions,
+) -> Result<Outcome, CliError> {
     let path = os_bytes(&request.path);
     let found = root
         .resolve_path_bytes(path)
@@ -1603,14 +1637,187 @@ fn export(root: &Filesystem, request: &transfer::ExportRequest) -> Result<Outcom
             show(path)
         )));
     }
-    transfer::export(
+    transfer::export_with_options(
         request,
         &mut ExportSource {
             fs: found.fs(root),
             inode,
             path,
         },
+        options,
     )
+}
+
+/// A stored time as a `SystemTime`, before the epoch as well as after it.
+fn system_time(t: &fs_btrfs::inode::Timestamp) -> Option<std::time::SystemTime> {
+    let seconds = std::time::Duration::from_secs(t.sec.unsigned_abs());
+    let base = if t.sec >= 0 {
+        std::time::UNIX_EPOCH.checked_add(seconds)?
+    } else {
+        std::time::UNIX_EPOCH.checked_sub(seconds)?
+    };
+    base.checked_add(std::time::Duration::from_nanos(u64::from(t.nsec)))
+}
+
+#[cfg(unix)]
+fn os_name(name: Vec<u8>) -> OsString {
+    use std::os::unix::ffi::OsStringExt;
+    OsString::from_vec(name)
+}
+
+#[cfg(not(unix))]
+fn os_name(name: Vec<u8>) -> OsString {
+    OsString::from(String::from_utf8_lossy(&name).into_owned())
+}
+
+/// Btrfs supplies lookups across subvolumes, listings, symlink targets,
+/// times and positioned reads. Core owns traversal, the depth bound, safe
+/// names, destination merging, publication and the per-item report (#541).
+struct TreeExport<'a> {
+    root: &'a Filesystem,
+    image: &'a Path,
+    /// The identity core is given for each (tree, inode): every
+    /// subvolume's top directory is inode 256, and a snapshot shares its
+    /// inode numbers with its source, so the number alone would make a
+    /// snapshot's file a hard link of the live one. An empty placeholder,
+    /// a snapshot's copy of a nested subvolume's entry, is its own by path.
+    ids: HashMap<(u64, u64, Option<PathBuf>), u64>,
+    /// The file `read_file_at` read last, by path. Core reads a file in
+    /// chunks, and resolving its path again for each one would walk every
+    /// directory, and open every subvolume, above it every time.
+    last: Option<(PathBuf, fs_btrfs::subvol::PathTarget)>,
+}
+
+impl TreeExport<'_> {
+    fn resolve(&self, path: &Path) -> Result<(Vec<u8>, fs_btrfs::subvol::PathTarget), CliError> {
+        let bytes = os_bytes(&path.as_os_str().to_owned()).to_vec();
+        let target = self
+            .root
+            .resolve_path_bytes(&bytes)
+            .map_err(|e| btrfs_error(&bytes, e))?;
+        Ok((bytes, target))
+    }
+
+    /// The tree id of the subvolume or snapshot `fs` reads.
+    fn tree_of(fs: &Filesystem, bytes: &[u8]) -> Result<u64, CliError> {
+        fs.subvolume_at(b"/").map_err(|e| btrfs_error(bytes, e))
+    }
+
+    fn metadata_of(&mut self, tree: u64, inode: &Inode, path: &Path) -> transfer::TreeMetadata {
+        let placeholder = inode.ino == fs_btrfs::subvol::EMPTY_SUBVOL_DIR_OBJECTID;
+        let key = (tree, inode.ino, placeholder.then(|| path.to_path_buf()));
+        let next = self.ids.len() as u64;
+        let id = *self.ids.entry(key).or_insert(next);
+        transfer::TreeMetadata {
+            kind: if inode.is_regular_file() {
+                transfer::TreeKind::File
+            } else if inode.is_dir() {
+                transfer::TreeKind::Directory
+            } else {
+                transfer::TreeKind::Other
+            },
+            size: if inode.is_regular_file() {
+                inode.size
+            } else {
+                0
+            },
+            inode: id,
+            accessed: system_time(&inode.atime),
+            modified: system_time(&inode.mtime),
+        }
+    }
+}
+
+impl transfer::TreeSource for TreeExport<'_> {
+    fn image_path(&self) -> Option<&Path> {
+        Some(self.image)
+    }
+
+    fn symbolic_link(&mut self, path: &Path) -> Result<Option<transfer::SymbolicLink>, CliError> {
+        let (bytes, target) = self.resolve(path)?;
+        if !target.inode.is_symlink() {
+            return Ok(None);
+        }
+        let link = target
+            .fs(self.root)
+            .read_link(target.inode.ino)
+            .map_err(|e| btrfs_error(&bytes, e))?;
+        Ok(Some(transfer::SymbolicLink {
+            target: PathBuf::from(os_name(link)),
+            // Btrfs stores no directory bit for a symlink. Never resolve
+            // the target to guess one, even when it happens to exist.
+            target_is_directory: false,
+        }))
+    }
+
+    fn metadata(&mut self, path: &Path) -> Result<transfer::TreeMetadata, CliError> {
+        let (bytes, target) = self.resolve(path)?;
+        let tree = Self::tree_of(target.fs(self.root), &bytes)?;
+        Ok(self.metadata_of(tree, &target.inode, path))
+    }
+
+    fn read_dir(&mut self, path: &Path) -> Result<Vec<transfer::TreeEntry>, CliError> {
+        let (bytes, target) = self.resolve(path)?;
+        let root = self.root;
+        let fs = target.fs(root);
+        let tree = Self::tree_of(fs, &bytes)?;
+        // A snapshot's copy of a nested subvolume's entry has no tree.
+        let children = if target.inode.ino == fs_btrfs::subvol::EMPTY_SUBVOL_DIR_OBJECTID {
+            Vec::new()
+        } else {
+            fs.read_dir(target.inode.ino)
+                .map_err(|e| btrfs_error(&bytes, e))?
+        };
+        children
+            .into_iter()
+            .filter(|child| child.name != b"." && child.name != b"..")
+            .map(|child| {
+                let child_bytes = child_path(&bytes, &child.name);
+                let local = path.join(os_name(child.name.clone()));
+                let metadata = if child.is_inode() {
+                    let inode = fs
+                        .read_inode(child.ino)
+                        .map_err(|e| btrfs_error(&child_bytes, e))?;
+                    self.metadata_of(tree, &inode, &local)
+                } else {
+                    // A subvolume or snapshot, entered as ls --recursive
+                    // enters it.
+                    let entered = root
+                        .resolve_path_bytes(&child_bytes)
+                        .map_err(|e| btrfs_error(&child_bytes, e))?;
+                    let inner = Self::tree_of(entered.fs(root), &child_bytes)?;
+                    self.metadata_of(inner, &entered.inode, &local)
+                };
+                Ok(transfer::TreeEntry {
+                    name: os_name(child.name),
+                    metadata,
+                })
+            })
+            .collect()
+    }
+
+    fn read_file_at(
+        &mut self,
+        path: &Path,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, CliError> {
+        if !matches!(&self.last, Some((last, _)) if last == path) {
+            let (bytes, target) = self.resolve(path)?;
+            if !target.inode.is_regular_file() {
+                return Err(CliError::failed(format!(
+                    "{}: not a regular file",
+                    show(&bytes)
+                )));
+            }
+            self.last = Some((path.to_path_buf(), target));
+        }
+        let (last, target) = self.last.as_ref().expect("resolved above");
+        target
+            .fs(self.root)
+            .read_at(target.inode.ino, offset, buf)
+            .map_err(|e| btrfs_error(os_bytes(&last.as_os_str().to_owned()), e))
+    }
 }
 
 /// Stream a regular file's bytes. Each chunk is read before it is
