@@ -165,8 +165,20 @@ refused1() {
     check "$what prints nothing on stdout" test ! -s "$SANDBOX/r.out"
     jq_check "$what is a structured error saying so" ".code == 1 and (.error | test(\"$pattern\"))" "$SANDBOX/r.err"
 }
-refused1 "ls of a missing path" "no such file" "$img" ls /missing
-refused1 "read of a missing path" "no such file" "$img" read /missing
+# A path that does not exist is rust-fs-core's not_found kind, exit 1, on
+# every verb that reads one, whatever its message says.
+not_found1() {
+    local what="$1"
+    shift
+    fs.btrfs "$@" >"$SANDBOX/r.out" 2>"$SANDBOX/r.err"
+    check "$what exits 1" test $? -eq 1
+    jq_check "$what is the not_found kind" '.code == 1 and .kind == "not_found"' "$SANDBOX/r.err"
+}
+not_found1 "ls of a missing path" "$img" ls /missing
+not_found1 "read of a missing path" "$img" read /missing
+not_found1 "read of a missing parent" "$img" read /missing/f
+not_found1 "export of a missing path" "$img" export /missing "$SANDBOX/nf-export"
+not_found1 "export --recursive of a missing path" "$img" export --recursive /missing "$SANDBOX/nf-tree"
 refused1 "read of a directory" "is a directory" "$img" read /dir
 refused1 "read of a symlink" "symlink to hello.txt" "$img" read /link
 refused1 "a missing image" "open " "$SANDBOX/absent.img" ls /
