@@ -35,7 +35,7 @@ use fs_btrfs_test_support::{
     sha256_hex, temp_path,
 };
 use fs_core::{BlockDevice, FileDevice};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -69,11 +69,25 @@ impl Scratch {
 
     /// As [`Scratch::made`], with tree blocks of `nodesize` bytes.
     fn sized(name: &str, algorithm: &str, features: &str, nodesize: &str, script: &str) -> Self {
+        Self::sized_bytes(name, algorithm, features, nodesize, 256 << 20, script)
+    }
+
+    /// As [`Scratch::sized`], on a sparse volume of `bytes`: mkfs sizes the
+    /// first data block group by the volume, and the driver writes data
+    /// only into the groups it finds, so a large write needs a large one.
+    fn sized_bytes(
+        name: &str,
+        algorithm: &str,
+        features: &str,
+        nodesize: &str,
+        bytes: u64,
+        script: &str,
+    ) -> Self {
         let dir = PathBuf::from(temp_path!("{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         let image = dir.join("fs.img");
         std::fs::File::create(&image)
-            .and_then(|f| f.set_len(256 << 20))
+            .and_then(|f| f.set_len(bytes))
             .unwrap();
         let made = oracle("mkfs.btrfs")
             .args([
@@ -3696,6 +3710,154 @@ fn a_write_adding_more_than_two_leaves_of_digests_splits_the_checksum_leaf_as_of
     guest_kernel_write_ok(
         &image.to_string_lossy(),
         "scrub after splitting the checksum leaf four ways",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+}
+
+/// More checksum leaves than one tree node points at, from a checksum
+/// root that is one leaf, in one write (#650, part of #617). 4 KiB tree
+/// blocks hold 121 key pointers, so the root has to grow two levels in that
+/// one transaction (#649). With sha256 a 4 KiB leaf holds 124 digests, so
+/// 72 MiB of new sectors need about 149 leaves. `btrfs check
+/// --check-data-csum`, the checksum tree's shape (one root two levels above
+/// its leaves, every pointer naming its child by its first key, no empty
+/// block, every new sector covered), a kernel read-back of the exact bytes
+/// and a scrub all agree.
+#[test]
+fn a_write_needing_more_checksum_leaves_than_a_node_holds_grows_the_checksum_root_two_levels() {
+    const LEN: u64 = 72 << 20;
+    let fill = "head -c 262144 /dev/urandom > \"$MNT/b.bin\"\n\
+                : > \"$MNT/c.bin\"\n\
+                sync";
+    let scratch = Scratch::sized_bytes(
+        "cow-write-csum-two-levels",
+        "sha256",
+        "no-holes",
+        "4096",
+        2 << 30,
+        fill,
+    );
+    let image = scratch.image();
+
+    let tree = csum_tree(&image);
+    assert_eq!(
+        tree.values().filter(|b| b.leaf).count(),
+        1,
+        "the checksum tree must start as one leaf for the write to grow: {tree:?}"
+    );
+
+    let mut fs = mount_rw(&image);
+    let b = ino_of(&fs, "b.bin");
+    let c = ino_of(&fs, "c.bin");
+    let expected_b = fs.read_file(b).unwrap();
+    let bytes: Vec<u8> = (0..LEN).map(|i| (i * 29 + i / 4093) as u8).collect();
+    let generation = fs.superblock().generation;
+    let n = fs
+        .write(c, 0, &bytes)
+        .unwrap_or_else(|e| panic!("writing 72 MiB into c.bin in one write: {e}"));
+    assert_eq!(n, bytes.len(), "a short write");
+    assert_eq!(
+        fs.superblock().generation,
+        generation + 1,
+        "the write must commit as one transaction"
+    );
+    assert!(
+        fs.read_file(c).unwrap() == bytes,
+        "c.bin reads back differently"
+    );
+    assert_eq!(
+        fs.read_file(b).unwrap(),
+        expected_b,
+        "b.bin reads back differently"
+    );
+    drop(fs);
+
+    assert_btrfs_check_clean(&image, "after growing the checksum root two levels");
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum finds data that disagrees with its digests:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let tree = csum_tree(&image);
+    let leaves = tree.values().filter(|b| b.leaf).count();
+    assert!(
+        leaves > 121,
+        "72 MiB of sha256 digests need more than 121 4 KiB leaves, not {leaves}"
+    );
+    let pointed: BTreeSet<u64> = tree
+        .values()
+        .flat_map(|b| b.ptrs.iter().map(|&(_, child)| child))
+        .collect();
+    let roots: Vec<_> = tree.keys().filter(|at| !pointed.contains(at)).collect();
+    assert_eq!(roots.len(), 1, "the checksum tree has one root:\n{tree:?}");
+    let root = &tree[roots[0]];
+    let two_levels = !root.leaf
+        && root.ptrs.iter().all(|&(_, child)| {
+            let node = &tree[&child];
+            !node.leaf && node.ptrs.iter().all(|&(_, leaf)| tree[&leaf].leaf)
+        });
+    assert!(
+        two_levels,
+        "the checksum root at {} is not two levels above its leaves:\n{tree:?}",
+        roots[0]
+    );
+    let mut covered: Vec<(u64, u64)> = Vec::new();
+    for (at, block) in &tree {
+        assert!(
+            block.items > 0,
+            "the checksum tree keeps an empty block at {at}:\n{tree:?}"
+        );
+        covered.extend(block.ranges.iter().copied());
+        for &(key, child) in &block.ptrs {
+            let below = tree
+                .get(&child)
+                .unwrap_or_else(|| panic!("the node at {at} points at {child}, not in the tree"));
+            assert_eq!(
+                Some(key),
+                below.first,
+                "the node at {at} names {child} by a key other than its first:\n{tree:?}"
+            );
+        }
+    }
+    covered.sort_unstable();
+    let written = mapped_ranges(
+        &kernel_map(&image, "after the two-level write", &["c.bin"])["c.bin"].1,
+        LEN,
+    );
+    for &(start, end) in &written {
+        let mut at = start;
+        while at < end {
+            at = covered
+                .iter()
+                .find(|&&(s, e)| s <= at && at < e)
+                .map(|&(_, e)| e)
+                .unwrap_or_else(|| {
+                    panic!("no digest covers byte {at} of c.bin's extent [{start}, {end})")
+                });
+        }
+    }
+
+    let after = kernel_view(&image, "after the two-level write", &["b.bin", "c.bin"]);
+    assert_eq!(
+        after["c.bin"].0,
+        sha256_hex(&bytes),
+        "the kernel reads back different bytes from c.bin than were written"
+    );
+    assert_eq!(
+        after["b.bin"].0,
+        sha256_hex(&expected_b),
+        "the kernel reads back different bytes from b.bin than it wrote"
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after growing the checksum root two levels",
         "btrfs scrub start -B \"$MNT\" >/dev/null",
     );
 }

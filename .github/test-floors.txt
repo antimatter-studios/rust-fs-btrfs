@@ -98,8 +98,8 @@ compression_oracle        3
 # CI must execute all 27 cases; local oracle runs are not permitted.
 # Appending past compressed inline data adds one kernel oracle (#593).
 # A write spanning a kept preallocated item's end and the file's end adds
-# one (#639).
-cow_write_oracle          31
+# one (#639). One write growing the checksum root two levels adds one (#650).
+cow_write_oracle          32
 crash_consistency         3
 csum_oracle               6
 csum_width_populated      1
