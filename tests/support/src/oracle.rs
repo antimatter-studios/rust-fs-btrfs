@@ -338,7 +338,9 @@ impl Oracle {
 
         // The evidence a green run carries: every tool call and its
         // verdict, printed by `chore test:oracle` (--show-output).
-        println!(
+        // The scratch directory is shown as $TMP, its full path printed
+        // once (#635).
+        crate::evidence(&format!(
             "[oracle vm] {} {} -> {code}",
             self.tool,
             self.args
@@ -346,7 +348,7 @@ impl Oracle {
                 .map(Arg::display)
                 .collect::<Vec<_>>()
                 .join(" ")
-        );
+        ));
         Output {
             status: ExitStatusExt::from_raw(code << 8),
             stdout,

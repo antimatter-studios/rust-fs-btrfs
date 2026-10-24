@@ -23,6 +23,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -125,6 +126,47 @@ pub fn temp_dir() -> &'static Path {
             })
         })
         .as_path()
+}
+
+/// `text` with `dir`'s path shown as `$TMP` wherever it appears (#635).
+/// Every evidence line names files in the scratch directory, whose full
+/// path, about 70 bytes on CI, would otherwise repeat on each of them.
+pub fn shorten_with(text: &str, dir: &Path) -> String {
+    let full = dir.to_string_lossy();
+    if full.is_empty() {
+        return text.to_string();
+    }
+    text.replace(full.as_ref(), "$TMP")
+}
+
+/// One evidence line as it is printed: the scratch directory `dir` shown
+/// as `$TMP`, and, when `header` is asked for and the line names `dir`, an
+/// `[evidence] $TMP = <full path>` line before it, so the file a failing
+/// call read can still be found. `dir` is `None` in a process that made no
+/// scratch directory; a line naming none prints unchanged (#635).
+pub fn evidence_text(line: &str, dir: Option<&Path>, header: bool) -> String {
+    let Some(dir) = dir.filter(|dir| {
+        let full = dir.to_string_lossy();
+        !full.is_empty() && line.contains(full.as_ref())
+    }) else {
+        return line.to_string();
+    };
+    let short = shorten_with(line, dir);
+    if header {
+        format!("[evidence] $TMP = {}\n{short}", dir.display())
+    } else {
+        short
+    }
+}
+
+/// Print an evidence line through [`evidence_text`], with the header the
+/// first time a line in this process names its scratch directory (#635).
+pub fn evidence(line: &str) {
+    static HEADER: AtomicBool = AtomicBool::new(false);
+    let dir = TEST_TEMP_DIR.get().map(PathBuf::as_path);
+    let names_it = dir.is_some_and(|dir| line.contains(dir.to_string_lossy().as_ref()));
+    let header = names_it && !HEADER.swap(true, Ordering::SeqCst);
+    println!("{}", evidence_text(line, dir, header));
 }
 
 /// Format a test filename beneath the selected scratch directory.
