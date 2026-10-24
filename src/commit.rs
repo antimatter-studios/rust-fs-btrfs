@@ -230,6 +230,21 @@ impl Filesystem {
         self.commit_with(blocks, commit, 0, Membership::Unchanged, true)
     }
 
+    /// [`Error::Stale`] when another handle of the same volume has
+    /// committed since this one read the superblock (#599). Its generation
+    /// and root tree are then behind the device's, and committing from them
+    /// would put the older tree back and use a generation twice.
+    pub(crate) fn refuse_stale(&self) -> Result<()> {
+        let (on_disk, _) = crate::superblock::read_superblock(&*self.device)?;
+        if on_disk.generation > self.sb.generation {
+            return Err(Error::Stale {
+                handle: self.sb.generation,
+                disk: on_disk.generation,
+            });
+        }
+        Ok(())
+    }
+
     /// The commit, with the incompat flags it sets, the device sizes and
     /// membership it records, and whether it empties the log.
     fn commit_with(
@@ -243,6 +258,7 @@ impl Filesystem {
         if self.writable.is_none() {
             return Err(Error::ReadOnly);
         }
+        self.refuse_stale()?;
 
         // 0. The superblock images, backup slot included, before anything
         //    is written: their roots are read out of the new root tree, and

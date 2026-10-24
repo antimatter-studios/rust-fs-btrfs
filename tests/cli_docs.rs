@@ -71,6 +71,16 @@ fn every_name_has_a_man_page_in_its_section_naming_its_subcommands() {
     for option in ["recursive", "max-depth", "limit", "64", "100000"] {
         assert!(ls.contains(option), "ls man page omits {option}");
     }
+    let mkdir = std::fs::read_to_string(share.join("man/man1/fs.btrfs-mkdir.1")).unwrap();
+    for option in ["parents", "0755"] {
+        assert!(mkdir.contains(option), "mkdir man page omits {option}");
+    }
+    let write_page = std::fs::read_to_string(share.join("man/man1/fs.btrfs-write.1")).unwrap();
+    assert!(write_page.replace("\\-", "-").contains("--at"));
+    assert!(write_page.contains("positioned write"));
+    let help = stdout(&ok(tool("fs.btrfs").args(["disk.img", "write", "--help"])));
+    assert!(help.contains("--at <BYTES>"), "{help}");
+    assert!(help.contains("write --at 0 /f"), "{help}");
 }
 
 #[test]
@@ -96,13 +106,16 @@ fn every_name_has_a_zsh_bash_and_fish_completion() {
         assert!(fish.contains(&format!("complete -c {name}")), "fish {name}");
         if name == "fs.btrfs" {
             for completion in [&zsh, &bash, &fish] {
-                for option in ["recursive", "max-depth", "limit"] {
+                for option in ["recursive", "max-depth", "limit", "parents"] {
                     assert!(
                         completion.contains(option),
                         "{name} completion omits {option}"
                     );
                 }
             }
+            assert!(zsh.contains("--at"), "zsh does not complete --at");
+            assert!(bash.contains("--at"), "bash does not complete --at");
+            assert!(fish.contains("-l at"), "fish does not complete --at");
         }
     }
 }

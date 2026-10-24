@@ -51,7 +51,7 @@ suite.
 | Profiles: raid5, raid6 | Refused | 0.3.0 | #268, #300 (PR #296, #319) | |
 | Mixed block groups (`mkfs.btrfs -M`) | Supported | 0.3.0 | | `oracle_vm_fixtures.rs` |
 | Subvolumes and snapshots: listing, with id, path, parent, snapshot and read-only flags | Supported | 0.6.0 | | `subvol_oracle.rs` |
-| Subvolumes and snapshots: reading inside one (`open_subvolume`) | Supported, read-only | 0.7.0 | | `subvol_oracle.rs`, `kernel_readback.rs` |
+| Subvolumes and snapshots: reading inside one (`open_subvolume`) | Supported | 0.7.0 | | `subvol_oracle.rs`, `kernel_readback.rs` |
 | A path that crosses into a subvolume (`resolve_path`) | Supported | 0.7.0 | | `subvol_oracle.rs`, `capi_subvol.rs` |
 | An extent item whose window falls outside its extent | Refused | 0.7.0 | | `extent_window_read.rs`, `compressed_extent_window.rs` |
 | An inode claiming an impossible size | Refused | 0.7.0 | | `read_file_huge_size.rs` |

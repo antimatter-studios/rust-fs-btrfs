@@ -40,29 +40,43 @@ attrs_kernel              1
 backup_ring               1
 block_group_extents_kernel 1
 block_group_tree_oracle   3
+# Two guest-kernel cases cover file changes and chunk item routing (#451).
+block_group_tree_write_kernel 2
 block_group_used          1
 bootstrap_chain           2
 btree_oracle              4
 capi                      39
 capi_pool                 5
 capi_subvol               2
+# One no-tool C ABI scope case and one kernel case through the C ABI alone (#520).
+capi_subvol_write_contract 1
+capi_subvol_write_kernel  1
 capi_write_kernel         1
 capi                      42
 chore_manifest            15
 chunk_tree_items          3
 ci_profile                67
-cli_dispatch              13
+cli_dispatch              15
 cli_docs                  2
+# One unit contract and two independent-kernel export cases (#540).
+cli_export                1
+cli_export_kernel         2
 cli_fsck_oracle           4
 cli_label_kernel          2
-# One find comparison covers nested subvolumes and an ancestor snapshot (#466).
-cli_ls_recursive_kernel   1
+# One find comparison covers nested subvolumes and an ancestor snapshot (#466);
+# damaged copies add a revisit test and an unreadable-directory test (#467).
+cli_ls_recursive_kernel   3
+# Chains the kernel then sees, and every refusal the kernel's own mkdir -p
+# gives, put to mkdir --parents (#414).
+cli_mkdir_kernel          2
 cli_mkfs_kernel           5
 cli_oracle                3
 cli_resize_kernel         3
 # One kernel stat case compares 17 paths, including nested subvolumes (#412).
 cli_stat_kernel           1
 cli_write_kernel          1
+cli_xattr                 2
+cli_xattr_kernel          2
 clone_kernel              1
 commit_order              3
 compat_ro_write_refusal   2
@@ -70,7 +84,17 @@ compressed_extent_window  3
 compress_write_kernel     3
 compressed_short_decode   2
 compression_oracle        3
-cow_write_oracle          7
+# Trailing-hole growth adds one twin-file kernel comparison (#602).
+# Sparse EOF growth adds one comparison with four twin-file shapes (#601).
+# A cross-leaf keyed-reference case adds one kernel oracle (#607);
+# all 19 cases must execute in the first full CI run.
+# Root collapse adds one checksum-tree kernel oracle (#548).
+# One combined overwrite adds leaf removal plus repeated splitting (#616).
+# A write inside a preallocated item adds a three-way split oracle (#537).
+# A write spanning a regular and a preallocated item adds one oracle (#638).
+# CI must execute all 27 cases; local oracle runs are not permitted.
+# Appending past compressed inline data adds one kernel oracle (#593).
+cow_write_oracle          30
 crash_consistency         3
 csum_oracle               6
 csum_width_populated      1
@@ -81,10 +105,17 @@ device_replace_kernel     4
 docs_describe_the_code    5
 dup_data_writes           1
 dup_mirror_fallback       7
+emptied_leaf_kernel       1
+encoded_extent_refused    3
+# Received through btrfs send --compressed-data, so the extents are
+# stored by encoded writes (#556).
+encoded_write_oracle      3
 extent_record_missing     1
 extent_window_read        2
 extent_window_write       3
 extent_write_oracle       3
+# The last-link oracle adds inline and regular-data cases in one test (#511).
+extref_namespace_kernel   2
 fixtures_present          2
 free_space_oracle         4
 free_space_straddle       2
@@ -95,21 +126,37 @@ fuzz_decoders             5
 getxattr_byte_names       1
 guest_scripts_drain_pipes 2
 hard_link_extref          5
-# Four cases in the file (#270): the existing three plus the recovered
-# remap-tree mount regression from #552; CI must confirm the executed count.
-incompat_feature_refusals 4
+# Five cases in the file (#447, #448, #449); the first full run's count confirms it.
+incompat_feature_refusals 5
 kernel_readback           2
 leaf_edit_oracle          3
 leaf_split                1
 leaf_split_oracle         1
-# The whole-suite counter includes the CLI inode flag unit case (#412).
-# Balance adds thirteen library cases (#304): chunk item and DUP stripe
-# placement, the balance filter and profile bits, and on kernel-made
-# volumes a DUP chunk, metadata evacuation and its three refusals.
-lib                       247
-log_tree_kernel           21
+# The baseline local unit run executed 343 library cases; four zoned
+# superblock cases raise the floor to 347 (#454). Three metadata evacuation
+# refusal cases on kernel-made volumes raise it by three (#579).
+# DUP chunk serialization and a kernel allocation/write/scrub case add
+# two library tests (#585); the kernel case runs in the whole-suite tier.
+# Two synthetic planner shapes cover a cascade to the root and a cascade
+# stopping at an ancestor with exactly one pointer free (#515).
+# One no-tool trailing-hole growth regression adds three file shapes (#602).
+# One no-tool EOF planner guard adds four sparse shapes and a data-backed control (#601).
+# The cross-leaf routing regression executed 357 library cases locally
+# (356 passed, one failed on the red commit 35946a4) on 2026-10-18 (#607).
+# Two synthetic removal cases cover recursive nodes and root collapse (#548).
+# Three leaf partition cases and three multi-way planner shapes (#615).
+# One no-tool mixed-stripe allocation case passed in the local unit tier
+# at 2bfceb1; one seed-pair chunk allocation oracle adds a whole-suite case (#625).
+# Two root-growth planner shapes and one level render case (#649); the
+# local unit tier executed 370 library cases at 727eb39 on 2026-10-19.
+lib                       371
+link_extref_kernel        1
+log_tree_kernel           31
 lookup_by_name_key        1
 namespace_kernel          2
+# Root growth, a non-root split with room above it, and a cascade through
+# two full ancestors (#513, #514, #515); CI verifies the new case executes.
+node_split_kernel         3
 node_write_oracle         4
 oracle_vm_fixtures        3
 pool_degraded             7
@@ -134,6 +181,11 @@ relocate_data_group_kernel 1
 # both copies compared, one corrupted and repaired by a kernel scrub, judged
 # by check --check-data-csum, filesystem df and a manifest read (#586).
 relocate_convert_dup_kernel 1
+# One executed: a DUP data group of the kernel's files converted to single,
+# each extent read from the copy that verifies after one copy of two extents
+# is corrupted, judged by dump-tree, check --check-data-csum, filesystem df
+# and a manifest read (#587).
+relocate_convert_single_kernel 1
 # Two executed: the empty data group relocated and judged by the kernel,
 # and the refusals before anything is written (#397).
 relocate_empty_group_kernel 2
@@ -156,17 +208,30 @@ send_stream_kernel        3
 send_stream_kernel        2
 send_stream_kernel        1
 scrub_oracle              2
-seed_oracle               5
+# Ten cases: the allocation regression adds a committed write and a pair check (#625),
+# the subvolume handle a second write (#628), and the overwritten seed file a
+# kernel readback of the pair (#563).
+seed_oracle               10
+# One declared kernel case reads the exact crate-written binary payload
+# from the complete seed and sprout pair (#626); CI must execute it.
+seed_write_kernel         1
 scrub_parity_oracle       4
 scrub_repair_kernel       7
 resize_kernel             2
-shared_tree_block_release 1
+shared_tree_block_release 2
 simple_quota_oracle       3
 snapshot_shared_write     1
 space_cache_v1_kernel     2
 split_oracle              4
+subvol_cow_write_kernel   1
 subvol_create_kernel      1
 subvol_default_kernel     1
+# Two no-tool scope contracts and two independent kernel namespace cases (#518).
+subvol_namespace_contract 2
+subvol_namespace_kernel   2
+# One no-tool scope case and one kernel snapshot-isolation case (#519).
+subvol_truncate_contract  1
+subvol_truncate_kernel    1
 subvol_oracle             12
 subvol_readonly_kernel    1
 superblock_mirrors        4
@@ -175,11 +240,15 @@ super_write_oracle        3
 test_contract             7
 transaction_oracle        5
 transaction_plan          7
-truncate_kernel           2
+truncate_kernel           5
 tree_write_oracle         6
 trim_oracle               3
 # Six executed (2 passed, 4 failed) in full CI run 38624143978 at a2dc3b6;
 # the descriptor-header correction keeps all six oracle cases unchanged.
 verity_oracle             6
+verity_write_kernel       1
 write_oracle              3
 xattr_oracle              9
+# Four cases cover kernel file contents, checking and both write mount paths (#454).
+zoned_oracle              4
+capi_two_handle_commit_kernel  1

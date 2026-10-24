@@ -166,6 +166,59 @@ fn what_is_refused_before_the_image_is_opened_answers_by_name() {
     );
 }
 
+#[test]
+fn positioned_writes_are_refused_before_opening_the_target() {
+    let dir = scratch_dir("positioned-write");
+    let target = dir.join("never-opened.img");
+    let target_arg = target.to_str().unwrap();
+    for at in ["0", "17", "18446744073709551615"] {
+        let message = refused(
+            tool("fs.btrfs").args([target_arg, "--offset", "1048576", "write", "--at", at, "/f"]),
+            3,
+        );
+        assert!(
+            message.starts_with("not implemented: positioned write"),
+            "{message}"
+        );
+        assert!(!target.exists(), "refusal created the target");
+    }
+
+    let original = b"a target the Btrfs reader must never open";
+    std::fs::write(&target, original).unwrap();
+    refused(
+        tool("fs.btrfs").args([target_arg, "write", "--at", "0", "/f"]),
+        3,
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), original);
+
+    let out = tool("fs.btrfs")
+        .args(["--text", target_arg, "write", "--at", "0", "/f"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert!(out.stdout.is_empty());
+    assert!(stderr(&out).starts_with("fs.btrfs: not implemented: positioned write"));
+    assert_eq!(std::fs::read(&target).unwrap(), original);
+}
+
+#[test]
+fn an_invalid_write_position_is_a_usage_error() {
+    for at in ["nope", "-1", "18446744073709551616"] {
+        refused(
+            tool("fs.btrfs").args(["never-opened.img", "write", &format!("--at={at}"), "/f"]),
+            2,
+        );
+    }
+    refused(
+        tool("fs.btrfs").args(["never-opened.img", "write", "--at"]),
+        2,
+    );
+    refused(
+        tool("fs.btrfs").args(["never-opened.img", "write", "--at", "0"]),
+        2,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // doctor
 // ---------------------------------------------------------------------------

@@ -20,7 +20,7 @@ use fs_btrfs::log_tree::{LoggedTree, DIR_LOG_INDEX_KEY};
 use fs_btrfs::Error;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, dump_tree, fixture, guest_kernel_read_ok, guest_kernel_report,
-    guest_kernel_write_ok, oracle, temp_path,
+    guest_kernel_write_ok, oracle, sha256_hex, temp_path,
 };
 use fs_core::{BlockDevice, BlockRead, FileDevice};
 use std::collections::BTreeMap;
@@ -347,6 +347,17 @@ fn differences(
 /// Returns the kernel's view of its own replay, for a test that also
 /// needs to know what that view holds.
 fn replays_as_the_kernel_does(fixture_name: &str, tag: &str) -> BTreeMap<(String, String), String> {
+    replays_as_the_kernel_does_then(fixture_name, tag, |_, _| {})
+}
+
+/// [`replays_as_the_kernel_does`], handing the kernel's replayed copy and
+/// this crate's to `inspect`, in that order, before they are removed, for
+/// a test that compares what the kernel's view does not show.
+fn replays_as_the_kernel_does_then(
+    fixture_name: &str,
+    tag: &str,
+    inspect: impl FnOnce(&Path, &Path),
+) -> BTreeMap<(String, String), String> {
     let image = fixture(fixture_name);
 
     let theirs = PathBuf::from(temp_path!("{tag}-kernel-replay.img"));
@@ -381,9 +392,13 @@ fn replays_as_the_kernel_does(fixture_name: &str, tag: &str) -> BTreeMap<(String
     assert_btrfs_check_clean(&ours, &format!("{tag}: this crate's replay"));
     let theirs_view = kernel_view(&theirs, &format!("{tag}: the kernel's replay"));
     let ours_view = kernel_view(&ours, &format!("{tag}: this crate's replay"));
+    let differ = differences(&ours_view, &theirs_view);
+    // What the views show differing is reported first.
+    if differ.is_empty() {
+        inspect(&theirs, &ours);
+    }
     let _ = std::fs::remove_file(&theirs);
     let _ = std::fs::remove_file(&ours);
-    let differ = differences(&ours_view, &theirs_view);
     assert!(
         differ.is_empty(),
         "[{tag}] the volume this crate replayed differs from the kernel's replay:\n{}",
@@ -870,6 +885,66 @@ fn a_log_whose_data_disagrees_with_its_checksums_is_refused_without_writing() {
     });
 }
 
+/// A logged directory whose names the log speaks for by hashed ranges
+/// (`DIR_LOG_ITEM`, over `DIR_ITEM` name hashes) rather than by index
+/// ranges (#408). The CI guest's kernel (Debian 12, 6.1) never writes
+/// one: in sixteen fsync shapes, adding, removing and renaming names in
+/// committed and new directories, every log it left held `DIR_INDEX`
+/// items and `DIR_LOG_INDEX` ranges and no `DIR_ITEM` or `DIR_LOG_ITEM`
+/// at all. With no kernel replay of one to judge this crate's against,
+/// replay keeps refusing the shape before anything is written. The
+/// kernel-made directory-fsync log has each index range of `/` retyped as
+/// a hashed range, in place on a copy, its leaf still in key order and
+/// given a fresh checksum.
+#[test]
+fn a_log_with_a_hashed_directory_range_is_refused_without_writing() {
+    an_unsupported_log_is_refused_without_writing("dirlink", |copy| {
+        use fs_btrfs::btree::{Body, HEADER_SIZE, ITEM_SIZE};
+        use fs_btrfs::log_tree::DIR_LOG_ITEM_KEY;
+        use std::os::unix::fs::FileExt;
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(copy).expect("open the copy"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the copy without replay");
+        let log = fs.log().unwrap().expect("the copy holds a log");
+        let top = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .expect("the copy holds a log of the top-level subvolume");
+        let block = fs.read_tree_block(top.root).unwrap();
+        let Body::Leaf(items) = &block.body else {
+            panic!("the directory-fsync log is expected to be one leaf");
+        };
+        let mut bytes = block.bytes().to_vec();
+        let mut keys = Vec::with_capacity(items.len());
+        for (n, item) in items.iter().enumerate() {
+            let mut key_type = item.key.key_type;
+            if (item.key.objectid, key_type) == (256, DIR_LOG_INDEX_KEY) {
+                // An item's key type is the byte after its 8-byte objectid.
+                key_type = DIR_LOG_ITEM_KEY;
+                bytes[HEADER_SIZE + n * ITEM_SIZE + 8] = key_type;
+            }
+            keys.push((item.key.objectid, key_type, item.key.offset));
+        }
+        assert!(
+            keys.iter()
+                .any(|&(o, t, _)| (o, t) == (256, DIR_LOG_ITEM_KEY)),
+            "the directory-fsync log holds no index range of /"
+        );
+        assert!(
+            keys.windows(2).all(|w| w[0] < w[1]),
+            "retyping the ranges left the leaf out of key order: {keys:?}"
+        );
+        fs_btrfs::tree_write::stamp_checksum(&mut bytes, fs.superblock());
+        let file = std::fs::OpenOptions::new().write(true).open(copy).unwrap();
+        for mirror in 0..fs.chunk_map().mirrors_at(top.root).unwrap() {
+            let m = fs.chunk_map().map_mirror(top.root, mirror).unwrap();
+            file.write_all_at(&bytes, m.physical).unwrap();
+        }
+    });
+}
+
 /// An inline rewrite of `/f`, made durable by fsync alone, that #364's
 /// same-length replay does not cover (#378): the kernel replays one copy
 /// of the crash image and `mount_rw` the other. Both must pass `btrfs
@@ -1080,6 +1155,82 @@ fn an_external_extent_overwrite_replays_as_the_kernel_does() {
         &kernel_view(&theirs, "external extent kernel")
     )
     .is_empty());
+}
+
+const COMPRESSED_CUT_FIXTURE: &str = "dirtylog/btrfs-dirty-log-compressedcut.img";
+const COMPRESSED_CUT_TRANSCRIPT: &str = "dirtylog/btrfs-dirty-log-compressedcut.logdump";
+/// The fixture's file: 128 KiB of `c` in one compressed extent, committed,
+/// then one sector of `r` written at [`COMPRESSED_CUT_AT`] and fsynced.
+const COMPRESSED_CUT_LEN: usize = 131072;
+const COMPRESSED_CUT_AT: usize = 32768;
+
+/// A sector written inside a committed compressed extent and made durable
+/// by fsync alone (#409): the log holds only the new sector's extent, so
+/// replay must leave the committed extent's head and tail as windows into
+/// the whole compressed extent, without decoding it. The kernel's replay
+/// of the same crash image is the oracle for the volume, its data
+/// checksums and the file's bytes.
+#[test]
+fn a_write_inside_a_compressed_extent_replays_as_the_kernel_does() {
+    use sha2::Digest;
+    let image = fixture(COMPRESSED_CUT_FIXTURE);
+    let transcript = std::fs::read_to_string(fixture(COMPRESSED_CUT_TRANSCRIPT))
+        .expect("the native transcript of the compressed cut log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    let committed = Filesystem::mount_ignoring_log(Arc::new(
+        FileDevice::open(&image).expect("open the compressed cut fixture"),
+    ) as Arc<dyn BlockRead>)
+    .expect("read the committed file without replay");
+    let ino = committed.lookup_path("/f").unwrap().ino;
+    assert_eq!(
+        committed.read_file(ino).unwrap(),
+        vec![b'c'; COMPRESSED_CUT_LEN],
+        "the committed file is the bytes written before the logged sector"
+    );
+    drop(committed);
+
+    replays_as_the_kernel_does(COMPRESSED_CUT_FIXTURE, "dirtylog-compressedcut");
+
+    let theirs_guard = ScratchCopy::of(&image, temp_path!("compressedcut-kernel.img"));
+    let ours_guard = ScratchCopy::of(&image, temp_path!("compressedcut-crate.img"));
+    let (theirs, ours) = (theirs_guard.0.clone(), ours_guard.0.clone());
+    let mut bytes = vec![b'c'; COMPRESSED_CUT_LEN];
+    bytes[COMPRESSED_CUT_AT..COMPRESSED_CUT_AT + 4096].fill(b'r');
+    const VIEW: &str = "stat -c '%i %s %h' \"$MNT/f\"; sha256sum \"$MNT/f\" | cut -d' ' -f1";
+    let expected = format!(
+        "{ino} {COMPRESSED_CUT_LEN} 1\n{:x}",
+        sha2::Sha256::digest(&bytes)
+    );
+    let kernel = guest_kernel_write_ok(
+        &theirs.to_string_lossy(),
+        "compressed cut kernel replay",
+        VIEW,
+    );
+    assert_eq!(
+        kernel.trim(),
+        expected,
+        "the real kernel recovered the sector"
+    );
+    assert_data_csums_clean(&theirs, "compressed cut kernel replay");
+    {
+        let fs = Filesystem::mount_rw(
+            Arc::new(FileDevice::open_rw(&ours).unwrap()) as Arc<dyn BlockDevice>
+        )
+        .unwrap_or_else(|error| panic!("a compressed cut log must replay: {error:?}"));
+        assert_eq!(fs.read_file(ino).unwrap(), bytes);
+    }
+    assert_data_csums_clean(&ours, "compressed cut crate replay");
+    let actual = guest_kernel_read_ok(
+        &ours.to_string_lossy(),
+        "compressed cut crate readback",
+        VIEW,
+    );
+    assert_eq!(
+        actual.trim(),
+        expected,
+        "the kernel reads the crate's replay"
+    );
 }
 
 /// An inline extent that grows from 33 bytes to 43 (#378): the file's
@@ -1621,6 +1772,1144 @@ fn a_log_adding_an_extended_reference_replays_as_the_kernel_does() {
             "{name} reads back differently from f"
         );
     }
+}
+
+/// The committed file `f` given a second name `g` after the last commit,
+/// made durable by an fsync of `/` alone (#461). The committed trees hold
+/// `f` alone, with one link. The log holds the entry of `/` naming `g`,
+/// in an index range of `/` that starts past `f`'s committed index, and
+/// `f` only as an inode that exists: generation 0, two links, no data,
+/// and its reference to `/` holding both names, the committed one at an
+/// index the log does not speak for. The kernel's replay of the same
+/// crash image is the oracle, down to each name's link count and inode.
+#[test]
+fn a_hard_link_made_durable_by_its_directory_replays_as_the_kernel_does() {
+    const DIRLINK_FIXTURE: &str = "dirtylog/btrfs-dirty-log-dirlink.img";
+    let image = fixture(DIRLINK_FIXTURE);
+    let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-dirlink.logdump"))
+        .expect("the native transcript of the directory-fsync hard-link log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the directory-fsync hard-link fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        let committed = fs.lookup_path("/f").expect("the committed trees hold /f");
+        assert_eq!(committed.nlink, 1, "/f is committed with one name");
+        assert!(
+            fs.lookup_path("/g").is_err(),
+            "/g was made after the commit, so the committed trees should not hold it"
+        );
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        // f's logged reference to /, read from the raw item: each name's
+        // index in / and the name.
+        let reference = top
+            .items
+            .iter()
+            .find(|i| {
+                (i.key.objectid, i.key.key_type, i.key.offset)
+                    == (committed.ino, INODE_REF_KEY, 256)
+            })
+            .unwrap_or_else(|| panic!("the log holds no reference of f to /: {keys:?}"));
+        let mut records: Vec<(u64, Vec<u8>)> = Vec::new();
+        let d = &reference.data;
+        let mut at = 0;
+        while at < d.len() {
+            let len = usize::from(u16::from_le_bytes(d[at + 8..at + 10].try_into().unwrap()));
+            records.push((
+                u64::from_le_bytes(d[at..at + 8].try_into().unwrap()),
+                d[at + 10..at + 10 + len].to_vec(),
+            ));
+            at += 10 + len;
+        }
+        let index_of = |name: &str| {
+            records
+                .iter()
+                .find(|r| r.1 == name.as_bytes())
+                .map(|r| r.0)
+                .unwrap_or_else(|| panic!("f's logged reference holds no {name}: {records:?}"))
+        };
+        assert_eq!(
+            records.len(),
+            2,
+            "f's logged reference holds f and g: {records:?}"
+        );
+        let (at_f, at_g) = (index_of("f"), index_of("g"));
+        let logged_f = top
+            .inode(committed.ino)
+            .unwrap()
+            .expect("f's logged inode item");
+        assert_eq!(
+            (logged_f.generation, logged_f.nlink),
+            (0, 2),
+            "the log holds f only as an inode that exists, with two links: {logged_f:?}"
+        );
+        assert!(
+            !top.items.iter().any(|i| (i.key.objectid, i.key.key_type)
+                == (committed.ino, fs_btrfs::fs::EXTENT_DATA_KEY)),
+            "the log holds no data of f: {keys:?}"
+        );
+        let entry_at = |index: u64| {
+            top.items
+                .iter()
+                .find(|i| {
+                    (i.key.objectid, i.key.key_type, i.key.offset) == (256, DIR_INDEX_KEY, index)
+                })
+                .map(|i| parse_dir_items(&i.data).unwrap())
+        };
+        assert_eq!(
+            entry_at(at_g)
+                .unwrap_or_else(|| panic!("the log holds no entry of / at index {at_g}: {keys:?}"))
+                .iter()
+                .map(|e| (e.ino, e.name.clone()))
+                .collect::<Vec<_>>(),
+            vec![(committed.ino, b"g".to_vec())],
+            "the logged entry of / at index {at_g} names f by g"
+        );
+        assert!(
+            entry_at(at_f).is_none(),
+            "the log holds an entry of / at f's committed index {at_f}: {keys:?}"
+        );
+        let ranges: Vec<(u64, u64)> = top
+            .items
+            .iter()
+            .filter(|i| i.key.objectid == 256 && i.key.key_type == DIR_LOG_INDEX_KEY)
+            .map(|i| {
+                (
+                    i.key.offset,
+                    u64::from_le_bytes(i.data[..8].try_into().unwrap()),
+                )
+            })
+            .collect();
+        let in_range = |index: u64| ranges.iter().any(|&(a, b)| a <= index && index <= b);
+        assert!(
+            in_range(at_g) && !in_range(at_f),
+            "a logged index range of / holds g at {at_g} and none holds f at {at_f}: {ranges:?}"
+        );
+    }
+    let theirs = replays_as_the_kernel_does(DIRLINK_FIXTURE, "dirtylog-dirlink");
+    // The two replays agree; this is what they agree on, as the kernel
+    // reports it, so a name both left out cannot pass.
+    let get = |kind: &str, name: &str| {
+        theirs
+            .get(&(kind.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("the kernel's replay reports no {kind} for {name}"))
+    };
+    for name in ["f", "g"] {
+        assert_eq!(get("stat", name), "f 2 33", "the kernel's replay of {name}");
+    }
+    assert_eq!(
+        get("ino", "f"),
+        get("ino", "g"),
+        "the kernel's replay names f and g as one inode"
+    );
+    assert_eq!(
+        get("sha256", "f"),
+        get("sha256", "g"),
+        "f and g read back differently"
+    );
+}
+
+/// The committed file `f`, with 64 more names in `/` of 255 bytes each,
+/// three of them in `INODE_EXTREF` items, rewritten in place with 33
+/// other bytes and made durable by an fsync of `f` alone (#462). The log
+/// holds `f` in full, at its committed generation with its 65 links and
+/// its new inline extent, but the kernel leaves the logged `nbytes`
+/// holding stale bytes of a long name rather than a count. The kernel's
+/// replay counts `nbytes` again from the data, so its replay of the same
+/// crash image is the oracle, with `btrfs check` judging the count.
+#[test]
+fn a_log_whose_inode_holds_a_stale_nbytes_replays_as_the_kernel_does() {
+    const NBYTES_FIXTURE: &str = "dirtylog/btrfs-dirty-log-nbytes.img";
+    const REWRITTEN: &[u8] = b"replayed-inline-bytes-ABCDEFGHIJK";
+    let long = |i: usize| format!("{i:03}").repeat(85);
+    let image = fixture(NBYTES_FIXTURE);
+    let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-nbytes.logdump"))
+        .expect("the native transcript of the stale-nbytes log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the stale-nbytes fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        let committed = fs.lookup_path("/f").expect("the committed trees hold /f");
+        assert_eq!(
+            (committed.nlink, committed.size, committed.nbytes),
+            (65, 33, 33),
+            "/f is committed with 65 names and 33 bytes"
+        );
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        let logged_f = top
+            .inode(committed.ino)
+            .unwrap()
+            .expect("f's logged inode item");
+        assert_eq!(
+            (logged_f.generation, logged_f.nlink, logged_f.size),
+            (committed.generation, 65, 33),
+            "the log holds the committed f in full: {logged_f:?}"
+        );
+        assert!(
+            logged_f.nbytes != 0 && logged_f.nbytes != committed.nbytes,
+            "the log holds f with a counted nbytes, not the stale one: {logged_f:?}"
+        );
+        let extent = top
+            .items
+            .iter()
+            .find(|i| {
+                (i.key.objectid, i.key.key_type, i.key.offset)
+                    == (committed.ino, fs_btrfs::fs::EXTENT_DATA_KEY, 0)
+            })
+            .unwrap_or_else(|| panic!("the log holds no extent of f at 0: {keys:?}"));
+        assert!(
+            extent.data.ends_with(REWRITTEN),
+            "the logged extent of f holds the rewritten bytes inline: {:?}",
+            extent.data
+        );
+        assert!(
+            !top.items
+                .iter()
+                .any(|i| i.key.key_type == DIR_INDEX_KEY || i.key.key_type == DIR_LOG_INDEX_KEY),
+            "only f was fsynced, so the log holds no entry of a directory: {keys:?}"
+        );
+    }
+    let theirs = replays_as_the_kernel_does(NBYTES_FIXTURE, "dirtylog-nbytes");
+    // The two replays agree; this is what they agree on, as the kernel
+    // reports it, so a rewrite both left out cannot pass.
+    let get = |kind: &str, name: &str| {
+        theirs
+            .get(&(kind.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("the kernel's replay reports no {kind} for {name}"))
+    };
+    for name in ["f".to_string(), long(0), long(63)] {
+        assert_eq!(
+            get("stat", &name),
+            "f 65 33",
+            "the kernel's replay of {name}"
+        );
+        assert_eq!(
+            get("ino", &name),
+            get("ino", "f"),
+            "the kernel's replay names {name} as f"
+        );
+        assert_eq!(
+            get("sha256", &name),
+            sha256_hex(REWRITTEN),
+            "{name} does not read back the rewritten bytes"
+        );
+    }
+}
+
+/// The committed file `f`, with 64 more names in `/` of 255 bytes each,
+/// three of them in `INODE_EXTREF` items, given the name `g` in the
+/// committed directory `d` and made durable by an fsync of `d` alone
+/// (#476). The log holds the entry of `d` naming `g`, and `f` only as an
+/// inode that exists: generation 0, 66 links, its `INODE_REF` items to
+/// `/` and to `d`, and none of its extended references, which stay
+/// committed. A replay that names `f` only from its `INODE_REF` items
+/// counts 63 links; the kernel's replay of the same crash image keeps
+/// all 66, and is the oracle.
+#[test]
+fn a_hard_link_of_a_file_with_extended_references_replays_as_the_kernel_does() {
+    const EXTREF_EXISTS_FIXTURE: &str = "dirtylog/btrfs-dirty-log-extrefexists.img";
+    /// `BTRFS_INODE_EXTREF_KEY`.
+    const INODE_EXTREF_KEY: u8 = 13;
+    let long = |i: usize| format!("{i:03}").repeat(85);
+    let image = fixture(EXTREF_EXISTS_FIXTURE);
+    let transcript =
+        std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-extrefexists.logdump"))
+            .expect("the native transcript of the extended-reference hard-link log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the extended-reference hard-link fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        let committed = fs.lookup_path("/f").expect("the committed trees hold /f");
+        assert_eq!(committed.nlink, 65, "/f is committed with 65 names");
+        for i in [0, 61, 63] {
+            let path = format!("/{}", long(i));
+            let ino = fs
+                .lookup_path(&path)
+                .unwrap_or_else(|e| panic!("the committed trees should hold name {i}: {e}"))
+                .ino;
+            assert_eq!(ino, committed.ino, "committed name {i} is f");
+        }
+        let d = fs.lookup_path("/d").expect("the committed trees hold /d");
+        assert!(
+            fs.lookup_path("/d/g").is_err(),
+            "/d/g was made after the commit, so the committed trees should not hold it"
+        );
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        let logged_f = top
+            .inode(committed.ino)
+            .unwrap()
+            .expect("f's logged inode item");
+        assert_eq!(
+            (logged_f.generation, logged_f.nlink),
+            (0, 66),
+            "the log holds f only as an inode that exists, with 66 links: {logged_f:?}"
+        );
+        assert!(
+            !top.items.iter().any(|i| i.key.key_type == INODE_EXTREF_KEY),
+            "the log holds no extended reference: {keys:?}"
+        );
+        assert!(
+            !top.items.iter().any(|i| (i.key.objectid, i.key.key_type)
+                == (committed.ino, fs_btrfs::fs::EXTENT_DATA_KEY)),
+            "the log holds no data of f: {keys:?}"
+        );
+        // f's logged reference to d, read from the raw item: g's index in
+        // d and the name.
+        let reference = top
+            .items
+            .iter()
+            .find(|i| {
+                (i.key.objectid, i.key.key_type, i.key.offset)
+                    == (committed.ino, INODE_REF_KEY, d.ino)
+            })
+            .unwrap_or_else(|| panic!("the log holds no reference of f to d: {keys:?}"));
+        let r = &reference.data;
+        let len = usize::from(u16::from_le_bytes(r[8..10].try_into().unwrap()));
+        assert_eq!(
+            (r.len(), &r[10..10 + len]),
+            (10 + len, &b"g"[..]),
+            "f's logged reference to d holds g alone"
+        );
+        let at_g = u64::from_le_bytes(r[..8].try_into().unwrap());
+        let entry = top
+            .items
+            .iter()
+            .find(|i| {
+                (i.key.objectid, i.key.key_type, i.key.offset) == (d.ino, DIR_INDEX_KEY, at_g)
+            })
+            .unwrap_or_else(|| panic!("the log holds no entry of d at index {at_g}: {keys:?}"));
+        assert_eq!(
+            parse_dir_items(&entry.data)
+                .unwrap()
+                .iter()
+                .map(|e| (e.ino, e.name.clone()))
+                .collect::<Vec<_>>(),
+            vec![(committed.ino, b"g".to_vec())],
+            "the logged entry of d at index {at_g} names f by g"
+        );
+        assert!(
+            top.items
+                .iter()
+                .filter(|i| i.key.objectid == d.ino && i.key.key_type == DIR_LOG_INDEX_KEY)
+                .any(|i| i.key.offset <= at_g
+                    && at_g <= u64::from_le_bytes(i.data[..8].try_into().unwrap())),
+            "no logged index range of d holds g at {at_g}: {keys:?}"
+        );
+        assert!(
+            !top.items.iter().any(|i| i.key.objectid == 256
+                && (i.key.key_type == DIR_INDEX_KEY || i.key.key_type == DIR_LOG_INDEX_KEY)),
+            "only d was fsynced, so the log holds no entry or index range of /: {keys:?}"
+        );
+    }
+    let theirs = replays_as_the_kernel_does(EXTREF_EXISTS_FIXTURE, "dirtylog-extrefexists");
+    // The two replays agree; this is what they agree on, as the kernel
+    // reports it, so a name both left out, or a link count both got
+    // wrong, cannot pass.
+    let get = |kind: &str, name: &str| {
+        theirs
+            .get(&(kind.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("the kernel's replay reports no {kind} for {name}"))
+    };
+    for name in [
+        "f".to_string(),
+        long(0),
+        long(61),
+        long(63),
+        "d/g".to_string(),
+    ] {
+        assert_eq!(
+            get("stat", &name),
+            "f 66 33",
+            "the kernel's replay of {name}"
+        );
+        assert_eq!(
+            get("ino", &name),
+            get("ino", "f"),
+            "the kernel's replay names {name} as f"
+        );
+        assert_eq!(
+            get("sha256", &name),
+            get("sha256", "f"),
+            "{name} reads back differently from f"
+        );
+    }
+}
+
+/// `n`, created empty after the commit and given 64 more names in `/` of
+/// 255 bytes each, three of them in `INODE_EXTREF` items, made durable by
+/// an fsync of `/` alone (#477). The log holds the entries of `/` for all
+/// 65 names, and `n` only as an inode that exists, though nothing of it
+/// is committed: generation 0, size 0, 65 links, its `INODE_REF` to `/`
+/// and its three extended references. A replay that names `n` only from
+/// its `INODE_REF` counts 62 links; the kernel's replay of the same crash
+/// image creates it with all 65, its extended references kept and the
+/// generation of the transaction replaying it, and is the oracle.
+#[test]
+fn a_file_the_log_creates_with_extended_references_replays_as_the_kernel_does() {
+    const EXTREF_CREATED_FIXTURE: &str = "dirtylog/btrfs-dirty-log-extrefcreated.img";
+    /// `BTRFS_INODE_EXTREF_KEY`.
+    const INODE_EXTREF_KEY: u8 = 13;
+    let long = |i: usize| format!("{i:03}").repeat(85);
+    let image = fixture(EXTREF_CREATED_FIXTURE);
+    let transcript =
+        std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-extrefcreated.logdump"))
+            .expect("the native transcript of the created extended-reference log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    let (n, committed_generation) = {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the created extended-reference fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        assert!(
+            fs.lookup_path("/n").is_err(),
+            "n was made after the commit, so the committed trees should not hold it"
+        );
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        let n = top.inode_named(256, b"n").expect("the log names n in /");
+        assert!(
+            fs.read_inode(n).is_err(),
+            "the committed trees hold no inode {n}, so the log creates n"
+        );
+        let logged = top.inode(n).unwrap().expect("n's logged inode item");
+        assert_eq!(
+            (logged.generation, logged.size, logged.nlink),
+            (0, 0, 65),
+            "the log holds n only as an inode that exists, with 65 links: {logged:?}"
+        );
+        assert_eq!(
+            top.items
+                .iter()
+                .filter(|i| (i.key.objectid, i.key.key_type) == (n, INODE_EXTREF_KEY))
+                .count(),
+            3,
+            "the log holds three extended references of n: {keys:?}"
+        );
+        for i in [0, 60, 61, 62, 63] {
+            assert_eq!(
+                top.inode_named(256, long(i).as_bytes()),
+                Some(n),
+                "the log's references of n name {i} in /"
+            );
+        }
+        assert!(
+            !top.items
+                .iter()
+                .any(|i| (i.key.objectid, i.key.key_type) == (n, fs_btrfs::fs::EXTENT_DATA_KEY)),
+            "the log holds no data of n: {keys:?}"
+        );
+        let entries: Vec<u64> = top
+            .items
+            .iter()
+            .filter(|i| (i.key.objectid, i.key.key_type) == (256, DIR_INDEX_KEY))
+            .map(|i| {
+                let named = parse_dir_items(&i.data).unwrap();
+                assert_eq!(
+                    named.iter().map(|e| e.ino).collect::<Vec<_>>(),
+                    vec![n],
+                    "the logged entry of / at index {} names n",
+                    i.key.offset
+                );
+                i.key.offset
+            })
+            .collect();
+        assert_eq!(
+            entries.len(),
+            65,
+            "the log holds an entry of / for every name of n"
+        );
+        for at in entries {
+            assert!(
+                top.items
+                    .iter()
+                    .filter(|i| i.key.objectid == 256 && i.key.key_type == DIR_LOG_INDEX_KEY)
+                    .any(|i| i.key.offset <= at
+                        && at <= u64::from_le_bytes(i.data[..8].try_into().unwrap())),
+                "no logged index range of / holds index {at}: {keys:?}"
+            );
+        }
+        (n, fs.superblock().generation)
+    };
+    // What the kernel's view does not show: n's inode item and its
+    // extended references, as the native tool prints them from each
+    // replayed copy.
+    let inode_of_n = |image: &Path| {
+        let dump = dump_tree(image, "5");
+        let mut lines = dump
+            .lines()
+            .skip_while(|l| !l.contains(&format!("key ({n} INODE_ITEM 0) itemoff")));
+        lines
+            .next()
+            .unwrap_or_else(|| panic!("{} holds no inode item of n", image.display()));
+        let mut fields = BTreeMap::new();
+        for line in lines.take(2) {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            for name in ["generation", "size", "nbytes", "links"] {
+                if let Some(at) = words.iter().position(|w| *w == name) {
+                    fields.insert(name, words[at + 1].to_string());
+                }
+            }
+        }
+        let extrefs: Vec<String> = dump
+            .lines()
+            .filter_map(|l| {
+                let (_, rest) = l.split_once(&format!("key ({n} INODE_EXTREF "))?;
+                let (hash, rest) = rest.split_once(')')?;
+                rest.contains("itemoff").then(|| hash.to_string())
+            })
+            .collect();
+        (fields, extrefs)
+    };
+    let theirs = replays_as_the_kernel_does_then(
+        EXTREF_CREATED_FIXTURE,
+        "dirtylog-extrefcreated",
+        |theirs, ours| {
+            let (kernel, kernel_extrefs) = inode_of_n(theirs);
+            let (this, this_extrefs) = inode_of_n(ours);
+            let replayed_in = (committed_generation + 1).to_string();
+            assert_eq!(
+                [
+                    kernel.get("generation"),
+                    kernel.get("size"),
+                    kernel.get("nbytes"),
+                    kernel.get("links")
+                ],
+                [
+                    Some(&replayed_in),
+                    Some(&"0".to_string()),
+                    Some(&"0".to_string()),
+                    Some(&"65".to_string())
+                ],
+                "the kernel's replay creates n in its own transaction, empty, with 65 links"
+            );
+            assert_eq!(
+                this, kernel,
+                "n's inode item, this crate's replay and the kernel's"
+            );
+            assert_eq!(
+                kernel_extrefs.len(),
+                3,
+                "the kernel's replay keeps n's three extended references: {kernel_extrefs:?}"
+            );
+            assert_eq!(
+                this_extrefs, kernel_extrefs,
+                "n's extended references, this crate's replay and the kernel's"
+            );
+        },
+    );
+    let get = |kind: &str, name: &str| {
+        theirs
+            .get(&(kind.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("the kernel's replay reports no {kind} for {name}"))
+    };
+    for name in ["n".to_string(), long(0), long(60), long(61), long(63)] {
+        assert_eq!(
+            get("stat", &name),
+            "f 65 0",
+            "the kernel's replay of {name}"
+        );
+        assert_eq!(
+            get("ino", &name),
+            get("ino", "n"),
+            "the kernel's replay names {name} as n"
+        );
+    }
+}
+
+/// `n`, created empty after the commit and given a second name `m` in
+/// `/`, made durable by an fsync of `/` alone (#470). The committed trees
+/// hold neither. The log holds the entries of `/` naming `n` and `m`, and
+/// `n` only as an inode that exists, though nothing of it is committed:
+/// generation 0, size 0, two links, no data, and its reference to `/`
+/// holding both names. The kernel's replay of the same crash image
+/// creates `n` in its own transaction with both names, and is the
+/// oracle, down to each name's link count and inode and `n`'s inode item.
+#[test]
+fn a_file_the_log_creates_with_two_names_durable_by_its_directory_replays_as_the_kernel_does() {
+    const CREATED_LINK_FIXTURE: &str = "dirtylog/btrfs-dirty-log-createdlink.img";
+    let image = fixture(CREATED_LINK_FIXTURE);
+    let transcript =
+        std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-createdlink.logdump"))
+            .expect("the native transcript of the created two-name log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    let (n, committed_generation) = {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the created two-name fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        for name in ["/n", "/m"] {
+            assert!(
+                fs.lookup_path(name).is_err(),
+                "{name} was made after the commit, so the committed trees should not hold it"
+            );
+        }
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        let n = top.inode_named(256, b"n").expect("the log names n in /");
+        assert_eq!(
+            top.inode_named(256, b"m"),
+            Some(n),
+            "the log's reference of n names m in /"
+        );
+        assert!(
+            fs.read_inode(n).is_err(),
+            "the committed trees hold no inode {n}, so the log creates n"
+        );
+        let logged = top.inode(n).unwrap().expect("n's logged inode item");
+        assert_eq!(
+            (logged.generation, logged.size, logged.nlink),
+            (0, 0, 2),
+            "the log holds n only as an inode that exists, with two links: {logged:?}"
+        );
+        assert!(
+            !top.items
+                .iter()
+                .any(|i| (i.key.objectid, i.key.key_type) == (n, fs_btrfs::fs::EXTENT_DATA_KEY)),
+            "the log holds no data of n: {keys:?}"
+        );
+        let mut named: Vec<Vec<u8>> = Vec::new();
+        for i in top
+            .items
+            .iter()
+            .filter(|i| (i.key.objectid, i.key.key_type) == (256, DIR_INDEX_KEY))
+        {
+            let entries = parse_dir_items(&i.data).unwrap();
+            assert_eq!(
+                entries.iter().map(|e| e.ino).collect::<Vec<_>>(),
+                vec![n],
+                "the logged entry of / at index {} names n",
+                i.key.offset
+            );
+            assert!(
+                top.items
+                    .iter()
+                    .filter(|r| r.key.objectid == 256 && r.key.key_type == DIR_LOG_INDEX_KEY)
+                    .any(|r| r.key.offset <= i.key.offset
+                        && i.key.offset <= u64::from_le_bytes(r.data[..8].try_into().unwrap())),
+                "no logged index range of / holds index {}: {keys:?}",
+                i.key.offset
+            );
+            named.extend(entries.into_iter().map(|e| e.name));
+        }
+        named.sort();
+        assert_eq!(
+            named,
+            vec![b"m".to_vec(), b"n".to_vec()],
+            "the logged entries of / are n and m: {keys:?}"
+        );
+        (n, fs.superblock().generation)
+    };
+    // What the kernel's view does not show: n's inode item, as the native
+    // tool prints it from each replayed copy.
+    let inode_of_n = |image: &Path| {
+        let dump = dump_tree(image, "5");
+        let mut lines = dump
+            .lines()
+            .skip_while(|l| !l.contains(&format!("key ({n} INODE_ITEM 0) itemoff")));
+        lines
+            .next()
+            .unwrap_or_else(|| panic!("{} holds no inode item of n", image.display()));
+        let mut fields = BTreeMap::new();
+        for line in lines.take(2) {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            for name in ["generation", "size", "nbytes", "links"] {
+                if let Some(at) = words.iter().position(|w| *w == name) {
+                    fields.insert(name, words[at + 1].to_string());
+                }
+            }
+        }
+        fields
+    };
+    let theirs = replays_as_the_kernel_does_then(
+        CREATED_LINK_FIXTURE,
+        "dirtylog-createdlink",
+        |theirs, ours| {
+            let kernel = inode_of_n(theirs);
+            let replayed_in = (committed_generation + 1).to_string();
+            assert_eq!(
+                [
+                    kernel.get("generation"),
+                    kernel.get("size"),
+                    kernel.get("nbytes"),
+                    kernel.get("links")
+                ],
+                [
+                    Some(&replayed_in),
+                    Some(&"0".to_string()),
+                    Some(&"0".to_string()),
+                    Some(&"2".to_string())
+                ],
+                "the kernel's replay creates n in its own transaction, empty, with two links"
+            );
+            assert_eq!(
+                inode_of_n(ours),
+                kernel,
+                "n's inode item, this crate's replay and the kernel's"
+            );
+        },
+    );
+    // The two replays agree; this is what they agree on, as the kernel
+    // reports it, so a name both left out cannot pass.
+    let get = |kind: &str, name: &str| {
+        theirs
+            .get(&(kind.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("the kernel's replay reports no {kind} for {name}"))
+    };
+    for name in ["n", "m"] {
+        assert_eq!(get("stat", name), "f 2 0", "the kernel's replay of {name}");
+    }
+    assert_eq!(
+        get("ino", "n"),
+        get("ino", "m"),
+        "the kernel's replay names n and m as one inode"
+    );
+}
+
+/// `f`, committed with one link, its only name the last of 64 long names
+/// in `/`, held in an `INODE_EXTREF` item once its `INODE_REF` was
+/// emptied, loses that name after the commit, and only `/` is fsynced
+/// (#478). The log holds an index range of `/` covering the removed index
+/// and no entry there, and does not hold `f`. A replay that looks for the
+/// name only in `INODE_REF` items refuses the log; the kernel's replay of
+/// the same crash image deletes `f` with its extended reference and its
+/// data, and is the oracle.
+#[test]
+fn an_inode_whose_last_name_is_an_extended_reference_is_deleted_as_the_kernel_does() {
+    const EXTREF_REMOVED_FIXTURE: &str = "dirtylog/btrfs-dirty-log-extrefremoved.img";
+    let last = "063".repeat(85);
+    let image = fixture(EXTREF_REMOVED_FIXTURE);
+    let transcript =
+        std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-extrefremoved.logdump"))
+            .expect("the native transcript of the removed extended-reference log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    // f and the index of its last name, as the native tool prints the
+    // committed trees: one INODE_EXTREF item, whose record reads
+    // `index N parent P namelen L name: X`.
+    let committed = dump_tree(&image, "5");
+    let mut extrefs: Vec<(u64, u64, u64, String)> = Vec::new();
+    let mut lines = committed.lines();
+    while let Some(line) = lines.next() {
+        let Some((_, key)) = line.split_once("key (") else {
+            continue;
+        };
+        let words: Vec<&str> = key.split_whitespace().collect();
+        if words.get(1) != Some(&"INODE_EXTREF") {
+            continue;
+        }
+        let record: Vec<&str> = lines
+            .next()
+            .expect("an extended reference holds a record")
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            [record[0], record[2], record[6]],
+            ["index", "parent", "name:"],
+            "a record of an extended reference, as the native tool prints it: {record:?}"
+        );
+        extrefs.push((
+            words[0].parse().unwrap(),
+            record[1].parse().unwrap(),
+            record[3].parse().unwrap(),
+            record[7].to_string(),
+        ));
+    }
+    assert_eq!(
+        extrefs.len(),
+        1,
+        "the committed trees hold one extended reference: {extrefs:?}"
+    );
+    let (f, at, parent, name) = extrefs.pop().unwrap();
+    assert_eq!(
+        (parent, name.as_str()),
+        (256, last.as_str()),
+        "f's extended reference names its last long name in /"
+    );
+    {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the removed extended-reference fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        assert!(
+            fs.lookup_path("/f").is_err(),
+            "the name f was removed before the commit"
+        );
+        let committed_f = fs
+            .lookup_path(&format!("/{last}"))
+            .expect("the committed trees hold the last long name");
+        assert_eq!(
+            (committed_f.ino, committed_f.nlink),
+            (f, 1),
+            "the last long name is f, committed with one link"
+        );
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        assert!(
+            !top.items.iter().any(|i| i.key.objectid == f),
+            "the log holds no item of f: {keys:?}"
+        );
+        for entry in top
+            .items
+            .iter()
+            .filter(|i| (i.key.objectid, i.key.key_type) == (256, DIR_INDEX_KEY))
+        {
+            assert_ne!(
+                entry.key.offset, at,
+                "the log holds an entry of / at the removed index: {keys:?}"
+            );
+            assert!(
+                parse_dir_items(&entry.data)
+                    .unwrap()
+                    .iter()
+                    .all(|e| e.ino != f),
+                "the logged entry of / at index {} names f",
+                entry.key.offset
+            );
+        }
+        assert!(
+            top.items
+                .iter()
+                .filter(|i| i.key.objectid == 256 && i.key.key_type == DIR_LOG_INDEX_KEY)
+                .any(|i| i.key.offset <= at
+                    && at <= u64::from_le_bytes(i.data[..8].try_into().unwrap())),
+            "no logged index range of / holds the removed index {at}: {keys:?}"
+        );
+    }
+    // What the kernel's view does not show: every item of f, and every
+    // entry naming it, as the native tool prints each replayed copy.
+    let items_of_f = |image: &Path| -> Vec<String> {
+        dump_tree(image, "5")
+            .lines()
+            .filter(|l| l.contains(&format!("key ({f} ")))
+            .map(|l| l.trim().to_string())
+            .collect()
+    };
+    let theirs = replays_as_the_kernel_does_then(
+        EXTREF_REMOVED_FIXTURE,
+        "dirtylog-extrefremoved",
+        |theirs, ours| {
+            assert_eq!(
+                items_of_f(theirs),
+                Vec::<String>::new(),
+                "the kernel's replay deletes f with its extended reference and its data"
+            );
+            assert_eq!(
+                items_of_f(ours),
+                Vec::<String>::new(),
+                "this crate's replay deletes f with its extended reference and its data"
+            );
+        },
+    );
+    assert_eq!(
+        theirs.get(&("stat".to_string(), last.clone())),
+        None,
+        "the kernel's replay removes the last name of f"
+    );
+    assert_eq!(
+        theirs
+            .get(&("stat".to_string(), "k".to_string()))
+            .map(String::as_str),
+        Some("f 1 4"),
+        "the kernel's replay keeps k"
+    );
+}
+
+/// A committed empty directory `e` in `/` is replaced by a new directory,
+/// which moves to `replacement` before only `/` is fsynced (#410). This
+/// avoids Debian 6.1's full commit after rmdir. The log holds a range of `/`
+/// covering the removed index and no entry there, and does not hold `e`.
+/// A replay that removes only regular files refuses the log; the kernel's
+/// replay of the same crash image removes the directory with its items,
+/// and is the oracle.
+#[test]
+fn a_directory_whose_name_the_log_removes_is_removed_as_the_kernel_does() {
+    const RMDIR_FIXTURE: &str = "dirtylog/btrfs-dirty-log-rmdir.img";
+    let image = fixture(RMDIR_FIXTURE);
+    let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-rmdir.logdump"))
+        .expect("the native transcript of the removed directory log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    let e = {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the removed directory fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        let committed_e = fs
+            .lookup_path("/e")
+            .expect("the committed trees hold the directory e");
+        assert!(
+            fs.read_dir(committed_e.ino)
+                .expect("e is a committed directory")
+                .is_empty(),
+            "e is committed empty"
+        );
+        let e = committed_e.ino;
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        assert!(
+            !top.items.iter().any(|i| i.key.objectid == e),
+            "the log holds no item of e: {keys:?}"
+        );
+        for entry in top
+            .items
+            .iter()
+            .filter(|i| (i.key.objectid, i.key.key_type) == (256, DIR_INDEX_KEY))
+        {
+            assert!(
+                parse_dir_items(&entry.data)
+                    .unwrap()
+                    .iter()
+                    .all(|d| d.ino != e),
+                "the logged entry of / at index {} names e",
+                entry.key.offset
+            );
+        }
+        assert!(
+            top.items
+                .iter()
+                .any(|i| i.key.objectid == 256 && i.key.key_type == DIR_LOG_INDEX_KEY),
+            "the log holds no index range of /: {keys:?}"
+        );
+        e
+    };
+    // What the kernel's view does not show: every item of e, and every
+    // entry naming it, as the native tool prints each replayed copy.
+    let items_of_e = |image: &Path| -> Vec<String> {
+        dump_tree(image, "5")
+            .lines()
+            .filter(|l| {
+                l.contains(&format!("key ({e} ")) || l.contains(&format!("location key ({e} "))
+            })
+            .map(|l| l.trim().to_string())
+            .collect()
+    };
+    let theirs =
+        replays_as_the_kernel_does_then(RMDIR_FIXTURE, "dirtylog-rmdir", |theirs, ours| {
+            assert_eq!(
+                items_of_e(theirs),
+                Vec::<String>::new(),
+                "the kernel's replay removes e with its items"
+            );
+            assert_eq!(
+                items_of_e(ours),
+                Vec::<String>::new(),
+                "this crate's replay removes e with its items"
+            );
+        });
+    assert_eq!(
+        theirs.get(&("stat".to_string(), "e".to_string())),
+        None,
+        "the kernel's replay removes the name e"
+    );
+    assert_eq!(
+        theirs
+            .get(&("stat".to_string(), "k".to_string()))
+            .map(String::as_str),
+        Some("f 1 4"),
+        "the kernel's replay keeps k"
+    );
+}
+
+/// `f` and `g`, two committed names of one file in `/`, lose `g` after
+/// the commit, and only `/` is fsynced (#411). The log holds an index
+/// range of `/` covering the removed index and no entry there, and does
+/// not hold the file. A replay that removes only an inode's last name
+/// refuses the log; the kernel's replay of the same crash image drops the
+/// name `g` and its reference record and leaves the file with one link,
+/// and is the oracle.
+#[test]
+fn a_name_whose_inode_keeps_another_is_removed_as_the_kernel_does() {
+    const LINK_REMOVED_FIXTURE: &str = "dirtylog/btrfs-dirty-log-linkremoved.img";
+    let image = fixture(LINK_REMOVED_FIXTURE);
+    let transcript =
+        std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-linkremoved.logdump"))
+            .expect("the native transcript of the removed name log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    let f = {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the removed name fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        let committed_f = fs
+            .lookup_path("/f")
+            .expect("the committed trees hold the file f");
+        let committed_g = fs
+            .lookup_path("/g")
+            .expect("the committed trees hold the name g");
+        assert_eq!(committed_f.ino, committed_g.ino, "f and g are one inode");
+        assert_eq!(committed_f.nlink, 2, "f is committed with two links");
+        let f = committed_f.ino;
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        assert!(
+            !top.items.iter().any(|i| i.key.objectid == f),
+            "the log holds no item of f: {keys:?}"
+        );
+        for entry in top
+            .items
+            .iter()
+            .filter(|i| (i.key.objectid, i.key.key_type) == (256, DIR_INDEX_KEY))
+        {
+            assert!(
+                parse_dir_items(&entry.data)
+                    .unwrap()
+                    .iter()
+                    .all(|d| d.ino != f),
+                "the logged entry of / at index {} names f",
+                entry.key.offset
+            );
+        }
+        assert!(
+            top.items
+                .iter()
+                .any(|i| i.key.objectid == 256 && i.key.key_type == DIR_LOG_INDEX_KEY),
+            "the log holds no index range of /: {keys:?}"
+        );
+        f
+    };
+    // What the kernel's view does not show: the file's reference records,
+    // as the native tool prints each replayed copy.
+    let refs_of_f = |image: &Path| -> Vec<String> {
+        let dump = dump_tree(image, "5");
+        let mut lines = dump.lines().map(str::trim);
+        let mut refs = Vec::new();
+        while let Some(line) = lines.next() {
+            if line.contains(&format!("key ({f} INODE_REF ")) {
+                refs.push(line.split(" itemoff").next().unwrap_or(line).to_string());
+                refs.extend(
+                    lines
+                        .clone()
+                        .take_while(|l| l.starts_with("index "))
+                        .map(str::to_string),
+                );
+            }
+        }
+        refs
+    };
+    let theirs = replays_as_the_kernel_does_then(
+        LINK_REMOVED_FIXTURE,
+        "dirtylog-linkremoved",
+        |theirs, ours| {
+            let kernel = refs_of_f(theirs);
+            assert_eq!(
+                kernel.len(),
+                2,
+                "the kernel's replay keeps one INODE_REF with one record: {kernel:?}"
+            );
+            assert!(
+                kernel[1].ends_with("name: f"),
+                "the kernel's replay keeps the name f: {kernel:?}"
+            );
+            assert_eq!(
+                refs_of_f(ours),
+                kernel,
+                "this crate's replay keeps the reference records the kernel's does"
+            );
+        },
+    );
+    assert_eq!(
+        theirs.get(&("stat".to_string(), "g".to_string())),
+        None,
+        "the kernel's replay removes the name g"
+    );
+    assert_eq!(
+        theirs
+            .get(&("stat".to_string(), "f".to_string()))
+            .map(String::as_str),
+        Some("f 1 4"),
+        "the kernel's replay keeps f with one link"
+    );
 }
 
 /// The inline writer's encoding fields are checked against the native

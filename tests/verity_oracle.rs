@@ -187,16 +187,31 @@ fn a_tampered_block_is_refused_as_the_kernel_refuses_it() {
 
 #[test]
 fn a_read_write_mount_is_refused_naming_fs_verity() {
+    // Keep the original regression's name: the refusal now belongs to
+    // each sealed inode, rather than to the volume's writable mount.
     let dir = std::path::PathBuf::from(temp_path!("verity-rw"));
     std::fs::create_dir_all(&dir).unwrap();
     let copy = dir.join("img");
     std::fs::copy(fixture("features/btrfs-verity.img"), &copy).expect("copy the fixture");
     let rw = FileDevice::open_rw(&copy).expect("open the copy for writing");
-    match Filesystem::mount_rw(Arc::new(rw) as Arc<dyn BlockDevice>) {
-        Ok(_) => panic!("a volume with fs-verity files must not mount for writing"),
-        Err(e) => assert!(
-            e.to_string().contains("fs-verity"),
-            "the refusal must name fs-verity: {e}"
-        ),
+    let mut fs = Filesystem::mount_rw(Arc::new(rw) as Arc<dyn BlockDevice>)
+        .expect("a verity volume mounts read-write");
+    for e in manifest().into_iter().filter(|e| e.sealed.is_some()) {
+        let ino = fs.lookup_path(&e.path).expect("sealed inode").ino;
+        assert!(!fs.can_write_in_place(ino).expect("writability"));
+        for result in [
+            fs.write(ino, 0, b"changed").map(|_| ()),
+            fs.write_at(ino, 0, b"changed").map(|_| ()),
+            fs.truncate(ino, 0),
+            fs.truncate(ino, e.size.parse().unwrap()),
+        ] {
+            assert!(
+                matches!(result, Err(Error::UnsupportedFeature(ref m)) if m.contains("fs-verity")),
+                "{}: a sealed inode refuses mutation by name: {result:?}",
+                e.path
+            );
+        }
     }
+    drop(fs);
+    std::fs::remove_dir_all(dir).unwrap();
 }

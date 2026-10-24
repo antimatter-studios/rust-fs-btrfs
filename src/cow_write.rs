@@ -49,9 +49,15 @@
 //! 6. **The inode** is stamped with the transaction, a new change count
 //!    and new change and modification times. A write into a hole, or past
 //!    the end of the file, adds the sectors it allocates to `nbytes`; one
-//!    past the end moves `size` to where it stops (#432). Without the
+//!    past the end moves `size` to where it stops (#432). One that starts
+//!    past the end leaves a gap, an implicit hole with no item; first, as
+//!    the kernel does, the old last sector is copied with zeros past the
+//!    old end when the write does not cover it (#433). Without the
 //!    no-holes feature, explicit hole items keep the ranges before and
-//!    after each fill, trimmed or split in the same transaction (#434).
+//!    after each fill, trimmed or split in the same transaction (#434),
+//!    and the gap a write past the end leaves is a hole item of its own,
+//!    from the sector after the old end to the one the write starts in,
+//!    as the kernel inserts it (#436).
 //!
 //! The data goes to every mirror first; then the tree blocks, a flush,
 //! the superblocks and a flush, in [`Filesystem::commit`]'s order. Until
@@ -62,21 +68,28 @@
 //! Each refusal is a case not yet written, named so a caller can tell
 //! which it met:
 //!
-//! - a checksum tree leaf the change would empty, other than the tree's
-//!   root, or a full one that cannot be split (its parent node has no
-//!   room for another pointer): removing a leaf and splitting a node are
-//!   not written yet;
-//! - a write that starts **past the end** of the file, leaving a gap: the
-//!   kernel zeroes the rest of the old last sector first (#433). One that
-//!   starts at or before the end and grows the file is written;
-//! - a write that grows a file on a volume **without the no-holes
-//!   feature**, where the hole a file ends with is an item of its own
-//!   (#436);
-//! - an **inline** or **preallocated** extent: each changes the item's
-//!   kind, not only where it points;
-//! - an extent a **snapshot** may share — one from at or before the last
-//!   snapshot, which the snapshot reads through a tree block it shares
-//!   and its record counts once for both;
+//! - an emptied tree block a snapshot shares; empty unshared leaves and
+//!   nodes leave their tree, and an empty root becomes a leaf (#546–#548);
+//! - a write past the end of a file, on a volume **without the no-holes
+//!   feature**, whose gap an extent item past the end (a preallocated one)
+//!   already reaches into, unless one preallocated item holds the old end,
+//!   the gap and the write, which is then written where its extent lies
+//!   and moves only the size (#603);
+//! - a **preallocated** extent the write cuts off a sector boundary, or one
+//!   another reference shares, or an **inline** one the write does not
+//!   lie within, or one that is encrypted or encoded: each changes the
+//!   item's kind, not only where it points. A write within inline data
+//!   rewrites that item, and the file stays inline (#437); compressed
+//!   inline data is decoded, written and encoded again (#438); a write
+//!   that grows the file past what inline data holds, or starts past its
+//!   end, moves that data into a regular extent at offset 0 with the
+//!   write, as the kernel does (#507); a write
+//!   covering the whole of a preallocated item is written where its
+//!   extent lies, and the item becomes regular in place (#535); one
+//!   covering its first or last sectors splits it in two over the same
+//!   extent (#536), and one strictly inside it splits it in three (#537);
+//!   a write spanning one of its edges is written in two at that edge
+//!   (#638);
 //! - an extent another reference shares whose reference from this file
 //!   is held anywhere but inline in its record: which entry to count
 //!   down is not known.
@@ -89,11 +102,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::chunk::{objectid, DiskKey};
 use crate::compression::Compression;
 use crate::error::{Error, Result};
-use crate::fs::{Filesystem, EXTENT_DATA_KEY};
+use crate::fs::{Filesystem, EXTENT_DATA_KEY, EXTENT_PREALLOC, EXTENT_REGULAR};
 use crate::inode::{Inode, INODE_ITEM_KEY, INODE_NODATACOW, INODE_NODATASUM};
 use crate::leaf_edit::OwnedItem;
 use crate::super_write::Commit;
-use crate::transaction::{DataAdd, DataMove, DataWrite, ItemEdit};
+use crate::transaction::{DataAdd, DataMove, DataShare, DataWrite, ItemEdit};
 use crate::write::window_inside_extent;
 
 /// How many rounds a write's plan has to close over its own bookkeeping.
@@ -123,6 +136,10 @@ struct Target {
     /// length to the inode's `nbytes` (#261). Explicit hole items are
     /// trimmed or split around the copy on a volume without NO_HOLES.
     hole: bool,
+    /// The length of the inline data this target's copy replaces, which
+    /// leaves the inode's `nbytes` as the copy's length is added (#422);
+    /// zero for every other target.
+    inline: u64,
 }
 
 /// One extent of a write's copies: a whole item's copy, or one unit of a
@@ -163,6 +180,9 @@ impl Filesystem {
     /// committed and the error is returned; this handle then still reads
     /// the previous generation and must be dropped.
     pub fn write(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize> {
+        if self.writable.is_none() && self.subvolume_writes.is_some() {
+            return self.writing_subvolume(|fs| fs.write(ino, offset, data));
+        }
         if self.writable.is_none() {
             return Err(Error::ReadOnly);
         }
@@ -173,42 +193,136 @@ impl Filesystem {
         if !inode.is_regular_file() {
             return Err(Error::NotAFile);
         }
+        crate::verity::refuse_mutation(ino, inode.flags)?;
         if inode.flags & INODE_NODATACOW != 0 {
+            if self.written_tree() != objectid::FS_TREE {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino} is nodatacow, and writing one in place is only implemented \
+                     in the top-level subvolume"
+                )));
+            }
             return self.write_at(ino, offset, data);
         }
-        self.write_cow(&inode, offset, data)
+        self.write_cow(&inode, offset, data, false)
     }
 
-    fn write_cow(&mut self, inode: &Inode, offset: u64, data: &[u8]) -> Result<usize> {
+    /// Write `data` at `offset` in a copy-on-write file whose data is
+    /// inline, moving that data into a regular extent at offset 0 that
+    /// holds it, the write, and zeros to the end of the sector the write
+    /// ends in, as the kernel does when inline data outgrows its item
+    /// (#422). A write that starts two sectors or more in moves the data
+    /// into a first-sector extent of its own and leaves a hole before the
+    /// write's extent (#592). The write must reach past the inline data.
+    pub(crate) fn write_moving_inline(
+        &mut self,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize> {
+        let inode = self.read_inode(ino)?;
+        if inode.flags & INODE_NODATACOW != 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino} is nodatacow and holds inline data, and moving that data into \
+                 an extent is only implemented for a copy-on-write file"
+            )));
+        }
+        self.write_cow(&inode, offset, data, true)
+    }
+
+    fn write_cow(
+        &mut self,
+        inode: &Inode,
+        offset: u64,
+        data: &[u8],
+        move_inline: bool,
+    ) -> Result<usize> {
         let ino = inode.ino;
         let summed = inode.flags & INODE_NODATASUM == 0;
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or_else(|| Error::UnsupportedFeature("write range overflows".into()))?;
-        // A write that grows the file starts at or before its end, so the
-        // sectors past its last extent are planned as a hole is (#432).
-        // One that starts past the end leaves a gap, and the kernel zeroes
-        // the rest of the old last sector before it makes one (#433). A
-        // volume without no-holes records the hole a file ends with as an
-        // item the hole fill does not maintain (#436).
-        if end > inode.size {
-            if offset > inode.size {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino}: writing at {offset} starts past the file's end at {}, and \
-                     a write that leaves a gap is not implemented",
-                    inode.size
-                )));
+        // Inline data the write lies within, or grows while it still fits
+        // inline, is rewritten in its item, and the file stays inline, as
+        // the kernel leaves it (#437, #530).
+        let grows_inline = offset <= inode.size && inode.size < u64::from(self.sb.sectorsize);
+        if !move_inline && (end <= inode.size || grows_inline) {
+            if let Some(written) = self.write_inline(inode, offset, data)? {
+                return Ok(written);
+            }
+        }
+        // Inline data a growing write outgrows, or starts past, moves into a
+        // regular extent at offset 0 with the write, as the kernel moves it,
+        // rather than the write planning an extent at its unaligned end
+        // (#507).
+        let move_inline =
+            move_inline || (end > inode.size && self.file_extents(ino)?.iter().any(|p| p.inline));
+        // A write over the whole of a preallocated item is written where
+        // its extent lies, and the item becomes regular (#535); one over
+        // its first or last sectors splits it in two (#536), and one
+        // strictly inside it in three (#537).
+        // One that spans an edge of a preallocated item is written in two
+        // at that edge, each side taking its own path, as the kernel writes
+        // the regular sectors to a new extent and the preallocated ones
+        // where their extent lies (#638).
+        // A growing write into space preallocated past the end, with
+        // `fallocate --keep-size`, is written where that extent lies as
+        // one within the size is, when one preallocated item holds the
+        // old end, any gap before the write and the write itself: the gap
+        // stays preallocated, and only the size moves (#603).
+        if !move_inline
+            && end > inode.size
+            && inode.size.is_multiple_of(u64::from(self.sb.sectorsize))
+            && self.prealloc_holds(ino, offset.min(inode.size), end)?
+        {
+            if let Some(written) = self.write_prealloc(inode, offset, data, summed)? {
+                return Ok(written);
+            }
+        }
+        if !move_inline && end <= inode.size {
+            if let Some(at) = self.prealloc_edge_within(ino, offset, end)? {
+                let first = usize::try_from(at - offset).map_err(|_| {
+                    Error::UnsupportedFeature(format!("a write of {} bytes", data.len()))
+                })?;
+                let before = self.write_cow(inode, offset, &data[..first], false)?;
+                let inode = self.read_inode(ino)?;
+                let after = self.write_cow(&inode, at, &data[first..], false)?;
+                return Ok(before + after);
+            }
+            if let Some(written) = self.write_prealloc(inode, offset, data, summed)? {
+                return Ok(written);
+            }
+        }
+        // A write that grows the file plans the sectors past its last
+        // extent as a hole is (#432). One that starts past the end leaves a
+        // gap, and the kernel zeroes the rest of the old last sector before
+        // it makes one: that sector is copied too, reading as zeros past
+        // the old end (#433). A volume without no-holes records that gap
+        // as a hole item, from the sector after the old end to the one the
+        // write starts in, as the kernel's extend does (#436).
+        // Moved inline data's copy covers the first sector, so it leaves no
+        // tail; it also covers every sector up to the write's unless the
+        // write starts clear of the sector after it, which leaves a gap
+        // (#592).
+        let sector = u64::from(self.sb.sectorsize);
+        let mut tail = None;
+        let mut gap = None;
+        if end > inode.size && (!move_inline || inline_move_leaves_gap(offset, sector)) {
+            if !move_inline && offset > inode.size && !inode.size.is_multiple_of(sector) {
+                tail = Some(inode.size);
             }
             if !self.sb.has_no_holes() {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino}: growing a file on a volume without the no-holes feature \
-                     means keeping its hole items, which is not implemented"
-                )));
+                let from = inode.size.checked_next_multiple_of(sector).ok_or_else(|| {
+                    Error::UnsupportedFeature(format!("inode {ino}: size overflows"))
+                })?;
+                let to = offset - offset % sector;
+                if from < to {
+                    gap = Some((self.cow_gap_start(ino, from)?, to));
+                }
             }
         }
 
         // Every refusal before anything is allocated.
-        let targets = self.plan_cow_targets(ino, offset, end)?;
+        let targets = self.plan_cow_targets(ino, tail, offset, end, move_inline)?;
 
         // Each copy: the item's bytes as they read now, with the write
         // laid over them. Past the end of the file the last sector reads
@@ -230,10 +344,14 @@ impl Filesystem {
                 .map_err(|_| Error::UnsupportedFeature(format!("an extent of {} bytes", t.len)))?;
             let mut buf = vec![0u8; size];
             self.read_at(ino, t.start, &mut buf)?;
+            // The old last sector a write past the end copies may lie
+            // wholly before the write, and then takes none of it (#433).
             let from = offset.max(t.start);
             let to = end.min(t.start + t.len);
-            buf[(from - t.start) as usize..(to - t.start) as usize]
-                .copy_from_slice(&data[(from - offset) as usize..(to - offset) as usize]);
+            if from < to {
+                buf[(from - t.start) as usize..(to - t.start) as usize]
+                    .copy_from_slice(&data[(from - offset) as usize..(to - offset) as usize]);
+            }
             let mut at = t.start;
             for chunk in buf.chunks(unit) {
                 let (bytes, compression) = self.encode_copy(chunk.to_vec(), algo);
@@ -270,6 +388,16 @@ impl Filesystem {
         // Remove or trim explicit holes before inserting the new data
         // items: a fill at a hole's start replaces its original key.
         let mut edits = self.cow_hole_edits(ino, &targets, generation)?;
+        if let Some((from, to)) = gap {
+            edits.push(ItemEdit::Put(OwnedItem {
+                key: DiskKey {
+                    objectid: ino,
+                    key_type: EXTENT_DATA_KEY,
+                    offset: from,
+                },
+                data: regular_extent_item(generation, 0, 0, to - from, COMPRESS_NONE),
+            }));
+        }
         for (p, &new) in pieces.iter().zip(&news) {
             let t = &targets[p.target];
             let disk_len = p.bytes.len() as u64;
@@ -329,9 +457,14 @@ impl Filesystem {
         if filled > 0 || end > inode.size {
             use crate::inode::offsets as io;
             let mut raw = self.raw_inode(ino)?;
-            let nbytes = inode.nbytes.checked_add(filled).ok_or_else(|| {
-                Error::UnsupportedFeature(format!("inode {ino}: nbytes overflows"))
-            })?;
+            let moved: u64 = targets.iter().map(|t| t.inline).sum();
+            let nbytes = inode
+                .nbytes
+                .checked_add(filled)
+                .and_then(|n| n.checked_sub(moved))
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(format!("inode {ino}: nbytes overflows"))
+                })?;
             raw[io::NBYTES..io::NBYTES + 8].copy_from_slice(&nbytes.to_le_bytes());
             let size = end.max(inode.size);
             raw[io::SIZE..io::SIZE + 8].copy_from_slice(&size.to_le_bytes());
@@ -351,7 +484,7 @@ impl Filesystem {
             }));
         }
         let write = DataWrite {
-            root: objectid::FS_TREE,
+            root: self.written_tree(),
             ino,
             moves,
             adds,
@@ -375,7 +508,8 @@ impl Filesystem {
             let mut leaves = BTreeSet::new();
             let keys = std::iter::once((INODE_ITEM_KEY, 0))
                 .chain(targets.iter().map(|t| (EXTENT_DATA_KEY, t.start)))
-                .chain(write.adds.iter().map(|a| (EXTENT_DATA_KEY, a.file_offset)));
+                .chain(write.adds.iter().map(|a| (EXTENT_DATA_KEY, a.file_offset)))
+                .chain(gap.map(|(from, _)| (EXTENT_DATA_KEY, from)));
             for (key_type, key_offset) in keys {
                 let key = DiskKey {
                     objectid: ino,
@@ -452,6 +586,374 @@ impl Filesystem {
         Ok(data.len())
     }
 
+    /// Write `data` at `offset` into the inline extent at the start of
+    /// `inode`'s data, when the write lies within it (#437): the item is
+    /// rewritten with the new bytes, its size unchanged, and stamped with
+    /// the transaction; the inode's times, `transid` and `sequence` move as
+    /// for any write. Inline data has no extent, extent record, free space
+    /// or checksum, so nothing else changes. `None` when the file holds no
+    /// inline item at offset 0.
+    ///
+    /// A write that starts within inline data holding the whole file and
+    /// ends past it grows the item, as long as the grown data still fits
+    /// inline, and moves the inode's `size` and `nbytes` with it (#530).
+    /// When it no longer fits, `None`: the caller moves the data into a
+    /// regular extent (#507).
+    ///
+    /// A compressed inline extent (#438) is decoded, written and stored
+    /// inline again: compressed when the file asks for compression and
+    /// the encoding is smaller, as the kernel decides, otherwise as it is.
+    /// The item's size may change with its encoding.
+    ///
+    /// An encrypted or otherwise encoded inline extent, an uncompressed one
+    /// whose length disagrees with its `ram_bytes`, and a rewrite within
+    /// the file that inline data could no longer hold are refused.
+    fn write_inline(&mut self, inode: &Inode, offset: u64, data: &[u8]) -> Result<Option<usize>> {
+        use crate::fs::file_extent as fe;
+        use crate::inode::offsets as io;
+        use crate::superblock::le64;
+        let ino = inode.ino;
+        let Some((key, item)) = self.items_of(ino)?.into_iter().find(|(k, d)| {
+            k.key_type == EXTENT_DATA_KEY && k.offset == 0 && d.get(fe::TYPE) == Some(&0)
+        }) else {
+            return Ok(None);
+        };
+        let end = offset + data.len() as u64;
+        let unencoded = item.len() >= fe::INLINE_DATA
+            && item[fe::ENCRYPTION] == 0
+            && item[fe::OTHER_ENCODING..fe::OTHER_ENCODING + 2] == [0, 0];
+        let compressed = unencoded && item[fe::COMPRESSION] != 0;
+        if !unencoded
+            || (!compressed
+                && item.len() as u64 != fe::INLINE_DATA as u64 + le64(&item, fe::RAM_BYTES))
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}: the inline extent at 0 is encrypted or encoded, or its length \
+                 disagrees with its ram_bytes, and writing one is not implemented"
+            )));
+        }
+        let sector = self.sb.sectorsize as usize;
+        let mut plain = if compressed {
+            crate::compression::decompress(
+                Compression::from_byte(item[fe::COMPRESSION])?,
+                &item[fe::INLINE_DATA..],
+                le64(&item, fe::RAM_BYTES) as usize,
+                sector,
+                crate::compression::ShortDecode::Pad,
+            )?
+        } else {
+            item[fe::INLINE_DATA..].to_vec()
+        };
+        let held = plain.len() as u64;
+        // A write past the inline data grows the file inline only when that
+        // data is the whole file and the write starts within it (#530).
+        if end > held && (held != inode.size || offset > held) {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}: the write to [{offset}, {end}) reaches past the {held} bytes of \
+                 inline data at 0, which are not the whole file or the write starts past them"
+            )));
+        }
+        let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
+            Error::UnsupportedFeature("the generation counter is exhausted".into())
+        })?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let now = (now.as_secs(), now.subsec_nanos());
+
+        let length = held.max(end);
+        plain.resize(length as usize, 0);
+        plain[offset as usize..end as usize].copy_from_slice(data);
+        let (bytes, compression) = if compressed {
+            self.encode_inline(plain, self.compression_for(inode)?)
+        } else {
+            (plain, COMPRESS_NONE)
+        };
+        // The kernel keeps compressed inline data no larger than its
+        // default `max_inline`, and plain inline data short of a sector,
+        // which `btrfs check` requires; data grown inline stays short of
+        // a sector however it is stored (#530).
+        let fits = if compression == COMPRESS_NONE {
+            bytes.len() < sector && bytes.len() <= MAX_INLINE
+        } else {
+            bytes.len() <= MAX_INLINE
+        } && (end <= held || length < sector as u64);
+        // Whole-file inline data a growing write outgrows is the caller's
+        // to move into a regular extent (#507).
+        if !fits && end > inode.size {
+            return Ok(None);
+        }
+        if !fits {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}: the write to [{offset}, {end}) leaves {} bytes of inline \
+                 data, more than an inline extent holds, and moving it out of line is \
+                 not implemented",
+                bytes.len()
+            )));
+        }
+        let mut rewritten = item;
+        rewritten[fe::GENERATION..fe::GENERATION + 8].copy_from_slice(&generation.to_le_bytes());
+        rewritten[fe::RAM_BYTES..fe::RAM_BYTES + 8].copy_from_slice(&length.to_le_bytes());
+        rewritten.truncate(fe::INLINE_DATA);
+        rewritten[fe::COMPRESSION] = compression;
+        rewritten.extend_from_slice(&bytes);
+        let mut raw = self.raw_inode(ino)?;
+        // A grown inline file's `size` moves to the write's end, and its
+        // `nbytes`, which counts inline data, by as much as the data grew.
+        if length > held {
+            let nbytes = (inode.nbytes - held.min(inode.nbytes))
+                .checked_add(length)
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(format!("inode {ino}: nbytes overflows"))
+                })?;
+            raw[io::SIZE..io::SIZE + 8].copy_from_slice(&length.to_le_bytes());
+            raw[io::NBYTES..io::NBYTES + 8].copy_from_slice(&nbytes.to_le_bytes());
+        }
+        crate::namespace::touch(&mut raw, generation, now, &[io::CTIME, io::MTIME]);
+        let edits = vec![
+            ItemEdit::Put(OwnedItem {
+                key,
+                data: rewritten,
+            }),
+            ItemEdit::Put(OwnedItem {
+                key: DiskKey {
+                    objectid: ino,
+                    key_type: INODE_ITEM_KEY,
+                    offset: 0,
+                },
+                data: raw,
+            }),
+        ];
+        self.commit_edits_in(self.written_tree(), ino, edits, generation, now)?;
+        Ok(Some(data.len()))
+    }
+
+    /// Write `data` at `offset` into the preallocated extent item holding
+    /// all of it, when that item is the extent's only reference. A write
+    /// covering the whole item (#535) goes where the extent lies — they were never readable, and nothing reads them
+    /// until the commit turns the item regular — and the item, stamped
+    /// with the transaction, changes kind in place, as the kernel's
+    /// `btrfs_mark_extent_written` does for a write covering the item. No
+    /// item is added, so the extent's record, the free space and the
+    /// inode's `nbytes` stay; the checksum tree gains the written sectors'
+    /// digests, unless the file is `nodatasum`.
+    ///
+    /// A write covering only the item's first or last sectors splits it in
+    /// two over the same extent (#536): a regular item for the written
+    /// sectors and a preallocated one for the rest, each with its own
+    /// offset into the extent. Both name the extent at the same reference
+    /// offset, so its record's inline `EXTENT_DATA_REF` is counted up by
+    /// one, as a clone's is; only the written sectors gain digests. A
+    /// write touching neither its first nor its last sector splits it in
+    /// three (#537): preallocated before the write, regular for the
+    /// written sectors, preallocated after, and the reference is counted
+    /// up by two. `None` when the write lies in no preallocated item, or
+    /// splits it off a sector boundary: the planner then refuses it by
+    /// name.
+    /// The first edge of a preallocated extent item of `ino` that lies
+    /// strictly inside `[offset, end)`: where a write over that range
+    /// leaves one item for another (#638). `None` when every preallocated
+    /// item the range touches holds the whole of it, or none does.
+    fn prealloc_edge_within(&self, ino: u64, offset: u64, end: u64) -> Result<Option<u64>> {
+        use crate::fs::file_extent as fe;
+        use crate::superblock::le64;
+        Ok(self
+            .items_of(ino)?
+            .into_iter()
+            .filter(|(k, d)| {
+                k.key_type == EXTENT_DATA_KEY
+                    && d.len() >= fe::REGULAR_SIZE
+                    && d[fe::TYPE] == EXTENT_PREALLOC
+            })
+            .flat_map(|(k, d)| [k.offset, k.offset.saturating_add(le64(&d, fe::NUM_BYTES))])
+            .filter(|&at| offset < at && at < end)
+            .min())
+    }
+
+    /// Whether one preallocated extent item of `ino` holds the whole of
+    /// `[from, end)` (#603).
+    fn prealloc_holds(&self, ino: u64, from: u64, end: u64) -> Result<bool> {
+        use crate::fs::file_extent as fe;
+        use crate::superblock::le64;
+        Ok(self.items_of(ino)?.into_iter().any(|(k, d)| {
+            k.key_type == EXTENT_DATA_KEY
+                && d.len() >= fe::REGULAR_SIZE
+                && d[fe::TYPE] == EXTENT_PREALLOC
+                && k.offset <= from
+                && end <= k.offset.saturating_add(le64(&d, fe::NUM_BYTES))
+        }))
+    }
+
+    fn write_prealloc(
+        &mut self,
+        inode: &Inode,
+        offset: u64,
+        data: &[u8],
+        summed: bool,
+    ) -> Result<Option<usize>> {
+        use crate::fs::file_extent as fe;
+        use crate::inode::offsets as io;
+        use crate::superblock::le64;
+        let ino = inode.ino;
+        let len = data.len() as u64;
+        let sector = u64::from(self.sb.sectorsize);
+        let end = offset + len;
+        let Some((key, item)) = self.items_of(ino)?.into_iter().find(|(k, d)| {
+            k.key_type == EXTENT_DATA_KEY
+                && d.len() >= fe::REGULAR_SIZE
+                && d[fe::TYPE] == EXTENT_PREALLOC
+                && k.offset <= offset
+                && end <= k.offset + le64(d, fe::NUM_BYTES)
+        }) else {
+            return Ok(None);
+        };
+        let item_end = key.offset + le64(&item, fe::NUM_BYTES);
+        // Each edge of the write that cuts the item must fall on a sector.
+        if (offset != key.offset && !offset.is_multiple_of(sector))
+            || (end != item_end && !end.is_multiple_of(sector))
+        {
+            return Ok(None);
+        }
+        if item[fe::COMPRESSION] != 0
+            || item[fe::ENCRYPTION] != 0
+            || item[fe::OTHER_ENCODING..fe::OTHER_ENCODING + 2] != [0, 0]
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}: the preallocated extent item at {offset} is compressed, \
+                 encrypted or encoded, and writing one is not implemented"
+            )));
+        }
+        let extent_start = le64(&item, fe::DISK_BYTENR);
+        let at = extent_start + le64(&item, fe::OFFSET) + (offset - key.offset);
+        let (refs, extent_len, made) = self.extent_item(extent_start)?;
+        if !window_inside_extent(at, len, extent_start, extent_len) {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}: offset {offset} maps to [{at}, +{len}), outside the \
+                 {extent_len}-byte extent the extent tree records at {extent_start}"
+            )));
+        }
+        let last_snapshot = self.root_last_snapshot(self.written_tree())?;
+        if refs != 1 || made <= last_snapshot {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}: the preallocated extent at {extent_start} has {refs} references \
+                 or predates the snapshot taken at {last_snapshot}, and writing one another \
+                 reference may read is not implemented"
+            )));
+        }
+        let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
+            Error::UnsupportedFeature("the generation counter is exhausted".into())
+        })?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let now = (now.as_secs(), now.subsec_nanos());
+
+        // Each part of the item: its file offset, length, and whether the
+        // write covers it. The preallocated parts before and after the
+        // write exist only where the write leaves some of the item (#537).
+        let parts: Vec<(u64, u64, bool)> = [
+            (key.offset, offset - key.offset, false),
+            (offset, len, true),
+            (end, item_end - end, false),
+        ]
+        .into_iter()
+        .filter(|&(_, num_bytes, written)| written || num_bytes > 0)
+        .collect();
+        let mut edits = Vec::new();
+        for &(file_offset, num_bytes, written) in &parts {
+            let mut part = item.clone();
+            part[fe::GENERATION..fe::GENERATION + 8].copy_from_slice(&generation.to_le_bytes());
+            if written {
+                part[fe::TYPE] = EXTENT_REGULAR;
+            }
+            let into = le64(&item, fe::OFFSET) + (file_offset - key.offset);
+            part[fe::OFFSET..fe::OFFSET + 8].copy_from_slice(&into.to_le_bytes());
+            part[fe::NUM_BYTES..fe::NUM_BYTES + 8].copy_from_slice(&num_bytes.to_le_bytes());
+            edits.push(ItemEdit::Put(OwnedItem {
+                key: DiskKey {
+                    offset: file_offset,
+                    ..key
+                },
+                data: part,
+            }));
+        }
+        // Every part after the first names the extent at the same
+        // reference offset as the first, so the record counts that
+        // reference up once for each (#536, #537).
+        let shares = vec![
+            DataShare {
+                bytenr: extent_start,
+                len: extent_len,
+                ref_offset: key.offset.wrapping_sub(le64(&item, fe::OFFSET)),
+            };
+            parts.len() - 1
+        ];
+        let mut raw = self.raw_inode(ino)?;
+        crate::namespace::touch(&mut raw, generation, now, &[io::CTIME, io::MTIME]);
+        // Preallocated sectors already count in `nbytes`; a write past the
+        // end moves only the size (#603).
+        if end > inode.size {
+            raw[io::SIZE..io::SIZE + 8].copy_from_slice(&end.to_le_bytes());
+        }
+        edits.push(ItemEdit::Put(OwnedItem {
+            key: DiskKey {
+                objectid: ino,
+                key_type: INODE_ITEM_KEY,
+                offset: 0,
+            },
+            data: raw,
+        }));
+        let csum_edits = self.csum_edits(&[], &[(at, data.to_vec())], summed)?;
+
+        // The data, to every mirror, before the commit that makes the
+        // item regular: until then the item still reads as zeros.
+        self.mirror_spans(at, data.len())?;
+        self.write_logical_all_mirrors(at, data)?;
+        let write = DataWrite {
+            root: self.written_tree(),
+            ino,
+            time: now,
+            edits,
+            csum_edits,
+            shares,
+            ..Default::default()
+        };
+        self.commit_write(write, generation)?;
+        Ok(Some(data.len()))
+    }
+
+    /// Refuse a gap past the end of a file that an extent item already
+    /// reaches into — a preallocated extent kept past the end — as the
+    /// hole item recording the gap would overlap it (#436). When a hole
+    /// ends exactly where the new gap starts, reuse its key so the put
+    /// extends that item instead of adding an adjacent hole (#602).
+    fn cow_gap_start(&self, ino: u64, from: u64) -> Result<u64> {
+        use crate::fs::file_extent as fe;
+        use crate::superblock::le64;
+        let mut start = from;
+        for (key, data) in self.items_of(ino)? {
+            // Inline data (type 0) only ever lies within the file's size.
+            if key.key_type != EXTENT_DATA_KEY
+                || data.len() < fe::REGULAR_SIZE
+                || data[fe::TYPE] == 0
+            {
+                continue;
+            }
+            let end = key.offset.saturating_add(le64(&data, fe::NUM_BYTES));
+            if end > from {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino}: an extent item past the end reaches into the gap a write \
+                     past the end leaves, which a hole item cannot record without overlapping it"
+                )));
+            }
+            if end == from && data[fe::TYPE] == EXTENT_REGULAR && le64(&data, fe::DISK_BYTENR) == 0
+            {
+                start = key.offset;
+            }
+        }
+        Ok(start)
+    }
+
     /// Preserve what remains of explicit hole items around the sectors
     /// filled by this write (#434). The read-oriented extent list omits
     /// holes, so their original keys and spans come from the raw items.
@@ -510,104 +1012,166 @@ impl Filesystem {
     /// The extent items `[offset, end)` touches, each checked writable.
     ///
     /// Every refusal happens here, while nothing is allocated: a window
-    /// outside its extent, or an extent from at or before the last
-    /// snapshot, which the snapshot may still be reading through a tree
-    /// block it shares — its record counts one reference for both.
+    /// outside its extent, or more of the write's items naming an extent
+    /// than its record counts.
     ///
-    /// An extent newer than the last snapshot is referenced only by file
-    /// items, each counted in its record. One whose references are all
-    /// items this write replaces is released; one with references beyond
-    /// them — a reflink's, or another item of this file outside the range
-    /// — is marked shared, and keeps them (#261).
-    fn plan_cow_targets(&self, ino: u64, offset: u64, end: u64) -> Result<Vec<Target>> {
+    /// One whose references are all items this write replaces is
+    /// released. One with references beyond them is marked shared, and
+    /// keeps them: a reflink's, another item of this file outside the
+    /// range (#261), or a snapshot's (#443). A snapshot's own copy of a
+    /// leaf counts in the record; a leaf it still shares with this tree
+    /// counts once for both, so an item there is shared too, and copying
+    /// that leaf gives the extent a reference naming the old one, which the
+    /// snapshot goes on reading, as the kernel's copy-on-write does.
+    fn plan_cow_targets(
+        &self,
+        ino: u64,
+        tail: Option<u64>,
+        offset: u64,
+        end: u64,
+        move_inline: bool,
+    ) -> Result<Vec<Target>> {
         let pieces = self.file_extents(ino)?;
-        let last_snapshot = self.fs_tree_last_snapshot()?;
         let mut out = Vec::new();
         // Each extent's reference count, from its record.
         let mut refs_of: BTreeMap<u64, u64> = BTreeMap::new();
         let sector = u64::from(self.sb.sectorsize);
         let mut pos = offset;
-        while pos < end {
-            let Some(piece) = pieces
-                .iter()
-                .find(|p| pos >= p.start && pos < p.start + p.len)
-            else {
-                // A hole: whole sectors of it, from the sector the write
-                // starts in to the one it ends in, never past the next
-                // item. The sectors read as zeros, and the copy keeps them.
-                let start = (pos / sector * sector).max(
-                    pieces
-                        .iter()
-                        .map(|p| p.start + p.len)
-                        .filter(|&e| e <= pos)
-                        .max()
-                        .unwrap_or(0),
-                );
-                let next = pieces
-                    .iter()
-                    .map(|p| p.start)
-                    .filter(|&s| s > pos)
-                    .min()
-                    .unwrap_or(u64::MAX);
-                let stop = end.div_ceil(sector).saturating_mul(sector).min(next);
-                out.push(Target {
-                    start,
-                    len: stop - start,
-                    extent_start: 0,
-                    extent_len: 0,
-                    extent_offset: 0,
-                    shared: false,
-                    hole: true,
-                });
-                pos = stop;
-                continue;
-            };
-            // A compressed extent's window is in its decoded bytes, which
-            // reading it already bounds by `ram_bytes`; on disk the whole
-            // extent is released, so there is no window to check there.
-            let logical = if piece.compressed {
-                None
-            } else {
-                Some(piece.logical.ok_or_else(|| {
-                    Error::UnsupportedFeature(format!(
-                        "inode {ino}: offset {pos} is inline or preallocated, and writing it \
-                         changes the item's kind, which is not implemented"
-                    ))
-                })?)
-            };
-            let (refs, extent_len, generation) = self.extent_item(piece.extent_start)?;
-            if let Some(logical) = logical {
-                if !window_inside_extent(logical, piece.len, piece.extent_start, extent_len) {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "inode {ino}: offset {pos} maps to [{logical}, +{}), outside the \
-                         {extent_len}-byte extent the extent tree records at {}",
-                        piece.len, piece.extent_start
-                    )));
-                }
-            }
-            if generation <= last_snapshot {
+        // Inline data moved into an extent (#422): the copy starts at the
+        // inline item's offset, takes its key, and covers whole sectors to
+        // the one the write ends in, as a hole's copy does. Inline data is
+        // only ever the file's one item, at offset 0, so nothing follows it.
+        if move_inline {
+            let Some(inline) = pieces.iter().find(|p| p.inline) else {
                 return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino}: the extent at {} is from generation {generation}, at or \
-                     before the snapshot taken at {last_snapshot}, so the snapshot may still \
-                     be reading it",
-                    piece.extent_start
+                    "inode {ino} holds no inline data to move"
+                )));
+            };
+            if inline.start != 0 || pieces.len() != 1 || end <= inline.start + inline.len {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino}: its inline data at {} is not the file's one item, or the \
+                     write does not reach past it",
+                    inline.start
                 )));
             }
+            // A write that starts clear of the sector after the inline
+            // data's leaves the data a first-sector copy of its own, and
+            // the write is planned past it as a hole's is: the kernel
+            // writes the two back as separate ranges, with a hole between
+            // (#592).
+            let gap = inline_move_leaves_gap(offset, sector);
+            let stop = if gap {
+                sector
+            } else {
+                end.div_ceil(sector).saturating_mul(sector)
+            };
             out.push(Target {
-                start: piece.start,
-                len: piece.len,
-                extent_start: piece.extent_start,
-                extent_len,
-                extent_offset: piece.ref_offset,
+                start: 0,
+                len: stop,
+                extent_start: 0,
+                extent_len: 0,
+                extent_offset: 0,
                 shared: false,
-                hole: false,
+                hole: true,
+                inline: inline.len,
             });
-            refs_of.insert(piece.extent_start, refs);
-            pos = piece.start + piece.len;
+            pos = if gap { offset } else { stop };
+        }
+        // A write past the end of a file whose end is partway through a
+        // sector copies the item holding that sector first, which reads as
+        // zeros past the old end (#433). The planning below then starts
+        // past it; a hole there needs nothing, as it reads as zeros.
+        let mut spans = Vec::with_capacity(2);
+        if let Some(size) = tail {
+            if pieces
+                .iter()
+                .any(|p| size >= p.start && size < p.start + p.len)
+            {
+                spans.push((size, size + 1));
+            }
+        }
+        spans.push((pos, end));
+        for (mut pos, end) in spans {
+            if let Some(last) = out.last() {
+                pos = pos.max(last.start + last.len);
+            }
+            while pos < end {
+                let Some(piece) = pieces
+                    .iter()
+                    .find(|p| pos >= p.start && pos < p.start + p.len)
+                else {
+                    // A hole: whole sectors of it, from the sector the write
+                    // starts in to the one it ends in, never past the next
+                    // item. The sectors read as zeros, and the copy keeps them.
+                    let start = (pos / sector * sector).max(
+                        pieces
+                            .iter()
+                            .map(|p| p.start + p.len)
+                            .filter(|&e| e <= pos)
+                            .max()
+                            .unwrap_or(0),
+                    );
+                    let next = pieces
+                        .iter()
+                        .map(|p| p.start)
+                        .filter(|&s| s > pos)
+                        .min()
+                        .unwrap_or(u64::MAX);
+                    let stop = end.div_ceil(sector).saturating_mul(sector).min(next);
+                    out.push(Target {
+                        start,
+                        len: stop - start,
+                        extent_start: 0,
+                        extent_len: 0,
+                        extent_offset: 0,
+                        shared: false,
+                        hole: true,
+                        inline: 0,
+                    });
+                    pos = stop;
+                    continue;
+                };
+                // A compressed extent's window is in its decoded bytes, which
+                // reading it already bounds by `ram_bytes`; on disk the whole
+                // extent is released, so there is no window to check there.
+                let logical = if piece.compressed {
+                    None
+                } else {
+                    Some(piece.logical.ok_or_else(|| {
+                        Error::UnsupportedFeature(format!(
+                            "inode {ino}: offset {pos} is inline or preallocated, and writing it \
+                         changes the item's kind, which is not implemented"
+                        ))
+                    })?)
+                };
+                let (refs, extent_len, _) = self.extent_item(piece.extent_start)?;
+                if let Some(logical) = logical {
+                    if !window_inside_extent(logical, piece.len, piece.extent_start, extent_len) {
+                        return Err(Error::UnsupportedFeature(format!(
+                            "inode {ino}: offset {pos} maps to [{logical}, +{}), outside the \
+                         {extent_len}-byte extent the extent tree records at {}",
+                            piece.len, piece.extent_start
+                        )));
+                    }
+                }
+                out.push(Target {
+                    start: piece.start,
+                    len: piece.len,
+                    extent_start: piece.extent_start,
+                    extent_len,
+                    extent_offset: piece.ref_offset,
+                    shared: false,
+                    hole: false,
+                    inline: 0,
+                });
+                refs_of.insert(piece.extent_start, refs);
+                pos = piece.start + piece.len;
+            }
         }
         // Shared when the extent has references beyond the write's own
-        // items. More items than its record counts is a record that does
-        // not describe this file, and nothing is written over it.
+        // items, or its item sits in a leaf a snapshot shares (#443). More
+        // items than its record counts is a record that does not describe
+        // this file, and nothing is written over it.
         let mut ours: BTreeMap<u64, u64> = BTreeMap::new();
         for t in out.iter().filter(|t| !t.hole) {
             *ours.entry(t.extent_start).or_default() += 1;
@@ -621,7 +1185,12 @@ impl Filesystem {
                     t.extent_start
                 )));
             }
-            t.shared = items < refs;
+            let key = DiskKey {
+                objectid: ino,
+                key_type: EXTENT_DATA_KEY,
+                offset: t.start,
+            };
+            t.shared = items < refs || self.leaf_shared(self.written_tree(), &key)?;
         }
         Ok(out)
     }
@@ -683,6 +1252,16 @@ impl Filesystem {
         }
         packed.resize(on_disk, 0);
         (packed, algo.to_byte())
+    }
+
+    /// The bytes inline data is stored as, and its compression type:
+    /// `algo`'s encoding when it is smaller than the data, as the kernel
+    /// keeps compressed inline data; otherwise the data as it is (#438).
+    fn encode_inline(&self, plain: Vec<u8>, algo: Compression) -> (Vec<u8>, u8) {
+        match crate::compression::compress(algo, &plain, self.sb.sectorsize as usize) {
+            Some(packed) if packed.len() < plain.len() => (packed, algo.to_byte()),
+            _ => (plain, COMPRESS_NONE),
+        }
     }
 
     /// The checksum tree edits a write makes (#261), or a truncate
@@ -889,8 +1468,22 @@ const INODE_COMPRESS: u64 = 1 << 11;
 /// An extent item's `compression` byte for a copy stored as it is.
 const COMPRESS_NONE: u8 = 0;
 
+/// The most inline data the kernel keeps in an extent item: its default
+/// `max_inline` mount option.
+const MAX_INLINE: usize = 2048;
+
 /// The attribute the kernel keeps the compression property in.
 const COMPRESSION_PROPERTY: &[u8] = b"btrfs.compression";
+
+/// Whether a write at `offset` that moves a file's inline data out of line
+/// starts two sectors or more into the file, clear of the sector after the
+/// inline data's. The kernel zeroes the rest of the inline data's sector as
+/// one range and writes the write's sectors as another; only a write
+/// starting in the very next sector joins the two into one extent, and any
+/// later one leaves the sectors between them a hole (#592).
+fn inline_move_leaves_gap(offset: u64, sector: u64) -> bool {
+    offset / sector > 1
+}
 
 /// A regular `EXTENT_DATA` item referencing the whole of the `len` bytes
 /// stored as `disk_len` at `bytenr`, written in transaction `generation`
@@ -962,6 +1555,159 @@ fn kept_runs(
 #[cfg(test)]
 mod tests {
     use super::kept_runs;
+
+    /// The independent comparison is the sparse EOF case in
+    /// cow_write_oracle.rs; this checks the planner before it allocates.
+    #[test]
+    fn old_eof_zeroing_is_planned_only_for_data_backed_sectors() {
+        use crate::{fs::file_extent as fe, mkfs, superblock::le64, Filesystem};
+        use fs_core::{BlockDevice, BlockRead, FileDevice};
+        use std::{path::PathBuf, sync::Arc};
+
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let image = Scratch(PathBuf::from(fs_btrfs_test_support::temp_path!(
+            "cow-sparse-eof-plan.img"
+        )));
+        std::fs::create_dir_all(image.0.parent().unwrap()).unwrap();
+        std::fs::File::create(&image.0)
+            .and_then(|f| f.set_len(128 << 20))
+            .unwrap();
+        let dev = Arc::new(FileDevice::open_rw(&image.0).unwrap());
+        mkfs::format(dev.as_ref(), &mkfs::Options::default()).unwrap();
+        for offset in [65_536, 64 << 20] {
+            let mut raw = [0; 4096];
+            dev.read_at(offset, &mut raw).unwrap();
+            let at = crate::superblock::offsets::INCOMPAT_FLAGS;
+            let flags = le64(&raw, at) & !crate::superblock::incompat::NO_HOLES;
+            raw[at..at + 8].copy_from_slice(&flags.to_le_bytes());
+            crate::super_write::stamp_checksum(&mut raw, crate::superblock::ChecksumType::Crc32c);
+            dev.write_at(offset, &raw).unwrap();
+        }
+        let mut fs = Filesystem::mount_rw(dev).unwrap();
+        let root = fs.lookup_path("/").unwrap().ino;
+        const OLD_SIZE: u64 = 40_000;
+        for (name, data_len, offset, len) in [
+            ("far", 8192usize, 70_000u64, 5000u64),
+            ("next", 8192, 40_960, 100),
+            ("same", 8192, 40_100, 100),
+            ("empty", 0, 70_000, 5000),
+            ("backed", 40_960, 70_000, 5000),
+        ] {
+            let ino = fs.create(root, name.as_bytes(), 0o644, 0, 0).unwrap();
+            if data_len > 0 {
+                fs.write(ino, 0, &vec![0x5a; data_len]).unwrap();
+            }
+            fs.truncate(ino, OLD_SIZE).unwrap();
+            assert!(!fs.superblock().has_no_holes());
+            let eof_in_hole = fs.items_of(ino).unwrap().iter().any(|(key, data)| {
+                key.key_type == super::EXTENT_DATA_KEY
+                    && data.len() >= fe::REGULAR_SIZE
+                    && le64(data, fe::DISK_BYTENR) == 0
+                    && key.offset <= OLD_SIZE
+                    && OLD_SIZE < key.offset + le64(data, fe::NUM_BYTES)
+            });
+            assert_eq!(eof_in_hole, name != "backed", "{name}: fixture shape");
+            let targets = fs
+                .plan_cow_targets(ino, Some(OLD_SIZE), offset, offset + len, false)
+                .unwrap();
+            let mut expected = Vec::new();
+            if name == "backed" {
+                expected.push((0, 40_960, false));
+            }
+            let start = offset / 4096 * 4096;
+            expected.push((start, (offset + len).next_multiple_of(4096) - start, true));
+            assert_eq!(
+                targets
+                    .iter()
+                    .map(|t| (t.start, t.len, t.hole))
+                    .collect::<Vec<_>>(),
+                expected,
+                "{name}: only data-backed EOF and payload sectors may be copied"
+            );
+        }
+    }
+
+    /// The kernel comparison for these shapes lives in cow_write_oracle.rs.
+    #[test]
+    fn a_growing_write_extends_the_existing_trailing_hole() {
+        use crate::{fs::file_extent as fe, mkfs, superblock::le64, Filesystem};
+        use fs_core::{BlockDevice, BlockRead, FileDevice};
+        use std::{path::PathBuf, sync::Arc};
+
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        for (name, old_size, data_len) in [
+            ("aligned", 32_768, 8192),
+            ("partial", 40_000, 8192),
+            ("sparse", 40_000, 0),
+        ] {
+            let image = Scratch(PathBuf::from(fs_btrfs_test_support::temp_path!(
+                "cow-grow-trailing-hole-{name}.img"
+            )));
+            std::fs::create_dir_all(image.0.parent().unwrap()).unwrap();
+            std::fs::File::create(&image.0)
+                .and_then(|f| f.set_len(128 << 20))
+                .unwrap();
+            let dev = Arc::new(FileDevice::open_rw(&image.0).unwrap());
+            mkfs::format(dev.as_ref(), &mkfs::Options::default()).unwrap();
+            // Change both on-disk superblocks: changing only the parsed
+            // flag would be lost when the first commit reloads the mount.
+            for offset in [65_536, 64 << 20] {
+                let mut raw = [0; 4096];
+                dev.read_at(offset, &mut raw).unwrap();
+                let at = crate::superblock::offsets::INCOMPAT_FLAGS;
+                let flags = le64(&raw, at) & !crate::superblock::incompat::NO_HOLES;
+                raw[at..at + 8].copy_from_slice(&flags.to_le_bytes());
+                crate::super_write::stamp_checksum(
+                    &mut raw,
+                    crate::superblock::ChecksumType::Crc32c,
+                );
+                dev.write_at(offset, &raw).unwrap();
+            }
+            let mut fs = Filesystem::mount_rw(dev).unwrap();
+            assert!(!fs.superblock().has_no_holes());
+            let root = fs.lookup_path("/").unwrap().ino;
+            let ino = fs.create(root, b"file", 0o644, 0, 0).unwrap();
+            if data_len > 0 {
+                fs.write(ino, 0, &vec![0x5a; data_len]).unwrap();
+            }
+            fs.truncate(ino, old_size).unwrap();
+            assert!(!fs.superblock().has_no_holes());
+            fs.write(ino, 65_536, &[0xc3; 5000]).unwrap();
+            let holes: Vec<_> = fs
+                .items_of(ino)
+                .unwrap()
+                .into_iter()
+                .filter(|(key, data)| {
+                    key.key_type == super::EXTENT_DATA_KEY
+                        && data.len() >= fe::REGULAR_SIZE
+                        && le64(data, fe::DISK_BYTENR) == 0
+                })
+                .map(|(key, data)| (key.offset, le64(&data, fe::NUM_BYTES)))
+                .collect();
+            assert_eq!(
+                holes,
+                vec![(data_len as u64, 65_536 - data_len as u64)],
+                "{name}: the old hole and the new gap must be one item"
+            );
+            let inode = fs.read_inode(ino).unwrap();
+            assert_eq!((inode.size, inode.nbytes), (70_536, data_len as u64 + 8192));
+            let mut expected = vec![0x5a; data_len];
+            expected.resize(65_536, 0);
+            expected.extend_from_slice(&[0xc3; 5000]);
+            assert_eq!(fs.read_file(ino).unwrap(), expected, "{name}");
+        }
+    }
 
     /// Eight 4-byte digests from 0x10000, one per 4 KiB sector, each
     /// holding its own index.

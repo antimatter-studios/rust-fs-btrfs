@@ -17,7 +17,7 @@ env:
   # this one is for the publish job below, which clones by hand because it
   # needs nothing else chore provides. Bump the two in lockstep with the
   # rust-fs-core version constraint in Cargo.toml.
-  FS_CORE_REF: v0.3.13
+  FS_CORE_REF: v0.3.14
 
 jobs:
   test:
@@ -139,9 +139,9 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-    uses: antimatter-studios/rust-fs-core/.github/workflows/release-cli.yml@166ffbdce9e4367db8faf79f0fd13734c20ddea2 # v0.3.13
+    uses: antimatter-studios/rust-fs-core/.github/workflows/release-cli.yml@19449ad4926d09447d19440c6312ba544b50bf4b # v0.3.14
     with:
-      core-ref: v0.3.13
+      core-ref: v0.3.14
       toolchain: 1.95.0
 
   publish:
