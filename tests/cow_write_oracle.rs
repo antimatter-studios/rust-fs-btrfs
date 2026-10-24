@@ -3307,11 +3307,15 @@ fn a_write_emptying_the_checksum_trees_first_leaf_removes_it_and_the_checker_agr
          head -c 262144 /dev/urandom > \"$MNT/b.bin\"\n\
          sync"
     );
-    let scratch = Scratch::sized(
+    // Overwriting the whole first file writes a new extent beside the old
+    // one, which the default 256 MiB volume's data group cannot hold
+    // (#680).
+    let scratch = Scratch::sized_bytes(
         "cow-write-first-csum-leaf",
         "crc32c",
         "no-holes",
         "4096",
+        1 << 30,
         &fill,
     );
     let image = scratch.image();
@@ -3606,7 +3610,17 @@ fn a_write_adding_more_than_two_leaves_of_digests_splits_the_checksum_leaf_as_of
     let fill = "head -c 262144 /dev/urandom > \"$MNT/b.bin\"\n\
                 : > \"$MNT/c.bin\"\n\
                 sync";
-    let scratch = Scratch::sized("cow-write-multi-split", "crc32c", "no-holes", "4096", fill);
+    // A 12 MiB write in one extent needs a data group with that much
+    // free: mkfs sizes the first by the volume, and on the default
+    // 256 MiB one it has no such room (#680).
+    let scratch = Scratch::sized_bytes(
+        "cow-write-multi-split",
+        "crc32c",
+        "no-holes",
+        "4096",
+        1 << 30,
+        fill,
+    );
     let image = scratch.image();
 
     let tree = csum_tree(&image);
