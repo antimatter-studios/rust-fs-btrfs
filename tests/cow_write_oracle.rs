@@ -2762,7 +2762,7 @@ fn keyed_refs(image: &Path, bytenr: u64) -> (u64, BTreeMap<u64, u64>) {
     let keyed_key = format!("key ({bytenr} EXTENT_DATA_REF ");
     let mut keyed = BTreeMap::new();
     for (i, line) in lines.iter().enumerate() {
-        if !item(*line) || !line.contains(&keyed_key) {
+        if !item(line) || !line.contains(&keyed_key) {
             continue;
         }
         let words: Vec<&str> = lines[i + 1].split_whitespace().collect();
