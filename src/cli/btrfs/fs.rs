@@ -60,7 +60,10 @@ fn command() -> Cmd {
              it is dirty), not a place to do real filesystem work: for that, mount it.\n\n\
              Metadata is JSON on stdout (--text for people); `read` and a named `xattr` \
              write raw bytes. A failure is {\"error\": \"...\", \"code\": N} on stderr, N being the \
-             exit status: 1 failed, 2 wrong command line, 3 not implemented or refused.\n\n\
+             exit status: 1 failed, 2 wrong command line, 3 not implemented or refused, 4 \
+             refused by the volume's state (rm, rmdir, mv, ln, mkdir or truncate meeting a \
+             directory that is not empty, a name already there, a missing target or a part \
+             of the path that is not a directory).\n\n\
              Writing is limited to what this library can do safely: `write` overwrites \
              an existing file at the same length, a NODATACOW file in place and any other \
              copy-on-write, committed as one transaction. What that cannot do yet answers \
@@ -602,7 +605,16 @@ fn names(
     })?;
     let (parent, name) = split_parent(&fs, path)?;
     let mode = mode_arg(sub)?;
-    let fail = |e| btrfs_error(path, e);
+    // What the volume's state refuses is decided first, as the C ABI
+    // decides it, so it is exit 4 (EXIT_REFUSED): the library reports a
+    // name already there and a directory with entries as
+    // `UnsupportedFeature`, which is exit 3.
+    match verb {
+        "mkdir" | "create" | "ln" => refuse_taken(&fs, parent.ino, name, path)?,
+        "rmdir" => refuse_non_empty(&fs, parent.ino, name, path)?,
+        _ => {}
+    }
+    let fail = |e| state_error(path, e);
     let (what, ino) = match verb {
         "mkdir" => (
             "created",
@@ -636,7 +648,7 @@ fn names(
             } else {
                 let file = fs
                     .lookup_path_bytes(source)
-                    .map_err(|e| btrfs_error(source, e))?;
+                    .map_err(|e| state_error(source, e))?;
                 fs.link(file.ino, parent.ino, name).map_err(fail)?;
                 ("linked", Some(file.ino))
             }
@@ -644,8 +656,16 @@ fn names(
         "mv" => {
             let source = os_bytes(sub.get_one::<OsString>("source").expect("clap requires it"));
             let (from, from_name) = split_parent(&fs, source)?;
+            // A directory moved over another one: that one must be empty.
+            if let (Ok(moved), Ok(over)) =
+                (fs.lookup(from.ino, from_name), fs.lookup(parent.ino, name))
+            {
+                if moved.is_dir() && over.is_dir() && over.ino != moved.ino {
+                    refuse_non_empty(&fs, parent.ino, name, path)?;
+                }
+            }
             fs.rename(from.ino, from_name, parent.ino, name)
-                .map_err(|e| btrfs_error(source, e))?;
+                .map_err(|e| state_error(source, e))?;
             ("moved", None)
         }
         other => unreachable!("not a namespace verb: {other}"),
@@ -704,7 +724,7 @@ fn mkdir_parents(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Out
                     // Last made, first removed, so each is empty when its
                     // turn comes. The error reported is the one that
                     // stopped the chain, and any removal that fails too.
-                    let mut refusal = btrfs_error(step.shown, e);
+                    let mut refusal = state_error(step.shown, e);
                     for done in chain[..made.len()].iter().rev() {
                         if let Err(undo) = fs.rmdir(parent(done, &made), done.name) {
                             refusal.message = format!(
@@ -801,7 +821,9 @@ enum Here {
 /// would follow.
 fn chain<'p>(fs: &Filesystem, path: &'p [u8]) -> Result<Vec<Step<'p>>, CliError> {
     if path.is_empty() {
-        return Err(CliError::failed("an empty path: no such file or directory"));
+        return Err(CliError::refused_by_state(
+            "an empty path: no such file or directory",
+        ));
     }
     // Each name, with where it ends in `path`.
     let mut names = Vec::new();
@@ -867,13 +889,13 @@ fn chain<'p>(fs: &Filesystem, path: &'p [u8]) -> Result<Vec<Step<'p>>, CliError>
                             inode: found.inode,
                         },
                         Ok(_) if named => {
-                            return Err(CliError::failed(format!(
+                            return Err(CliError::refused_by_state(format!(
                                 "{}: already exists",
                                 show(shown)
                             )))
                         }
                         Ok(_) => {
-                            return Err(CliError::failed(format!(
+                            return Err(CliError::refused_by_state(format!(
                                 "{}: not a directory",
                                 show(shown)
                             )))
@@ -886,7 +908,7 @@ fn chain<'p>(fs: &Filesystem, path: &'p [u8]) -> Result<Vec<Step<'p>>, CliError>
                                 show(shown)
                             )))
                         }
-                        Err(e) => return Err(btrfs_error(shown, e)),
+                        Err(e) => return Err(state_error(shown, e)),
                     }
                 }
             }
@@ -923,9 +945,9 @@ fn truncate(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Outcome,
     })?;
     let inode = fs
         .lookup_path_bytes(path)
-        .map_err(|e| btrfs_error(path, e))?;
+        .map_err(|e| state_error(path, e))?;
     fs.truncate(inode.ino, size)
-        .map_err(|e| btrfs_error(path, e))?;
+        .map_err(|e| state_error(path, e))?;
     let report = Json::object([("path", Json::from(show(path))), ("size", Json::from(size))]);
     Ok(Outcome::report(report).with_text(format!("{} is {size} bytes", show(path))))
 }
@@ -1061,11 +1083,40 @@ fn split_parent<'a>(fs: &Filesystem, path: &'a [u8]) -> Result<(Inode, &'a [u8])
         Some(at) => (&trimmed[..at], &trimmed[at + 1..]),
         None => (&b""[..], trimmed),
     };
-    let parent = fs.lookup_path_bytes(dir).map_err(|e| btrfs_error(dir, e))?;
+    let parent = fs.lookup_path_bytes(dir).map_err(|e| state_error(dir, e))?;
     if !parent.is_dir() {
-        return Err(CliError::failed(format!("{}: not a directory", show(dir))));
+        return Err(CliError::refused_by_state(format!(
+            "{}: not a directory",
+            show(dir)
+        )));
     }
     Ok((parent, name))
+}
+
+/// A name already at `name` in directory `dir`: the volume's state refuses
+/// a new one there, exit 4, as the C ABI refuses it (EEXIST).
+fn refuse_taken(fs: &Filesystem, dir: u64, name: &[u8], path: &[u8]) -> Result<(), CliError> {
+    match fs.lookup(dir, name) {
+        Err(Error::NotFound) => Ok(()),
+        Err(Error::UnsupportedFeature(_)) | Ok(_) => Err(CliError::refused_by_state(format!(
+            "{}: already exists",
+            show(path)
+        ))),
+        Err(e) => Err(btrfs_error(path, e)),
+    }
+}
+
+/// A directory at `name` in `dir` that still holds entries: the volume's
+/// state refuses removing or replacing it, exit 4, as the C ABI refuses it
+/// (ENOTEMPTY). Anything else is the library's to judge.
+fn refuse_non_empty(fs: &Filesystem, dir: u64, name: &[u8], path: &[u8]) -> Result<(), CliError> {
+    match fs.lookup(dir, name).and_then(|i| fs.read_dir(i.ino)) {
+        Ok(entries) if !entries.is_empty() => Err(CliError::refused_by_state(format!(
+            "{}: directory not empty",
+            show(path)
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// A byte string for a person to read. Never fed back into a lookup:
@@ -1081,6 +1132,19 @@ fn btrfs_error(what: &[u8], e: Error) -> CliError {
     match e {
         Error::UnsupportedFeature(_) | Error::ReadOnly => CliError::refused(message),
         _ => CliError::failed(message),
+    }
+}
+
+/// A namespace verb's library error: a name that is not there, or a part of
+/// the path that is not a directory, is the volume's state refusing it, the
+/// CLI contract's exit 4 (EXIT_REFUSED); every other error is
+/// [`btrfs_error`]'s.
+fn state_error(what: &[u8], e: Error) -> CliError {
+    match e {
+        Error::NotFound | Error::NotADirectory => {
+            CliError::refused_by_state(format!("{}: {e}", show(what)))
+        }
+        e => btrfs_error(what, e),
     }
 }
 

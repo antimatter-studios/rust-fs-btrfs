@@ -117,10 +117,25 @@ name_ok rm /newdir/empty.txt
 name_ok rmdir /newdir
 fs.btrfs "$names" ls / >"$SANDBOX/ls.json" 2>/dev/null
 jq_check "the directory is gone again" 'all(.[]; .name != "newdir")' "$SANDBOX/ls.json"
-status=0
-fs.btrfs "$names" rmdir /dir >/dev/null 2>"$SANDBOX/n.err" || status=$?
-check "rmdir of a directory with entries exits 3, not $status" test "$status" -eq 3
-jq_check "rmdir says the directory is not empty" '.code == 3 and (.error | test("not empty"))' "$SANDBOX/n.err"
+# What the volume's state refuses is exit 4, `refused`, in the CLI contract
+# (EXIT_REFUSED): a directory that is not empty, a name already there, a
+# missing name. Each leaves the image byte-identical.
+sparse_copy "$names" "$SANDBOX/before-n.img"
+state_refused() {
+    local why="$1" status=0
+    shift
+    fs.btrfs "$names" "$@" >"$SANDBOX/n.out" 2>"$SANDBOX/n.err" || status=$?
+    check "$* exits 4, not $status ($(cat "$SANDBOX/n.err"))" test "$status" -eq 4
+    check "$* prints nothing on stdout" test ! -s "$SANDBOX/n.out"
+    jq_check "$* is refused: $why" ".code == 4 and (.error | test(\"$why\"))" "$SANDBOX/n.err"
+    check "$* left the image byte-identical" cmp -s "$names" "$SANDBOX/before-n.img"
+}
+state_refused "not empty" rmdir /dir
+state_refused "already exists" mkdir /dir
+state_refused "already exists" mkdir /hello.txt
+state_refused "no such file or directory" rm /missing
+state_refused "no such file or directory" rmdir /missing
+state_refused "no such file or directory" mkdir /missing/x
 # The last name of a file holding data: it goes, with its data (#262).
 name_ok rm /dir/random.bin
 fs.btrfs "$names" ls /dir >"$SANDBOX/ls.json" 2>/dev/null
@@ -136,8 +151,8 @@ sparse_copy "$src" "$parents"
 sparse_copy "$parents" "$SANDBOX/before-p.img"
 status=0
 fs.btrfs "$parents" mkdir /m1/m2 >"$SANDBOX/p.out" 2>"$SANDBOX/p.err" || status=$?
-check "plain mkdir under a missing parent exits 1, not $status" test "$status" -eq 1
-jq_check "plain mkdir makes no parent" '.code == 1 and (.error | test("no such file"))' "$SANDBOX/p.err"
+check "plain mkdir under a missing parent exits 4, not $status" test "$status" -eq 4
+jq_check "plain mkdir makes no parent" '.code == 4 and (.error | test("no such file"))' "$SANDBOX/p.err"
 check "plain mkdir under a missing parent left the image as it was" cmp -s "$parents" "$SANDBOX/before-p.img"
 p_ok() {
     local status=0
@@ -187,8 +202,9 @@ check "mkdir -p --text says when nothing was made" \
     test "$(cat "$SANDBOX/p.txt")" = "/p/q exists; nothing created"
 check "a chain already there was not written to" cmp -s "$parents" "$SANDBOX/chain.img"
 
-# Refusals: anything but a directory on the way, a name too long or an
-# empty path exits 1, and a directory inside a subvolume other than the
+# Refusals: anything but a directory on the way, a name already there or an
+# empty path exits 4, the volume's state refusing it (EXIT_REFUSED); a
+# name too long exits 1, and a directory inside a subvolume other than the
 # top level, which only the kernel writes, exits 3. Each is decided before
 # anything is made, so no partial chain is left and the image is
 # byte-identical. A symlink is never followed, even one naming a directory.
@@ -206,20 +222,20 @@ p_refused() {
     jq_check "mkdir -p ${p:0:40} is refused: $why" ".code == $code and (.error | test(\"$why\"))" "$SANDBOX/x.err"
     check "mkdir -p ${p:0:40} left the image byte-identical" cmp -s "$parents" "$SANDBOX/before-p.img"
 }
-p_refused 1 "already exists" /hello.txt
-p_refused 1 "already exists" /hello.txt/
-p_refused 1 "not a directory" /hello.txt/x
-p_refused 1 "not a directory" /hello.txt/x/y
-p_refused 1 "not a directory" /new/../hello.txt/x
-p_refused 1 "not a directory" /dir/sub/deep.txt/x
-p_refused 1 "not a directory" /vol/inside.txt/x
+p_refused 4 "already exists" /hello.txt
+p_refused 4 "already exists" /hello.txt/
+p_refused 4 "not a directory" /hello.txt/x
+p_refused 4 "not a directory" /hello.txt/x/y
+p_refused 4 "not a directory" /new/../hello.txt/x
+p_refused 4 "not a directory" /dir/sub/deep.txt/x
+p_refused 4 "not a directory" /vol/inside.txt/x
 p_refused 1 "name too long" "/n1/n2/$long"
-p_refused 1 "not a directory" "/hello.txt/$long"
-p_refused 1 "already exists" /link
-p_refused 1 "not a directory" /link/x
-p_refused 1 "already exists" /dl
-p_refused 1 "not a directory" /dl/x
-p_refused 1 "no such file or directory" ""
+p_refused 4 "not a directory" "/hello.txt/$long"
+p_refused 4 "already exists" /link
+p_refused 4 "not a directory" /link/x
+p_refused 4 "already exists" /dl
+p_refused 4 "not a directory" /dl/x
+p_refused 4 "no such file or directory" ""
 p_refused 3 "subvolume" /vol/new
 p_refused 3 "subvolume" /vol/a/b
 p_refused 3 "subvolume" /snap/x
