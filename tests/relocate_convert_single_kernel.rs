@@ -37,8 +37,11 @@ impl Scratch {
         let dir = PathBuf::from(temp_path!("{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         let image = dir.join("fs.img");
+        // Sparse, and big enough that converting the DUP data group to
+        // single finds a free stripe: on 256 MiB, mkfs's DUP groups leave
+        // no room for one (#680).
         std::fs::File::create(&image)
-            .and_then(|f| f.set_len(256 << 20))
+            .and_then(|f| f.set_len(1 << 30))
             .unwrap();
         let made = oracle("mkfs.btrfs")
             .args(["-q", "-f", "-d", "dup", "-s", "4096", "-n", "16384"])
