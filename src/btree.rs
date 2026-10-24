@@ -1459,6 +1459,44 @@ mod tests {
         );
     }
 
+    /// A leaf stamped with `fsid` instead of the volume's own.
+    fn leaf_of(fsid: [u8; UUID_SIZE]) -> Vec<u8> {
+        let mut bytes = leaf(LEAF_A, objectid::FS_TREE, &[(key(1, 1, 0), vec![1])]);
+        bytes[header_offsets::FSID..header_offsets::FSID + UUID_SIZE].copy_from_slice(&fsid);
+        seal(&mut bytes);
+        bytes
+    }
+
+    #[test]
+    fn accepts_a_block_a_seed_device_wrote() {
+        // A sprouted filesystem's blocks from before it sprouted are on
+        // its seed, stamped with the seed's fsid (#679).
+        const SEED: [u8; UUID_SIZE] = [0x11; UUID_SIZE];
+        let block = TreeBlock::parse_accepting(leaf_of(SEED), LEAF_A, &geom(), &[SEED]).unwrap();
+        assert_eq!(block.header.fsid, SEED);
+        // Beside a seed, another filesystem's block is still refused.
+        let err = TreeBlock::parse_accepting(leaf_of(SEED), LEAF_A, &geom(), &[[0x22; UUID_SIZE]])
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("is not this volume's"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_tree_given_its_seeds_reads_the_blocks_they_wrote() {
+        const SEED: [u8; UUID_SIZE] = [0x11; UUID_SIZE];
+        let blocks = HashMap::from([(LEAF_A, leaf_of(SEED))]);
+        let read = reader(&blocks);
+        let seeds = [SEED];
+        assert!(
+            Tree::new(geom(), &read).read_block(LEAF_A).is_err(),
+            "without the seed, its block is another filesystem's"
+        );
+        let tree = Tree::new(geom(), &read).with_seed_fsids(&seeds);
+        assert_eq!(tree.read_block(LEAF_A).unwrap().header.fsid, SEED);
+    }
+
     #[test]
     fn rejects_a_level_above_the_maximum_tree_height() {
         let mut bytes = node(ROOT, objectid::FS_TREE, 1, &[(key(1, 1, 0), LEAF_A)]);
