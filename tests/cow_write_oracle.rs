@@ -2604,10 +2604,11 @@ fn extent_kind_and_refs(image: &Path, ino: u64, offset: u64) -> (String, u64, u6
         .unwrap_or_else(|| panic!("no disk byte for inode {ino} at {offset}: {body:?}"));
     let extents = dump_tree(image, "2");
     let lines: Vec<&str> = extents.lines().collect();
+    // Items only: a node's child pointer can carry the record's key.
     let needle = format!("key ({bytenr} EXTENT_ITEM ");
     let at = lines
         .iter()
-        .position(|l| l.contains(&needle))
+        .position(|l| l.trim_start().starts_with("item ") && l.contains(&needle))
         .unwrap_or_else(|| panic!("no extent record at {bytenr}\n{extents}"));
     let words: Vec<&str> = lines[at + 1].split_whitespace().collect();
     let refs = words

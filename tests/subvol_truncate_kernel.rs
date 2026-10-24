@@ -73,9 +73,15 @@ sync
             .next()
             .unwrap();
         let extents = dump_tree(&image, "extent");
+        // The record's item line, then its first line: a node's child
+        // pointer can carry the same key, and is not the record.
         let marker = format!("key ({bytenr} EXTENT_ITEM ");
-        let record = extents.split(&marker).nth(1).expect("nc extent record");
-        assert!(record.lines().nth(1).unwrap().contains("refs 1 "));
+        let record = extents
+            .lines()
+            .skip_while(|l| !(l.trim_start().starts_with("item ") && l.contains(&marker)))
+            .nth(1)
+            .expect("nc extent record");
+        assert!(record.contains("refs 1 "), "{record}");
         assert!(
             !fs.can_write_in_place(nc).unwrap(),
             "sv's snapshot shares nc/data"
