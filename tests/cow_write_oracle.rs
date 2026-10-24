@@ -344,10 +344,13 @@ fn a_checksummed_file_is_written_with_digests_the_checker_and_kernel_verify() {
 fn data_refs(image: &Path, bytenr: u64) -> (u64, Vec<String>, usize) {
     let extents = dump_tree(image, "2");
     let lines: Vec<&str> = extents.lines().collect();
+    // Items only: a node above the leaves prints `key (...) block N` for
+    // each child, and the record's key can be one of those too.
+    let item = |l: &str| l.trim_start().starts_with("item ");
     let record = format!("key ({bytenr} EXTENT_ITEM ");
     let at = lines
         .iter()
-        .position(|l| l.contains(&record))
+        .position(|&l| item(l) && l.contains(&record))
         .unwrap_or_else(|| panic!("no extent record at {bytenr}\n{extents}"));
     let words: Vec<&str> = lines[at + 1].split_whitespace().collect();
     let refs = words
@@ -2741,10 +2744,13 @@ fn keyed_fill(count: usize) -> String {
 fn keyed_refs(image: &Path, bytenr: u64) -> (u64, BTreeMap<u64, u64>) {
     let extents = dump_tree(image, "2");
     let lines: Vec<&str> = extents.lines().collect();
+    // Items only: a node above the leaves prints `key (...) block N` for
+    // each child, and the record's key can be one of those too.
+    let item = |l: &str| l.trim_start().starts_with("item ");
     let record = format!("key ({bytenr} EXTENT_ITEM ");
     let at = lines
         .iter()
-        .position(|l| l.contains(&record))
+        .position(|&l| item(l) && l.contains(&record))
         .unwrap_or_else(|| panic!("no extent record at {bytenr}\n{extents}"));
     let words: Vec<&str> = lines[at + 1].split_whitespace().collect();
     let total = words
@@ -2755,7 +2761,7 @@ fn keyed_refs(image: &Path, bytenr: u64) -> (u64, BTreeMap<u64, u64>) {
     let keyed_key = format!("key ({bytenr} EXTENT_DATA_REF ");
     let mut keyed = BTreeMap::new();
     for (i, line) in lines.iter().enumerate() {
-        if !line.contains(&keyed_key) {
+        if !item(*line) || !line.contains(&keyed_key) {
             continue;
         }
         let words: Vec<&str> = lines[i + 1].split_whitespace().collect();
@@ -2951,6 +2957,11 @@ fn keyed_refs_by_offset(image: &Path, bytenr: u64) -> BTreeMap<(u64, u64), (u64,
     let keyed_key = format!("key ({bytenr} EXTENT_DATA_REF ");
     let mut keyed = BTreeMap::new();
     for (i, line) in lines.iter().enumerate() {
+        // Items only, as in keyed_refs: a node's child pointer can carry
+        // the same key.
+        if !line.trim_start().starts_with("item ") {
+            continue;
+        }
         let Some(at) = line.find(&keyed_key) else {
             continue;
         };
@@ -3141,7 +3152,10 @@ fn csum_tree(image: &Path) -> BTreeMap<u64, CsumBlock> {
     for line in tree.lines() {
         let words: Vec<&str> = line.split_whitespace().collect();
         match words.as_slice() {
-            [kind @ ("leaf" | "node"), addr, rest @ ..] => {
+            // Each block has two header lines: `leaf|node N items K ...`
+            // and `leaf|node N flags ... backref revision 1`. Only the
+            // first carries the item count.
+            [kind @ ("leaf" | "node"), addr, rest @ ..] if rest.contains(&"items") => {
                 at = addr.parse().unwrap();
                 let items = rest
                     .iter()
@@ -4497,7 +4511,7 @@ fn a_growing_write_into_space_preallocated_past_the_end_is_written_in_place() {
          head -c {OLD} /dev/zero | tr '\\000' '\\101' > \"$MNT/$f\"; done\n\
          sync\n\
          for f in {AT} {AT_CONTROL} {PAST} {PAST_CONTROL}; do \
-         fallocate -k -o {OLD} -l {KEPT} \"$MNT/$f\"; done\n\
+         fallocate -n -o {OLD} -l {KEPT} \"$MNT/$f\"; done\n\
          sync\n\
          head -c {PART} /dev/zero | tr '\\000' '\\132' \
          | dd of=\"$MNT/{AT_CONTROL}\" bs={PART} seek={at_seek} conv=notrunc status=none\n\

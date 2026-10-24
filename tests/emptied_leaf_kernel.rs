@@ -61,7 +61,9 @@ fn fs_leaves(image: &std::path::Path) -> Vec<(u64, usize, Vec<u64>)> {
     let mut out: Vec<(u64, usize, Vec<u64>)> = Vec::new();
     for line in tree.lines() {
         let words: Vec<&str> = line.split_whitespace().collect();
-        if words.first() == Some(&"leaf") {
+        // A leaf's second header line, `leaf N flags ... backref
+        // revision 1`, carries no item count: only the first is read.
+        if words.first() == Some(&"leaf") && words.contains(&"items") {
             let at = words[1].parse().unwrap();
             let items = words
                 .iter()
