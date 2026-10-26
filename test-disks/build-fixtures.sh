@@ -36,7 +36,7 @@ DISKS="$REPO/test-disks"
 
 # target -> the artefacts it produces, relative to test-disks/, in build
 # order. Every name here is checked by --check and named in chores.yml.
-TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog cli features scrub seed squota"
+TARGETS="geometry populated rich compression subvol xattr acl nodatacow commit cow split pool dirtylog cli features scrub seed squota encoded"
 
 artefacts_for() {
     case "$1" in
@@ -151,12 +151,31 @@ artefacts_for() {
             echo dirtylog/btrfs-dirty-log-hardlink.logdump
             echo dirtylog/btrfs-dirty-log-extref.img
             echo dirtylog/btrfs-dirty-log-extref.logdump
+            echo dirtylog/btrfs-dirty-log-dirlink.img
+            echo dirtylog/btrfs-dirty-log-dirlink.logdump
+            echo dirtylog/btrfs-dirty-log-nbytes.img
+            echo dirtylog/btrfs-dirty-log-nbytes.logdump
+            echo dirtylog/btrfs-dirty-log-extrefexists.img
+            echo dirtylog/btrfs-dirty-log-extrefexists.logdump
+            echo dirtylog/btrfs-dirty-log-extrefcreated.img
+            echo dirtylog/btrfs-dirty-log-extrefcreated.logdump
+            echo dirtylog/btrfs-dirty-log-extrefremoved.img
+            echo dirtylog/btrfs-dirty-log-extrefremoved.logdump
+            echo dirtylog/btrfs-dirty-log-compressedcut.img
+            echo dirtylog/btrfs-dirty-log-compressedcut.logdump
+            echo dirtylog/btrfs-dirty-log-rmdir.img
+            echo dirtylog/btrfs-dirty-log-rmdir.logdump
+            echo dirtylog/btrfs-dirty-log-linkremoved.img
+            echo dirtylog/btrfs-dirty-log-linkremoved.logdump
+            echo dirtylog/btrfs-dirty-log-createdlink.img
+            echo dirtylog/btrfs-dirty-log-createdlink.logdump
             ;;
         cli)
             echo cli/btrfs-cli.img; echo cli/btrfs-cli.superdump; echo cli/btrfs-cli.manifest
             ;;
         features)
             echo features/btrfs-bgt.img; echo features/btrfs-bgt.manifest
+            echo features/btrfs-zoned.img; echo features/btrfs-zoned.manifest
             echo features/btrfs-verity.img; echo features/btrfs-verity.manifest
             echo features/btrfs-verity-tampered.img
             ;;
@@ -174,6 +193,10 @@ artefacts_for() {
             ;;
         squota)
             echo squota/btrfs-squota.img; echo squota/btrfs-squota.manifest
+            ;;
+        encoded)
+            echo encoded/btrfs-encoded.img; echo encoded/btrfs-encoded.manifest
+            echo encoded/btrfs-encoded.compression
             ;;
         *)
             echo "build-fixtures: unknown target '$1'" >&2
@@ -263,7 +286,9 @@ while IFS= read -r -d '' image; do
         exit 1
     fi
     mkdir -p "$(dirname "$DISKS/$rel")"
-    cp --sparse=always "$image" "$DISKS/$rel.partial"
+    # GNU and BSD dd both preserve zero-filled runs as holes. Spell the
+    # block size in bytes so it has the same meaning on either userland.
+    dd if="$image" of="$DISKS/$rel.partial" bs=1048576 conv=sparse status=none
     mv -f "$DISKS/$rel.partial" "$DISKS/$rel"
     rm -f "$image"
     built=$((built + 1))

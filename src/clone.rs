@@ -88,6 +88,7 @@ impl Filesystem {
         if !source.is_regular_file() || !target.is_regular_file() {
             return Err(Error::NotAFile);
         }
+        crate::verity::refuse_mutation(dst, target.flags)?;
         if (source.flags ^ target.flags) & INODE_NODATASUM != 0 {
             return Err(refused(format!(
                 "inode {src} and inode {dst} differ in whether they checksum their data, and \

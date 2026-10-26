@@ -32,15 +32,16 @@
 //! (#397, #493, #580) in committed transactions, each leaving a filesystem the kernel and
 //! `btrfs check` accept on its own:
 //!
-//! 1. **A new chunk** of the group's profile, or DUP when a single data
-//!    group is converted (#586): its `CHUNK_ITEM` in the
+//! 1. **A new chunk** of the group's profile, DUP when a single data
+//!    group is converted (#586), or single when a DUP data group is
+//!    (#587): its `CHUNK_ITEM` in the
 //!    chunk tree, a `DEV_EXTENT` in the device tree for each stripe, an
 //!    empty `BLOCK_GROUP_ITEM`, a `FREE_SPACE_INFO` and one free run
 //!    covering it in the free-space tree, and the device's `bytes_used`
 //!    raised in the chunk tree's device item and the superblock's copy.
 //! 2. **The extents move**, when the group holds any (#493), at most 64
 //!    per committed transaction (#494): each one's bytes are read verified
-//!    against their digests and written into every copy the new chunk keeps, then the
+//!    against their digests, from whichever copy verifies, and written into every copy the new chunk keeps, then the
 //!    batch's commit re-points every file item naming it (#495), each
 //!    keeping its offset into the extent, moves its `EXTENT_ITEM`, expands
 //!    snapshot-shared references into per-subvolume data references, files its
@@ -53,9 +54,10 @@
 //!    allocation still excludes it during this final transaction.
 //!
 //! Besides everything above, it refuses a system group, a conversion to
-//! another profile but a single data group's to DUP, a group of any
-//! profile but single, a volume of more than one
-//! device, one with no free-space tree or with a block group tree, and a
+//! another profile but a single data group's to DUP or a DUP data
+//! group's to single (#587), a group of any other profile but single,
+//! a volume of more than one
+//! device, one with no free-space tree, and a
 //! group holding an extent with a sector that a checksummed file's
 //! regular item names and that has no checksum, each before anything is
 //! written. Preallocated extents and those of `NODATASUM` files move with
@@ -294,8 +296,8 @@ impl Filesystem {
 
     /// Relocate the data or metadata block group at `start` into a new
     /// chunk of its own profile, or of `profile` when that converts a
-    /// single data group to DUP, and return where the new group is (#397,
-    /// #493, #580, #586).
+    /// single data group to DUP or a DUP data group to single, and return
+    /// where the new group is (#397, #493, #580, #586, #587).
     ///
     /// Committed transactions, each leaving a filesystem the kernel
     /// accepts on its own: the new chunk is allocated, the group's extents
@@ -598,13 +600,15 @@ impl Filesystem {
             self.refuse_unenumerable(group)?;
         }
         let own = ChunkProfile::from_type(group.flags)?;
-        // A single data group converts to DUP (#586); every other
-        // conversion is refused.
+        // A single data group converts to DUP (#586) and a DUP data group
+        // back to single (#587); every other conversion is refused.
+        let converts = |from, to| !group.holds_metadata() && own == from && profile == Some(to);
+        let to_single = converts(ChunkProfile::Dup, ChunkProfile::Single);
         if let Some(p) = profile.filter(|&p| p != own) {
-            if group.holds_metadata() || own != ChunkProfile::Single || p != ChunkProfile::Dup {
+            if !converts(ChunkProfile::Single, ChunkProfile::Dup) && !to_single {
                 return Err(Error::UnsupportedFeature(format!(
                     "converting a {} {} block group to {} is not implemented; only a \
-                     single data group to dup is",
+                     single data group to dup, or a dup one to single, is",
                     own.name(),
                     if group.holds_metadata() {
                         "metadata"
@@ -615,7 +619,9 @@ impl Filesystem {
                 )));
             }
         }
-        if own != ChunkProfile::Single {
+        // A DUP data group moves only into single; the extents are read
+        // from whichever of its two copies verifies.
+        if own != ChunkProfile::Single && !to_single {
             return Err(Error::UnsupportedFeature(format!(
                 "allocating a {} chunk is not implemented; only single is",
                 own.name()
@@ -635,13 +641,9 @@ impl Filesystem {
                     .into(),
             ));
         }
-        if self.sb.has_block_group_tree() {
-            return Err(Error::UnsupportedFeature(
-                "this volume keeps its block group items in a block group tree, and \
-                 allocating a chunk there is not implemented"
-                    .into(),
-            ));
-        }
+        // A block group tree volume keeps its group items in tree 11, where
+        // the new group's item is put and the old one's deleted
+        // (`block_group_tree_id`, #559).
         if group.holds_metadata() {
             return Ok(Vec::new());
         }
@@ -734,7 +736,19 @@ impl Filesystem {
     /// `flags`, with its empty block group, in one committed transaction,
     /// and return its logical address. DUP takes two stripes on this device.
     fn allocate_chunk(&mut self, flags: u64, length: u64) -> Result<u64> {
-        let devid = self.sb.dev_item.devid;
+        // A seed may have a device item and abundant physical space;
+        // only a device this mount can write may supply a new stripe.
+        let devid = if self.writable_pool.is_empty() {
+            self.writable
+                .as_ref()
+                .filter(|device| device.is_writable())
+                .map(|_| self.sb.dev_item.devid)
+        } else {
+            self.writable_pool
+                .iter()
+                .find_map(|(&id, device)| device.is_writable().then_some(id))
+        }
+        .ok_or(Error::ReadOnly)?;
         let copies = match ChunkProfile::from_type(flags)? {
             ChunkProfile::Single => 1,
             ChunkProfile::Dup => 2,
@@ -779,7 +793,7 @@ impl Filesystem {
             })?;
         dev_item[DEV_ITEM_BYTES_USED..DEV_ITEM_BYTES_USED + 8].copy_from_slice(&used.to_le_bytes());
 
-        let dev_uuid = self.sb.dev_item.uuid;
+        let dev_uuid = crate::superblock::DevItem::parse(&dev_item)?.uuid;
         let stripe_list: Vec<(u64, u64, [u8; 16])> =
             stripes.iter().map(|&p| (devid, p, dev_uuid)).collect();
         let mut tree_edits = vec![
@@ -822,7 +836,7 @@ impl Filesystem {
         group.extend_from_slice(&objectid::FIRST_CHUNK_TREE.to_le_bytes());
         group.extend_from_slice(&flags.to_le_bytes());
         tree_edits.push((
-            objectid::EXTENT_TREE,
+            self.block_group_tree_id(),
             ItemEdit::Put(OwnedItem {
                 key: DiskKey {
                     objectid: logical,
@@ -927,7 +941,7 @@ impl Filesystem {
             ItemEdit::Put(OwnedItem { key, data: item }),
         ));
         tree_edits.push((
-            objectid::EXTENT_TREE,
+            self.block_group_tree_id(),
             ItemEdit::Delete(DiskKey {
                 objectid: start,
                 key_type: key_type::BLOCK_GROUP_ITEM,
@@ -1724,6 +1738,55 @@ mod tests {
     /// Tests that need the oracle VM; the unit tier skips them by name.
     mod needs_host {
         use super::*;
+
+        #[test]
+        fn a_sprouted_pool_allocates_new_chunk_stripes_only_on_the_sprout() {
+            use fs_btrfs_test_support::{fixture, oracle, sha256_hex, temp_path};
+            use fs_core::{BlockDevice, FileDevice};
+            use std::sync::Arc;
+            let seed = std::path::PathBuf::from(temp_path!("chunk-seed.img"));
+            let sprout = std::path::PathBuf::from(temp_path!("chunk-sprout.img"));
+            std::fs::copy(fixture("seed/btrfs-seed.img"), &seed).unwrap();
+            std::fs::copy(fixture("seed/btrfs-sprout.img"), &sprout).unwrap();
+            let before = sha256_hex(&std::fs::read(&seed).unwrap());
+            let members: Vec<Arc<dyn BlockDevice>> = [&seed, &sprout]
+                .iter()
+                .map(|p| Arc::new(FileDevice::open_rw(p).unwrap()) as Arc<dyn BlockDevice>)
+                .collect();
+            let mut fs = Filesystem::mount_pool_rw(members).unwrap();
+            let sprout_id = fs.sb.dev_item.devid;
+            for flags in [bg::DATA, bg::METADATA | bg::DUP] {
+                let at = fs
+                    .allocate_chunk(flags, 8 * MIB)
+                    .expect("allocate on the sprout");
+                let chunk = fs.map.chunk_for(at).unwrap();
+                assert!(chunk.stripes.iter().all(|s| s.devid == sprout_id));
+                let extents: Vec<_> = fs
+                    .dev_extents()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|e| e.chunk_offset == at)
+                    .collect();
+                assert_eq!(extents.len(), chunk.stripes.len());
+                assert!(extents.iter().all(|e| e.devid == sprout_id));
+            }
+            drop(fs);
+            assert_eq!(sha256_hex(&std::fs::read(&seed).unwrap()), before);
+            let out = oracle("bash")
+                .arg(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/support/check-pool.sh"),
+                )
+                .arg(&sprout)
+                .arg(&seed)
+                .output();
+            assert!(
+                out.status.success(),
+                "btrfs check: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
 
         /// A private copy of an oracle-made image, removed even on a panic.
         struct RefusalImage(std::path::PathBuf);

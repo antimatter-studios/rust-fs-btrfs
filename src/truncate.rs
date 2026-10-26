@@ -1,6 +1,6 @@
 //! Changing a regular file's length: truncate (#262).
 //!
-//! A truncate is one committed transaction on the top-level subvolume,
+//! A truncate is one committed transaction on the selected subvolume,
 //! through the same planner and commit as [`crate::namespace`]:
 //!
 //! - **Shrinking** deletes every `EXTENT_DATA` item that begins at or past
@@ -9,28 +9,40 @@
 //!   tree and the block group's `used` give the space back, and its digests
 //!   leave the checksum tree. An item that straddles the new end keeps its
 //!   extent whole and references less of it (`num_bytes` shrinks), as the
-//!   kernel does; an inline item is cut to the new length.
+//!   kernel does; an inline item is cut to the new length, a compressed
+//!   one decoded and the bytes kept written back uncompressed (#423).
 //! - **Growing** moves the inode's size. With the `NO_HOLES` feature the
 //!   new range is an implicit hole; without it every range up to the size,
 //!   rounded up to a sector, must have an item, so each part of the new
 //!   range no item covers gets a hole item, a regular extent item whose disk
-//!   bytenr is 0, as the kernel records it (#420).
+//!   bytenr is 0, as the kernel records it (#420). A file that ends
+//!   partway through a sector first has the rest of that sector rewritten
+//!   copy-on-write with zeros (#421), through [`Filesystem::write`], so
+//!   stale bytes past the old end never read back. A file that holds
+//!   inline data first has that data moved into a regular extent at
+//!   offset 0, the rest of its sector zeros (#422), as the kernel does:
+//!   an inline extent never stays shorter than its file.
 //!
 //! Either way the inode's `nbytes` is recounted from the items left (inline
 //! data at its length, every other item with an extent at its `num_bytes`,
 //! as `btrfs check` counts it), and its change and modification times move.
 //!
+//! An extent something else still reads stays, and only this file's
+//! reference to it goes (#262): one a reflink shares, counting more than
+//! one reference, and one a snapshot shares, whose file item sits in a leaf
+//! the snapshot reaches too. Copying that leaf out of the snapshot's way
+//! gives the extent a reference naming the old leaf, as the kernel's
+//! copy-on-write does, so the snapshot keeps reading it.
+//!
 //! # What it refuses
 //!
-//! - an extent a snapshot may share, one from at or before the last
-//!   snapshot; an extent a reflink shares has this file's reference
-//!   dropped and stays for the others (#262), unless that reference is held
-//!   anywhere but inline in the extent's record, or is its last;
-//! - growing a file whose last sector is partly past its end, or that holds
-//!   inline data: the bytes between the old end and the sector boundary
-//!   must read as zeros, which means writing that sector;
-//! - a compressed inline extent cut short, and any subvolume other than the
-//!   top level.
+//! - an extent whose reference from this file is held anywhere but inline
+//!   in the extent's record;
+//! - on a volume without `NO_HOLES`, growing a file whose last sector is
+//!   partly past its end, inline data included; and growing a `nodatacow`
+//!   file that holds inline data.
+//! - an encrypted or otherwise encoded inline extent cut short, and a
+//!   compressed one cut to a sector or more.
 
 use crate::chunk::DiskKey;
 use crate::error::{Error, Result};
@@ -56,13 +68,22 @@ impl Filesystem {
     /// [`Error::NotAFile`] for anything but a regular file, and
     /// [`Error::UnsupportedFeature`] for every refusal the [module
     /// documentation](crate::truncate) lists. Nothing is written unless
-    /// everything is.
+    /// everything is, except that a file ending partway through a sector,
+    /// or holding inline data, and grown past it commits the zeroed sector
+    /// first: if the growth after it then fails, the file ends at that
+    /// sector's boundary.
     pub fn truncate(&mut self, ino: u64, size: u64) -> Result<()> {
-        self.require_writable_top_level()?;
+        if self.writable.is_none() && self.subvolume_writes.is_some() {
+            return self.writing_subvolume(|fs| fs.truncate(ino, size));
+        }
+        if self.writable.is_none() {
+            return Err(Error::ReadOnly);
+        }
         let inode = self.read_inode(ino)?;
         if !inode.is_regular_file() {
             return Err(Error::NotAFile);
         }
+        crate::verity::refuse_mutation(ino, inode.flags)?;
         if size == inode.size {
             return Ok(());
         }
@@ -80,6 +101,35 @@ impl Filesystem {
         let mut released = Vec::new();
         if size > inode.size {
             self.refuse_growth(ino, inode.size, &items)?;
+            if items.iter().any(|(_, d)| d.get(fe::TYPE) == Some(&INLINE)) {
+                // Inline data cannot stay shorter than its file, so it moves
+                // into a regular extent at offset 0 (#422) that the write
+                // fills to the next sector boundary with zeros; any growth
+                // past that boundary is then sector-aligned.
+                let boundary = (inode.size / sector + 1) * sector;
+                let zeros = vec![0u8; (size.min(boundary) - inode.size) as usize];
+                if self.subvolume_writes.is_some() {
+                    self.writing_subvolume(|fs| fs.write_moving_inline(ino, inode.size, &zeros))?;
+                } else {
+                    self.write_moving_inline(ino, inode.size, &zeros)?;
+                }
+                return self.truncate(ino, size);
+            }
+            if !inode.size.is_multiple_of(sector) && !items.is_empty() {
+                // The rest of the old last sector may hold stale bytes, so
+                // it is rewritten copy-on-write with zeros past the old end,
+                // as the kernel does; the write moves the size up to the
+                // sector boundary or to `size`, whichever comes first, and
+                // any growth past that boundary is then sector-aligned.
+                let boundary = inode.size.next_multiple_of(sector);
+                let zeros = vec![0u8; (size.min(boundary) - inode.size) as usize];
+                if self.subvolume_writes.is_some() {
+                    self.writing_subvolume(|fs| fs.write(ino, inode.size, &zeros))?;
+                } else {
+                    self.write(ino, inode.size, &zeros)?;
+                }
+                return self.truncate(ino, size);
+            }
             if !self.sb.has_no_holes() {
                 let from = inode.size.next_multiple_of(sector);
                 let to = size.next_multiple_of(sector);
@@ -87,18 +137,10 @@ impl Filesystem {
             }
         } else {
             let cut = size.next_multiple_of(sector);
-            let last_snapshot = self.fs_tree_last_snapshot()?;
             for (k, d) in &items {
-                if let Some(edit) = self.shrink_item(
-                    ino,
-                    size,
-                    cut,
-                    last_snapshot,
-                    k,
-                    d,
-                    &mut releases,
-                    &mut unrefs,
-                )? {
+                if let Some(edit) =
+                    self.shrink_item(ino, size, cut, k, d, &mut releases, &mut unrefs)?
+                {
                     edits.push(edit);
                 }
             }
@@ -124,7 +166,7 @@ impl Filesystem {
         }));
 
         let write = DataWrite {
-            root: crate::chunk::objectid::FS_TREE,
+            root: self.written_tree(),
             ino,
             moves: Vec::new(),
             adds: Vec::new(),
@@ -147,16 +189,14 @@ impl Filesystem {
     /// Refuse growing a file whose new bytes could not be read as zeros
     /// without writing data.
     fn refuse_growth(&self, ino: u64, old: u64, items: &[(DiskKey, Vec<u8>)]) -> Result<()> {
-        if items.iter().any(|(_, d)| d.get(fe::TYPE) == Some(&INLINE)) {
+        if !old.is_multiple_of(u64::from(self.sb.sectorsize))
+            && !items.is_empty()
+            && !self.sb.has_no_holes()
+        {
             return Err(Error::UnsupportedFeature(format!(
-                "inode {ino} holds inline data, and growing it means moving that data into \
-                 an extent, which is not written yet"
-            )));
-        }
-        if !old.is_multiple_of(u64::from(self.sb.sectorsize)) && !items.is_empty() {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino} ends partway through a sector at {old}, and growing it means \
-                 zeroing the rest of that sector, which is not written yet"
+                "inode {ino} ends partway through a sector at {old}, and growing it on a \
+                 volume without the no-holes feature means zeroing the rest of that sector \
+                 with a write that keeps hole items, which is not implemented"
             )));
         }
         Ok(())
@@ -165,14 +205,13 @@ impl Filesystem {
     /// What shrinking to `size` does to one `EXTENT_DATA` item: nothing,
     /// a shorter item, or its deletion — with its extent released when
     /// this item was its one reference, and its reference dropped from the
-    /// extent when a reflink shares it (#262).
+    /// extent when a reflink or a snapshot shares it (#262).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn shrink_item(
         &self,
         ino: u64,
         size: u64,
         cut: u64,
-        last_snapshot: u64,
         k: &DiskKey,
         d: &[u8],
         releases: &mut Vec<DataRelease>,
@@ -193,13 +232,46 @@ impl Filesystem {
                 if size >= start + ram {
                     return Ok(None);
                 }
+                let keep = (size - start) as usize;
+                let sector = self.sb.sectorsize as usize;
+                if d[fe::COMPRESSION] != 0
+                    && d[fe::ENCRYPTION] == 0
+                    && d[fe::OTHER_ENCODING..fe::OTHER_ENCODING + 2] == [0, 0]
+                {
+                    // A compressed inline extent is decoded and the bytes
+                    // kept are written back plain (#423): the kernel reads
+                    // either shape, and a plain one cannot hold stale
+                    // decoded bytes past the file's end. Kept short of a
+                    // sector, which `btrfs check` requires of plain inline
+                    // data.
+                    if keep >= sector {
+                        return Err(Error::UnsupportedFeature(format!(
+                            "inode {ino}: the compressed inline extent at {start} would \
+                             keep {keep} bytes, a sector or more, which inline data \
+                             cannot hold uncompressed"
+                        )));
+                    }
+                    let decoded = crate::compression::decompress(
+                        crate::compression::Compression::from_byte(d[fe::COMPRESSION])?,
+                        &d[fe::INLINE_DATA..],
+                        ram as usize,
+                        sector,
+                        crate::compression::ShortDecode::Pad,
+                    )?;
+                    let mut data = d[..fe::INLINE_DATA].to_vec();
+                    data[fe::COMPRESSION] = 0;
+                    data[fe::RAM_BYTES..fe::RAM_BYTES + 8]
+                        .copy_from_slice(&(keep as u64).to_le_bytes());
+                    data.extend_from_slice(&decoded[..keep]);
+                    return Ok(Some(ItemEdit::Put(OwnedItem { key: *k, data })));
+                }
                 if !unencoded(d) || d.len() != fe::INLINE_DATA + ram as usize {
                     return Err(Error::UnsupportedFeature(format!(
-                        "inode {ino}: the inline extent at {start} is compressed or encoded, \
-                         and cutting one short is not implemented"
+                        "inode {ino}: the inline extent at {start} is encrypted or encoded, \
+                         or its length disagrees with its ram_bytes, and cutting one short \
+                         is not implemented"
                     )));
                 }
-                let keep = (size - start) as usize;
                 let mut data = d[..fe::INLINE_DATA + keep].to_vec();
                 data[fe::RAM_BYTES..fe::RAM_BYTES + 8]
                     .copy_from_slice(&(keep as u64).to_le_bytes());
@@ -221,7 +293,7 @@ impl Filesystem {
                 let bytenr = le64(d, fe::DISK_BYTENR);
                 if bytenr != 0 {
                     let offset = le64(d, fe::OFFSET);
-                    let (refs, extent_len, generation) = self.extent_item(bytenr)?;
+                    let (refs, extent_len, _) = self.extent_item(bytenr)?;
                     // A compressed extent's window is in its decoded bytes,
                     // which its on-disk length does not bound.
                     let compressed = d[fe::COMPRESSION] != 0;
@@ -234,23 +306,18 @@ impl Filesystem {
                             bytenr + offset
                         )));
                     }
-                    if generation <= last_snapshot {
-                        return Err(Error::UnsupportedFeature(format!(
-                            "inode {ino}: the extent at {bytenr} is from generation \
-                             {generation}, at or before the snapshot taken at {last_snapshot}, \
-                             so the snapshot may still be reading it"
-                        )));
-                    }
                     let release = DataRelease {
                         old: bytenr,
                         old_len: extent_len,
                         old_ref_offset: start - offset,
                     };
-                    // Newer than the last snapshot, so every other
-                    // reference is a file item a reflink made -- another
-                    // file's, or another of this file's: this one's is
-                    // dropped and the extent stays for the rest (#262).
-                    if refs == 1 {
+                    // Another reference is a file item a reflink made, or
+                    // a snapshot's own copy of a leaf; a leaf the snapshot
+                    // still shares counts none, and gains one naming it
+                    // when this change copies it. Either way this item's
+                    // reference is dropped and the extent stays for the
+                    // rest (#262).
+                    if refs == 1 && !self.leaf_shared(self.written_tree(), k)? {
                         releases.push(release);
                     } else {
                         unrefs.push(release);
