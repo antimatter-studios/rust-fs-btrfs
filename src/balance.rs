@@ -32,9 +32,9 @@
 //! (#397, #493, #580) in committed transactions, each leaving a filesystem the kernel and
 //! `btrfs check` accept on its own:
 //!
-//! 1. **A new chunk** of the group's profile, DUP when a single data
-//!    group is converted (#586), or single when a DUP data group is
-//!    (#587): its `CHUNK_ITEM` in the
+//! 1. **A new chunk** of the group's profile, DUP when a single data or
+//!    metadata group is converted (#586, #588), or single when a DUP one
+//!    is (#587, #588): its `CHUNK_ITEM` in the
 //!    chunk tree, a `DEV_EXTENT` in the device tree for each stripe, an
 //!    empty `BLOCK_GROUP_ITEM`, a `FREE_SPACE_INFO` and one free run
 //!    covering it in the free-space tree, and the device's `bytes_used`
@@ -54,8 +54,8 @@
 //!    allocation still excludes it during this final transaction.
 //!
 //! Besides everything above, it refuses a system group, a conversion to
-//! another profile but a single data group's to DUP or a DUP data
-//! group's to single (#587), a group of any other profile but single,
+//! another profile but a single data or metadata group's to DUP or a DUP
+//! one's to single (#587, #588), a group of any other profile but single,
 //! a volume of more than one
 //! device, one with no free-space tree, and a
 //! group holding an extent with a sector that a checksummed file's
@@ -296,8 +296,8 @@ impl Filesystem {
 
     /// Relocate the data or metadata block group at `start` into a new
     /// chunk of its own profile, or of `profile` when that converts a
-    /// single data group to DUP or a DUP data group to single, and return
-    /// where the new group is (#397, #493, #580, #586, #587).
+    /// single data or metadata group to DUP or a DUP one to single, and
+    /// return where the new group is (#397, #493, #580, #586, #587, #588).
     ///
     /// Committed transactions, each leaving a filesystem the kernel
     /// accepts on its own: the new chunk is allocated, the group's extents
@@ -600,15 +600,17 @@ impl Filesystem {
             self.refuse_unenumerable(group)?;
         }
         let own = ChunkProfile::from_type(group.flags)?;
-        // A single data group converts to DUP (#586) and a DUP data group
-        // back to single (#587); every other conversion is refused.
-        let converts = |from, to| !group.holds_metadata() && own == from && profile == Some(to);
+        // A single data or metadata group converts to DUP (#586, #588) and
+        // a DUP one back to single (#587, #588); every other conversion is
+        // refused. A metadata group's tree blocks are copied into the new
+        // chunk, which takes the converted profile.
+        let converts = |from, to| own == from && profile == Some(to);
         let to_single = converts(ChunkProfile::Dup, ChunkProfile::Single);
         if let Some(p) = profile.filter(|&p| p != own) {
             if !converts(ChunkProfile::Single, ChunkProfile::Dup) && !to_single {
                 return Err(Error::UnsupportedFeature(format!(
                     "converting a {} {} block group to {} is not implemented; only a \
-                     single data group to dup, or a dup one to single, is",
+                     single group to dup, or a dup one to single, is",
                     own.name(),
                     if group.holds_metadata() {
                         "metadata"
@@ -619,8 +621,8 @@ impl Filesystem {
                 )));
             }
         }
-        // A DUP data group moves only into single; the extents are read
-        // from whichever of its two copies verifies.
+        // A DUP group moves only into single; a data group's extents are
+        // read from whichever of its two copies verifies.
         if own != ChunkProfile::Single && !to_single {
             return Err(Error::UnsupportedFeature(format!(
                 "allocating a {} chunk is not implemented; only single is",
