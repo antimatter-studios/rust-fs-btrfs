@@ -177,6 +177,73 @@ fn a_kernel_written_metadata_group_is_relocated_and_every_file_survives() {
     assert_btrfs_check_clean(&image, "after the kernel writes into relocated metadata");
 }
 
+/// A kernel-written single metadata group converted to DUP and back
+/// (#588): `btrfs filesystem df` shows each profile in turn, `btrfs check`
+/// is clean after each, and the kernel reads every file it wrote before.
+#[test]
+fn a_kernel_written_metadata_group_converts_to_dup_and_back() {
+    let scratch = Scratch::new("relocate-metadata-convert", "single");
+    let image = scratch.image();
+    let wrote = guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "populate metadata before conversion",
+        &format!(
+            "cd \"$MNT\"\n\
+             mkdir files\n\
+             for i in $(seq 1 96); do\n\
+                 head -c 8192 /dev/urandom > \"files/f$i\"\n\
+             done\n\
+             sync\n\
+             {MANIFEST}"
+        ),
+    );
+    let before = manifest(&wrote);
+    assert_eq!(before.len(), 96, "the kernel manifest: {wrote}");
+
+    let mut start = metadata_group(&mount_rw(&image)).start;
+    for (to, shown, gone) in [
+        (ChunkProfile::Dup, "Metadata, DUP", "Metadata, single"),
+        (ChunkProfile::Single, "Metadata, single", "Metadata, DUP"),
+    ] {
+        start = {
+            let mut fs = mount_rw(&image);
+            let new = fs
+                .relocate_block_group(start, Some(to))
+                .unwrap_or_else(|e| panic!("convert metadata to {}: {e}", to.name()));
+            let replacement = fs
+                .block_groups()
+                .unwrap()
+                .into_iter()
+                .find(|g| g.start == new)
+                .unwrap();
+            assert_eq!(ChunkProfile::from_type(replacement.flags).unwrap(), to);
+            new
+        };
+        assert_btrfs_check_clean(
+            &image,
+            &format!("after converting metadata to {}", to.name()),
+        );
+        let read = guest_kernel_read_ok(
+            &image.to_string_lossy(),
+            &format!("read every file after converting metadata to {}", to.name()),
+            &format!("{MANIFEST}\nbtrfs filesystem df \"$MNT\""),
+        );
+        assert!(
+            read.lines().any(|line| line.starts_with(shown)),
+            "`btrfs filesystem df` shows no {shown}: {read}"
+        );
+        assert!(
+            !read.lines().any(|line| line.starts_with(gone)),
+            "`btrfs filesystem df` still shows {gone}: {read}"
+        );
+        assert_eq!(
+            manifest(&read),
+            before,
+            "kernel reads different files: {read}"
+        );
+    }
+}
+
 #[test]
 fn unsupported_metadata_profiles_are_refused_before_allocation() {
     for (name, profile, conversion, reason) in [
@@ -184,7 +251,7 @@ fn unsupported_metadata_profiles_are_refused_before_allocation() {
         (
             "conversion",
             "single",
-            Some(ChunkProfile::Dup),
+            Some(ChunkProfile::Raid1),
             "converting",
         ),
     ] {
