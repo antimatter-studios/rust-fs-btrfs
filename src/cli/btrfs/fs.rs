@@ -1,12 +1,13 @@
 //! `fs.btrfs <target> <verb>`: an errand inside a Btrfs image or device,
 //! without mounting it.
 //!
-//! The verbs are the shared set: `ls`, `stat`, `read`, `write`, `mkdir`,
+//! The verbs are the shared set: `ls`, `stat`, `read`, `export`, `xattr`, `write`, `mkdir`,
 //! `get`/`info`, `set`, `resize`, and the names and lengths this library
 //! can change: `create`, `ln`, `rm`, `rmdir`, `mv`, `truncate`. Metadata is
 //! JSON (or `--text`); file content is raw bytes. A case the library
-//! refuses answers with exit status 3 and its reason, so a script moved
-//! between filesystems fails loudly instead of meaning something else.
+//! refuses, or a verb it cannot do yet, answers with exit status 3 and its
+//! reason, so a script moved between filesystems fails loudly instead of
+//! meaning something else.
 //!
 //! `write` changes the bytes of a file that exists, and never shortens it:
 //! a NODATACOW file in place at the same length, any other one
@@ -25,7 +26,7 @@ use super::device;
 use fs_btrfs::inode::{FileType, Inode};
 use fs_btrfs::superblock::{compat_ro, incompat};
 use fs_btrfs::{ChecksumType, Error, Filesystem, Superblock};
-use fs_core::cli::{CliError, Format, Json, Outcome, Tool};
+use fs_core::cli::{transfer, CliError, Format, Json, Outcome, Tool};
 
 pub const TOOL: Tool = Tool {
     name: "fs.btrfs",
@@ -56,8 +57,8 @@ fn command() -> Cmd {
             "Work inside a Btrfs image or device directly: no mount, no kernel driver.\n\n\
              An escape hatch for an errand (get a file out, read the label, check whether \
              it is dirty), not a place to do real filesystem work: for that, mount it.\n\n\
-             Metadata is JSON on stdout (--text for people); `read` writes the file's raw \
-             bytes. A failure is {\"error\": \"...\", \"code\": N} on stderr, N being the \
+             Metadata is JSON on stdout (--text for people); `read` and a named `xattr` \
+             write raw bytes. A failure is {\"error\": \"...\", \"code\": N} on stderr, N being the \
              exit status: 1 failed, 2 wrong command line, 3 not implemented or refused.\n\n\
              Writing is limited to what this library can do safely: `write` overwrites \
              an existing file at the same length, a NODATACOW file in place and any other \
@@ -161,10 +162,66 @@ fn command() -> Cmd {
                 ),
         )
         .subcommand(
+            Cmd::new("export")
+                .about("Copy a regular file out through the shared bounded transfer")
+                .args(transfer::export_args())
+                .after_help(
+                    "Examples:\n  fs.btrfs disk.img export /backup.tar backup.tar\n  \
+                     fs.btrfs disk.img export --replace /etc/hostname hostname\n  \
+                     fs.btrfs disk.img export /backup.tar - | tar tf -\n\n\
+                     Files are copied in fixed chunks. A local destination is published only \
+                     when complete; an existing name is refused unless --replace is given. \
+                     The report includes the byte count and SHA-256; DEST - writes only raw \
+                     bytes to stdout. Directories, symlinks and special files are refused.",
+                ),
+        )
+        .subcommand(
+            Cmd::new("xattr")
+                .about("List a path's extended attributes, or read one value as raw bytes")
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .arg(
+                    Arg::new("name")
+                        .value_name("NAME")
+                        .help("The fully qualified attribute name, including its namespace")
+                        .value_parser(value_parser!(OsString)),
+                )
+                .arg(
+                    Arg::new("output")
+                        .short('o')
+                        .long("output")
+                        .value_name("FILE")
+                        .requires("name")
+                        .value_parser(value_parser!(OsString))
+                        .help("Write the named value here instead of stdout"),
+                )
+                .after_help(
+                    "Examples:\n  fs.btrfs disk.img xattr /notes.txt\n  \
+                     fs.btrfs disk.img xattr /notes.txt --text\n  \
+                     fs.btrfs disk.img xattr /notes.txt user.comment\n  \
+                     fs.btrfs disk.img xattr /bin/tool security.capability -o capability.bin\n\n\
+                     Listings are JSON names and byte lengths (--text for people). A \
+                     non-UTF-8 name is shown lossily with its exact bytes in name_hex. \
+                     A named value is always raw bytes, including with --text. Inspection \
+                     only: attributes are never set or removed.",
+                ),
+        )
+        .subcommand(
             Cmd::new("write")
                 .about(
                     "Overwrite an existing file with at least as many bytes as it holds, from stdin",
 
+                )
+                .arg(
+                    Arg::new("at")
+                        .long("at")
+                        .value_name("BYTES")
+                        .value_parser(value_parser!(u64))
+                        .help("Position inside the file; positioned writes are not implemented (exit 3)"),
                 )
                 .arg(
                     Arg::new("path")
@@ -174,23 +231,51 @@ fn command() -> Cmd {
                 )
                 .after_help(
                     "Examples:\n  fs.btrfs disk.img write /vm/disk.raw < disk.raw\n  \
-                     fs.btrfs disk.img read /db/data | fix-up | fs.btrfs disk.img write /db/data\n\n\
+                     fs.btrfs disk.img read /db/data | fix-up | fs.btrfs disk.img write /db/data\n  \
+                     fs.btrfs disk.img write --at 0 /f < payload.bin\n\n\
+                     --at is a byte position inside the file: positioned writes are not \
+                     implemented and exit 3 before reading stdin or opening TARGET, even \
+                     at zero. --offset remains the filesystem's position inside TARGET.\n\n\
                      The file must exist and get at least as many bytes as it already holds. \
                      A NODATACOW file (chattr +C) is overwritten in place, at the same length; \
                      any other is written copy-on-write into new extents, growing it where the \
                      library can, and committed as one transaction. A new file is `create`'s \
                      to make and a shorter one `truncate`'s to cut, so both are refused with \
-                     exit status 3, as is anything the library cannot write yet, such as a \
-                     snapshotted, inline or preallocated extent, with the reason \
-                     (rust-fs-btrfs#261).",
+                     exit status 3, as is anything the library cannot write yet, with the \
+                     reason (rust-fs-btrfs#261).",
                 ),
         )
-        .subcommand(name_command(
-            "mkdir",
-            "Create an empty directory, mode 0755 unless --mode says otherwise",
-            "fs.btrfs disk.img mkdir /backup\n  fs.btrfs disk.img mkdir --mode 700 /private",
-            Some("755"),
-        ))
+        .subcommand(
+            name_command(
+                "mkdir",
+                "Create an empty directory, mode 0755 unless --mode says otherwise \
+                 (its parent must exist, or with -p every one on the way)",
+                "fs.btrfs disk.img mkdir /backup\n  fs.btrfs disk.img mkdir --mode 700 /private",
+                Some("755"),
+            )
+            .arg(
+                Arg::new("parents")
+                    .short('p')
+                    .long("parents")
+                    .action(ArgAction::SetTrue)
+                    .help("Make every missing directory on the way; one already there is success"),
+            )
+            .after_help(format!(
+                "Examples:\n  fs.btrfs disk.img mkdir /backup\n  \
+                 fs.btrfs disk.img mkdir --mode 700 /private\n  \
+                 fs.btrfs disk.img mkdir -p /backup/2026/10/17\n\n\
+                 {NAMES_NOTE}\n\n\
+                 With --parents every missing directory on the way to PATH is made, mode \
+                 0755 (--mode is PATH's own), and the report lists those it made: none, and \
+                 nothing written, when the whole chain is already there, a subvolume's top \
+                 included. A file, a symlink or a name too long anywhere on the way is \
+                 refused with exit 1, and a directory inside a subvolume other than the top \
+                 level with exit 3, before the image is opened for writing, so a refused \
+                 command makes no part of the chain. Each directory is its own committed \
+                 transaction; should one still fail, those made before it are removed \
+                 again. A symlink is never followed, even one naming a directory."
+            )),
+        )
         .subcommand(name_command(
             "create",
             "Create an empty regular file, mode 0644 unless --mode says otherwise",
@@ -285,9 +370,8 @@ fn command() -> Cmd {
                      fs.btrfs disk.img truncate /sparse.img 1073741824\n\n\
                      Committed as one transaction. Shrinking releases the extents wholly past \
                      the new end, or drops the file's reference of one a reflink shares; \
-                     growing records the new range as a hole. An extent a snapshot may \
-                     share, and growing a file whose last sector is partly past its end, \
-                     are refused with exit 3 (rust-fs-btrfs#426, #421).",
+                     growing records the new range as a hole. What the library still refuses \
+                     answers with exit 3 and its reason (rust-fs-btrfs#262).",
                 ),
         )
         .subcommand(key_command(
@@ -353,6 +437,10 @@ fn command() -> Cmd {
         )
 }
 
+/// What every namespace verb's help says about how it writes.
+const NAMES_NOTE: &str = "Committed as one transaction. What the library still refuses \
+     answers with exit 3 and its reason (rust-fs-btrfs#262).";
+
 /// A verb taking one PATH, and for one that creates, a --mode.
 fn name_command(
     name: &'static str,
@@ -368,13 +456,7 @@ fn name_command(
                 .required(true)
                 .value_parser(value_parser!(OsString)),
         )
-        .after_help(format!(
-            "Examples:\n  {examples}\n\n\
-             Committed as one transaction. Only the top-level subvolume is written; a \
-             directory whose full leaf cannot be split, and the last name of a \
-             file whose data a snapshot may share, are refused with exit 3 \
-             (rust-fs-btrfs#426)."
-        ));
+        .after_help(format!("Examples:\n  {examples}\n\n{NAMES_NOTE}"));
     if let Some(default) = mode {
         cmd = cmd.arg(
             Arg::new("mode")
@@ -426,7 +508,21 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
             path_arg(sub),
             sub.get_one("output"),
         ),
+        "export" => {
+            let request = transfer::ExportRequest::from_matches(sub)?;
+            export(&device::mount(target, offset)?, &request)
+        }
+        "write" if sub.get_one::<u64>("at").is_some() => Err(CliError::not_implemented(
+            "positioned write (--at) is not supported",
+        )),
+        "xattr" => xattr(
+            &device::mount(target, offset)?,
+            path_arg(sub),
+            sub.get_one::<OsString>("name").map(os_bytes),
+            sub.get_one("output"),
+        ),
         "write" => write(target, offset, path_arg(sub)),
+        "mkdir" if sub.get_flag("parents") => mkdir_parents(target, offset, sub),
         "mkdir" | "create" | "rm" | "rmdir" | "ln" | "mv" => names(target, offset, verb, sub),
         "truncate" => truncate(target, offset, sub),
         "get" | "info" => get(
@@ -475,13 +571,7 @@ fn names(
         )
     })?;
     let (parent, name) = split_parent(&fs, path)?;
-    let mode = match sub.try_get_one::<String>("mode") {
-        Ok(Some(m)) => u32::from_str_radix(m, 8)
-            .ok()
-            .filter(|m| *m <= 0o7777)
-            .ok_or_else(|| CliError::usage(format!("--mode {m}: not octal permission bits")))?,
-        _ => 0,
-    };
+    let mode = mode_arg(sub)?;
     let fail = |e| btrfs_error(path, e);
     let (what, ino) = match verb {
         "mkdir" => (
@@ -535,6 +625,259 @@ fn names(
         fields.push(("inode", Json::from(ino)));
     }
     Ok(Outcome::report(Json::object(fields)).with_text(format!("{what} {}", show(path))))
+}
+
+/// A creating verb's `--mode`, in octal; 0 for a verb that has none.
+fn mode_arg(sub: &ArgMatches) -> Result<u32, CliError> {
+    match sub.try_get_one::<String>("mode") {
+        Ok(Some(m)) => u32::from_str_radix(m, 8)
+            .ok()
+            .filter(|m| *m <= 0o7777)
+            .ok_or_else(|| CliError::usage(format!("--mode {m}: not octal permission bits"))),
+        _ => Ok(0),
+    }
+}
+
+/// Create every missing directory on the way to `path`, as `mkdir -p`
+/// does, through the library's `mkdir`, all in one writable open: mode
+/// 0755, or `--mode` for the directory `path` itself names, each owned as
+/// the directory already there that the chain starts from. Every refusal
+/// is decided first, on a read-only mount, so a refused command never
+/// opens the image for writing and makes no part of the chain; a chain
+/// already there all the way is success without opening it for writing
+/// either. Each directory is one committed transaction, and should one be
+/// refused all the same (a full leaf that cannot be split), the ones made
+/// before it are removed again, last first.
+fn mkdir_parents(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Outcome, CliError> {
+    let path = path_arg(sub);
+    let mode = mode_arg(sub)?;
+    let chain = chain(&device::mount(target, offset)?, path)?;
+    if !chain.is_empty() {
+        let dev = device::open_rw(target, offset)?;
+        let mut fs = Filesystem::mount_rw(dev).map_err(|e| {
+            btrfs_error(
+                format!("{} (read-write)", target.to_string_lossy()).as_bytes(),
+                e,
+            )
+        })?;
+        let mut made: Vec<u64> = Vec::with_capacity(chain.len());
+        let parent = |step: &Step, made: &[u64]| match step.parent {
+            Dir::Existing(ino) => ino,
+            Dir::Made(i) => made[i],
+        };
+        for step in &chain {
+            let bits = if step.named { mode } else { 0o755 };
+            let (uid, gid) = step.owner;
+            match fs.mkdir(parent(step, &made), step.name, bits, uid, gid) {
+                Ok(ino) => made.push(ino),
+                Err(e) => {
+                    // Last made, first removed, so each is empty when its
+                    // turn comes. The error reported is the one that
+                    // stopped the chain, and any removal that fails too.
+                    let mut refusal = btrfs_error(step.shown, e);
+                    for done in chain[..made.len()].iter().rev() {
+                        if let Err(undo) = fs.rmdir(parent(done, &made), done.name) {
+                            refusal.message = format!(
+                                "{}; and removing {} again failed: {undo}",
+                                refusal.message,
+                                show(done.shown)
+                            );
+                        }
+                    }
+                    return Err(refusal);
+                }
+            }
+        }
+    }
+    let text = if chain.is_empty() {
+        format!("{} exists; nothing created", show(path))
+    } else {
+        let lines: Vec<String> = chain
+            .iter()
+            .map(|step| format!("created {}", show(step.shown)))
+            .collect();
+        lines.join("\n")
+    };
+    let created: Vec<Json> = chain
+        .iter()
+        .map(|step| Json::from(show(step.shown)))
+        .collect();
+    let mut fields = vec![("path", Json::from(show(path)))];
+    if std::str::from_utf8(path).is_err() {
+        fields.push((
+            "path_hex",
+            Json::from(path.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        ));
+    }
+    fields.push(("created", Json::from(created)));
+    Ok(Outcome::report(Json::object(fields)).with_text(text))
+}
+
+/// The directory a directory of a chain is made in: one already on the
+/// volume, in the top-level subvolume, or the one the chain makes at that
+/// index.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dir {
+    Existing(u64),
+    Made(usize),
+}
+
+/// One directory `mkdir --parents` makes: the entry `name` in `parent`,
+/// owned by `owner`, reported as `shown`, the path as given up to and
+/// including the name. `named` when it is the last name of the path, the
+/// directory the path itself names.
+struct Step<'p> {
+    parent: Dir,
+    owner: (u32, u32),
+    name: &'p [u8],
+    shown: &'p [u8],
+    named: bool,
+}
+
+/// Where the walk of `mkdir --parents` is: a directory already on the
+/// volume, by its path with no `.` or `..` in it, and whether it is in
+/// the top-level subvolume, the only one written; or a directory the
+/// chain makes.
+enum Here {
+    Existing {
+        at: Vec<u8>,
+        inode: Inode,
+        top: bool,
+    },
+    Made(usize),
+}
+
+/// The directories `mkdir --parents` makes for `path`, in order, once each
+/// refusal the guest's `mkdir -p` gives on the kernel's mount has been
+/// ruled out, for the same reason and, where two apply, at the first name
+/// on the way that fails (`tests/cli_mkdir_kernel.rs` holds the two to the
+/// same answers):
+///
+/// - an empty path: no such file or directory;
+/// - a name over 255 bytes: a name too long;
+/// - a name already there that is not a directory: not a directory when
+///   more of the path follows it, and already there when it is the last.
+///
+/// A subvolume is a directory on the way, as on a mount, and `..` at its
+/// top climbs back out. Where the kernel would make a directory inside a
+/// subvolume other than the top level, this refuses with exit 3: only the
+/// top level is written. `.` stays where the walk is and `..` goes back
+/// to where it came from, through a directory the chain makes as well as
+/// one already there, so `a/../b` makes `a` and `b` as `mkdir -p` does.
+/// Nothing is made until every name has been decided: where `mkdir -p`
+/// makes the start of a chain before it stops, this makes none of it. No
+/// symlink is followed, so one on the way is not a directory and one at
+/// `path` is already there, even one naming a directory, which `mkdir -p`
+/// would follow.
+fn chain<'p>(fs: &Filesystem, path: &'p [u8]) -> Result<Vec<Step<'p>>, CliError> {
+    if path.is_empty() {
+        return Err(CliError::failed("an empty path: no such file or directory"));
+    }
+    // Each name, with where it ends in `path`.
+    let mut names = Vec::new();
+    let mut end = 0;
+    for name in path.split(|&b| b == b'/') {
+        end += name.len();
+        if !name.is_empty() {
+            names.push((name, end));
+        }
+        end += 1;
+    }
+    let root = fs.root_inode().map_err(|e| btrfs_error(b"/", e))?;
+    let mut walk = vec![Here::Existing {
+        at: Vec::new(),
+        inode: root,
+        top: true,
+    }];
+    let mut steps: Vec<Step<'p>> = Vec::new();
+    for (i, &(name, end)) in names.iter().enumerate() {
+        let shown = &path[..end];
+        let named = i + 1 == names.len();
+        if name == b"." {
+            continue;
+        }
+        if name == b".." {
+            if walk.len() > 1 {
+                walk.pop();
+            }
+            continue;
+        }
+        if name.len() > fs_btrfs::dir::MAX_NAME_LEN {
+            return Err(CliError::failed(format!("{}: name too long", show(shown))));
+        }
+        let step = |parent: Dir, owner: (u32, u32)| Step {
+            parent,
+            owner,
+            name,
+            shown,
+            named,
+        };
+        let next = match walk.last().expect("the top is never popped") {
+            &Here::Made(j) => {
+                let owner = steps[j].owner;
+                plan(&mut steps, step(Dir::Made(j), owner))
+            }
+            Here::Existing { at, inode, top } => {
+                let here = Dir::Existing(inode.ino);
+                let owner = (inode.uid, inode.gid);
+                // A name the chain already makes here is not looked up:
+                // it is not on the volume yet.
+                if *top && steps.iter().any(|s| s.parent == here && s.name == name) {
+                    plan(&mut steps, step(here, owner))
+                } else {
+                    let mut below = at.clone();
+                    below.push(b'/');
+                    below.extend_from_slice(name);
+                    match fs.resolve_path_bytes(&below) {
+                        Ok(found) if found.inode.is_dir() => Here::Existing {
+                            at: below,
+                            top: *top
+                                && found.tree.is_none()
+                                && found.inode.ino != fs_btrfs::subvol::EMPTY_SUBVOL_DIR_OBJECTID,
+                            inode: found.inode,
+                        },
+                        Ok(_) if named => {
+                            return Err(CliError::failed(format!(
+                                "{}: already exists",
+                                show(shown)
+                            )))
+                        }
+                        Ok(_) => {
+                            return Err(CliError::failed(format!(
+                                "{}: not a directory",
+                                show(shown)
+                            )))
+                        }
+                        Err(Error::NotFound) if *top => plan(&mut steps, step(here, owner)),
+                        Err(Error::NotFound) => {
+                            return Err(CliError::refused(format!(
+                                "{}: inside a subvolume other than the top level, and only the \
+                                 top level is written (rust-fs-btrfs#262)",
+                                show(shown)
+                            )))
+                        }
+                        Err(e) => return Err(btrfs_error(shown, e)),
+                    }
+                }
+            }
+        };
+        walk.push(next);
+    }
+    Ok(steps)
+}
+
+/// Where the walk goes for the directory `step` makes: the step already
+/// planned for the same name in the same directory, if the walk has been
+/// there before (`a/../a/b`), or `step`, planned now.
+fn plan<'p>(steps: &mut Vec<Step<'p>>, step: Step<'p>) -> Here {
+    let k = steps
+        .iter()
+        .position(|s| s.parent == step.parent && s.name == step.name)
+        .unwrap_or_else(|| {
+            steps.push(step);
+            steps.len() - 1
+        });
+    Here::Made(k)
 }
 
 /// Set a file's length, as one committed transaction.
@@ -1140,6 +1483,134 @@ fn stat(root: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
         ]),
     ));
     Ok(Outcome::report(Json::object(fields)))
+}
+
+/// Inspect attributes in the resolved path's own tree, including inside
+/// subvolumes and snapshots. A value is read completely before any output
+/// is opened, so lookup failures cannot truncate a destination file.
+fn xattr(
+    root: &Filesystem,
+    path: &[u8],
+    name: Option<&[u8]>,
+    output: Option<&OsString>,
+) -> Result<Outcome, CliError> {
+    let found = root
+        .resolve_path_bytes(path)
+        .map_err(|e| btrfs_error(path, e))?;
+    let fs = found.fs(root);
+    if let Some(name) = name {
+        let value = fs
+            .get_xattr(found.inode.ino, name)
+            .map_err(|e| btrfs_error(path, e))?
+            .ok_or_else(|| {
+                CliError::failed(format!(
+                    "{}: no such extended attribute {}",
+                    show(path),
+                    show(name)
+                ))
+            })?;
+        if let Some(file) = output {
+            let dest = std::path::Path::new(file);
+            let mut partial = dest.as_os_str().to_owned();
+            partial.push(".partial");
+            let partial = std::path::PathBuf::from(partial);
+            let written =
+                std::fs::write(&partial, &value).and_then(|()| std::fs::rename(&partial, dest));
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&partial);
+                return Err(CliError::failed(format!("write {}: {e}", dest.display())));
+            }
+        } else {
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(&value)
+                .and_then(|()| stdout.flush())
+                .map_err(|e| CliError::failed(format!("write: {e}")))?;
+        }
+        return Ok(Outcome::done());
+    }
+    let mut attrs = fs
+        .list_xattrs(found.inode.ino)
+        .map_err(|e| btrfs_error(path, e))?;
+    attrs.sort_by(|a, b| a.name.cmp(&b.name));
+    let text = attrs
+        .iter()
+        .map(|attr| format!("{}\t{}", show(&attr.name), attr.value.len()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let entries = attrs
+        .into_iter()
+        .map(|attr| {
+            let mut fields = vec![
+                ("name", Json::from(show(&attr.name))),
+                ("size", Json::from(attr.value.len() as u64)),
+            ];
+            if std::str::from_utf8(&attr.name).is_err() {
+                fields.push((
+                    "name_hex",
+                    Json::from(
+                        attr.name
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>(),
+                    ),
+                ));
+            }
+            Json::object(fields)
+        })
+        .collect();
+    Ok(Outcome::report(Json::Arr(entries)).with_text(text))
+}
+
+/// A positioned source in the resolved path's own subvolume or snapshot.
+struct ExportSource<'a> {
+    fs: &'a Filesystem,
+    inode: &'a Inode,
+    path: &'a [u8],
+}
+
+impl transfer::FileSource for ExportSource<'_> {
+    fn size(&self) -> u64 {
+        self.inode.size
+    }
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize, CliError> {
+        self.fs
+            .read_at(self.inode.ino, offset, buf)
+            .map_err(|e| btrfs_error(self.path, e))
+    }
+}
+
+/// Resolve the source here; core owns copying, digesting and publication.
+fn export(root: &Filesystem, request: &transfer::ExportRequest) -> Result<Outcome, CliError> {
+    let path = os_bytes(&request.path);
+    let found = root
+        .resolve_path_bytes(path)
+        .map_err(|e| btrfs_error(path, e))?;
+    let inode = &found.inode;
+    if inode.is_dir() {
+        return Err(CliError::failed(format!("{}: is a directory", show(path))));
+    }
+    if inode.is_symlink() {
+        return Err(CliError::failed(format!(
+            "{}: is a symlink; export the target instead",
+            show(path)
+        )));
+    }
+    if !inode.is_regular_file() {
+        return Err(CliError::failed(format!(
+            "{}: not a regular file",
+            show(path)
+        )));
+    }
+    transfer::export(
+        request,
+        &mut ExportSource {
+            fs: found.fs(root),
+            inode,
+            path,
+        },
+    )
 }
 
 /// Stream a regular file's bytes. Each chunk is read before it is

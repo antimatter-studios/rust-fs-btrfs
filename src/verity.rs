@@ -56,6 +56,17 @@ pub const VERITY_MERKLE_ITEM_KEY: u8 = 37;
 /// of the read-only flags, which are the upper 32 bits.
 pub const INODE_RO_VERITY: u64 = 1 << 32;
 
+/// Refuse a data mutation or removal before any bytes are written. A
+/// sealed inode keeps its descriptor and Merkle tree unchanged (#452).
+pub(crate) fn refuse_mutation(ino: u64, flags: u64) -> Result<()> {
+    if flags & INODE_RO_VERITY != 0 {
+        return Err(Error::UnsupportedFeature(format!(
+            "inode {ino} is sealed by fs-verity, so its data and verity items cannot be changed"
+        )));
+    }
+    Ok(())
+}
+
 /// Size of `struct btrfs_verity_descriptor_item`: `size`, two reserved
 /// `u64`s and the `encryption` byte, packed without trailing padding.
 /// The kernel-made oracle fixture stores all six headers as 25 bytes.
@@ -420,6 +431,22 @@ pub(crate) fn assemble(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sealed_inode_refuses_mutation_even_with_nodatacow_flags() {
+        for flags in [INODE_RO_VERITY, INODE_RO_VERITY | 3] {
+            let result = refuse_mutation(123, flags);
+            assert!(matches!(result, Err(Error::UnsupportedFeature(m))
+                if m.contains("fs-verity") && m.contains("123")));
+        }
+    }
+
+    #[test]
+    fn an_unsealed_inode_can_be_changed() {
+        for flags in [0, 3, 1 << 31] {
+            refuse_mutation(123, flags).unwrap();
+        }
+    }
 
     /// A Merkle tree built the way the format describes it, for a
     /// descriptor whose root hash it then fills in. The kernel-made

@@ -14,8 +14,9 @@
 # The toolchain and the build directory live on the VM's own disk
 # (/var/lib, /var/cache), which outlives `vm:down` and is thrown away by
 # `vm:destroy`: the first run pays a full build, later runs are
-# incremental. The repository itself is a 9p mount, so nothing is written
-# back into it except what the tests write to tmp/.
+# incremental. Source and fixtures use the host share; scratch work uses
+# the guest disk, bind-mounted at /repo/tmp. Shared-folder negative dentries
+# can hide a destination just published by a hard link from another process.
 set -euo pipefail
 
 [ "${FLTH_GUEST:-}" = 1 ] ||
@@ -61,5 +62,5 @@ command -v cargo >/dev/null ||
 
 echo "== in-guest suite: $(uname -srm), $(cargo --version)"
 started=$(date +%s)
-scripts/test.sh --locked --release "$@"
+bash scripts/guest-scratch.sh /repo scripts/test.sh --locked --release "$@"
 echo "== in-guest suite: $(( $(date +%s) - started ))s"

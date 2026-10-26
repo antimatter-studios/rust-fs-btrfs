@@ -98,15 +98,12 @@ chore_min_version: 0.10.0
 #   warm, 957 on the first run in a fresh guest.
 #
 #     tier      measured          budget            headroom, and why
-#     unit        497 /  30,611      650 /  40,000   ~30%: tests get added.
-#                                                    497 / 30,611 is CI's
-#                                                    unit job on #225's
-#                                                    first run (36613265993):
-#                                                    COLD, because the lock
-#                                                    changed, so 99 lines are
-#                                                    cargo fetching and
-#                                                    compiling, clap's among
-#                                                    them. Was 368 / 24,411
+#     unit        669 /  42,273      850 /  55,000   ~30%: cold local unit run
+#                                                    on 2026-10-18 for #615,
+#                                                    commit 6eea85c: 513 cases
+#                                                    pass, including six new
+#                                                    multi-way split cases.
+#                                                    Warm: 618 / 40,323.
 #     images      384 /  18,065      500 /  23,500   ~30%. 384 / 18,065 is
 #                                                    CI's aarch64 job with
 #                                                    #301's
@@ -130,8 +127,11 @@ chore_min_version: 0.10.0
 #                                                    cold (51 lines of
 #                                                    cargo), run 36616794750;
 #                                                    was 361 / 19,014
-#     kernel      887 /  66,088    1,160 /  86,000   ~30%. All 61 kernel tests
-#                                                    passed on #360 at
+#     kernel    2,427 / 225,509    3,200 / 300,000   ~30% beyond the #668
+#                                                    queue prefix, run
+#                                                    40361645452 (#689).
+#                                                    Previously all 61
+#                                                    kernel tests passed at
 #                                                    542dd4e, including both
 #                                                    v1 space-cache oracles
 #                                                    (run 38585013429); exit
@@ -150,11 +150,11 @@ chore_min_version: 0.10.0
 #                                                    36610919288, logs-test).
 #                                                    Was 84 / 6,906 before
 #                                                    hard_link_extref's sweeps
-#     suite     1,082 /  58,108    1,410 /  75,600   ~30%: every target
-#                                                    once, so it grows
-#                                                    with the suite; sized
-#                                                    for a merge queue
-#                                                    group (#330)
+#     suite     1,891 / 104,526    2,500 / 140,000   ~30% beyond #668's full
+#                                                    guest run, including
+#                                                    its wrapper (#689).
+#                                                    The native tier runs
+#                                                    every target once.
 #     scripts     134 /   6,672      175 /   8,700   ~30%: one line per
 #                                                    assertion, so it grows
 #                                                    with the guards. 134 /
@@ -236,7 +236,7 @@ vars:
   FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
   # It is also the version of every family script the tiers run in place
   # from that checkout, so moving it is how they are upgraded.
-  FS_CORE_REF: v0.3.13
+  FS_CORE_REF: v0.3.14
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   LINUX_HARNESS_REF: v0.2.0
 
@@ -491,12 +491,43 @@ tasks:
       # a committed file whose INODE_REF is full given another name, held
       # in an INODE_EXTREF item, durable by an fsync of /
       - test-disks/dirtylog/btrfs-dirty-log-extref.img
+      # a committed file given a second name, durable by an fsync of /
+      # alone, which logs the file only as an inode that exists
+      - test-disks/dirtylog/btrfs-dirty-log-dirlink.img
+      # a committed file with INODE_EXTREF items rewritten in place,
+      # durable by an fsync of it, whose logged nbytes holds stale bytes
+      - test-disks/dirtylog/btrfs-dirty-log-nbytes.img
+      # a committed file with INODE_EXTREF items given a name in a
+      # committed directory, durable by an fsync of that directory alone,
+      # which logs the file only as an inode that exists
+      - test-disks/dirtylog/btrfs-dirty-log-extrefexists.img
+      # a file created after the commit and given 64 more names, three
+      # of them INODE_EXTREF items, durable by an fsync of / alone, which
+      # logs the file only as an inode that exists
+      - test-disks/dirtylog/btrfs-dirty-log-extrefcreated.img
+      # a committed file whose only name is in an INODE_EXTREF item,
+      # that name removed and / alone fsynced, which leaves the file
+      # unlogged for replay to delete
+      - test-disks/dirtylog/btrfs-dirty-log-extrefremoved.img
+      # a sector written inside a committed compressed extent, fsynced
+      - test-disks/dirtylog/btrfs-dirty-log-compressedcut.img
+      # a committed empty directory removed and / alone fsynced, which
+      # leaves the directory unlogged for replay to remove
+      - test-disks/dirtylog/btrfs-dirty-log-rmdir.img
+      # one of two committed names of a file removed and / alone fsynced,
+      # which leaves the file unlogged with one link for replay to drop
+      - test-disks/dirtylog/btrfs-dirty-log-linkremoved.img
+      # a file created after the commit and given a second name,
+      # durable by an fsync of / alone, which logs the file only as an
+      # inode that exists
+      - test-disks/dirtylog/btrfs-dirty-log-createdlink.img
       # the volume the command-line tools are tested against, labelled
       # CLITEST, with a manifest of what the kernel wrote into it
       - test-disks/cli/btrfs-cli.img
       # one volume per optional on-disk feature; its own directory, as
       # some are refused for writing on purpose
       - test-disks/features/btrfs-bgt.img
+      - test-disks/features/btrfs-zoned.img
       - test-disks/features/btrfs-verity.img
       - test-disks/features/btrfs-verity-tampered.img
       # a DUP volume with three copies damaged on purpose, and the
@@ -517,6 +548,9 @@ tasks:
       - test-disks/scrub/btrfs-scrub-raid6-4.img
       # simple quotas, refused for writing on purpose
       - test-disks/squota/btrfs-squota.img
+      # a volume received through btrfs send --compressed-data, its
+      # compressed extents stored by encoded writes
+      - test-disks/encoded/btrfs-encoded.img
     # A hung boot must not hold the VM and the machine-wide slot for
     # ever. The split fixtures alone mount and unmount up to four hundred
     # times, and the populated pair writes eighty thousand files, so this
@@ -532,7 +566,7 @@ tasks:
     cmds:
       - |
         set -eu
-        rm -rf test-disks/snapshot test-disks/dirtylog test-disks/features test-disks/scrub test-disks/seed test-disks/squota
+        rm -rf test-disks/snapshot test-disks/dirtylog test-disks/features test-disks/scrub test-disks/seed test-disks/squota test-disks/encoded
         rm -f test-disks/btrfs-*.img test-disks/*.superdump test-disks/*.manifest \
               test-disks/*.compression test-disks/*.super test-disks/btrfs-split*.txt
 
@@ -551,7 +585,7 @@ tasks:
     # rather than listed here. CI runs this job with no fixtures present,
     # which is what proves the split.
     cmds:
-      - 'EXPECT_OVERFLOW_CHECKS=1 ../rust-fs-core/scripts/tier.sh test:unit unit 650 40000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
+      - 'EXPECT_OVERFLOW_CHECKS=1 ../rust-fs-core/scripts/tier.sh test:unit unit 850 55000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
 
   test:images:
     desc: 'The tests that read a fixture but need no VM — what a host without KVM can still run'
@@ -622,10 +656,14 @@ tasks:
     # bytes against 116000. The growth is kept evidence, the `[oracle vm]`
     # and `[kernel vm]` line per tool call: the log-replay tests alone
     # print 19765 bytes, recursive ls 1002. About 30% over that is 1890
-    # lines and 151500 bytes.
+    # lines and 151500 bytes. The restored targets in #668 reached 2427
+    # lines / 225509 bytes in queue run 40361645452, before the seed
+    # registry race stopped the tier (#688). Keep that evidence: 3200 /
+    # 300000 allows about 30% beyond the measured prefix for the remaining
+    # targets and cold-build variation (#689).
     cmds:
       - test-disks/build-fixtures.sh --check
-      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 1890 151500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 3200 300000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
@@ -725,8 +763,11 @@ tasks:
       # Re-measured on the #361 + #363 merge-queue group, run 38972578754
       # (2026-10-16): every test passed, but the suite printed 1433 lines and
       # 76679 bytes against 1410 and 75600, and #364 adds more above it.
-      # About 30% over that is 1870 lines and 100000 bytes.
-      - '../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 1870 100000 -- scripts/test.sh --locked --release'
+      # About 30% over that is 1870 lines and 100000 bytes. The restored
+      # suite in #668 measured 1891 / 104526 in the complete guest run
+      # (989 passing cases, 2026-10-26). That includes the guest wrapper;
+      # 2500 / 140000 gives about 30% beyond it for the native tier (#689).
+      - '../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 2500 140000 -- scripts/test.sh --locked --release'
       - task: test:scripts
       # The command-line tools, built and staged from this checkout, then
       # tested as installed. A separate invocation because test:cli reads
@@ -759,15 +800,20 @@ tasks:
     # tier was added, 176 with test-docs.sh; the floor is about 95% of that.
     # Stat adds 39 assertions and one generated man-page check (#412):
     # raise the existing floor by those 40 checks; CI verifies execution.
+    # xattr adds 24 installed assertions and one generated man-page check
+    # (#416); raise the floor by 25 and let CI verify execution.
     #
     # BUDGET: 26 lines and 1047 bytes measured with fsck.btrfs's checks in
     # the tier (#260, run 37378163675), so 26 lines and 1200 bytes.
     # test-stat.sh adds exactly three success lines, so 29 lines now.
     # Recursive ls adds 62 installed assertions (#466) and three success
     # lines (95 bytes); add them to the existing floor and budget.
+    # mkdir --parents adds 114 assertions to test-write.sh (#414) and no
+    # file, so no line; the floor takes them and the budget stays.
+    # test-xattr.sh adds three fixed success lines, exactly 81 bytes.
     cmds:
-      - '../rust-fs-core/scripts/tier.sh test:cli cli 32 1295 -- scripts/test-cli.sh'
-      - 'bash ../rust-fs-core/scripts/test-floor.sh cli 269'
+      - '../rust-fs-core/scripts/tier.sh test:cli cli 35 1376 -- scripts/test-cli.sh'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh cli 408'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
@@ -850,7 +896,8 @@ tasks:
       - bash ../rust-fs-core/scripts/agents-core-check.sh
       - bash ../rust-fs-core/scripts/changelog-check.sh
       - bash ../rust-fs-core/scripts/features-check.sh
-      - cargo fmt --check
+      # Include the path-dependent test-support package as well as this crate.
+      - cargo fmt --all -- --check
       # `--features cli`: the command-line tools' target requires it, and
       # clippy silently leaves out a target whose features are off.
       - cargo clippy --locked --all-targets --features cli -- -D warnings

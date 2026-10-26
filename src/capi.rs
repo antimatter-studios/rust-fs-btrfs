@@ -75,6 +75,15 @@ const fn enotsup() -> c_int {
     }
 }
 
+/// `ESTALE` is 70 on Darwin and 116 on Linux.
+const fn estale() -> c_int {
+    if cfg!(target_os = "macos") {
+        70
+    } else {
+        116
+    }
+}
+
 /// Map a driver error onto the errno a filesystem client expects.
 ///
 /// A client distinguishes "this file is not here" from "this volume is
@@ -86,6 +95,7 @@ fn errno_for(e: &Error) -> c_int {
         Error::NotADirectory => ENOTDIR,
         Error::NotAFile => EISDIR,
         Error::ReadOnly => EROFS_ERRNO,
+        Error::Stale { .. } => estale(),
         // A format the caller asked for that cannot be made.
         Error::InvalidGeometry(_) => EINVAL,
         // A compressed extent, an unsupported profile, or a feature this
@@ -493,11 +503,20 @@ pub unsafe extern "C" fn fs_btrfs_mount_pool(
     })
 }
 
-/// A new handle reading subvolume or snapshot `id` as a filesystem of its
-/// own: paths through it are absolute within the subvolume.
+/// A new handle on subvolume or snapshot `id` as a filesystem of its own:
+/// paths through it are absolute within the subvolume.
 ///
-/// Read-only whatever `fs` is, and released with [`fs_btrfs_umount`]
-/// independently of `fs`. ENOENT when no subvolume has that id.
+/// On a handle from [`fs_btrfs_mount_rw`] it writes that subvolume's tree
+/// (#520): [`fs_btrfs_create`], [`fs_btrfs_mkdir`], [`fs_btrfs_symlink`],
+/// [`fs_btrfs_link`], [`fs_btrfs_unlink`], [`fs_btrfs_rmdir`],
+/// [`fs_btrfs_rename`], [`fs_btrfs_truncate`] and [`fs_btrfs_write_file`]
+/// each commit one transaction against it, and the handle stays on the
+/// subvolume after each. Other writes refuse it, and
+/// [`fs_btrfs_is_writable`] answers 0 for it. The subvolume of a read-only
+/// mount refuses every write with EROFS.
+///
+/// Released with [`fs_btrfs_umount`] independently of `fs`. ENOENT when no
+/// subvolume has that id.
 ///
 /// # Safety
 ///
@@ -1180,11 +1199,12 @@ pub unsafe extern "C" fn fs_btrfs_can_write_in_place(
 /// copy-on-write: the bytes land in newly allocated extents and the
 /// change is committed as one transaction, so a crash leaves the old
 /// contents or the new and never a mixture. A hole is filled, and a write
-/// that starts at or before the end of the file grows it. What that path
-/// cannot write yet — a write that starts past the end, one that grows a
-/// file on a volume without the no-holes feature, an inline or
-/// preallocated extent, or an extent a snapshot may share
-/// (rust-fs-btrfs#261) — is refused with ENOTSUP and the case named.
+/// past the end of the file grows it, the gap reading as zeros and, without
+/// the no-holes feature, recorded as a hole item. What that path cannot
+/// write yet — a preallocated extent, inline data the write does not lie
+/// within, or an extent a snapshot may share (rust-fs-btrfs#261) — is
+/// refused with ENOTSUP and the case named. A write within inline data
+/// rewrites it, compressed or not, and the file stays inline.
 ///
 /// # Safety
 ///
@@ -1581,8 +1601,10 @@ pub unsafe extern "C" fn fs_btrfs_rename(
 /// Returns 0, or -1 with the error recorded: ENOENT for no such path,
 /// EISDIR for anything but a regular file, EROFS on a read-only handle,
 /// and ENOTSUP for what cannot be written yet — an extent a snapshot may
-/// share, or growing a file whose last sector is partly past its end. An
-/// extent a reflink shares loses the file's reference and stays.
+/// share, or growing a file whose last sector is partly past its end on a
+/// volume without the no-holes feature. Elsewhere the rest of that sector
+/// is rewritten with zeros first. An extent a reflink shares loses the
+/// file's reference and stays.
 ///
 /// # Safety
 ///

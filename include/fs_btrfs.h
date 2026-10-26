@@ -138,11 +138,23 @@ fs_btrfs_fs_t *fs_btrfs_mount_with_fs_core_device(struct FsCoreDevice *handle);
  */
 fs_btrfs_fs_t *fs_btrfs_mount_pool(const char *const *device_paths, size_t count);
 /*
- * A new, read-only handle over subvolume or snapshot `id` (as `btrfs
- * subvolume list` numbers them); paths through it are absolute within the
- * subvolume. Release it with fs_btrfs_umount, independently of `fs`.
- * Paths given to `fs` itself already cross into subvolumes, as a mount
- * shows them; this is for a caller that wants one subvolume as its root.
+ * A new handle over subvolume or snapshot `id` (as `btrfs subvolume list`
+ * numbers them); paths through it are absolute within the subvolume.
+ * Release it with fs_btrfs_umount, independently of `fs`. Paths given to
+ * `fs` itself already cross into subvolumes for reading, as a mount shows
+ * them; this is for a caller that wants one subvolume as its root.
+ *
+ * On a handle from fs_btrfs_mount_rw it writes that subvolume's tree:
+ * create, mkdir, symlink, link, unlink, rmdir, rename, truncate and
+ * write_file each commit one transaction against it, and the handle stays
+ * on the subvolume after each. Other writes refuse it, and
+ * fs_btrfs_is_writable answers 0 for it. The subvolume of a read-only
+ * mount refuses every write with EROFS.
+ *
+ * Each handle keeps its own view of the volume. A write through a handle
+ * after another handle of the same volume (this one, `fs`, or another
+ * subvolume handle) has committed is refused with ESTALE and writes
+ * nothing; release the handle and open it again to write.
  */
 fs_btrfs_fs_t *fs_btrfs_open_subvolume(fs_btrfs_fs_t *fs, uint64_t id);
 
@@ -310,10 +322,12 @@ int fs_btrfs_can_write_in_place(fs_btrfs_fs_t *fs, const char *path);
  *
  * A NODATACOW file is written in place, and never grown; any other is
  * written copy-on-write and committed, filling holes and growing the
- * file. Refused with ENOTSUP, the case named, for an extent a snapshot
- * shares, an inline or preallocated one, a write that starts past the
- * end, or one that grows a file on a volume without the no-holes
- * feature (rust-fs-btrfs#261).
+ * file, including from past its end, where the gap reads as zeros.
+ * Without the no-holes feature that gap is recorded as a hole item.
+ * A write within inline data rewrites it, compressed or not, and the file
+ * stays inline. Refused with ENOTSUP, the case named, for an extent a
+ * snapshot shares, a preallocated one, or inline data the write does not
+ * lie within (rust-fs-btrfs#261).
  */
 int64_t fs_btrfs_write_file(fs_btrfs_fs_t *fs, const char *path,
                             const void *buf, uint64_t offset, uint64_t length);
@@ -382,8 +396,10 @@ int fs_btrfs_rename(fs_btrfs_fs_t *fs, const char *from, const char *to);
  * growing records the new range as a hole, an item of its own on a volume
  * without the no-holes feature. Returns 0, or -1: ENOENT
  * for no such path, EISDIR for anything but a regular file, EROFS on a
- * read-only handle, ENOTSUP for an extent a snapshot or reflink shares or
- * for growing a file whose last sector is partly past its end.
+ * read-only handle, ENOTSUP for an extent a snapshot or reflink shares or,
+ * on a volume without the no-holes feature, for growing a file whose last
+ * sector is partly past its end. Elsewhere the rest of that sector is
+ * rewritten with zeros first.
  */
 int fs_btrfs_truncate(fs_btrfs_fs_t *fs, const char *path, uint64_t size);
 

@@ -429,6 +429,24 @@ impl TreeBlock {
     /// the fsid is foreign or the block's internal geometry does not
     /// hold up.
     pub fn parse(bytes: Vec<u8>, logical: u64, geom: &TreeGeometry) -> Result<Self> {
+        Self::parse_accepting(bytes, logical, geom, &[])
+    }
+
+    /// [`TreeBlock::parse`], also accepting a header stamped with any of
+    /// `seeds`. A sprouted filesystem's blocks from before it sprouted
+    /// are on its seed devices and carry the seed's fsid, which the
+    /// kernel's `check_tree_block_fsid` accepts too (#679).
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeBlock::parse`]; a foreign fsid is one that is neither
+    /// the geometry's nor a seed's.
+    pub fn parse_accepting(
+        bytes: Vec<u8>,
+        logical: u64,
+        geom: &TreeGeometry,
+        seeds: &[[u8; UUID_SIZE]],
+    ) -> Result<Self> {
         let nodesize = geom.nodesize as usize;
         if bytes.len() != nodesize {
             return Err(bad_block(
@@ -464,7 +482,7 @@ impl TreeBlock {
                 found: header.bytenr,
             });
         }
-        if header.fsid != geom.fsid {
+        if header.fsid != geom.fsid && !seeds.contains(&header.fsid) {
             // Not BlockIdentityMismatch: that variant carries u64
             // addresses, and squeezing a UUID into one would produce an
             // error message that reads like nonsense.
@@ -723,6 +741,9 @@ pub struct Tree<'a> {
     redundancy: Option<(MirrorCount<'a>, ReadMirror<'a>)>,
     /// Verified blocks kept between walks, where the caller keeps them.
     cache: Option<(CacheGet<'a>, CachePut<'a>)>,
+    /// Fsids a block may carry besides the geometry's: a sprouted
+    /// filesystem's seeds' (#679). Empty for every other volume.
+    seeds: &'a [[u8; UUID_SIZE]],
 }
 
 impl<'a> Tree<'a> {
@@ -736,6 +757,7 @@ impl<'a> Tree<'a> {
             read,
             redundancy: None,
             cache: None,
+            seeds: &[],
         }
     }
 
@@ -753,6 +775,14 @@ impl<'a> Tree<'a> {
     /// changes.
     pub fn with_redundancy(mut self, mirrors: MirrorCount<'a>, read: ReadMirror<'a>) -> Self {
         self.redundancy = Some((mirrors, read));
+        self
+    }
+
+    /// Also accept blocks stamped with any of `seeds`: the fsids of a
+    /// sprouted filesystem's seed devices, which hold its blocks from
+    /// before it sprouted (#679). See [`TreeBlock::parse_accepting`].
+    pub fn with_seed_fsids(mut self, seeds: &'a [[u8; UUID_SIZE]]) -> Self {
+        self.seeds = seeds;
         self
     }
 
@@ -858,7 +888,7 @@ impl<'a> Tree<'a> {
 
     fn read_uncached(&self, logical: u64, generation: Option<u64>) -> Result<TreeBlock> {
         let parse = |buf: Vec<u8>| {
-            let block = TreeBlock::parse(buf, logical, &self.geom)?;
+            let block = TreeBlock::parse_accepting(buf, logical, &self.geom, self.seeds)?;
             match generation {
                 Some(want) if block.header.generation != want => Err(bad_block(
                     logical,
@@ -912,6 +942,14 @@ impl<'a> Tree<'a> {
     /// below its parent's, plus anything [`TreeBlock::parse`] can
     /// report for each block along the way.
     pub fn descend(&self, root: u64, key: &DiskKey) -> Result<TreeBlock> {
+        let mut path = self.descend_path(root, key)?;
+        Ok(path.pop().expect("a descent reads at least the root"))
+    }
+
+    /// Every block a descent from `root` towards `key` reads, the root
+    /// first and the leaf last. As [`Tree::descend`].
+    pub fn descend_path(&self, root: u64, key: &DiskKey) -> Result<Vec<TreeBlock>> {
+        let mut path = Vec::new();
         let mut logical = root;
         let mut expected_level: Option<u8> = None;
         let mut expected_generation: Option<u64> = None;
@@ -932,12 +970,14 @@ impl<'a> Tree<'a> {
                 }
             }
             let Some(ptrs) = block.body.key_ptrs() else {
-                return Ok(block);
+                path.push(block);
+                return Ok(path);
             };
             let slot = node_slot(ptrs, key);
             expected_level = Some(block.header.level - 1);
             expected_generation = Some(ptrs[slot].generation);
             logical = ptrs[slot].blockptr;
+            path.push(block);
         }
         Err(bad_block(
             root,
@@ -1447,6 +1487,44 @@ mod tests {
             format!("{err}").contains("is not this volume's"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A leaf stamped with `fsid` instead of the volume's own.
+    fn leaf_of(fsid: [u8; UUID_SIZE]) -> Vec<u8> {
+        let mut bytes = leaf(LEAF_A, objectid::FS_TREE, &[(key(1, 1, 0), vec![1])]);
+        bytes[header_offsets::FSID..header_offsets::FSID + UUID_SIZE].copy_from_slice(&fsid);
+        seal(&mut bytes);
+        bytes
+    }
+
+    #[test]
+    fn accepts_a_block_a_seed_device_wrote() {
+        // A sprouted filesystem's blocks from before it sprouted are on
+        // its seed, stamped with the seed's fsid (#679).
+        const SEED: [u8; UUID_SIZE] = [0x11; UUID_SIZE];
+        let block = TreeBlock::parse_accepting(leaf_of(SEED), LEAF_A, &geom(), &[SEED]).unwrap();
+        assert_eq!(block.header.fsid, SEED);
+        // Beside a seed, another filesystem's block is still refused.
+        let err = TreeBlock::parse_accepting(leaf_of(SEED), LEAF_A, &geom(), &[[0x22; UUID_SIZE]])
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("is not this volume's"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_tree_given_its_seeds_reads_the_blocks_they_wrote() {
+        const SEED: [u8; UUID_SIZE] = [0x11; UUID_SIZE];
+        let blocks = HashMap::from([(LEAF_A, leaf_of(SEED))]);
+        let read = reader(&blocks);
+        let seeds = [SEED];
+        assert!(
+            Tree::new(geom(), &read).read_block(LEAF_A).is_err(),
+            "without the seed, its block is another filesystem's"
+        );
+        let tree = Tree::new(geom(), &read).with_seed_fsids(&seeds);
+        assert_eq!(tree.read_block(LEAF_A).unwrap().header.fsid, SEED);
     }
 
     #[test]
