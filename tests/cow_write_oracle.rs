@@ -4617,6 +4617,122 @@ fn an_append_outgrowing_compressed_inline_data_moves_it_into_a_regular_extent() 
     }
 }
 
+/// One copy-on-write write that covers the last sectors of an item
+/// `fallocate --keep-size` preallocated past the end of a checksummed file,
+/// and runs past that item, growing the file (#639). The kernel made the
+/// same write into a control preallocated alongside, so the item kinds and
+/// offsets, the reference counts, `size` and `nbytes` the driver is held to
+/// are its own; `btrfs check --check-data-csum` and a kernel scrub verify
+/// the digests, and the kernel must read the old data, zeros for the
+/// preallocated sectors left unwritten, and the written bytes.
+#[test]
+fn a_write_spanning_a_kept_preallocated_items_end_and_the_files_end_is_written() {
+    const OURS: &str = "kept-end.bin";
+    const THEIRS: &str = "kept-end-control.bin";
+    const OLD: usize = 16384;
+    const KEPT: usize = 16384;
+    const AT: usize = OLD + 8192;
+    const PART: usize = 16384;
+    let script = format!(
+        "for f in {OURS} {THEIRS}; do \
+         head -c {OLD} /dev/zero | tr '\\000' '\\101' > \"$MNT/$f\"; done\n\
+         sync\n\
+         for f in {OURS} {THEIRS}; do \
+         fallocate -n -o {OLD} -l {KEPT} \"$MNT/$f\"; done\n\
+         sync\n\
+         head -c {PART} /dev/zero | tr '\\000' '\\132' \
+         | dd of=\"$MNT/{THEIRS}\" bs=4096 seek={seek} conv=notrunc status=none\n\
+         sync\n",
+        seek = AT / 4096,
+    );
+    let scratch = Scratch::new("cow-write-kept-end-grow", &script);
+    let image = scratch.image();
+
+    let fs = mount_rw(&image);
+    let (ours, theirs) = (ino_of(&fs, OURS), ino_of(&fs, THEIRS));
+    drop(fs);
+    let (kind, before, _) = extent_kind_and_refs(&image, ours, OLD as u64);
+    assert_eq!(
+        kind, "prealloc",
+        "the kernel did not preallocate past {OURS}'s end"
+    );
+
+    let mut fs = mount_rw(&image);
+    let data = vec![0x5au8; PART];
+    assert_eq!(
+        fs.write(ours, AT as u64, &data).unwrap_or_else(|e| panic!(
+            "a write spanning {OURS}'s kept preallocated end and its own end: {e}"
+        )),
+        PART
+    );
+    let mut bytes = vec![0x41u8; OLD];
+    bytes.resize(AT, 0);
+    bytes.extend_from_slice(&data);
+    assert_eq!(fs.read_file(ours).unwrap(), bytes, "{OURS} reads back");
+    let (a, b) = (fs.read_inode(ours).unwrap(), fs.read_inode(theirs).unwrap());
+    assert_eq!(
+        (a.size, a.nbytes),
+        (b.size, b.nbytes),
+        "{OURS}'s size and nbytes are not what the kernel's write gave its control"
+    );
+    assert_eq!(a.size, (AT + PART) as u64, "{OURS} grew to the write's end");
+    drop(fs);
+
+    let tree = dump_tree(&image, "5");
+    let starts = |ino: u64| -> Vec<u64> {
+        (0..(AT + PART) as u64)
+            .step_by(4096)
+            .filter(|at| tree.contains(&format!("key ({ino} EXTENT_DATA {at})")))
+            .collect()
+    };
+    assert_eq!(
+        starts(ours),
+        starts(theirs),
+        "{OURS}'s items do not start where the control's do"
+    );
+    for item in starts(theirs) {
+        let (kind, bytenr, refs) = extent_kind_and_refs(&image, ours, item);
+        let (their_kind, _, their_refs) = extent_kind_and_refs(&image, theirs, item);
+        assert_eq!(
+            (kind.as_str(), refs),
+            (their_kind.as_str(), their_refs),
+            "{OURS}'s item at {item}: kind and reference count differ from the control's"
+        );
+        if (OLD as u64..(OLD + KEPT) as u64).contains(&item) {
+            assert_eq!(
+                bytenr, before,
+                "{OURS}'s item at {item} left the preallocated extent"
+            );
+        }
+    }
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum after a write past a kept preallocated end:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after a write past a kept preallocated end",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+    let seen = kernel_view(
+        &image,
+        "after a write past a kept preallocated end",
+        &[OURS, THEIRS],
+    );
+    assert_eq!(seen[OURS].0, sha256_hex(&bytes), "{OURS}: wrong bytes");
+    assert_eq!(
+        seen[OURS].0, seen[THEIRS].0,
+        "{OURS} does not read as its control"
+    );
+}
+
 /// A growing write into space `fallocate --keep-size` preallocated past the
 /// end of a checksummed copy-on-write file is written where that extent
 /// lies, as a write within the size is, and moves the size to where it
