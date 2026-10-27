@@ -47,7 +47,9 @@ bootstrap_chain           2
 btree_oracle              4
 capi                      39
 capi_pool                 5
-capi_subvol               2
+capi_subvol               4
+# The C ABI subvolume create, and the kernel judging it (#267).
+capi_subvol_create_kernel 1
 # One no-tool C ABI scope case and one kernel case through the C ABI alone (#520).
 capi_subvol_write_contract 1
 capi_subvol_write_kernel  1

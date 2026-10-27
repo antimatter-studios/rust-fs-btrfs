@@ -1367,6 +1367,42 @@ unsafe fn make(fs: *mut fs_btrfs_fs, path: *const c_char, mode: u32, dir: bool) 
     })
 }
 
+/// Create an empty subvolume at `path` whose top directory has
+/// permission bits `mode`, owned like the directory it is made in,
+/// committed as one transaction (#267).
+///
+/// Returns the new subvolume's id -- not its top directory's inode,
+/// which is always 256 -- or 0 with the error recorded, as
+/// [`fs_btrfs_create`]; a mount of a subvolume other than the top level,
+/// quotas, or a property the new subvolume would inherit are ENOTSUP.
+///
+/// # Safety
+///
+/// As [`fs_btrfs_create`].
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_subvol_create(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+    mode: u32,
+) -> u64 {
+    guard(0, || {
+        let Some(fs) = (unsafe { handle_mut(fs) }) else {
+            return 0;
+        };
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
+            return 0;
+        };
+        let Some((parent, name)) = new_name(fs, path) else {
+            return 0;
+        };
+        fs.create_subvolume(parent.ino, name, mode, parent.uid, parent.gid)
+            .unwrap_or_else(|e| {
+                record(&e);
+                0
+            })
+    })
+}
+
 /// Create a symbolic link at `linkpath` pointing at `target`, stored
 /// inline. Returns the new inode number, or 0 with the error recorded,
 /// as [`fs_btrfs_create`]; a target too long to store inline is ENOTSUP.
