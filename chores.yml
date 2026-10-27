@@ -236,7 +236,7 @@ vars:
   FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
   # It is also the version of every family script the tiers run in place
   # from that checkout, so moving it is how they are upgraded.
-  FS_CORE_REF: v0.3.15
+  FS_CORE_REF: v0.3.17
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   LINUX_HARNESS_REF: v0.2.0
 
