@@ -89,7 +89,8 @@
 //!   covering its first or last sectors splits it in two over the same
 //!   extent (#536), and one strictly inside it splits it in three (#537);
 //!   a write spanning one of its edges is written in two at that edge
-//!   (#638);
+//!   (#638), and so is a growing write that starts in an item kept past
+//!   the end and runs past that item's end (#639);
 //! - an extent another reference shares whose reference from this file
 //!   is held anywhere but inline in its record: which entry to count
 //!   down is not known.
@@ -276,6 +277,21 @@ impl Filesystem {
         {
             if let Some(written) = self.write_prealloc(inode, offset, data, summed)? {
                 return Ok(written);
+            }
+        }
+        // A growing write that starts in a preallocated item, kept past the
+        // end with `fallocate --keep-size`, and runs past that item's end
+        // is written in two at that end: the part in the item where its
+        // extent lies, as above, and the rest as any growing write (#639).
+        if !move_inline && end > inode.size {
+            if let Some(at) = self.prealloc_end_within(ino, offset, end)? {
+                let first = usize::try_from(at - offset).map_err(|_| {
+                    Error::UnsupportedFeature(format!("a write of {} bytes", data.len()))
+                })?;
+                let before = self.write_cow(inode, offset, &data[..first], false)?;
+                let inode = self.read_inode(ino)?;
+                let after = self.write_cow(&inode, at, &data[first..], false)?;
+                return Ok(before + after);
             }
         }
         if !move_inline && end <= inode.size {
@@ -768,6 +784,25 @@ impl Filesystem {
             .flat_map(|(k, d)| [k.offset, k.offset.saturating_add(le64(&d, fe::NUM_BYTES))])
             .filter(|&at| offset < at && at < end)
             .min())
+    }
+
+    /// The end of the preallocated extent item of `ino` that a write over
+    /// `[offset, end)` starts in and runs past (#639), as
+    /// [`prealloc_end_split`] finds it. `None` for any other write.
+    fn prealloc_end_within(&self, ino: u64, offset: u64, end: u64) -> Result<Option<u64>> {
+        use crate::fs::file_extent as fe;
+        use crate::superblock::le64;
+        let items: Vec<(u64, u64)> = self
+            .items_of(ino)?
+            .into_iter()
+            .filter(|(k, d)| {
+                k.key_type == EXTENT_DATA_KEY
+                    && d.len() >= fe::REGULAR_SIZE
+                    && d[fe::TYPE] == EXTENT_PREALLOC
+            })
+            .map(|(k, d)| (k.offset, le64(&d, fe::NUM_BYTES)))
+            .collect();
+        Ok(prealloc_end_split(&items, offset, end))
     }
 
     /// Whether one preallocated extent item of `ino` holds the whole of
@@ -1529,6 +1564,19 @@ const ITEM_HEADER: usize = 25;
 /// holds, each with its digests: what is kept of the item when the
 /// extents in `released` (each `[start, end)`) give theirs up. The item
 /// begins at `offset` and holds `size`-byte digests, one per `sector`.
+/// Where a write over `[offset, end)` is cut when it starts in one of the
+/// preallocated items `items`, each `(file offset, length)`, and runs past
+/// that item's end (#639): that end. `None` when the write starts in no
+/// item, or ends at or before the end of the one it starts in.
+fn prealloc_end_split(items: &[(u64, u64)], offset: u64, end: u64) -> Option<u64> {
+    items
+        .iter()
+        .map(|&(start, len)| (start, start.saturating_add(len)))
+        .filter(|&(start, stop)| start <= offset && offset < stop && stop < end)
+        .map(|(_, stop)| stop)
+        .min()
+}
+
 fn kept_runs(
     offset: u64,
     data: &[u8],
@@ -1554,7 +1602,28 @@ fn kept_runs(
 
 #[cfg(test)]
 mod tests {
-    use super::kept_runs;
+    use super::{kept_runs, prealloc_end_split};
+
+    /// A growing write that starts in a preallocated item and runs past its
+    /// end is cut at that end (#639); every other write is not cut there.
+    /// The kernel's account of the result is in cow_write_oracle.rs.
+    #[test]
+    fn a_growing_write_is_cut_at_the_end_of_the_preallocated_item_it_starts_in() {
+        // One item kept past a 16 KiB file: [16 KiB, 32 KiB).
+        let kept = [(16384, 16384)];
+        assert_eq!(prealloc_end_split(&kept, 24576, 40960), Some(32768));
+        assert_eq!(prealloc_end_split(&kept, 16384, 40960), Some(32768));
+        // Inside the item, or ending exactly at its end: nothing to cut.
+        assert_eq!(prealloc_end_split(&kept, 24576, 32768), None);
+        assert_eq!(prealloc_end_split(&kept, 16384, 24576), None);
+        // Starting before the item, or past it, is not this write.
+        assert_eq!(prealloc_end_split(&kept, 8192, 40960), None);
+        assert_eq!(prealloc_end_split(&kept, 32768, 40960), None);
+        // The item the write starts in decides, not a later one.
+        let two = [(16384, 8192), (32768, 8192)];
+        assert_eq!(prealloc_end_split(&two, 20480, 49152), Some(24576));
+        assert_eq!(prealloc_end_split(&[], 0, 4096), None);
+    }
 
     /// The independent comparison is the sparse EOF case in
     /// cow_write_oracle.rs; this checks the planner before it allocates.
