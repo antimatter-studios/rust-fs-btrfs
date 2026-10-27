@@ -3,7 +3,8 @@
 //!
 //! The verbs are the shared set: `ls`, `stat`, `read`, `export`, `xattr`, `write`, `mkdir`,
 //! `get`/`info`, `set`, `resize`, and the names and lengths this library
-//! can change: `create`, `ln`, `rm`, `rmdir`, `mv`, `truncate`. Metadata is
+//! can change: `create`, `ln`, `rm`, `rmdir`, `mv`, `truncate`. `subvolume`
+//! creates a subvolume and sets its read-only flag or the default one. Metadata is
 //! JSON (or `--text`); file content is raw bytes. A case the library
 //! refuses, or a verb it cannot do yet, answers with exit status 3 and its
 //! reason, so a script moved between filesystems fails loudly instead of
@@ -61,7 +62,7 @@ fn command() -> Cmd {
              Metadata is JSON on stdout (--text for people); `read` and a named `xattr` \
              write raw bytes. A failure is {\"error\": \"...\", \"code\": N} on stderr, N being the \
              exit status: 1 failed, 2 wrong command line, 3 not implemented or refused, 4 \
-             refused by the volume's state (rm, rmdir, mv, ln, mkdir or truncate meeting a \
+             refused by the volume's state (rm, rmdir, mv, ln, mkdir, subvolume or truncate meeting a \
              directory that is not empty, a name already there, a missing target or a part \
              of the path that is not a directory).\n\n\
              Writing is limited to what this library can do safely: `write` overwrites \
@@ -445,11 +446,76 @@ fn command() -> Cmd {
                      with exit 3 (rust-fs-btrfs#264), leaving the image as it was.",
                 ),
         )
+        .subcommand(subvolume_command())
         .after_help(
             "Examples:\n  fs.btrfs disk.img ls /\n  \
              fs.btrfs disk.img read /etc/fstab > fstab\n  \
              fs.btrfs disk.img get label --text\n  \
              fs.btrfs --offset 1048576 whole-disk.img info",
+        )
+}
+
+/// `subvolume create|set-read-only|set-default`, named as btrfs-progs
+/// names them.
+fn subvolume_command() -> Cmd {
+    let id = || {
+        Arg::new("id")
+            .value_name("ID")
+            .required(true)
+            .value_parser(value_parser!(u64))
+            .help("The subvolume's id, as `btrfs subvolume list` prints it (5 is the top level)")
+    };
+    Cmd::new("subvolume")
+        .about("Create a subvolume, or set one's read-only flag or make it the default")
+        .subcommand_required(true)
+        .subcommand(
+            name_command(
+                "create",
+                "Create an empty subvolume, mode 0755 unless --mode says otherwise",
+                "fs.btrfs disk.img subvolume create /home",
+                Some("755"),
+            )
+            .after_help(
+                "Examples:\n  fs.btrfs disk.img subvolume create /home\n  \
+                 fs.btrfs disk.img subvolume create --mode 700 /backup/2026\n\n\
+                 What `btrfs subvolume create` does, committed as one transaction. The \
+                 parent must be a directory of the top-level subvolume, and the report \
+                 carries the new subvolume's id. A name already there or a missing parent \
+                 is refused with exit 4; a read-only top level, a volume with quotas \
+                 enabled or a top level carrying a btrfs.* property with exit 3 \
+                 (rust-fs-btrfs#267).",
+            ),
+        )
+        .subcommand(
+            Cmd::new("set-read-only")
+                .about("Make a subvolume read-only, or writable again")
+                .arg(id())
+                .arg(
+                    Arg::new("read-only")
+                        .value_name("BOOL")
+                        .required(true)
+                        .value_parser(value_parser!(bool))
+                        .help("true or false"),
+                )
+                .after_help(
+                    "Examples:\n  fs.btrfs disk.img subvolume set-read-only 256 true\n  \
+                     fs.btrfs disk.img subvolume set-read-only 256 false\n\n\
+                     What `btrfs property set <subvolume> ro` does, committed as one \
+                     transaction; the state it is already in commits nothing. An id no \
+                     subvolume has is refused with exit 4, and a received subvolume made \
+                     writable with exit 3.",
+                ),
+        )
+        .subcommand(
+            Cmd::new("set-default")
+                .about("Make a subvolume the one a mount without subvol= shows")
+                .arg(id())
+                .after_help(
+                    "Examples:\n  fs.btrfs disk.img subvolume set-default 256\n  \
+                     fs.btrfs disk.img subvolume set-default 5\n\n\
+                     What `btrfs subvolume set-default` does, committed as one transaction. \
+                     An id no subvolume has is refused with exit 4.",
+                ),
         )
 }
 
@@ -565,6 +631,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         ),
         "set" => set(target, offset, sub),
         "resize" => resize(target, offset, sub),
+        "subvolume" => subvolume(target, offset, sub),
         other => unreachable!("clap knows no verb {other}"),
     }
 }
@@ -675,6 +742,60 @@ fn names(
         fields.push(("inode", Json::from(ino)));
     }
     Ok(Outcome::report(Json::object(fields)).with_text(format!("{what} {}", show(path))))
+}
+
+/// The subvolume verbs: each opens the image read-write and makes one
+/// change through the library, which commits it.
+fn subvolume(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Outcome, CliError> {
+    let (verb, sub) = sub.subcommand().expect("clap requires a subvolume verb");
+    let mode = mode_arg(sub)?;
+    let dev = device::open_rw(target, offset)?;
+    let mut fs = Filesystem::mount_rw(dev).map_err(|e| {
+        btrfs_error(
+            format!("{} (read-write)", target.to_string_lossy()).as_bytes(),
+            e,
+        )
+    })?;
+    let id = sub
+        .try_get_one::<u64>("id")
+        .ok()
+        .flatten()
+        .copied()
+        .unwrap_or_default();
+    let named = format!("subvolume {id}");
+    match verb {
+        "create" => {
+            let path = path_arg(sub);
+            let (parent, name) = split_parent(&fs, path)?;
+            refuse_taken(&fs, parent.ino, name, path)?;
+            let id = fs
+                .create_subvolume(parent.ino, name, mode, parent.uid, parent.gid)
+                .map_err(|e| state_error(path, e))?;
+            Ok(Outcome::report(Json::object([
+                ("path", Json::from(show(path))),
+                ("created", Json::from(true)),
+                ("id", Json::from(id)),
+            ]))
+            .with_text(format!("created subvolume {} (id {id})", show(path))))
+        }
+        "set-read-only" => {
+            let read_only = *sub.get_one::<bool>("read-only").expect("clap requires it");
+            fs.set_subvolume_read_only(id, read_only)
+                .map_err(|e| state_error(named.as_bytes(), e))?;
+            Ok(Outcome::report(Json::object([
+                ("id", Json::from(id)),
+                ("read_only", Json::from(read_only)),
+            ]))
+            .with_text(format!("{named} read-only: {read_only}")))
+        }
+        "set-default" => {
+            fs.set_default_subvolume(id)
+                .map_err(|e| state_error(named.as_bytes(), e))?;
+            Ok(Outcome::report(Json::object([("default", Json::from(id))]))
+                .with_text(format!("default subvolume is {id}")))
+        }
+        other => unreachable!("clap knows no subvolume verb {other}"),
+    }
 }
 
 /// A creating verb's `--mode`, in octal; 0 for a verb that has none.
