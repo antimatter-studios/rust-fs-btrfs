@@ -1,4 +1,4 @@
-//! `fs.btrfs subvolume create|set-read-only|set-default` (#267): the
+//! `fs.btrfs subvolume create|delete|set-read-only|set-default` (#267): the
 //! library's own subvolume operations reached from the command line, on
 //! this crate's own `mkfs.btrfs` volume. Each change is read back through
 //! the library's listing and through `ls`, and each refusal leaves the
@@ -42,7 +42,7 @@ fn subvolume_help_and_man_pages_name_every_verb() {
         "subvolume",
         "--help",
     ])));
-    for verb in ["create", "set-read-only", "set-default"] {
+    for verb in ["create", "delete", "set-read-only", "set-default"] {
         assert!(help.contains(verb), "subvolume --help omits {verb}: {help}");
     }
     let create = stdout(&ok(tool("fs.btrfs").args([
@@ -62,6 +62,7 @@ fn subvolume_help_and_man_pages_name_every_verb() {
     for page in [
         "fs.btrfs-subvolume.1",
         "fs.btrfs-subvolume-create.1",
+        "fs.btrfs-subvolume-delete.1",
         "fs.btrfs-subvolume-set-read-only.1",
         "fs.btrfs-subvolume-set-default.1",
     ] {
@@ -196,6 +197,85 @@ fn refusals_name_their_reason_and_leave_the_image_as_it_was() {
     let before = std::fs::read(&img).unwrap();
     let message = refused(fs_btrfs(&img).args(["subvolume", "create", "/new"]), 3);
     assert!(message.contains("/new"), "{message}");
+    assert!(
+        std::fs::read(&img).unwrap() == before,
+        "a read-only top level changed the image"
+    );
+}
+
+#[test]
+fn delete_removes_the_subvolume_and_ls_no_longer_lists_it() {
+    let img = volume("subvolume-delete");
+    ok(fs_btrfs(&img).args(["subvolume", "create", "/keep"]));
+    ok(fs_btrfs(&img).args(["subvolume", "create", "/gone"]));
+    ok(fs_btrfs(&img).args(["mkdir", "/d"]));
+    ok(fs_btrfs(&img).args(["subvolume", "create", "/d/inner"]));
+    ok(fs_btrfs(&img).args(["subvolume", "set-read-only", "258", "true"]));
+
+    let report = stdout(&ok(fs_btrfs(&img).args(["subvolume", "delete", "/gone"])));
+    assert_eq!(json_field(&report, "path"), "/gone", "{report}");
+    assert_eq!(json_field(&report, "deleted"), "true", "{report}");
+    assert_eq!(json_field(&report, "id"), "257", "{report}");
+    // A read-only subvolume is deleted, as the kernel deletes a read-only
+    // snapshot; and one in a directory below the top.
+    let text = stdout(&ok(fs_btrfs(&img).args([
+        "--text",
+        "subvolume",
+        "delete",
+        "/d/inner",
+    ])));
+    assert!(text.contains("/d/inner") && text.contains("258"), "{text}");
+
+    let listing = stdout(&ok(fs_btrfs(&img).args(["ls", "/"])));
+    assert!(listing.contains("\"name\": \"keep\""), "{listing}");
+    assert!(!listing.contains("\"name\": \"gone\""), "{listing}");
+    let inner = stdout(&ok(fs_btrfs(&img).args(["ls", "/d"])));
+    assert!(!inner.contains("inner"), "{inner}");
+
+    let ids: Vec<u64> = mounted(&img)
+        .subvolumes()
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(ids, vec![5, 256], "the library still lists a deleted one");
+}
+
+#[test]
+fn delete_refusals_name_their_reason_and_leave_the_image_as_it_was() {
+    let img = volume("subvolume-delete-refusals");
+    ok(fs_btrfs(&img).args(["subvolume", "create", "/sv"]));
+    ok(fs_btrfs(&img).args(["subvolume", "create", "/default"]));
+    ok(fs_btrfs(&img).args(["subvolume", "set-default", "257"]));
+    ok(fs_btrfs(&img).args(["mkdir", "/plain"]));
+    ok(fs_btrfs(&img).args(["create", "/file"]));
+    let before = std::fs::read(&img).unwrap();
+    let unchanged = |what: &str| {
+        assert!(
+            std::fs::read(&img).unwrap() == before,
+            "{what} changed the image"
+        );
+    };
+
+    // The volume's state refuses: a missing name, a name that is no
+    // subvolume, a missing parent, a parent that is not a directory.
+    for path in ["/missing", "/plain", "/file", "/missing/sv", "/file/sv"] {
+        refused(fs_btrfs(&img).args(["subvolume", "delete", path]), 4);
+        unchanged(path);
+    }
+    // The library refuses the default subvolume, exit 3.
+    let message = refused(fs_btrfs(&img).args(["subvolume", "delete", "/default"]), 3);
+    assert!(message.contains("default"), "{message}");
+    unchanged("the default subvolume");
+    // The command line is wrong: no path.
+    refused(fs_btrfs(&img).args(["subvolume", "delete"]), 2);
+    unchanged("a wrong command line");
+
+    // A read-only top-level subvolume: the library refuses, exit 3.
+    ok(fs_btrfs(&img).args(["subvolume", "set-read-only", "5", "true"]));
+    let before = std::fs::read(&img).unwrap();
+    let message = refused(fs_btrfs(&img).args(["subvolume", "delete", "/sv"]), 3);
+    assert!(message.contains("/sv"), "{message}");
     assert!(
         std::fs::read(&img).unwrap() == before,
         "a read-only top level changed the image"
