@@ -100,8 +100,8 @@ compression_oracle        3
 # The layout comparison regression brings this to 31: all passed in the
 # harness guest on 2026-10-26 (tmp/logs/vm.log, 156.17 seconds).
 # A write spanning a kept preallocated item's end and the file's end adds
-# one (#639).
-cow_write_oracle          32
+# one (#639). One write growing the checksum root two levels adds one (#650).
+cow_write_oracle          33
 crash_consistency         3
 csum_oracle               6
 csum_width_populated      1
