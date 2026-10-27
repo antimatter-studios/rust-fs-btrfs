@@ -10,3 +10,10 @@
   leaf is refused.
 - **A subvolume's UUIDs can be read (#267).** `subvolume_uuids` returns a
   subvolume's own UUID and the UUID of the subvolume it is a snapshot of.
+
+### Fixed
+
+- **A read-only subvolume refuses a write (#267).** A handle from
+  `open_subvolume` on a subvolume carrying the read-only flag, a
+  snapshot taken read-only among them, now refuses every write with
+  `ReadOnly`, as the kernel refuses one with `EROFS`.

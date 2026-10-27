@@ -3002,7 +3002,7 @@ impl Filesystem {
 /// `nodesize`: past it the kernel files them as items of their own.
 /// Measured, `docs/transaction-format.md`: 198 and 981 bytes were the
 /// largest seen at 4 KiB and 16 KiB nodes, and both fit under this.
-fn max_inline_extent_item(nodesize: u32) -> usize {
+pub(crate) fn max_inline_extent_item(nodesize: u32) -> usize {
     ((nodesize as usize - 101) >> 4) - 25
 }
 
