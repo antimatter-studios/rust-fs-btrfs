@@ -79,6 +79,7 @@ cli_oracle                3
 cli_resize_kernel         3
 # One kernel stat case compares 17 paths, including nested subvolumes (#412).
 cli_stat_kernel           1
+cli_subvolume             4
 cli_write_kernel          1
 cli_xattr                 2
 cli_xattr_kernel          2
