@@ -90,6 +90,8 @@ use crate::fs::root_item;
 mod root_ref {
     /// `u64`. The directory of the parent the subvolume's entry is in.
     pub const DIRID: usize = 0;
+    /// `u64`. The index the parent files the subvolume's entry under.
+    pub const SEQUENCE: usize = 8;
     /// `u16`. How many bytes of name follow.
     pub const NAME_LEN: usize = 16;
     /// The name itself.
@@ -247,6 +249,15 @@ impl Filesystem {
             if *key_type != ROOT_ITEM_KEY
                 || !is_subvolume_id(*objectid)
                 || data.len() < root_item::MIN_SIZE
+            {
+                continue;
+            }
+            // A deleted subvolume no directory refers to any more, waiting
+            // for the kernel's cleaner: `btrfs subvolume list` leaves it out.
+            if *objectid != FS_TREE_OBJECTID
+                && data
+                    .get(root_item_more::REFS..root_item_more::REFS + 4)
+                    .is_some_and(|r| r == [0; 4])
             {
                 continue;
             }
@@ -897,6 +908,10 @@ mod root_item_more {
     pub const BYTES_USED: usize = 192;
     /// `u32`. How many directory entries refer to the tree.
     pub const REFS: usize = 216;
+    /// `btrfs_disk_key`. Where the cleaner's drop of a dead tree got to.
+    pub const DROP_PROGRESS: usize = 220;
+    /// `u8`. The level the cleaner's drop got to.
+    pub const DROP_LEVEL: usize = 237;
     /// `[u8; 16]`. The subvolume's own UUID.
     pub const UUID: usize = 247;
     /// `u64`. The transaction that last changed the tree's contents.
@@ -1144,7 +1159,246 @@ impl Filesystem {
         )?;
         Ok(id)
     }
+
+    /// Delete the subvolume `name` in directory `parent` of the top-level
+    /// subvolume, and commit it.
+    ///
+    /// What `btrfs subvolume delete` does, lazily and as one transaction:
+    /// the parent loses both its entries for the name, and its size, times
+    /// and change counter move as for any unlink; the root tree loses the
+    /// `ROOT_REF` and `ROOT_BACKREF`; the UUID tree loses the subvolume's
+    /// UUID (and its received UUID, if it has one); and the `ROOT_ITEM` is
+    /// marked dead -- no references, `BTRFS_ROOT_SUBVOL_DEAD` set, drop
+    /// progress cleared -- with an `ORPHAN_ITEM` filed under its id in the
+    /// root tree. The subvolume's own tree is left as it is, for the
+    /// kernel's cleaner to drop on the next read-write mount, as it drops
+    /// one the kernel deleted. A read-only subvolume is deleted like any
+    /// other, as the kernel deletes a read-only snapshot.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] unless mounted with [`Filesystem::mount_rw`],
+    /// or when the top-level subvolume is read-only;
+    /// [`Error::NotADirectory`] if `parent` is not one;
+    /// [`Error::NotFound`] for a name that is absent or names anything but
+    /// a subvolume; [`Error::UnsupportedFeature`] for the default
+    /// subvolume (which the kernel refuses with `EPERM`), one that holds
+    /// another subvolume (`ENOTEMPTY`), a mount of a subvolume other than
+    /// the top level, a volume with quotas enabled, and whatever the
+    /// planner refuses. Nothing is written unless everything is.
+    pub fn delete_subvolume(&mut self, parent: u64, name: &[u8]) -> Result<()> {
+        use crate::chunk::objectid::ROOT_TREE;
+        use crate::dir::{name_hash, DIR_INDEX_KEY, DIR_ITEM_KEY};
+        use crate::inode::{offsets as io, INODE_ITEM_KEY};
+        use crate::leaf_edit::OwnedItem;
+        use crate::namespace::{now, touch, without_dir_record};
+        use crate::transaction::ItemEdit;
+
+        self.require_writable_top_level()?;
+        let items = self.root_tree_items()?;
+        let top_flags = items
+            .iter()
+            .find(|(o, t, _, d)| {
+                *o == FS_TREE_OBJECTID && *t == ROOT_ITEM_KEY && d.len() >= root_item::MIN_SIZE
+            })
+            .map(|(_, _, _, d)| le64(d, root_item::FLAGS))
+            .ok_or(Error::NotFound)?;
+        if top_flags & ROOT_SUBVOL_RDONLY != 0 {
+            return Err(Error::ReadOnly);
+        }
+        let entry = self.lookup_entry(parent, name)?;
+        if entry.location_type != ROOT_ITEM_KEY {
+            return Err(Error::NotFound);
+        }
+        let id = entry.ino;
+        let (root_key_offset, mut root) = items
+            .iter()
+            .find(|(o, t, _, _)| *o == id && *t == ROOT_ITEM_KEY)
+            .map(|(_, _, off, d)| (*off, d.clone()))
+            .ok_or(Error::NotFound)?;
+        if root.len() < root_item_more::DROP_LEVEL + 1 {
+            return Err(Error::UnsupportedFeature(format!(
+                "subvolume {id}'s root item is {} bytes, too short to mark dead",
+                root.len()
+            )));
+        }
+        if self.default_subvolume()? == id {
+            return Err(Error::UnsupportedFeature(format!(
+                "subvolume {id} is the default subvolume, which is not deleted"
+            )));
+        }
+        if items
+            .iter()
+            .any(|(o, t, _, _)| *o == id && *t == ROOT_REF_KEY)
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "subvolume {id} holds other subvolumes, which go first"
+            )));
+        }
+        if self.tree_root(QUOTA_TREE_OBJECTID).is_ok() {
+            return Err(Error::UnsupportedFeature(
+                "quotas are enabled, and the quota group a deleted subvolume belongs to is \
+                 not accounted"
+                    .into(),
+            ));
+        }
+        let reference = items
+            .iter()
+            .find(|(o, t, off, _)| *o == FS_TREE_OBJECTID && *t == ROOT_REF_KEY && *off == id)
+            .map(|(_, _, _, d)| d.clone())
+            .ok_or_else(|| {
+                Error::UnsupportedFeature(format!(
+                    "subvolume {id} has no reference from the top-level subvolume"
+                ))
+            })?;
+        if reference.len() < root_ref::NAME || le64(&reference, root_ref::DIRID) != parent {
+            return Err(Error::UnsupportedFeature(format!(
+                "subvolume {id}'s reference does not name directory {parent}"
+            )));
+        }
+        let index = le64(&reference, root_ref::SEQUENCE);
+        let generation = self.next_generation()?;
+        let now = now();
+
+        // The parent's two entries, and its size, which counts the name
+        // once per entry.
+        let hash_key = key(parent, DIR_ITEM_KEY, name_hash(name));
+        let by_hash = self.item_bytes(hash_key)?.ok_or(Error::NotFound)?;
+        let rest = without_dir_record(&by_hash, name).ok_or(Error::NotFound)?;
+        let index_key = key(parent, DIR_INDEX_KEY, index);
+        if self.item_bytes(index_key)?.is_none() {
+            return Err(Error::UnsupportedFeature(format!(
+                "directory {parent} has no index entry {index} for subvolume {id}"
+            )));
+        }
+        let mut parent_raw = self.raw_inode(parent)?;
+        let size = le64(&parent_raw, io::SIZE)
+            .checked_sub(2 * name.len() as u64)
+            .ok_or_else(|| {
+                Error::UnsupportedFeature(format!(
+                    "directory {parent}'s size is smaller than its entries for subvolume {id}"
+                ))
+            })?;
+        parent_raw[io::SIZE..io::SIZE + 8].copy_from_slice(&size.to_le_bytes());
+        touch(&mut parent_raw, generation, now, &[io::CTIME, io::MTIME]);
+        let edits = vec![
+            if rest.is_empty() {
+                ItemEdit::Delete(hash_key)
+            } else {
+                ItemEdit::Put(OwnedItem {
+                    key: hash_key,
+                    data: rest,
+                })
+            },
+            ItemEdit::Delete(index_key),
+            ItemEdit::Put(OwnedItem {
+                key: key(parent, INODE_ITEM_KEY, 0),
+                data: parent_raw,
+            }),
+        ];
+
+        // The root item, dead: no references, the dead flag, and a drop
+        // that starts from the beginning, as `btrfs_delete_subvolume`
+        // leaves it.
+        let flags = le64(&root, root_item::FLAGS) | ROOT_SUBVOL_DEAD;
+        root[root_item::FLAGS..root_item::FLAGS + 8].copy_from_slice(&flags.to_le_bytes());
+        root[root_item_more::REFS..root_item_more::REFS + 4].fill(0);
+        root[root_item_more::DROP_PROGRESS..=root_item_more::DROP_LEVEL].fill(0);
+        let mut tree_edits = vec![
+            (
+                ROOT_TREE,
+                ItemEdit::Delete(key(FS_TREE_OBJECTID, ROOT_REF_KEY, id)),
+            ),
+            (
+                ROOT_TREE,
+                ItemEdit::Put(OwnedItem {
+                    key: key(id, ROOT_ITEM_KEY, root_key_offset),
+                    data: root.clone(),
+                }),
+            ),
+            (
+                ROOT_TREE,
+                ItemEdit::Delete(key(id, ROOT_BACKREF_KEY, FS_TREE_OBJECTID)),
+            ),
+            (
+                ROOT_TREE,
+                ItemEdit::Put(OwnedItem {
+                    key: key(ORPHAN_OBJECTID, ORPHAN_ITEM_KEY, id),
+                    data: Vec::new(),
+                }),
+            ),
+        ];
+
+        // The UUID tree's entries for the subvolume, each a list of ids
+        // that loses this one. One the kernel finds missing it passes
+        // over, and so does this.
+        if let Ok(uuid_root) = self.tree_root(UUID_TREE_OBJECTID) {
+            for (at, key_type) in [
+                (root_item_more::UUID, UUID_KEY_SUBVOL),
+                (ROOT_ITEM_RECEIVED_UUID, UUID_KEY_RECEIVED_SUBVOL),
+            ] {
+                let Some(uuid) = root.get(at..at + 16).filter(|u| u.iter().any(|&b| b != 0)) else {
+                    continue;
+                };
+                let uuid_key = key(le64(uuid, 0), key_type, le64(uuid, 8));
+                let held = {
+                    let reader = self.pool_reader();
+                    reader
+                        .tree()
+                        .search(uuid_root, &uuid_key)?
+                        .map(|item| item.data)
+                };
+                let Some(held) = held else { continue };
+                let ids: Vec<u8> = held
+                    .chunks_exact(8)
+                    .filter(|c| *c != id.to_le_bytes())
+                    .flatten()
+                    .copied()
+                    .collect();
+                if ids.len() == held.len() {
+                    continue;
+                }
+                tree_edits.push((
+                    UUID_TREE_OBJECTID,
+                    if ids.is_empty() {
+                        ItemEdit::Delete(uuid_key)
+                    } else {
+                        ItemEdit::Put(OwnedItem {
+                            key: uuid_key,
+                            data: ids,
+                        })
+                    },
+                ));
+            }
+        }
+
+        self.commit_write(
+            DataWrite {
+                root: FS_TREE_OBJECTID,
+                ino: parent,
+                time: now,
+                edits,
+                tree_edits,
+                ..Default::default()
+            },
+            generation,
+        )
+    }
 }
+
+/// `BTRFS_ROOT_SUBVOL_DEAD`: set in a deleted subvolume's `ROOT_ITEM`
+/// flags until the cleaner has dropped its tree.
+const ROOT_SUBVOL_DEAD: u64 = 1 << 48;
+
+/// `BTRFS_ORPHAN_OBJECTID`: the objectid orphan items are filed under.
+const ORPHAN_OBJECTID: u64 = -5i64 as u64;
+
+/// `BTRFS_ORPHAN_ITEM_KEY`: in the root tree, a tree the cleaner drops.
+const ORPHAN_ITEM_KEY: u8 = 48;
+
+/// `BTRFS_UUID_KEY_RECEIVED_SUBVOL`: a UUID tree item naming the
+/// subvolumes received from the one whose UUID it is filed under.
+const UUID_KEY_RECEIVED_SUBVOL: u8 = 252;
 
 /// `S_IFDIR`.
 const S_IFDIR: u32 = 0o040_000;
