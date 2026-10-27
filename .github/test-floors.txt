@@ -257,6 +257,8 @@ subvol_truncate_contract  1
 subvol_truncate_kernel    1
 subvol_oracle             12
 subvol_readonly_kernel    1
+subvol_snapshot_contract  4
+subvol_snapshot_kernel    1
 superblock_mirrors        4
 super_flags_refusals      3
 super_write_oracle        3
