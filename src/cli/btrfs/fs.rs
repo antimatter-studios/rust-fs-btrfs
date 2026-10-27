@@ -1135,6 +1135,16 @@ fn btrfs_error(what: &[u8], e: Error) -> CliError {
     }
 }
 
+/// A reading verb's path lookup: a path that does not exist is
+/// rust-fs-core's `not_found` kind, exit 1, which a script matches whatever
+/// the message says; every other error is [`btrfs_error`]'s.
+fn read_error(what: &[u8], e: Error) -> CliError {
+    match e {
+        Error::NotFound => CliError::not_found(format!("{}: {e}", show(what))),
+        e => btrfs_error(what, e),
+    }
+}
+
 /// A namespace verb's library error: a name that is not there, or a part of
 /// the path that is not a directory, is the volume's state refusing it, the
 /// CLI contract's exit 4 (EXIT_REFUSED); every other error is
@@ -1247,7 +1257,7 @@ fn entry_text(e: &Json) -> String {
 fn ls(root: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
     let found = root
         .resolve_path_bytes(path)
-        .map_err(|e| btrfs_error(path, e))?;
+        .map_err(|e| read_error(path, e))?;
     let fs = found.fs(root);
     let entries = if found.inode.is_dir() {
         let mut listed = Vec::new();
@@ -1417,7 +1427,7 @@ fn ls_recursive(
 ) -> Result<Outcome, CliError> {
     let found = root
         .resolve_path_bytes(path)
-        .map_err(|e| btrfs_error(path, e))?;
+        .map_err(|e| read_error(path, e))?;
     let bounds = (
         sub.get_one::<u64>("max-depth")
             .copied()
@@ -1509,7 +1519,7 @@ fn device_numbers_split_at_bit_20() {
 fn stat(root: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
     let found = root
         .resolve_path_bytes(path)
-        .map_err(|e| btrfs_error(path, e))?;
+        .map_err(|e| read_error(path, e))?;
     let fs = found.fs(root);
     let inode = &found.inode;
     let subvolume = fs.subvolume_at(b"/").map_err(|e| btrfs_error(path, e))?;
@@ -1684,7 +1694,7 @@ fn export(
     let path = os_bytes(&request.path);
     let found = root
         .resolve_path_bytes(path)
-        .map_err(|e| btrfs_error(path, e))?;
+        .map_err(|e| read_error(path, e))?;
     let inode = &found.inode;
     if inode.is_dir() {
         return Err(CliError::failed(format!("{}: is a directory", show(path))));
@@ -1758,7 +1768,7 @@ impl TreeExport<'_> {
         let target = self
             .root
             .resolve_path_bytes(&bytes)
-            .map_err(|e| btrfs_error(&bytes, e))?;
+            .map_err(|e| read_error(&bytes, e))?;
         Ok((bytes, target))
     }
 
@@ -1893,7 +1903,7 @@ impl transfer::TreeSource for TreeExport<'_> {
 fn read(root: &Filesystem, path: &[u8], output: Option<&OsString>) -> Result<Outcome, CliError> {
     let found = root
         .resolve_path_bytes(path)
-        .map_err(|e| btrfs_error(path, e))?;
+        .map_err(|e| read_error(path, e))?;
     let fs = found.fs(root);
     let inode = &found.inode;
     if inode.is_dir() {

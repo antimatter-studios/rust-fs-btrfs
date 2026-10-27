@@ -142,7 +142,12 @@ pub fn refused(cmd: &mut Command, code: i32) -> String {
     let err = stderr(&out);
     let line = err.trim_end();
     assert!(
-        line.starts_with("{\"error\": \"") && line.ends_with(&format!("\"code\": {code}}}")),
+        line.starts_with("{\"error\": \"") && line.ends_with('}'),
+        "{cmd:?}: not a structured error: {err}"
+    );
+    assert_eq!(
+        json_field(line, "code"),
+        code.to_string(),
         "{cmd:?}: not a structured error with code {code}: {err}"
     );
     json_field(line, "error")
