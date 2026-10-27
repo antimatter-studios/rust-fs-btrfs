@@ -354,6 +354,16 @@ uint64_t fs_btrfs_create(fs_btrfs_fs_t *fs, const char *path, uint32_t mode);
 uint64_t fs_btrfs_mkdir(fs_btrfs_fs_t *fs, const char *path, uint32_t mode);
 
 /*
+ * Create an empty subvolume at `path` whose top directory has permission
+ * bits `mode`. Returns the new subvolume's id (not its top directory's
+ * inode, which is always 256), or 0 as fs_btrfs_create; ENOTSUP also on
+ * a handle opened on a subvolume other than the top level, with quotas
+ * enabled, or when the top level carries a property to inherit.
+ */
+uint64_t fs_btrfs_subvol_create(fs_btrfs_fs_t *fs, const char *path,
+                                uint32_t mode);
+
+/*
  * Create a symbolic link at `linkpath` whose target is `target`, stored
  * inline (at most one sector less a byte). Returns the new inode number,
  * or 0 as fs_btrfs_create.
