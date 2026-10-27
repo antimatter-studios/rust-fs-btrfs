@@ -4,7 +4,7 @@
 //! The verbs are the shared set: `ls`, `stat`, `read`, `export`, `xattr`, `write`, `mkdir`,
 //! `get`/`info`, `set`, `resize`, and the names and lengths this library
 //! can change: `create`, `ln`, `rm`, `rmdir`, `mv`, `truncate`. `subvolume`
-//! creates a subvolume and sets its read-only flag or the default one. Metadata is
+//! creates or deletes a subvolume and sets its read-only flag or the default one. Metadata is
 //! JSON (or `--text`); file content is raw bytes. A case the library
 //! refuses, or a verb it cannot do yet, answers with exit status 3 and its
 //! reason, so a script moved between filesystems fails loudly instead of
@@ -455,7 +455,7 @@ fn command() -> Cmd {
         )
 }
 
-/// `subvolume create|set-read-only|set-default`, named as btrfs-progs
+/// `subvolume create|delete|set-read-only|set-default`, named as btrfs-progs
 /// names them.
 fn subvolume_command() -> Cmd {
     let id = || {
@@ -466,7 +466,7 @@ fn subvolume_command() -> Cmd {
             .help("The subvolume's id, as `btrfs subvolume list` prints it (5 is the top level)")
     };
     Cmd::new("subvolume")
-        .about("Create a subvolume, or set one's read-only flag or make it the default")
+        .about("Create or delete a subvolume, or set one's read-only flag or make it the default")
         .subcommand_required(true)
         .subcommand(
             name_command(
@@ -484,6 +484,25 @@ fn subvolume_command() -> Cmd {
                  is refused with exit 4; a read-only top level, a volume with quotas \
                  enabled or a top level carrying a btrfs.* property with exit 3 \
                  (rust-fs-btrfs#267).",
+            ),
+        )
+        .subcommand(
+            name_command(
+                "delete",
+                "Delete a subvolume, as btrfs subvolume delete does",
+                "fs.btrfs disk.img subvolume delete /home",
+                None,
+            )
+            .after_help(
+                "Examples:\n  fs.btrfs disk.img subvolume delete /home\n  \
+                 fs.btrfs disk.img subvolume delete /backup/2026\n\n\
+                 What `btrfs subvolume delete` does, lazily and committed as one \
+                 transaction: the kernel's cleaner drops the subvolume's tree on the next \
+                 read-write mount. The parent must be a directory of the top-level \
+                 subvolume, and the report carries the deleted subvolume's id. A missing \
+                 name, a name that is no subvolume or a missing parent is refused with \
+                 exit 4; the default subvolume, one holding another subvolume, a read-only \
+                 top level or a volume with quotas enabled with exit 3 (rust-fs-btrfs#267).",
             ),
         )
         .subcommand(
@@ -777,6 +796,19 @@ fn subvolume(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Outcome
                 ("id", Json::from(id)),
             ]))
             .with_text(format!("created subvolume {} (id {id})", show(path))))
+        }
+        "delete" => {
+            let path = path_arg(sub);
+            let (parent, name) = split_parent(&fs, path)?;
+            let id = fs.subvolume_at(path).map_err(|e| state_error(path, e))?;
+            fs.delete_subvolume(parent.ino, name)
+                .map_err(|e| state_error(path, e))?;
+            Ok(Outcome::report(Json::object([
+                ("path", Json::from(show(path))),
+                ("deleted", Json::from(true)),
+                ("id", Json::from(id)),
+            ]))
+            .with_text(format!("deleted subvolume {} (id {id})", show(path))))
         }
         "set-read-only" => {
             let read_only = *sub.get_one::<bool>("read-only").expect("clap requires it");

@@ -232,6 +232,227 @@ fn subvol_create_refusals_change_nothing() {
     let _ = std::fs::remove_dir_all(image.parent().unwrap());
 }
 
+/// A fresh 128 MiB volume made by this crate's mkfs, for the deletes that
+/// need subvolumes of their own to remove: no fixture, no VM.
+fn fresh(tag: &str) -> std::path::PathBuf {
+    use fs_core::FileDevice;
+    let dir = std::path::PathBuf::from(fs_btrfs_test_support::temp_path!(
+        "capi-subvol-{tag}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create the scratch directory");
+    let image = dir.join("fresh.img");
+    std::fs::File::create(&image)
+        .and_then(|f| f.set_len(128 << 20))
+        .expect("size the image");
+    let dev = FileDevice::open_rw(&image).expect("open the image");
+    fs_btrfs::mkfs::format(&dev, &fs_btrfs::mkfs::Options::default()).expect("mkfs");
+    image
+}
+
+fn mount_rw(image: &std::path::Path) -> *mut fs_btrfs_fs {
+    let c = cstr(image.to_str().unwrap());
+    let fs = unsafe { fs_btrfs_mount_rw(c.as_ptr()) };
+    assert!(!fs.is_null(), "mount rw: {}", last_error());
+    fs
+}
+
+fn subvol_create(fs: *mut fs_btrfs_fs, path: &str) -> u64 {
+    let c = cstr(path);
+    let id = unsafe { fs_btrfs_subvol_create(fs, c.as_ptr(), 0o755) };
+    assert_ne!(id, 0, "subvol_create {path}: {}", last_error());
+    id
+}
+
+fn subvol_delete(fs: *mut fs_btrfs_fs, path: &str) -> i32 {
+    let c = cstr(path);
+    unsafe { fs_btrfs_subvol_delete(fs, c.as_ptr()) }
+}
+
+/// Every name `path` lists, with whether it is a subvolume.
+fn listing(fs: *mut fs_btrfs_fs, path: &str) -> Vec<(String, u8)> {
+    let c = cstr(path);
+    let iter = unsafe { fs_btrfs_dir_open(fs, c.as_ptr()) };
+    assert!(!iter.is_null(), "listing {path}: {}", last_error());
+    let mut names = Vec::new();
+    loop {
+        let entry = unsafe { fs_btrfs_dir_next(iter) };
+        if entry.is_null() {
+            break;
+        }
+        let entry = unsafe { &*entry };
+        let name = unsafe { CStr::from_ptr(entry.name.as_ptr()) };
+        names.push((name.to_string_lossy().into_owned(), entry.is_subvolume));
+    }
+    unsafe { fs_btrfs_dir_close(iter) };
+    names.sort();
+    names
+}
+
+/// `fs_btrfs_subvol_delete` removes a subvolume -- a read-only one too,
+/// and one in a directory below the top -- and after a remount its path
+/// no longer resolves and its directory no longer lists it.
+#[test]
+fn subvol_delete_removes_the_subvolume() {
+    let image = fresh("delete");
+    let fs = mount_rw(&image);
+    subvol_create(fs, "/keep");
+    subvol_create(fs, "/gone");
+    subvol_create(fs, "/ro");
+    let ro = cstr("/ro");
+    assert_eq!(
+        unsafe { fs_btrfs_subvol_set_readonly(fs, ro.as_ptr(), 1) },
+        0,
+        "set /ro read-only: {}",
+        last_error()
+    );
+    let dir = cstr("/dir");
+    assert_ne!(
+        unsafe { fs_btrfs_mkdir(fs, dir.as_ptr(), 0o755) },
+        0,
+        "mkdir /dir: {}",
+        last_error()
+    );
+    subvol_create(fs, "/dir/inner");
+
+    for path in ["/gone", "/ro", "/dir/inner"] {
+        assert_eq!(
+            subvol_delete(fs, path),
+            0,
+            "delete {path}: {}",
+            last_error()
+        );
+        assert_eq!(fs_btrfs_last_errno(), 0, "delete {path}");
+    }
+    let gone = cstr("/gone");
+    let mut attr: fs_btrfs_attr_t = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { fs_btrfs_stat(fs, gone.as_ptr(), &mut attr) }, -1);
+    assert_eq!(fs_btrfs_last_errno(), libc_errno::ENOENT, "/gone resolves");
+    unsafe { fs_btrfs_umount(fs) };
+
+    let c_img = cstr(image.to_str().unwrap());
+    let fs = unsafe { fs_btrfs_mount(c_img.as_ptr()) };
+    assert!(!fs.is_null(), "mount: {}", last_error());
+    assert_eq!(
+        listing(fs, "/"),
+        vec![("dir".to_string(), 0), ("keep".to_string(), 1)],
+        "/ after the deletes"
+    );
+    assert_eq!(listing(fs, "/dir"), vec![], "/dir after the delete");
+    for path in ["/gone", "/ro", "/dir/inner"] {
+        let c = cstr(path);
+        let mut attr: fs_btrfs_attr_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { fs_btrfs_stat(fs, c.as_ptr(), &mut attr) },
+            -1,
+            "{path} still resolves"
+        );
+        assert_eq!(fs_btrfs_last_errno(), libc_errno::ENOENT, "{path}");
+        assert_eq!(
+            unsafe { fs_btrfs_subvol_is_readonly(fs, c.as_ptr()) },
+            -1,
+            "{path} is still a subvolume"
+        );
+    }
+    let keep = cstr("/keep");
+    assert_eq!(unsafe { fs_btrfs_subvol_is_readonly(fs, keep.as_ptr()) }, 0);
+    unsafe { fs_btrfs_umount(fs) };
+    let _ = std::fs::remove_dir_all(image.parent().unwrap());
+}
+
+/// Every refusal returns -1 with its errno and leaves the image byte for
+/// byte as it was: NULL arguments, a read-only handle, the default
+/// subvolume, a name that is missing or is no subvolume, and a handle on
+/// another subvolume.
+#[test]
+fn subvol_delete_refusals_change_nothing() {
+    let image = fresh("delete-refuse");
+    let fs = mount_rw(&image);
+    subvol_create(fs, "/kept");
+    let default = subvol_create(fs, "/default");
+    let c_default = cstr("/default");
+    assert_eq!(
+        unsafe { fs_btrfs_subvol_set_default(fs, c_default.as_ptr()) },
+        0,
+        "set-default: {}",
+        last_error()
+    );
+    let plain = cstr("/plain");
+    assert_ne!(unsafe { fs_btrfs_mkdir(fs, plain.as_ptr(), 0o755) }, 0);
+    let file = cstr("/file");
+    assert_ne!(unsafe { fs_btrfs_create(fs, file.as_ptr(), 0o644) }, 0);
+    unsafe { fs_btrfs_umount(fs) };
+    let before = std::fs::read(&image).expect("read the image");
+    let c_img = cstr(image.to_str().unwrap());
+
+    let kept = cstr("/kept");
+    assert_eq!(
+        unsafe { fs_btrfs_subvol_delete(std::ptr::null_mut(), kept.as_ptr()) },
+        -1
+    );
+    assert_eq!(fs_btrfs_last_errno(), libc_errno::EIO, "NULL fs");
+
+    let ro = unsafe { fs_btrfs_mount(c_img.as_ptr()) };
+    assert!(!ro.is_null(), "mount: {}", last_error());
+    assert_eq!(subvol_delete(ro, "/kept"), -1);
+    assert_eq!(fs_btrfs_last_errno(), libc_errno::EROFS, "read-only handle");
+    unsafe { fs_btrfs_umount(ro) };
+
+    let fs = mount_rw(&image);
+    assert_eq!(unsafe { fs_btrfs_subvol_delete(fs, std::ptr::null()) }, -1);
+    assert_eq!(fs_btrfs_last_errno(), libc_errno::ENOENT, "NULL path");
+    for (what, path, errno) in [
+        ("the default subvolume", "/default", libc_errno::ENOTSUP),
+        ("a missing name", "/missing", libc_errno::ENOENT),
+        ("an ordinary directory", "/plain", libc_errno::ENOENT),
+        ("a file", "/file", libc_errno::ENOENT),
+        ("a missing directory", "/missing/kept", libc_errno::ENOENT),
+        ("a file as the directory", "/file/kept", libc_errno::ENOTDIR),
+        ("the top itself", "/", libc_errno::EINVAL),
+    ] {
+        assert_eq!(subvol_delete(fs, path), -1, "{what}");
+        assert_eq!(fs_btrfs_last_errno(), errno, "{what}: {}", last_error());
+    }
+    // A handle on a subvolume other than the top level deletes nothing.
+    let sub = unsafe { fs_btrfs_open_subvolume(fs, default) };
+    assert!(!sub.is_null(), "open default: {}", last_error());
+    assert_eq!(subvol_delete(sub, "/kept"), -1, "a subvolume handle");
+    assert_ne!(fs_btrfs_last_errno(), 0, "a subvolume handle");
+    unsafe { fs_btrfs_umount(sub) };
+    unsafe { fs_btrfs_umount(fs) };
+
+    let after = std::fs::read(&image).expect("read the image");
+    assert!(before == after, "a refused delete changed the image");
+    let _ = std::fs::remove_dir_all(image.parent().unwrap());
+}
+
+/// A subvolume holding another is refused with ENOTSUP, as the kernel
+/// refuses it with ENOTEMPTY, and the kernel-made image is unchanged:
+/// `/sub` holds `/sub/inner`.
+#[test]
+fn subvol_delete_refuses_a_subvolume_holding_another() {
+    let image = scratch("delete-held");
+    let before = std::fs::read(&image).expect("read the image");
+    let fs = mount_rw(&image);
+    assert_eq!(subvol_delete(fs, "/sub"), -1);
+    assert_eq!(
+        fs_btrfs_last_errno(),
+        libc_errno::ENOTSUP,
+        "{}",
+        last_error()
+    );
+    assert!(
+        last_error().contains("holds other subvolumes"),
+        "{}",
+        last_error()
+    );
+    unsafe { fs_btrfs_umount(fs) };
+    let after = std::fs::read(&image).expect("read the image");
+    assert!(before == after, "a refused delete changed the image");
+    let _ = std::fs::remove_dir_all(image.parent().unwrap());
+}
+
 /// The errno values the header documents, as the platform numbers them.
 mod libc_errno {
     pub const ENOENT: i32 = 2;

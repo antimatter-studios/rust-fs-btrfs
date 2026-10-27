@@ -1403,6 +1403,46 @@ pub unsafe extern "C" fn fs_btrfs_subvol_create(
     })
 }
 
+/// Delete the subvolume at `path`, in a directory of the top-level
+/// subvolume, committed as one transaction, as `btrfs subvolume delete`
+/// does: lazily, the kernel's cleaner dropping its tree on the next
+/// read-write mount (#267).
+///
+/// Returns 0, or -1 with the error recorded: ENOENT when no subvolume is
+/// at `path` -- a missing name, an ordinary directory or a file --
+/// ENOTDIR or EINVAL for the directory as [`fs_btrfs_unlink`], EROFS on a
+/// read-only handle or a read-only top level, and ENOTSUP for the
+/// default subvolume, one holding another, a handle on a subvolume other
+/// than the top level and a volume with quotas enabled.
+///
+/// # Safety
+///
+/// As [`fs_btrfs_unlink`].
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_subvol_delete(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+) -> c_int {
+    guard(-1, || {
+        let Some(fs) = (unsafe { handle_mut(fs) }) else {
+            return -1;
+        };
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
+            return -1;
+        };
+        let Some((parent, name)) = parent_of(fs, path) else {
+            return -1;
+        };
+        match fs.delete_subvolume(parent.ino, name) {
+            Ok(()) => 0,
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
+}
+
 /// Create a symbolic link at `linkpath` pointing at `target`, stored
 /// inline. Returns the new inode number, or 0 with the error recorded,
 /// as [`fs_btrfs_create`]; a target too long to store inline is ENOTSUP.

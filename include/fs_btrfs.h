@@ -21,7 +21,8 @@
  * fs_btrfs_truncate change names and lengths in the top-level
  * subvolume, each as one committed transaction, and
  * fs_btrfs_subvol_set_readonly and fs_btrfs_subvol_set_default change a
- * subvolume's read-only flag and which subvolume a plain mount shows.
+ * subvolume's read-only flag and which subvolume a plain mount shows;
+ * fs_btrfs_subvol_create and fs_btrfs_subvol_delete make and remove one.
  * Each function below names what it refuses, with ENOTSUP. It
  * refuses rather than guesses, when reading as well: a compressed extent
  * fails with ENOTSUP rather than returning its undecoded bytes, because a
@@ -362,6 +363,18 @@ uint64_t fs_btrfs_mkdir(fs_btrfs_fs_t *fs, const char *path, uint32_t mode);
  */
 uint64_t fs_btrfs_subvol_create(fs_btrfs_fs_t *fs, const char *path,
                                 uint32_t mode);
+
+/*
+ * Delete the subvolume at `path`, in a directory of the top-level
+ * subvolume, committed as one transaction, as `btrfs subvolume delete`
+ * does: lazily, the kernel's cleaner dropping its tree on the next
+ * read-write mount. Returns 0, or -1: ENOENT when no subvolume is at
+ * `path` (a missing name, an ordinary directory, a file), ENOTDIR or
+ * EINVAL for the directory as fs_btrfs_unlink, EROFS on a read-only
+ * handle or top level, and ENOTSUP for the default subvolume, one holding
+ * another, a handle on another subvolume or quotas enabled.
+ */
+int fs_btrfs_subvol_delete(fs_btrfs_fs_t *fs, const char *path);
 
 /*
  * Create a symbolic link at `linkpath` whose target is `target`, stored
