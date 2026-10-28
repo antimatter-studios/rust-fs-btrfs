@@ -820,7 +820,7 @@ tasks:
     # test-xattr.sh adds three fixed success lines, exactly 81 bytes.
     cmds:
       - '../rust-fs-core/scripts/tier.sh test:cli cli 35 1376 -- scripts/test-cli.sh'
-      - 'bash ../rust-fs-core/scripts/test-floor.sh cli 408'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 408'
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
