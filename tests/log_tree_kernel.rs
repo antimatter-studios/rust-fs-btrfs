@@ -2912,6 +2912,134 @@ fn a_name_whose_inode_keeps_another_is_removed_as_the_kernel_does() {
     );
 }
 
+/// A symbolic link `l`, a character device `c`, a block device `b`, a
+/// FIFO `p` and a UNIX socket `s`, each committed in `/` as the one name
+/// of its inode, lose that name after the commit, and only `/` is
+/// fsynced. The log holds index ranges of `/` covering every removed
+/// index and no entry there, and holds none of the five inodes. A replay
+/// that deletes only a regular file or an empty directory losing its
+/// last name refuses the log; the kernel's replay of the same crash image
+/// deletes each inode with all its items, the inline extent holding the
+/// target of the link among them, and is the oracle.
+#[test]
+fn links_and_nodes_whose_last_names_the_log_removes_are_deleted_as_the_kernel_does() {
+    use fs_btrfs::inode::FileType;
+    const NODES_REMOVED_FIXTURE: &str = "dirtylog/btrfs-dirty-log-nodesremoved.img";
+    let nodes: [(&str, FileType); 5] = [
+        ("l", FileType::Symlink),
+        ("c", FileType::CharDevice),
+        ("b", FileType::BlockDevice),
+        ("p", FileType::Fifo),
+        ("s", FileType::Socket),
+    ];
+    let image = fixture(NODES_REMOVED_FIXTURE);
+    let transcript =
+        std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-nodesremoved.logdump"))
+            .expect("the native transcript of the removed links and nodes log");
+    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+        .expect("the transcript is of this exact image");
+    let inodes: Vec<u64> = {
+        let fs = Filesystem::mount_ignoring_log(Arc::new(
+            FileDevice::open(&image).expect("open the removed links and nodes fixture"),
+        ) as Arc<dyn BlockRead>)
+        .expect("read the committed trees without replay");
+        let log = fs.log().unwrap().expect("a dirty log");
+        let top: &LoggedTree = log
+            .trees
+            .iter()
+            .find(|t| t.subvolume == 5)
+            .unwrap_or_else(|| panic!("no log tree for the top-level subvolume: {log:?}"));
+        let keys: Vec<String> = top
+            .items
+            .iter()
+            .map(|i| format!("({} {} {})", i.key.objectid, i.key.key_type, i.key.offset))
+            .collect();
+        assert!(
+            top.items
+                .iter()
+                .any(|i| i.key.objectid == 256 && i.key.key_type == DIR_LOG_INDEX_KEY),
+            "the log holds no index range of /: {keys:?}"
+        );
+        nodes
+            .iter()
+            .map(|(name, kind)| {
+                let committed = fs
+                    .lookup_path(&format!("/{name}"))
+                    .unwrap_or_else(|e| panic!("the committed trees hold no {name}: {e}"));
+                assert_eq!(
+                    (committed.file_type(), committed.nlink),
+                    (Some(*kind), 1),
+                    "{name} is not committed as the recipe made it"
+                );
+                let ino = committed.ino;
+                assert!(
+                    !top.items.iter().any(|i| i.key.objectid == ino),
+                    "the log holds an item of {name}: {keys:?}"
+                );
+                for entry in top
+                    .items
+                    .iter()
+                    .filter(|i| (i.key.objectid, i.key.key_type) == (256, DIR_INDEX_KEY))
+                {
+                    assert!(
+                        parse_dir_items(&entry.data)
+                            .unwrap()
+                            .iter()
+                            .all(|d| d.ino != ino),
+                        "the logged entry of / at index {} names {name}",
+                        entry.key.offset
+                    );
+                }
+                ino
+            })
+            .collect()
+    };
+    // What the kernel's view does not show: every item of each inode, and
+    // every entry naming one, as the native tool prints each replayed copy.
+    let items_of = |image: &Path| -> Vec<String> {
+        dump_tree(image, "5")
+            .lines()
+            .filter(|l| {
+                inodes.iter().any(|ino| {
+                    l.contains(&format!("key ({ino} "))
+                        || l.contains(&format!("location key ({ino} "))
+                })
+            })
+            .map(|l| l.trim().to_string())
+            .collect()
+    };
+    let theirs = replays_as_the_kernel_does_then(
+        NODES_REMOVED_FIXTURE,
+        "dirtylog-nodesremoved",
+        |theirs, ours| {
+            assert_eq!(
+                items_of(theirs),
+                Vec::<String>::new(),
+                "the kernel's replay deletes each inode with its items"
+            );
+            assert_eq!(
+                items_of(ours),
+                Vec::<String>::new(),
+                "this crate's replay deletes each inode with its items"
+            );
+        },
+    );
+    for (name, _) in &nodes {
+        assert_eq!(
+            theirs.get(&("stat".to_string(), name.to_string())),
+            None,
+            "the kernel's replay removes the name {name}"
+        );
+    }
+    assert_eq!(
+        theirs
+            .get(&("stat".to_string(), "k".to_string()))
+            .map(String::as_str),
+        Some("f 1 4"),
+        "the kernel's replay keeps k"
+    );
+}
+
 /// The inline writer's encoding fields are checked against the native
 /// tools, not against our own parser. `dump-tree` prints an inline file
 /// extent's data size, `ram_bytes` and compression; the raw item must hold

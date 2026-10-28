@@ -1308,6 +1308,7 @@ build_dirtylog() {
     build_dirtylog_refused rmdir 'compress=no,max_inline=2048' rmdir
     build_dirtylog_refused linkremoved 'compress=no,max_inline=2048' linkremoved
     build_dirtylog_refused createdlink 'compress=no,max_inline=2048' createdlink
+    build_dirtylog_refused nodesremoved 'compress=no,max_inline=2048' nodesremoved
 }
 
 # fsync_path <path> — fsync one file or directory, and nothing else.
@@ -1494,6 +1495,19 @@ for i in range(63):
             # A file f with a second name g, both committed in /.
             printf 'kept' > "$MNT/f"
             ln "$MNT/f" "$MNT/g" ;;
+        nodesremoved)
+            # A symbolic link l, a character device c (240:300), a block
+            # device b (241:5), a FIFO p and a bound UNIX socket s, each
+            # the one name of its inode, and a file k, committed in /.
+            ln -s target-of-the-link "$MNT/l"
+            mknod "$MNT/c" c 240 300
+            mknod "$MNT/b" b 241 5
+            mkfifo "$MNT/p"
+            python3 -c 'import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+s.close()' "$MNT/s"
+            printf 'kept' > "$MNT/k" ;;
         compressedcut)
             # 128 KiB of one byte: compress-force stores it as one
             # compressed extent, the largest the kernel makes.
@@ -1656,6 +1670,16 @@ if kind == "linkremoved":
     os.unlink(d + "/g")
     dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
     sys.exit(0)
+if kind == "nodesremoved":
+    # The one name of each of l, c, b, p and s is removed after the
+    # commit, and only / is fsynced. The log holds index ranges of /
+    # covering every removed index and no entry there, and holds none of
+    # the five inodes: its replay deletes each with all its items, the
+    # inline extent holding the target of the link among them.
+    for name in ("l", "c", "b", "p", "s"):
+        os.unlink(d + "/" + name)
+    dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+    sys.exit(0)
 fd = os.open(d + "/f", os.O_WRONLY)
 if kind == "sizechange":
     os.pwrite(fd, b"replayed-and-longer-inline-bytes-0123456789", 0)
@@ -1765,6 +1789,7 @@ want = {
     'compressedcut': r'EXTENT_DATA 32768\)',
     'rmdir': r'key \(256 DIR_LOG_INDEX \d+\) itemoff \d+ itemsize \d+\n\s+dir log end \d+\n',
     'linkremoved': r'key \(256 DIR_LOG_INDEX \d+\) itemoff \d+ itemsize \d+\n\s+dir log end \d+\n',
+    'nodesremoved': r'key \(256 DIR_LOG_INDEX \d+\) itemoff \d+ itemsize \d+\n\s+dir log end \d+\n',
 }[kind]
 assert re.search(want, dump), (kind, 'native dump does not show the unsupported shape')
 if kind == 'symlink':
@@ -2094,6 +2119,33 @@ if kind == 'linkremoved':
         r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
     assert any(a <= at <= b for a, b in ranges), \
         (kind, 'no logged index range of / holds the removed index', at, ranges)
+if kind == 'nodesremoved':
+    # Committed, / names l, c, b, p and s, each by an entry typed as its
+    # inode is, and each inode holds one link. The log holds none of these
+    # inodes and no entry naming them, and holds index ranges of /
+    # covering each of their indexes with no entry there.
+    import subprocess
+    tree = subprocess.run(['btrfs', 'inspect-internal', 'dump-tree', '-t', '5', sys.argv[3]],
+                          check=True, capture_output=True, text=True).stdout
+    ranges = [(int(a), int(b)) for a, b in re.findall(
+        r'key \(256 DIR_LOG_INDEX (\d+)\) itemoff \d+ itemsize \d+\n\s+dir log end (\d+)\n', dump)]
+    for name, ftype, mode in (('l', 'SYMLINK', '120'), ('c', 'CHRDEV', '20'), ('b', 'BLKDEV', '60'),
+                              ('p', 'FIFO', '10'), ('s', 'SOCK', '140')):
+        named = re.findall(r'key \(256 DIR_INDEX (\d+)\) itemoff \d+ itemsize \d+\n'
+                           r'\s+location key \((\d+) INODE_ITEM 0\) type %s\n[^\n]*\n\s+name: %s\n'
+                           % (ftype, name), tree)
+        assert len(named) == 1, (kind, 'the committed / does not name one', ftype, name, named)
+        at, ino = int(named[0][0]), named[0][1]
+        item = re.search(r'key \(%s INODE_ITEM 0\) itemoff \d+ itemsize \d+\n'
+                         r'\s+generation \d+ transid \d+ size \d+ nbytes \d+\n'
+                         r'\s+block group \d+ mode %s\d{3} links (\d+) ' % (ino, mode), tree)
+        assert item and item.group(1) == '1', \
+            (kind, name, 'is not committed with one link', item and item.group(1))
+        assert not re.search(r'\bkey \(%s ' % ino, dump), (kind, 'the log holds an item of', name)
+        assert not re.search(r'key \(256 DIR_INDEX %d\) ' % at, dump), \
+            (kind, 'the log holds an entry of / at the removed index of', name, at)
+        assert any(a <= at <= b for a, b in ranges), \
+            (kind, 'no logged index range of / holds the removed index of', name, at, ranges)
 if kind == 'compressedinline':
     # The native tool must print a compressed inline extent: nonzero
     # compression on the inline line itself, stored smaller than its bytes.
