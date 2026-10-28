@@ -95,7 +95,9 @@ HARNESS="$REPO/../fs-linux-test-harness"
 session=()
 if [[ "${FLTH_GUEST:-}" != 1 && -f "$HARNESS/scripts/vm-session.sh" ]] &&
     "$HARNESS/scripts/host-tools.sh" --quiet >/dev/null 2>&1; then
-    export FLTH_CONFIG="$REPO/fs-linux-test-harness.toml"
+    # The Debian 12 guest, unless the caller chose another config:
+    # `chore test:kernel-new` points this at the Debian 13 one.
+    export FLTH_CONFIG="${FLTH_CONFIG:-$REPO/fs-linux-test-harness.toml}"
     # Not `exec`, and cargo is not exec'd either: the trap belongs to
     # this shell, which must outlive cargo to run it.
     # shellcheck disable=SC2016  # expanded by the inner shell

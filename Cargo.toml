@@ -52,6 +52,11 @@ required-features = ["cli"]
 # completions -- is rust-fs-core's `cli` feature, turned on only here, so
 # the static library gains nothing. clap is MIT/Apache-2.0.
 cli = ["dep:clap", "rust-fs-core/cli"]
+# Test-only, and nothing in the library or the tools reads it: it builds the
+# suites under tests/kernel_new/, which need the harness's Debian 13 guest
+# (kernel 6.12) and fail on the Debian 12 one every other tier boots.
+# `chore test:kernel-new` turns it on; see the [[test]] targets below.
+kernel-new-tests = []
 
 [dependencies]
 # Btrfs lets the volume pick its metadata hash at mkfs time, so a reader
@@ -92,6 +97,16 @@ ruzstd = "0.9.0"
 # the `rust-fs-btrfs` target above). No derive: the builder API keeps each
 # tool's command a function the man pages and completions can be made from.
 clap = { version = "4.5", optional = true, default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
+
+# THE SUITES THAT NEED THE DEBIAN 13 GUEST. Listed by hand, because cargo
+# discovers only tests/*.rs, and behind `kernel-new-tests`, so the whole
+# suite (`scripts/test.sh` with no target, in every tier and in the guest)
+# never builds them: Debian 12's kernel 6.1 cannot mount what they make.
+# `chore test:kernel-new` builds and runs them, and holds them to a floor.
+[[test]]
+name = "simple_quota_owner_kernel"
+path = "tests/kernel_new/simple_quota_owner_kernel.rs"
+required-features = ["kernel-new-tests"]
 
 [dev-dependencies]
 # The test suite's one way in to a fixture, to a btrfs-progs tool and to
