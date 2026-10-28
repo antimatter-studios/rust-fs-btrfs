@@ -195,7 +195,7 @@ jobs:
         # running this task.
         run: chore test:unit
       - name: The unit tier executed its tests
-        run: bash ../rust-fs-core/scripts/test-floor.sh unit 323
+        run: bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored unit 323
       # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to
       # tmp/logs/<tier>.log and prints one line naming it; without this the
       # file goes away with the runner. `if: always()` because the failing
@@ -331,13 +331,16 @@ jobs:
       # of this branch, exactly. A tier runs on its own in some job here
       # and inside the whole-suite run in others, so it needs a total of
       # its own: the per-target file above only sees the suite log.
+      # --refuse-ignored on every count: libtest prints `N ignored` and
+      # exits 0, and a run once passed every job with two doc-tests
+      # ignored (#371). tests/scripts/no-ignored-tests.sh holds the flag.
       - name: The tiers executed their tests
         run: |
           set -euo pipefail
-          bash ../rust-fs-core/scripts/test-floor.sh unit 323
-          bash ../rust-fs-core/scripts/test-floor.sh oracle 30
-          bash ../rust-fs-core/scripts/test-floor.sh kernel 8
-          bash ../rust-fs-core/scripts/test-floor.sh suite 503
+          bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored unit 323
+          bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored oracle 30
+          bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 8
+          bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored suite 503
       # The shell tests are counted by their own `ok` lines rather than
       # by libtest's summary, but the failure is identical in shape:
       # `tests/scripts/*.sh` matching fewer files, or a script that
@@ -416,8 +419,8 @@ jobs:
       - name: Both tiers executed their tests
         run: |
           set -euo pipefail
-          bash ../rust-fs-core/scripts/test-floor.sh unit 323
-          bash ../rust-fs-core/scripts/test-floor.sh images 149
+          bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored unit 323
+          bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored images 149
       # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to
       # tmp/logs/<tier>.log and prints one line naming it; without this the
       # file goes away with the runner. `if: always()` because the failing
@@ -470,7 +473,7 @@ jobs:
       - name: chore vm:status (the VM is down again)
         run: '! chore vm:status'
       - name: The in-guest suite executed its tests
-        run: bash ../rust-fs-core/scripts/test-floor.sh vm 503
+        run: bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored vm 503
       # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to
       # tmp/logs/<tier>.log and prints one line naming it; without this the
       # file goes away with the runner. `if: always()` because the failing
