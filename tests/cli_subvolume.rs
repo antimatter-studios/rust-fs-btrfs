@@ -1,9 +1,10 @@
-//! `fs.btrfs subvolume create|delete|set-read-only|set-default` (#267): the
-//! library's own subvolume operations reached from the command line, on
-//! this crate's own `mkfs.btrfs` volume. Each change is read back through
-//! the library's listing and through `ls`, and each refusal leaves the
-//! image byte-identical. What the kernel makes of a subvolume the library
-//! creates is tests/capi_subvol_create_kernel.rs.
+//! `fs.btrfs subvolume create|delete|snapshot|set-read-only|set-default`
+//! (#267): the library's own subvolume operations reached from the command
+//! line, on this crate's own `mkfs.btrfs` volume. Each change is read back
+//! through the library's listing and through `ls`, and each refusal leaves
+//! the image byte-identical. What the kernel makes of a subvolume the
+//! library creates is tests/capi_subvol_create_kernel.rs, and of a
+//! snapshot tests/capi_subvol_snapshot_kernel.rs.
 //!
 //! No fixture, no VM: the unit tier.
 
@@ -42,7 +43,13 @@ fn subvolume_help_and_man_pages_name_every_verb() {
         "subvolume",
         "--help",
     ])));
-    for verb in ["create", "delete", "set-read-only", "set-default"] {
+    for verb in [
+        "create",
+        "delete",
+        "snapshot",
+        "set-read-only",
+        "set-default",
+    ] {
         assert!(help.contains(verb), "subvolume --help omits {verb}: {help}");
     }
     let create = stdout(&ok(tool("fs.btrfs").args([
@@ -63,6 +70,7 @@ fn subvolume_help_and_man_pages_name_every_verb() {
         "fs.btrfs-subvolume.1",
         "fs.btrfs-subvolume-create.1",
         "fs.btrfs-subvolume-delete.1",
+        "fs.btrfs-subvolume-snapshot.1",
         "fs.btrfs-subvolume-set-read-only.1",
         "fs.btrfs-subvolume-set-default.1",
     ] {
@@ -279,5 +287,160 @@ fn delete_refusals_name_their_reason_and_leave_the_image_as_it_was() {
     assert!(
         std::fs::read(&img).unwrap() == before,
         "a read-only top level changed the image"
+    );
+}
+
+/// Mount `img` read-write through the library, hand the top level and
+/// the mount to `fill`, and commit whatever it writes.
+fn populate(img: &Path, fill: impl FnOnce(&mut Filesystem, u64)) {
+    let dev = Arc::new(FileDevice::open_rw(img).unwrap());
+    let mut fs = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>).unwrap();
+    let root = fs.root_inode().unwrap().ino;
+    fill(&mut fs, root);
+}
+
+#[test]
+fn snapshot_reports_the_new_id_and_holds_what_its_source_held() {
+    let img = volume("subvolume-snapshot");
+    ok(fs_btrfs(&img).args(["subvolume", "create", "/sv"]));
+    ok(fs_btrfs(&img).args(["mkdir", "/d"]));
+    populate(&img, |fs, root| {
+        let file = fs.create(root, b"top.txt", 0o644, 0, 0).unwrap();
+        fs.write(file, 0, b"in the top level").unwrap();
+        let mut sv = fs.open_subvolume(256).unwrap();
+        let sv_root = sv.root_inode().unwrap().ino;
+        let inside = sv.create(sv_root, b"inside.txt", 0o644, 0, 0).unwrap();
+        sv.write(inside, 0, b"in sv").unwrap();
+    });
+
+    let report = stdout(&ok(fs_btrfs(&img).args([
+        "subvolume",
+        "snapshot",
+        "--read-only",
+        "/sv",
+        "/d/rosnap",
+    ])));
+    assert_eq!(json_field(&report, "source"), "/sv", "{report}");
+    assert_eq!(json_field(&report, "path"), "/d/rosnap", "{report}");
+    assert_eq!(json_field(&report, "created"), "true", "{report}");
+    assert_eq!(json_field(&report, "id"), "257", "{report}");
+    assert_eq!(json_field(&report, "read_only"), "true", "{report}");
+    // As btrfs-progs spells it, and of the top level.
+    let text = stdout(&ok(fs_btrfs(&img).args([
+        "--text",
+        "subvolume",
+        "snapshot",
+        "/",
+        "/snap",
+    ])));
+    assert!(text.contains("/snap") && text.contains("258"), "{text}");
+    let report = stdout(&ok(fs_btrfs(&img).args([
+        "subvolume",
+        "snapshot",
+        "-r",
+        "/sv",
+        "/rosnap2",
+    ])));
+    assert_eq!(json_field(&report, "read_only"), "true", "{report}");
+
+    let listing = stdout(&ok(fs_btrfs(&img).args(["ls", "/d"])));
+    let rosnap = listing
+        .split('}')
+        .find(|e| e.contains("\"name\": \"rosnap\""))
+        .unwrap_or_else(|| panic!("ls /d does not list rosnap: {listing}"));
+    assert_eq!(json_field(rosnap, "subvolume"), "true", "{listing}");
+    let read = |path: &str| stdout(&ok(fs_btrfs(&img).args(["read", path])));
+    assert_eq!(read("/d/rosnap/inside.txt"), "in sv");
+    assert_eq!(read("/snap/top.txt"), "in the top level");
+
+    let subvolumes = mounted(&img).subvolumes().unwrap();
+    let found: Vec<(u64, &str, bool)> = subvolumes
+        .iter()
+        .map(|s| (s.id, s.path.as_str(), s.read_only))
+        .collect();
+    assert!(found.contains(&(257, "d/rosnap", true)), "{found:?}");
+    assert!(found.contains(&(258, "snap", false)), "{found:?}");
+    assert!(found.contains(&(259, "rosnap2", true)), "{found:?}");
+}
+
+#[test]
+fn snapshot_refusals_name_their_reason_and_leave_the_image_as_it_was() {
+    let img = volume("subvolume-snapshot-refusals");
+    ok(fs_btrfs(&img).args(["subvolume", "create", "/sv"]));
+    ok(fs_btrfs(&img).args(["mkdir", "/plain"]));
+    ok(fs_btrfs(&img).args(["create", "/file"]));
+    let before = std::fs::read(&img).unwrap();
+    let unchanged = |what: &str| {
+        assert!(
+            std::fs::read(&img).unwrap() == before,
+            "{what} changed the image"
+        );
+    };
+
+    // The volume's state refuses: a source that is no subvolume, a name
+    // already there, a missing parent, a parent that is not a directory.
+    for source in ["/missing", "/plain", "/file"] {
+        let message = refused(
+            fs_btrfs(&img).args(["subvolume", "snapshot", source, "/snap"]),
+            4,
+        );
+        assert!(message.contains(source), "{message}");
+        unchanged(source);
+    }
+    let message = refused(
+        fs_btrfs(&img).args(["subvolume", "snapshot", "/sv", "/file"]),
+        4,
+    );
+    assert!(message.contains("already exists"), "{message}");
+    refused(
+        fs_btrfs(&img).args(["subvolume", "snapshot", "/sv", "/sv"]),
+        4,
+    );
+    unchanged("an existing name");
+    for path in ["/missing/snap", "/file/snap"] {
+        refused(
+            fs_btrfs(&img).args(["subvolume", "snapshot", "/sv", path]),
+            4,
+        );
+        unchanged(path);
+    }
+    // The command line is wrong: no destination, no source.
+    refused(fs_btrfs(&img).args(["subvolume", "snapshot", "/sv"]), 2);
+    refused(fs_btrfs(&img).args(["subvolume", "snapshot"]), 2);
+    unchanged("a wrong command line");
+
+    // A read-only top-level subvolume: the library refuses, exit 3.
+    ok(fs_btrfs(&img).args(["subvolume", "set-read-only", "5", "true"]));
+    let before = std::fs::read(&img).unwrap();
+    let message = refused(
+        fs_btrfs(&img).args(["subvolume", "snapshot", "/sv", "/snap"]),
+        3,
+    );
+    assert!(message.contains("/snap"), "{message}");
+    assert!(
+        std::fs::read(&img).unwrap() == before,
+        "a read-only top level changed the image"
+    );
+}
+
+#[test]
+fn snapshot_of_a_source_taller_than_a_leaf_is_refused_with_exit_3() {
+    let img = volume("subvolume-snapshot-tall");
+    // Enough inodes that the top level's tree outgrows one leaf.
+    populate(&img, |fs, root| {
+        for i in 0..200 {
+            let name = format!("file-{i:04}");
+            fs.create(root, name.as_bytes(), 0o644, 0, 0).unwrap();
+        }
+    });
+    let before = std::fs::read(&img).unwrap();
+    let message = refused(
+        fs_btrfs(&img).args(["subvolume", "snapshot", "/", "/snap"]),
+        3,
+    );
+    assert!(message.contains("level"), "{message}");
+    assert!(
+        std::fs::read(&img).unwrap() == before,
+        "a refused snapshot changed the image"
     );
 }

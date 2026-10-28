@@ -48,10 +48,13 @@ btree_oracle              4
 capi                      39
 capi_pool                 5
 # Deleting through the C ABI: two no-tool cases on this crate's mkfs volume
-# and one refusal on the kernel-made fixture (#267).
-capi_subvol               7
+# and one refusal on the kernel-made fixture (#267). Snapshotting through
+# it: three more no-tool cases, taken and refused.
+capi_subvol               10
 # The C ABI subvolume create, and the kernel judging it (#267).
 capi_subvol_create_kernel 1
+# The C ABI snapshot, and the kernel judging it (#267).
+capi_subvol_snapshot_kernel 1
 # One no-tool C ABI scope case and one kernel case through the C ABI alone (#520).
 capi_subvol_write_contract 1
 capi_subvol_write_kernel  1
@@ -81,8 +84,9 @@ cli_oracle                3
 cli_resize_kernel         3
 # One kernel stat case compares 17 paths, including nested subvolumes (#412).
 cli_stat_kernel           1
-# `subvolume delete`, removed and refused (#267).
-cli_subvolume             6
+# `subvolume delete`, removed and refused; `subvolume snapshot`, taken,
+# refused and refused for a tree taller than a leaf (#267).
+cli_subvolume             9
 cli_write_kernel          1
 cli_xattr                 2
 cli_xattr_kernel          2
