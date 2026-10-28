@@ -238,7 +238,14 @@ vars:
   # from that checkout, so moving it is how they are upgraded.
   FS_CORE_REF: v0.4.2
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
-  LINUX_HARNESS_REF: v0.2.0
+  # v0.5.1: a consumer can choose `[vm] guest = "debian-13"`, whose kernel
+  # 6.12 mounts what Debian 12's 6.1 refuses -- a simple-quota volume, to
+  # have the kernel write owner references into it (#455). Debian 12 stays
+  # the default guest for every tier here. On the way: every boot is
+  # disposable (v0.3.0), a halt that hangs is forced and concurrent ups of
+  # one machine wait for the boot under way (v0.4.0), and a boot that fails
+  # prints its console (v0.4.1).
+  LINUX_HARNESS_REF: v0.5.1
 
 # The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
 # harness is a sibling that `chore siblings` itself checks out: without

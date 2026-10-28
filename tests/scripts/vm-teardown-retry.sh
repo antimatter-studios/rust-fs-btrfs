@@ -45,7 +45,8 @@ printf '#!/usr/bin/env bash\nexit 0\n' > "$SUT/scripts/vm-setup.sh"
 cp -R "$HARNESS/scripts" "$H/"
 cp "$HARNESS/tests/stubs/engine.sh" "$H/scripts/lib/engine.sh"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$H/scripts/host-tools.sh"
-# A halt that returns with the guest still running, down_failures times;
+# A halt that returns with the guest still running, down_failures times
+# (each `vm.sh down` is a graceful halt then a forced one, since v0.4.0);
 # destroy_fails makes `vm.sh destroy` leave it running as well.
 cat >> "$H/scripts/lib/engine.sh" <<'WRAP'
 
@@ -53,7 +54,9 @@ engine_down() {
     local n
     n="$(stub_read down_failures 0)"
     stub_log "down${1:+ $1}"
-    if [ "$n" -gt 0 ]; then
+    # A provisioning boot's halt is the harness's own (v0.3.0), not the
+    # session's end: a fault there makes `up` refuse, before cargo runs.
+    if [ "$n" -gt 0 ] && [ ! -f "$FLTH_MACHINE_DIR/provisioning" ]; then
         echo $((n - 1)) > "$STUB/down_failures"
         echo running > "$STUB/state"
         return 0
@@ -105,19 +108,19 @@ vm_state() { cat "$FLTH_TEST_STUB/state"; }
 run() { (cd "$SUT" && scripts/test.sh --test oracle_stand_in) > "$sandbox/out" 2>&1; }
 
 # --- 1. One halt leaves the VM running; the retry stops it. --------------
-reset 1
+reset 2
 CARGO_STUB=pass run; rc=$?
 [ "$rc" = 0 ] && ok || fail "a passing run whose first halt left the VM running exits 0 once the retry stops it (got $rc)"
 [ "$(vm_state)" = stopped ] && ok || fail "the retried halt leaves the VM stopped (state: $(vm_state))"
 
 # --- 2. Same, with cargo failing: cargo's status survives the retry. -----
-reset 1
+reset 2
 CARGO_STUB=fail run; rc=$?
 [ "$rc" = 101 ] && ok || fail "a failing run keeps cargo's status through the retry (got $rc)"
 [ "$(vm_state)" = stopped ] && ok || fail "and the VM is stopped (state: $(vm_state))"
 
 # --- 3. Two halts fail; destroy is the last step and confirms it gone. ---
-reset 2
+reset 4
 CARGO_STUB=pass run; rc=$?
 [ "$rc" = 0 ] && ok || fail "a run whose halts both failed exits 0 once destroy confirms the VM gone (got $rc)"
 grep -qx destroy "$FLTH_TEST_STUB/calls" && ok || fail "destroy is the step after a failed retry"
@@ -130,7 +133,7 @@ CARGO_STUB=pass run; rc=$?
 grep -q 'TEARDOWN FAILED' "$sandbox/out" && ok || fail "and names the teardown failure"
 
 # --- 5. Another live session owns the VM: it is never halted or destroyed.
-# Harness v0.2.0's `session-end` returns 0 and leaves the VM running when
+# Harness v0.5.1's `session-end` returns 0 and leaves the VM running when
 # another live session marker exists, so the recovery must neither read
 # that as a stop nor fall through to `vm.sh destroy`. The marker is the
 # harness's own format: "<pid>\t<ps -o lstart=>" in the machine's
@@ -156,7 +159,7 @@ rm -f "$sessions/$owner"
 # The original checks above are unchanged. This contender attempts the
 # real harness session-begin at the last destructive boundary, rather
 # than merely being present when recovery first checks the registry.
-reset 2
+reset 4
 echo "$$" > "$FLTH_TEST_STUB/new_session"
 CARGO_STUB=pass run; rc=$?
 [ "$rc" = 0 ] && ok || fail "reserved recovery still finishes successfully (got $rc)"
@@ -166,7 +169,7 @@ grep -qx new-session-entered "$FLTH_TEST_STUB/calls" && fail "destroy never admi
 [ -w "$sessions" ] && ok || fail "recovery restores session registry access"
 
 # --- 7. Destroy recovery cannot turn a failed oracle into success. ------
-reset 2
+reset 4
 CARGO_STUB=fail run; rc=$?
 [ "$rc" = 101 ] && ok || fail "cargo's failure survives destroy recovery (got $rc)"
 [ "$(vm_state)" = absent ] && ok || fail "failed cargo still receives confirmed teardown"
