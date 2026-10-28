@@ -1443,6 +1443,57 @@ pub unsafe extern "C" fn fs_btrfs_subvol_delete(
     })
 }
 
+/// Snapshot the subvolume whose top directory is `source` -- `/` for the
+/// top level -- as a new subvolume at `dest`, read-only when `read_only`
+/// is non-zero, committed as one transaction, as `btrfs subvolume
+/// snapshot` does (#267).
+///
+/// Returns the snapshot's id, or 0 with the error recorded: ENOENT when
+/// no subvolume's top directory is at `source`, EEXIST when `dest` is
+/// taken, ENOENT/ENOTDIR or EINVAL for `dest`'s directory as
+/// [`fs_btrfs_create`], EROFS on a read-only handle or a read-only top
+/// level, and ENOTSUP for a source tree taller than one leaf, a `dest`
+/// inside a subvolume other than the top level, a handle on another
+/// subvolume and a volume with quotas enabled.
+///
+/// # Safety
+///
+/// As [`fs_btrfs_create`]; `source` and `dest` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_subvol_snapshot(
+    fs: *mut fs_btrfs_fs,
+    source: *const c_char,
+    dest: *const c_char,
+    read_only: c_int,
+) -> u64 {
+    guard(0, || {
+        let Some(fs) = (unsafe { handle_mut(fs) }) else {
+            return 0;
+        };
+        let Some(source) = (unsafe { borrow_bytes(source, "source") }) else {
+            return 0;
+        };
+        let Some(dest) = (unsafe { borrow_bytes(dest, "dest") }) else {
+            return 0;
+        };
+        let id = match fs.subvolume_at(source) {
+            Ok(id) => id,
+            Err(e) => {
+                record(&e);
+                return 0;
+            }
+        };
+        let Some((parent, name)) = new_name(fs, dest) else {
+            return 0;
+        };
+        fs.create_snapshot(id, parent.ino, name, read_only != 0)
+            .unwrap_or_else(|e| {
+                record(&e);
+                0
+            })
+    })
+}
+
 /// Create a symbolic link at `linkpath` pointing at `target`, stored
 /// inline. Returns the new inode number, or 0 with the error recorded,
 /// as [`fs_btrfs_create`]; a target too long to store inline is ENOTSUP.
