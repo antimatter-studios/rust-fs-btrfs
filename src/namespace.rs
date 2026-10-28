@@ -959,6 +959,11 @@ impl Filesystem {
         write: impl FnOnce(&mut Self) -> Result<R>,
     ) -> Result<R> {
         let held = self.subvolume_writes.clone().ok_or(Error::ReadOnly)?;
+        // A stale handle is refused first: its root tree is the one another
+        // handle's commit replaced, so the flags read below would come from
+        // blocks that may already be reused, and refuse with NotFound rather
+        // than ESTALE (#599).
+        self.refuse_stale()?;
         // A read-only subvolume -- a snapshot taken with `-r` among them --
         // takes no write, as the kernel refuses one with EROFS (#267).
         if self.subvolume_is_read_only(held.id)? {
