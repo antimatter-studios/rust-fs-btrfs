@@ -87,6 +87,11 @@ fn a_snapshot_is_one_the_kernel_reads_and_writes() {
             let inside = sv.create(sv_root, b"inside", 0o644, 0, 0).unwrap();
             sv.write(inside, 0, &pattern(80 << 10, 3)).unwrap();
         }
+        // `sv` committed after `fs` did, so `fs` is stale (#599): mount
+        // the volume afresh before snapshotting through it.
+        drop(fs);
+        let dev = Arc::new(FileDevice::open_rw(&image).expect("open rw"));
+        let mut fs = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>).expect("mount rw");
 
         let generation = fs.superblock().generation;
         fs.create_snapshot(FS_TREE_OBJECTID, root, b"snap", false)
