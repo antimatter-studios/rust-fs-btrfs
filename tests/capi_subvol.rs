@@ -453,6 +453,228 @@ fn subvol_delete_refuses_a_subvolume_holding_another() {
     let _ = std::fs::remove_dir_all(image.parent().unwrap());
 }
 
+fn subvol_snapshot(fs: *mut fs_btrfs_fs, source: &str, path: &str, read_only: i32) -> u64 {
+    let source = cstr(source);
+    let path = cstr(path);
+    unsafe { fs_btrfs_subvol_snapshot(fs, source.as_ptr(), path.as_ptr(), read_only) }
+}
+
+/// Write `bytes` into a new file at `path` through `fs`.
+fn put(fs: *mut fs_btrfs_fs, path: &str, bytes: &[u8]) {
+    let c = cstr(path);
+    assert_ne!(
+        unsafe { fs_btrfs_create(fs, c.as_ptr(), 0o644) },
+        0,
+        "create {path}: {}",
+        last_error()
+    );
+    let n = unsafe {
+        fs_btrfs_write_file(
+            fs,
+            c.as_ptr(),
+            bytes.as_ptr().cast::<c_void>(),
+            0,
+            bytes.len() as u64,
+        )
+    };
+    assert_eq!(n, bytes.len() as i64, "write {path}: {}", last_error());
+}
+
+/// `fs_btrfs_subvol_snapshot` returns the snapshot's id, and after a
+/// remount the snapshot lists as a subvolume holding what its source held
+/// when it was taken -- of a subvolume read-only into a directory below
+/// the top, and of the top level itself writable -- while the source
+/// keeps what was written to it after.
+#[test]
+fn subvol_snapshot_returns_the_snapshot_id() {
+    let image = fresh("snapshot");
+    let fs = mount_rw(&image);
+    let sv = subvol_create(fs, "/sv");
+    let dir = cstr("/dir");
+    assert_ne!(unsafe { fs_btrfs_mkdir(fs, dir.as_ptr(), 0o755) }, 0);
+    put(fs, "/top.txt", b"in the top level");
+    let sub = unsafe { fs_btrfs_open_subvolume(fs, sv) };
+    assert!(!sub.is_null(), "open /sv: {}", last_error());
+    put(sub, "/inside.txt", b"in sv");
+    unsafe { fs_btrfs_umount(sub) };
+    // The subvolume handle committed after `fs` did, so `fs` is stale
+    // (#599): mount afresh before snapshotting.
+    unsafe { fs_btrfs_umount(fs) };
+
+    let fs = mount_rw(&image);
+    let rosnap = subvol_snapshot(fs, "/sv", "/dir/rosnap", 1);
+    assert_eq!(rosnap, sv + 1, "snapshot /sv: {}", last_error());
+    assert_eq!(fs_btrfs_last_errno(), 0);
+    let snap = subvol_snapshot(fs, "/", "/snap", 0);
+    assert_eq!(snap, sv + 2, "snapshot /: {}", last_error());
+    assert_eq!(fs_btrfs_last_errno(), 0);
+    put(fs, "/later.txt", b"after the snapshot");
+    unsafe { fs_btrfs_umount(fs) };
+
+    let c_img = cstr(image.to_str().unwrap());
+    let fs = unsafe { fs_btrfs_mount(c_img.as_ptr()) };
+    assert!(!fs.is_null(), "mount: {}", last_error());
+    assert_eq!(
+        listing(fs, "/dir"),
+        vec![("rosnap".to_string(), 1)],
+        "/dir lists the read-only snapshot as a subvolume"
+    );
+    assert_eq!(read_all(fs, "/dir/rosnap/inside.txt"), b"in sv");
+    let c_rosnap = cstr("/dir/rosnap");
+    assert_eq!(
+        unsafe { fs_btrfs_subvol_is_readonly(fs, c_rosnap.as_ptr()) },
+        1,
+        "/dir/rosnap: {}",
+        last_error()
+    );
+    assert!(
+        listing(fs, "/").contains(&("snap".to_string(), 1)),
+        "/ lists the snapshot of the top level as a subvolume"
+    );
+    assert_eq!(read_all(fs, "/snap/top.txt"), b"in the top level");
+    let c_snap = cstr("/snap");
+    assert_eq!(
+        unsafe { fs_btrfs_subvol_is_readonly(fs, c_snap.as_ptr()) },
+        0,
+        "/snap: {}",
+        last_error()
+    );
+    // The snapshot holds the top level as it stood before: not the file
+    // written after, nor its own entry.
+    let names: Vec<String> = listing(fs, "/snap").into_iter().map(|(n, _)| n).collect();
+    assert!(!names.contains(&"later.txt".to_string()), "{names:?}");
+    assert!(!names.contains(&"snap".to_string()), "{names:?}");
+    assert_eq!(read_all(fs, "/later.txt"), b"after the snapshot");
+    unsafe { fs_btrfs_umount(fs) };
+    let _ = std::fs::remove_dir_all(image.parent().unwrap());
+}
+
+/// Every refusal returns 0 with its errno and leaves the image byte for
+/// byte as it was: NULL arguments, a read-only handle, a source that is
+/// no subvolume, a destination taken, missing or no directory, and a
+/// handle on another subvolume.
+#[test]
+fn subvol_snapshot_refusals_change_nothing() {
+    let image = fresh("snapshot-refuse");
+    let fs = mount_rw(&image);
+    let sv = subvol_create(fs, "/sv");
+    let plain = cstr("/plain");
+    assert_ne!(unsafe { fs_btrfs_mkdir(fs, plain.as_ptr(), 0o755) }, 0);
+    let file = cstr("/file");
+    assert_ne!(unsafe { fs_btrfs_create(fs, file.as_ptr(), 0o644) }, 0);
+    unsafe { fs_btrfs_umount(fs) };
+    let before = std::fs::read(&image).expect("read the image");
+    let c_img = cstr(image.to_str().unwrap());
+
+    assert_eq!(
+        subvol_snapshot(std::ptr::null_mut(), "/sv", "/snap", 0),
+        0,
+        "NULL fs"
+    );
+    assert_eq!(fs_btrfs_last_errno(), libc_errno::EIO, "NULL fs");
+
+    let ro = unsafe { fs_btrfs_mount(c_img.as_ptr()) };
+    assert!(!ro.is_null(), "mount: {}", last_error());
+    assert_eq!(subvol_snapshot(ro, "/sv", "/snap", 0), 0);
+    assert_eq!(fs_btrfs_last_errno(), libc_errno::EROFS, "read-only handle");
+    unsafe { fs_btrfs_umount(ro) };
+
+    let fs = mount_rw(&image);
+    let snap = cstr("/snap");
+    let source = cstr("/sv");
+    assert_eq!(
+        unsafe { fs_btrfs_subvol_snapshot(fs, std::ptr::null(), snap.as_ptr(), 0) },
+        0
+    );
+    assert_eq!(fs_btrfs_last_errno(), libc_errno::ENOENT, "NULL source");
+    assert_eq!(
+        unsafe { fs_btrfs_subvol_snapshot(fs, source.as_ptr(), std::ptr::null(), 0) },
+        0
+    );
+    assert_eq!(fs_btrfs_last_errno(), libc_errno::ENOENT, "NULL path");
+    for (what, source, path, errno) in [
+        ("a missing source", "/missing", "/snap", libc_errno::ENOENT),
+        (
+            "an ordinary directory",
+            "/plain",
+            "/snap",
+            libc_errno::ENOENT,
+        ),
+        ("a file as the source", "/file", "/snap", libc_errno::ENOENT),
+        ("a name taken by a file", "/sv", "/file", libc_errno::EEXIST),
+        (
+            "a name taken by a subvolume",
+            "/sv",
+            "/sv",
+            libc_errno::EEXIST,
+        ),
+        (
+            "a missing directory",
+            "/sv",
+            "/missing/snap",
+            libc_errno::ENOENT,
+        ),
+        (
+            "a file as the directory",
+            "/sv",
+            "/file/snap",
+            libc_errno::ENOTDIR,
+        ),
+        ("the top itself", "/sv", "/", libc_errno::EINVAL),
+    ] {
+        assert_eq!(subvol_snapshot(fs, source, path, 0), 0, "{what}");
+        assert_eq!(fs_btrfs_last_errno(), errno, "{what}: {}", last_error());
+    }
+    // A handle on a subvolume other than the top level snapshots nothing.
+    let sub = unsafe { fs_btrfs_open_subvolume(fs, sv) };
+    assert!(!sub.is_null(), "open /sv: {}", last_error());
+    assert_eq!(
+        subvol_snapshot(sub, "/", "/snap", 0),
+        0,
+        "a subvolume handle"
+    );
+    assert_ne!(fs_btrfs_last_errno(), 0, "a subvolume handle");
+    unsafe { fs_btrfs_umount(sub) };
+    unsafe { fs_btrfs_umount(fs) };
+
+    let after = std::fs::read(&image).expect("read the image");
+    assert!(before == after, "a refused snapshot changed the image");
+    let _ = std::fs::remove_dir_all(image.parent().unwrap());
+}
+
+/// A source whose tree is taller than one leaf is refused with ENOTSUP,
+/// the refusal naming the tree's level (#700), and the image is unchanged.
+#[test]
+fn subvol_snapshot_refuses_a_source_taller_than_a_leaf() {
+    let image = fresh("snapshot-tall");
+    let fs = mount_rw(&image);
+    // Enough inodes that the top level's tree outgrows one leaf.
+    for i in 0..200 {
+        let c = cstr(&format!("/file-{i:04}"));
+        assert_ne!(
+            unsafe { fs_btrfs_create(fs, c.as_ptr(), 0o644) },
+            0,
+            "create file-{i:04}: {}",
+            last_error()
+        );
+    }
+    unsafe { fs_btrfs_umount(fs) };
+    let before = std::fs::read(&image).expect("read the image");
+    let fs = mount_rw(&image);
+    assert_eq!(subvol_snapshot(fs, "/", "/snap", 0), 0);
+    assert_eq!(
+        fs_btrfs_last_errno(),
+        libc_errno::ENOTSUP,
+        "{}",
+        last_error()
+    );
+    assert!(last_error().contains("level"), "{}", last_error());
+    unsafe { fs_btrfs_umount(fs) };
+    let after = std::fs::read(&image).expect("read the image");
+    assert!(before == after, "a refused snapshot changed the image");
+    let _ = std::fs::remove_dir_all(image.parent().unwrap());
+}
+
 /// The errno values the header documents, as the platform numbers them.
 mod libc_errno {
     pub const ENOENT: i32 = 2;

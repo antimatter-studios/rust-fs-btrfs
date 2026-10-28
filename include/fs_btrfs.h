@@ -22,7 +22,8 @@
  * subvolume, each as one committed transaction, and
  * fs_btrfs_subvol_set_readonly and fs_btrfs_subvol_set_default change a
  * subvolume's read-only flag and which subvolume a plain mount shows;
- * fs_btrfs_subvol_create and fs_btrfs_subvol_delete make and remove one.
+ * fs_btrfs_subvol_create, fs_btrfs_subvol_snapshot and
+ * fs_btrfs_subvol_delete make, snapshot and remove one.
  * Each function below names what it refuses, with ENOTSUP. It
  * refuses rather than guesses, when reading as well: a compressed extent
  * fails with ENOTSUP rather than returning its undecoded bytes, because a
@@ -375,6 +376,19 @@ uint64_t fs_btrfs_subvol_create(fs_btrfs_fs_t *fs, const char *path,
  * another, a handle on another subvolume or quotas enabled.
  */
 int fs_btrfs_subvol_delete(fs_btrfs_fs_t *fs, const char *path);
+
+/*
+ * Snapshot the subvolume at `source` ("/" for the top level) as a new
+ * subvolume at `path`, in a directory of the top-level subvolume,
+ * read-only when `read_only` is non-zero, committed as one transaction,
+ * as `btrfs subvolume snapshot` does. Returns the snapshot's id, or 0:
+ * ENOENT when no subvolume is at `source`, and for `path` as
+ * fs_btrfs_subvol_create; EROFS on a read-only handle or top level;
+ * ENOTSUP for a source whose tree is taller than one leaf
+ * (rust-fs-btrfs#700), a handle on another subvolume or quotas enabled.
+ */
+uint64_t fs_btrfs_subvol_snapshot(fs_btrfs_fs_t *fs, const char *source,
+                                  const char *path, int read_only);
 
 /*
  * Create a symbolic link at `linkpath` whose target is `target`, stored

@@ -4,11 +4,11 @@
 //! The verbs are the shared set: `ls`, `stat`, `read`, `export`, `xattr`, `write`, `mkdir`,
 //! `get`/`info`, `set`, `resize`, and the names and lengths this library
 //! can change: `create`, `ln`, `rm`, `rmdir`, `mv`, `truncate`. `subvolume`
-//! creates or deletes a subvolume and sets its read-only flag or the default one. Metadata is
-//! JSON (or `--text`); file content is raw bytes. A case the library
-//! refuses, or a verb it cannot do yet, answers with exit status 3 and its
-//! reason, so a script moved between filesystems fails loudly instead of
-//! meaning something else.
+//! creates, snapshots or deletes a subvolume and sets its read-only flag or
+//! the default one. Metadata is JSON (or `--text`); file content is raw
+//! bytes. A case the library refuses, or a verb it cannot do yet, answers
+//! with exit status 3 and its reason, so a script moved between filesystems
+//! fails loudly instead of meaning something else.
 //!
 //! `write` changes the bytes of a file that exists, and never shortens it:
 //! a NODATACOW file in place at the same length, any other one
@@ -455,7 +455,7 @@ fn command() -> Cmd {
         )
 }
 
-/// `subvolume create|delete|set-read-only|set-default`, named as btrfs-progs
+/// `subvolume create|delete|snapshot|set-read-only|set-default`, named as btrfs-progs
 /// names them.
 fn subvolume_command() -> Cmd {
     let id = || {
@@ -466,7 +466,10 @@ fn subvolume_command() -> Cmd {
             .help("The subvolume's id, as `btrfs subvolume list` prints it (5 is the top level)")
     };
     Cmd::new("subvolume")
-        .about("Create or delete a subvolume, or set one's read-only flag or make it the default")
+        .about(
+            "Create, snapshot or delete a subvolume, or set one's read-only flag or make it the \
+             default",
+        )
         .subcommand_required(true)
         .subcommand(
             name_command(
@@ -504,6 +507,41 @@ fn subvolume_command() -> Cmd {
                  exit 4; the default subvolume, one holding another subvolume, a read-only \
                  top level or a volume with quotas enabled with exit 3 (rust-fs-btrfs#267).",
             ),
+        )
+        .subcommand(
+            Cmd::new("snapshot")
+                .about("Snapshot a subvolume, as btrfs subvolume snapshot does")
+                .arg(
+                    Arg::new("source")
+                        .value_name("SOURCE")
+                        .required(true)
+                        .value_parser(value_parser!(OsString))
+                        .help("The path of the subvolume to snapshot (/ is the top level)"),
+                )
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(OsString))
+                        .help("Where the snapshot goes"),
+                )
+                .arg(
+                    Arg::new("read-only")
+                        .short('r')
+                        .long("read-only")
+                        .action(ArgAction::SetTrue)
+                        .help("Make the snapshot read-only"),
+                )
+                .after_help(
+                    "Examples:\n  fs.btrfs disk.img subvolume snapshot /home /home-2026\n  \
+                     fs.btrfs disk.img subvolume snapshot --read-only / /snapshots/top\n\n\
+                     What `btrfs subvolume snapshot` does, committed as one transaction. The \
+                     snapshot's parent must be a directory of the top-level subvolume, and the \
+                     report carries its id. A source that is no subvolume, a name already \
+                     there or a missing parent is refused with exit 4; a read-only top level, \
+                     a volume with quotas enabled or a source whose tree is taller than one \
+                     leaf with exit 3 (rust-fs-btrfs#700).",
+                ),
         )
         .subcommand(
             Cmd::new("set-read-only")
@@ -809,6 +847,31 @@ fn subvolume(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Outcome
                 ("id", Json::from(id)),
             ]))
             .with_text(format!("deleted subvolume {} (id {id})", show(path))))
+        }
+        "snapshot" => {
+            let source = os_bytes(sub.get_one::<OsString>("source").expect("clap requires it"));
+            let path = path_arg(sub);
+            let read_only = sub.get_flag("read-only");
+            let from = fs
+                .subvolume_at(source)
+                .map_err(|e| state_error(source, e))?;
+            let (parent, name) = split_parent(&fs, path)?;
+            refuse_taken(&fs, parent.ino, name, path)?;
+            let id = fs
+                .create_snapshot(from, parent.ino, name, read_only)
+                .map_err(|e| state_error(path, e))?;
+            Ok(Outcome::report(Json::object([
+                ("source", Json::from(show(source))),
+                ("path", Json::from(show(path))),
+                ("created", Json::from(true)),
+                ("id", Json::from(id)),
+                ("read_only", Json::from(read_only)),
+            ]))
+            .with_text(format!(
+                "created snapshot {} of {} (id {id})",
+                show(path),
+                show(source)
+            )))
         }
         "set-read-only" => {
             let read_only = *sub.get_one::<bool>("read-only").expect("clap requires it");
