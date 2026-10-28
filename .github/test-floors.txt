@@ -86,7 +86,7 @@ cli_subvolume             6
 cli_write_kernel          1
 cli_xattr                 2
 cli_xattr_kernel          2
-clone_kernel              1
+clone_kernel              2
 commit_order              3
 compat_ro_write_refusal   2
 compressed_extent_window  3

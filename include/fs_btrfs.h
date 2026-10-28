@@ -429,18 +429,18 @@ int fs_btrfs_truncate(fs_btrfs_fs_t *fs, const char *path, uint64_t size);
 /*
  * Clone `len` bytes of the regular file at `src`, from `src_offset`, into
  * the regular file at `dst` at `dst_offset`, as one committed transaction:
- * the two then share those extents, and no data is copied. A `len` of 0
- * clones to the end of `src`, as FICLONERANGE does; `src` and `dst` may be
- * one file when the ranges do not overlap. A later write into either copy
- * is refused (ENOTSUP), as a write into any shared extent is; truncating
- * or unlinking one leaves the extents to the other. Returns 0, or -1:
- * ENOENT for no such path, EISDIR for anything but a regular file, EROFS
- * on a read-only handle, ENOTSUP for a range the kernel would refuse
- * (offsets that are not whole sectors, a length that is not either and
- * does not reach the end of `src`, a range past that end) and for what
- * cannot be written yet: a destination range that already holds data,
- * inline data, an extent whose references are kept as items of their own,
- * or a volume without the no-holes feature.
+ * the two then share those extents, no data is copied, and whatever `dst`
+ * held in the range is replaced. A `len` of 0 clones to the end of `src`,
+ * as FICLONERANGE does; `src` and `dst` may be one file when the ranges do
+ * not overlap. A later write into either copy copies the extent it lands
+ * in; truncating or unlinking one leaves the extents to the other.
+ * Returns 0, or -1: ENOENT for no such path, EISDIR for anything but a
+ * regular file, EROFS on a read-only handle, ENOTSUP for a range the
+ * kernel would refuse (offsets that are not whole sectors, a length that
+ * is not either and does not reach the end of `src`, a range past that
+ * end) and for what cannot be written yet: inline data, an extent the
+ * clone adds a reference to whose references are kept as items of their
+ * own, or a volume without the no-holes feature.
  */
 int fs_btrfs_clone_range(fs_btrfs_fs_t *fs, const char *src, uint64_t src_offset,
                          const char *dst, uint64_t dst_offset, uint64_t len);
