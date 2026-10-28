@@ -46,6 +46,8 @@ block_group_used          1
 bootstrap_chain           2
 btree_oracle              4
 capi                      39
+# The C ABI defragment, held to the library's on a twin image (#305).
+capi_defrag               3
 capi_pool                 5
 # Deleting through the C ABI: two no-tool cases on this crate's mkfs volume
 # and one refusal on the kernel-made fixture (#267).
@@ -62,6 +64,9 @@ chunk_tree_items          3
 ci_profile                67
 cli_dispatch              15
 cli_docs                  2
+# fs.btrfs defragment, held to the library's, and judged by the kernel (#305).
+cli_defrag                4
+cli_defrag_kernel         1
 # One unit contract and two independent-kernel export cases (#540).
 cli_export                1
 cli_export_kernel         2
