@@ -3,7 +3,8 @@
 //!
 //! The verbs are the shared set: `ls`, `stat`, `read`, `export`, `xattr`, `write`, `mkdir`,
 //! `get`/`info`, `set`, `resize`, and the names and lengths this library
-//! can change: `create`, `ln`, `rm`, `rmdir`, `mv`, `truncate`. `subvolume`
+//! can change: `create`, `ln`, `rm`, `rmdir`, `mv`, `truncate`. `defragment`
+//! rewrites a file's runs of extents as one. `subvolume`
 //! creates or deletes a subvolume and sets its read-only flag or the default one. Metadata is
 //! JSON (or `--text`); file content is raw bytes. A case the library
 //! refuses, or a verb it cannot do yet, answers with exit status 3 and its
@@ -62,9 +63,10 @@ fn command() -> Cmd {
              Metadata is JSON on stdout (--text for people); `read` and a named `xattr` \
              write raw bytes. A failure is {\"error\": \"...\", \"code\": N} on stderr, N being the \
              exit status: 1 failed, 2 wrong command line, 3 not implemented or refused, 4 \
-             refused by the volume's state (rm, rmdir, mv, ln, mkdir, subvolume or truncate meeting a \
-             directory that is not empty, a name already there, a missing target or a part \
-             of the path that is not a directory).\n\n\
+             refused by the volume's state (rm, rmdir, mv, ln, mkdir, subvolume, truncate or defragment \
+             meeting a directory that is not empty, a name already there, a missing target, a \
+             part of the path that is not a directory or, for defragment, a path that is not a \
+             regular file).\n\n\
              Writing is limited to what this library can do safely: `write` overwrites \
              an existing file at the same length, a NODATACOW file in place and any other \
              copy-on-write, committed as one transaction. What that cannot do yet answers \
@@ -391,6 +393,38 @@ fn command() -> Cmd {
                      answers with exit 3 and its reason (rust-fs-btrfs#262).",
                 ),
         )
+        .subcommand(
+            Cmd::new("defragment")
+                .about("Rewrite each run of a file's extents as one, copy-on-write")
+                .arg(
+                    Arg::new("target")
+                        .long("target")
+                        .short('t')
+                        .value_name("SIZE")
+                        .help(
+                            "Leave extents at least this long alone, and make none longer \
+                             (32M unless given; K, M, G are powers of 1024)",
+                        ),
+                )
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .after_help(
+                    "Examples:\n  fs.btrfs disk.img defragment /var/log/syslog\n  \
+                     fs.btrfs disk.img defragment --target 1M /data.db\n\n\
+                     As `btrfs filesystem defragment -t SIZE` does for one file: each run \
+                     of adjacent extents shorter than SIZE is copied into one new extent, \
+                     committed as one transaction, and the file reads the same bytes. \
+                     Inline, preallocated and compressed extents are left as they are; a \
+                     reflink's extents are copied and the file's reference dropped. Only \
+                     the top-level subvolume is written. A missing path or one that is not \
+                     a regular file exits 4; an extent a snapshot may share, and what the \
+                     library cannot write yet, exit 3 (rust-fs-btrfs#305).",
+                ),
+        )
         .subcommand(key_command(
             "get",
             "Report the filesystem's properties, or one of them",
@@ -643,6 +677,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         "mkdir" if sub.get_flag("parents") => mkdir_parents(target, offset, sub),
         "mkdir" | "create" | "rm" | "rmdir" | "ln" | "mv" => names(target, offset, verb, sub),
         "truncate" => truncate(target, offset, sub),
+        "defragment" => defragment(target, offset, sub),
         "get" | "info" => get(
             target,
             offset,
@@ -1103,6 +1138,55 @@ fn truncate(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Outcome,
         .map_err(|e| state_error(path, e))?;
     let report = Json::object([("path", Json::from(show(path))), ("size", Json::from(size))]);
     Ok(Outcome::report(report).with_text(format!("{} is {size} bytes", show(path))))
+}
+
+fn defragment(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Outcome, CliError> {
+    let path = path_arg(sub);
+    let size = match sub.get_one::<String>("target") {
+        None => fs_btrfs::defrag::DEFRAG_TARGET,
+        Some(spec) => super::mkfs::parse_bytes(spec)
+            .filter(|n| *n > 0)
+            .ok_or_else(|| {
+                CliError::usage(format!("defragment --target {spec}: not a size (64K, 32M)"))
+            })?,
+    };
+    let dev = device::open_rw(target, offset)?;
+    let mut fs = Filesystem::mount_rw(dev).map_err(|e| {
+        btrfs_error(
+            format!("{} (read-write)", target.to_string_lossy()).as_bytes(),
+            e,
+        )
+    })?;
+    let inode = fs
+        .lookup_path_bytes(path)
+        .map_err(|e| state_error(path, e))?;
+    // A path that is not a regular file is the volume's state refusing,
+    // exit 4, as a missing one is.
+    if !inode.is_regular_file() {
+        return Err(CliError::refused_by_state(format!(
+            "{}: {}",
+            show(path),
+            Error::NotAFile
+        )));
+    }
+    let done = fs
+        .defragment_to(inode.ino, size)
+        .map_err(|e| state_error(path, e))?;
+    let report = Json::object([
+        ("path", Json::from(show(path))),
+        ("items_before", Json::from(done.items_before as u64)),
+        ("items_after", Json::from(done.items_after as u64)),
+        ("runs", Json::from(done.runs as u64)),
+        ("bytes", Json::from(done.bytes)),
+    ]);
+    Ok(Outcome::report(report).with_text(format!(
+        "{}: {} extent items to {}, {} run(s) of {} bytes rewritten",
+        show(path),
+        done.items_before,
+        done.items_after,
+        done.runs,
+        done.bytes
+    )))
 }
 
 /// What `resize SIZE` asks for: a size, a change to the current one, or

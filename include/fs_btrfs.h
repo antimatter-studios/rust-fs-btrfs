@@ -445,6 +445,32 @@ int fs_btrfs_truncate(fs_btrfs_fs_t *fs, const char *path, uint64_t size);
 int fs_btrfs_clone_range(fs_btrfs_fs_t *fs, const char *src, uint64_t src_offset,
                          const char *dst, uint64_t dst_offset, uint64_t len);
 
+/* What fs_btrfs_defragment did. */
+typedef struct {
+    uint64_t items_before; /* the file's extent items before, holes included */
+    uint64_t items_after;  /* and after: each run rewritten is one item */
+    uint64_t runs;         /* runs rewritten, each into one new extent */
+    uint64_t bytes;        /* bytes copied into them */
+} fs_btrfs_defrag_t;
+
+/*
+ * Rewrite each run of the regular file at `path`'s adjacent extents
+ * shorter than `target` bytes as one extent, copy-on-write, as one
+ * committed transaction. A `target` of 0 is the default, 32 MiB, as
+ * `btrfs filesystem defragment` without -t. Inline, preallocated and
+ * compressed extents, and an extent the file references twice, are left
+ * as they are; a reflink's extents are copied and the file's reference
+ * dropped, as the kernel does. A file with no such run is left untouched.
+ * `out`, when not NULL, receives the counts.
+ * Returns 0, or -1: ENOENT for no such path, EISDIR for anything but a
+ * regular file, EROFS on a read-only handle, ENOTSUP for a target shorter
+ * than a sector, a handle on a subvolume other than the top level, an
+ * extent a snapshot may share, or what the copy-on-write transaction
+ * cannot write yet.
+ */
+int fs_btrfs_defragment(fs_btrfs_fs_t *fs, const char *path, uint64_t target,
+                        fs_btrfs_defrag_t *out);
+
 /* ---- attributes ---- */
 
 /*

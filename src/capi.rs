@@ -1762,6 +1762,82 @@ pub unsafe extern "C" fn fs_btrfs_clone_range(
     })
 }
 
+/// What [`fs_btrfs_defragment`] did, as [`crate::defrag::Defragmented`]
+/// counts it.
+#[repr(C)]
+pub struct fs_btrfs_defrag_t {
+    /// The file's `EXTENT_DATA` items before, holes and inline data
+    /// included.
+    pub items_before: u64,
+    /// And after: each run rewritten is one item.
+    pub items_after: u64,
+    /// How many runs were rewritten, each into one new extent.
+    pub runs: u64,
+    /// The bytes copied into them.
+    pub bytes: u64,
+}
+
+/// Rewrite each run of the regular file at `path`'s adjacent extents
+/// shorter than `target` bytes as one extent, copy-on-write, as one
+/// committed transaction (#305). A `target` of 0 is the default, 32 MiB,
+/// as `btrfs filesystem defragment` without `-t`. A file with no such run
+/// is left untouched and nothing is committed. `out`, when not NULL,
+/// receives the counts.
+///
+/// Returns 0, or -1 with the error recorded: ENOENT for no such path,
+/// EISDIR for anything but a regular file, EROFS on a read-only handle,
+/// and ENOTSUP for a target shorter than a sector, a handle on a
+/// subvolume other than the top level, an extent a snapshot may share,
+/// and every refusal of the copy-on-write transaction.
+///
+/// # Safety
+///
+/// `fs` must be a live handle, `path` NUL-terminated, and `out` NULL or
+/// writable.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_defragment(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+    target: u64,
+    out: *mut fs_btrfs_defrag_t,
+) -> c_int {
+    guard(-1, || {
+        let Some(fs) = (unsafe { handle_mut(fs) }) else {
+            return -1;
+        };
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
+            return -1;
+        };
+        let target = if target == 0 {
+            crate::defrag::DEFRAG_TARGET
+        } else {
+            target
+        };
+        let done = fs
+            .lookup_path_bytes(path)
+            .and_then(|inode| fs.defragment_to(inode.ino, target));
+        match done {
+            Ok(done) => {
+                if !out.is_null() {
+                    unsafe {
+                        *out = fs_btrfs_defrag_t {
+                            items_before: done.items_before as u64,
+                            items_after: done.items_after as u64,
+                            runs: done.runs as u64,
+                            bytes: done.bytes,
+                        };
+                    }
+                }
+                0
+            }
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
+}
+
 // ---------------------------------------------------------------------
 // Attributes (#263): extended attributes, mode, owner, times
 // ---------------------------------------------------------------------
