@@ -1713,18 +1713,18 @@ pub unsafe extern "C" fn fs_btrfs_truncate(
 
 /// Clone `len` bytes of the regular file at `src`, from `src_offset`,
 /// into the regular file at `dst` at `dst_offset`, as one committed
-/// transaction (#269): the two share those extents, and no data is
-/// copied. A `len` of zero clones to the end of `src`, as `FICLONERANGE`
-/// does; `src` and `dst` may be one file when the ranges do not overlap.
+/// transaction (#269): the two share those extents, no data is copied,
+/// and whatever `dst` held in the range is replaced. A `len` of zero
+/// clones to the end of `src`, as `FICLONERANGE` does; `src` and `dst`
+/// may be one file when the ranges do not overlap.
 ///
 /// Returns 0, or -1 with the error recorded: ENOENT for no such path,
 /// EISDIR for anything but a regular file, EROFS on a read-only handle,
 /// and ENOTSUP for a range the kernel's rules refuse (offsets that are
 /// not whole sectors, a length that is not either and does not reach the
 /// end of `src`, a range past that end) and for what cannot be written
-/// yet: a destination range that already holds data, inline data, an
-/// extent whose references are kept as items of their own, a volume
-/// without no-holes.
+/// yet: inline data, an extent the clone adds a reference to whose
+/// references are kept as items of their own, a volume without no-holes.
 ///
 /// # Safety
 ///

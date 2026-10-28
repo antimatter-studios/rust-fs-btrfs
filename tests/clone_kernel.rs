@@ -29,6 +29,14 @@
 //! - and the kernel writes to, truncates and deletes the clones and their
 //!   sources, which finds and drops each reference this crate added, and
 //!   `btrfs check` looks again.
+//!
+//! A second volume holds destinations of three kernel-written extents
+//! each, one of them reflinked, and every range is cloned over data the
+//! destination already holds: an item covered exactly, one split by the
+//! range, one cut short and one started again, one whose extent another
+//! file shares, and one the clone grows past. The same oracles judge it,
+//! and the kernel's `FICLONERANGE` into twin destinations must leave the
+//! same items and the same references.
 
 use fs_btrfs::capi::*;
 use fs_btrfs::extent_write::data_ref_hash;
@@ -87,6 +95,33 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(name: &str) -> Self {
+        Self::made_by(
+            name,
+            "cd \"$MNT\"\n\
+             head -c 65536 /dev/urandom > multi\n\
+             sync\n\
+             head -c 65536 /dev/urandom >> multi\n\
+             sync\n\
+             head -c 65536 /dev/urandom >> multi\n\
+             sync\n\
+             head -c 10000 /dev/urandom > odd\n\
+             head -c 65536 /dev/urandom > self\n\
+             touch dst part odd2 r1 r2 r3 r4 r5 blank\n\
+             touch nosum\n\
+             chattr +C nosum\n\
+             head -c 8192 /dev/urandom >> nosum\n\
+             head -c 4096 /dev/urandom > k\n\
+             for i in 1 2 3 4 5; do cp --reflink=always k k.$i; done\n\
+             head -c 4096 /dev/urandom > many\n\
+             for i in $(seq 1 40); do cp --reflink=always many many.$i; done\n\
+             mkdir dir\n\
+             sync",
+        )
+    }
+
+    /// A no-holes volume of 4 KiB sectors, filled by the kernel running
+    /// `script` in the guest.
+    fn made_by(name: &str, script: &str) -> Self {
         let dir = PathBuf::from(temp_path!("{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         let image = dir.join("fs.img");
@@ -102,30 +137,7 @@ impl Scratch {
             "mkfs.btrfs: {}",
             String::from_utf8_lossy(&made.stderr)
         );
-        guest_kernel_write_ok(
-            &image.to_string_lossy(),
-            name,
-            "cd \"$MNT\"\n\
-             head -c 65536 /dev/urandom > multi\n\
-             sync\n\
-             head -c 65536 /dev/urandom >> multi\n\
-             sync\n\
-             head -c 65536 /dev/urandom >> multi\n\
-             sync\n\
-             head -c 10000 /dev/urandom > odd\n\
-             head -c 65536 /dev/urandom > self\n\
-             head -c 8192 /dev/urandom > full\n\
-             touch dst part odd2 r1 r2 r3 r4 r5 blank\n\
-             touch nosum\n\
-             chattr +C nosum\n\
-             head -c 8192 /dev/urandom >> nosum\n\
-             head -c 4096 /dev/urandom > k\n\
-             for i in 1 2 3 4 5; do cp --reflink=always k k.$i; done\n\
-             head -c 4096 /dev/urandom > many\n\
-             for i in $(seq 1 40); do cp --reflink=always many many.$i; done\n\
-             mkdir dir\n\
-             sync",
-        );
+        guest_kernel_write_ok(&image.to_string_lossy(), name, script);
         Scratch(dir)
     }
 
@@ -479,8 +491,6 @@ fn ranges_cloned_through_the_abi_share_their_extents_and_the_kernel_agrees() {
     refused(fs, "/multi", 0, "/blank", 0, 5000, ENOTSUP);
     // Past the source's end.
     refused(fs, "/odd", 0, "/blank", 0, 20_000, ENOTSUP);
-    // Over data the destination already holds.
-    refused(fs, "/multi", 0, "/full", 0, 4096, ENOTSUP);
     // A file into itself, over the range it reads.
     refused(fs, "/self", 0, "/self", 4096, 65_536, ENOTSUP);
     // A checksummed file into one that is not, and back.
@@ -722,5 +732,279 @@ fn ranges_cloned_through_the_abi_share_their_extents_and_the_kernel_agrees() {
     assert_eq!(
         last, want,
         "the kernel reads the clones differently after changing them"
+    );
+}
+
+/// Each clone over data the destination already holds: the source's
+/// offset, the file cloned into through the ABI, its twin the kernel
+/// clones into, the destination's offset and the length. Each destination
+/// is three 64 KiB extents the kernel wrote, and the source two.
+const OVER_DATA: [(u64, &str, &str, u64, u64); 5] = [
+    // Exactly the middle item: deleted, and its extent released.
+    (0, "d1", "k1", 65_536, 65_536),
+    // Inside the first item: split in two, both halves naming its
+    // extent at one reference offset.
+    (4096, "d2", "k2", 16_384, 4096),
+    // Into the first item and out of the last: the first cut short, the
+    // middle deleted, the last started again.
+    (0, "d3", "k3", 32_768, 131_072),
+    // The first item, whose extent `/s4` shares: one reference dropped,
+    // and the extent kept for `/s4`.
+    (0, "d4", "k4", 0, 65_536),
+    // The last item and on past the end: the file grows.
+    (0, "d5", "k5", 131_072, 131_072),
+];
+
+/// The kernel's own clones of [`OVER_DATA`], into the twins, through
+/// `FICLONERANGE` as [`KERNEL_CLONES`] makes them; then the inodes this
+/// test compares.
+fn kernel_clones_over_data() -> String {
+    let calls: String = OVER_DATA
+        .iter()
+        .map(|(from, _, twin, at, len)| format!("    ('{twin}', {from}, {at}, {len}),\n"))
+        .collect();
+    format!(
+        "cd \"$MNT\"\n\
+         python3 - <<'PY'\n\
+         import fcntl, os, struct\n\
+         FICLONERANGE = 0x4020940d\n\
+         for dst, src_offset, dst_offset, length in [\n{calls}]:\n\
+         \x20   s = os.open('src', os.O_RDONLY)\n\
+         \x20   d = os.open(dst, os.O_WRONLY)\n\
+         \x20   fcntl.ioctl(d, FICLONERANGE, struct.pack('=qQQQ', s, src_offset, length, dst_offset))\n\
+         \x20   os.close(s)\n\
+         \x20   os.close(d)\n\
+         PY\n\
+         sync\n\
+         for f in src s4 ks4 d1 d2 d3 d4 d5 k1 k2 k3 k4 k5; do \
+           printf '%s %s\\n' \"$f\" \"$(stat -c %i \"$f\")\"; done\n"
+    )
+}
+
+/// Inode `ino`'s extent items with each extent named by what it is rather
+/// than where it is: `src N` for the source's `N`th extent, which both
+/// twins share at one address, and `own N` for the `N`th of the file's
+/// own, which the kernel wrote at a different address in each twin.
+fn item_shapes(fs_tree: &str, ino: u64, source: &[u64]) -> Vec<(u64, String, u64, u64, u64)> {
+    let mut own: Vec<u64> = Vec::new();
+    extent_items(fs_tree, ino)
+        .into_iter()
+        .map(|[key, bytenr, disk_len, within, len]| {
+            let name = match source.iter().position(|b| *b == bytenr) {
+                Some(n) => format!("src {n}"),
+                None => {
+                    let n = own.iter().position(|b| *b == bytenr).unwrap_or_else(|| {
+                        own.push(bytenr);
+                        own.len() - 1
+                    });
+                    format!("own {n}")
+                }
+            };
+            (key, name, disk_len, within, len)
+        })
+        .collect()
+}
+
+/// The data references naming inode `ino`, inline or keyed: for each, its
+/// record's total when the extent is the file's own rather than one of
+/// the source's (whose totals count both twins' clones), its offset and
+/// its count.
+fn references_naming(tree: &ExtentTree, ino: u64, source: &[u64]) -> Vec<(Option<u64>, u64, u64)> {
+    let mut found: Vec<(Option<u64>, u64, u64)> = tree
+        .records
+        .iter()
+        .flat_map(|(bytenr, record)| {
+            let total = (!source.contains(bytenr)).then_some(record.refs);
+            record
+                .inline
+                .iter()
+                .filter(|d| d.root == 5 && d.objectid == ino)
+                .map(move |d| (total, d.offset, d.count))
+        })
+        .collect();
+    assert!(
+        !tree.keyed.iter().any(|(_, d)| d.objectid == ino),
+        "inode {ino} holds references filed as items of their own, which this test does not \
+         compare"
+    );
+    found.sort_unstable();
+    found
+}
+
+#[test]
+fn ranges_cloned_over_data_the_destination_holds_replace_it_and_the_kernel_agrees() {
+    let scratch = Scratch::made_by(
+        "clone-over-data-kernel",
+        "cd \"$MNT\"\n\
+         head -c 65536 /dev/urandom > src\n\
+         sync\n\
+         head -c 65536 /dev/urandom >> src\n\
+         sync\n\
+         for f in d1 d2 d3 d4 d5 k1 k2 k3 k4 k5; do\n\
+           for i in 1 2 3; do head -c 65536 /dev/urandom >> \"$f\"; sync; done\n\
+         done\n\
+         cp --reflink=always d4 s4\n\
+         cp --reflink=always k4 ks4\n\
+         sync",
+    );
+    let image = scratch.image();
+
+    let fs = unsafe { fs_btrfs_mount_rw(c(&image).as_ptr()) };
+    assert!(!fs.is_null(), "mount_rw: {}", last_error());
+    let src = read(fs, "/src", 1 << 20);
+    assert_eq!(src.len(), 131_072, "/src is not the size made");
+
+    // What each destination holds once the clone replaces its range.
+    let mut want: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
+    for (from, dst, _, at, len) in OVER_DATA {
+        let mut bytes = read(fs, &format!("/{dst}"), 1 << 20);
+        assert_eq!(bytes.len(), 196_608, "/{dst} is not the size made");
+        let (from, at, len) = (from as usize, at as usize, len as usize);
+        bytes.resize(bytes.len().max(at + len), 0);
+        bytes[at..at + len].copy_from_slice(&src[from..from + len]);
+        want.insert(dst, bytes);
+    }
+    let s4 = read(fs, "/s4", 1 << 20);
+
+    for (from, dst, _, at, len) in OVER_DATA {
+        cloned(fs, "/src", from, &format!("/{dst}"), at, len);
+    }
+    for (dst, bytes) in &want {
+        assert!(
+            read(fs, &format!("/{dst}"), 1 << 20) == *bytes,
+            "/{dst} does not read back as its range replaced by /src's"
+        );
+    }
+    assert!(read(fs, "/s4", 1 << 20) == s4, "/s4 changed with /d4");
+    unsafe { fs_btrfs_umount(fs) };
+
+    // The checker: each released extent's record, free space and
+    // checksums gone, each extent still shared counted down, and every
+    // file's byte count what its items add up to.
+    assert_btrfs_check_clean(
+        Path::new(&image),
+        "after ranges were cloned over data through the ABI",
+    );
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "btrfs check --check-data-csum finds data that disagrees with its digests:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    // What the kernel reads.
+    let names: Vec<&str> = want.keys().copied().chain(["src", "s4"]).collect();
+    let seen = guest_kernel_read_ok(
+        &image,
+        "after the ABI's clones over data",
+        &format!(
+            "cd \"$MNT\"\n\
+             for f in {all}; do \
+               printf '%s %s %s\\n' \"$f\" \"$(stat -c %s \"$f\")\" \
+                 \"$(sha256sum \"$f\" | cut -d' ' -f1)\"; done",
+            all = names.join(" ")
+        ),
+    );
+    let expected: String = want
+        .iter()
+        .map(|(name, bytes)| (*name, bytes.as_slice()))
+        .chain([("src", src.as_slice()), ("s4", s4.as_slice())])
+        .map(|(name, bytes)| format!("{name} {} {}\n", bytes.len(), sha256_hex(bytes)))
+        .collect();
+    assert_eq!(
+        seen, expected,
+        "the kernel reads the files cloned over differently"
+    );
+    guest_kernel_write_ok(&image, "scrub", "btrfs scrub start -B \"$MNT\" >/dev/null");
+
+    // The kernel makes the same clones into the twins, and the items and
+    // references it leaves must be the ones written here.
+    let twins = guest_kernel_write_ok(
+        &image,
+        "the kernel's own clones over data",
+        &kernel_clones_over_data(),
+    );
+    let ino: BTreeMap<&str, u64> = twins
+        .lines()
+        .map(|line| {
+            let (name, n) = line.split_once(' ').unwrap();
+            (name, n.parse().unwrap())
+        })
+        .collect();
+    let fs_tree = dump_tree(Path::new(&image), "5");
+    let source: Vec<u64> = extent_items(&fs_tree, ino["src"])
+        .iter()
+        .map(|item| item[1])
+        .collect();
+    assert_eq!(source.len(), 2, "/src is not two extents: {source:?}");
+    let extents = extent_tree(&image);
+    for (_, ours, kernels, _, _) in OVER_DATA {
+        let mine = item_shapes(&fs_tree, ino[ours], &source);
+        assert!(
+            mine.iter().any(|(_, name, ..)| name.starts_with("src")),
+            "/{ours} names none of /src's extents: {mine:?}"
+        );
+        assert_eq!(
+            mine,
+            item_shapes(&fs_tree, ino[kernels], &source),
+            "/{ours}'s extent items are not the ones the kernel made for /{kernels}"
+        );
+        assert_eq!(
+            references_naming(&extents, ino[ours], &source),
+            references_naming(&extents, ino[kernels], &source),
+            "the references naming /{ours} are not the ones naming /{kernels}"
+        );
+    }
+    assert_eq!(
+        extent_items(&fs_tree, ino["s4"]).len(),
+        3,
+        "/s4 no longer names three extents"
+    );
+
+    // The kernel deletes, writes into and truncates what the clones left:
+    // each reference added or dropped here is one it has to find.
+    let ones = vec![b'x'; 4096];
+    guest_kernel_write_ok(
+        &image,
+        "the kernel changes the files cloned over",
+        "cd \"$MNT\"\n\
+         rm src d1 s4\n\
+         head -c 4096 /dev/zero | tr '\\0' x | dd of=d2 bs=4096 seek=4 conv=notrunc status=none\n\
+         head -c 4096 /dev/zero | tr '\\0' x | dd of=d3 bs=4096 seek=10 conv=notrunc status=none\n\
+         truncate -s 100000 d5\n\
+         sync",
+    );
+    assert_btrfs_check_clean(
+        Path::new(&image),
+        "after the kernel changed the files cloned over",
+    );
+    let mut after = want.clone();
+    after.remove("d1");
+    after.get_mut("d2").unwrap()[16_384..20_480].copy_from_slice(&ones);
+    after.get_mut("d3").unwrap()[40_960..45_056].copy_from_slice(&ones);
+    after.get_mut("d5").unwrap().truncate(100_000);
+    let last = guest_kernel_read_ok(
+        &image,
+        "after the kernel's changes",
+        &format!(
+            "cd \"$MNT\"\n\
+             for f in {all}; do \
+               printf '%s %s %s\\n' \"$f\" \"$(stat -c %s \"$f\")\" \
+                 \"$(sha256sum \"$f\" | cut -d' ' -f1)\"; done",
+            all = after.keys().copied().collect::<Vec<_>>().join(" ")
+        ),
+    );
+    let expected: String = after
+        .iter()
+        .map(|(name, bytes)| format!("{name} {} {}\n", bytes.len(), sha256_hex(bytes)))
+        .collect();
+    assert_eq!(
+        last, expected,
+        "the kernel reads the files cloned over differently after changing them"
     );
 }

@@ -9,11 +9,20 @@
 //! offset the extent's first byte would sit at. Nothing is allocated, so
 //! the free-space tree, the block groups' `used` and the checksum tree --
 //! keyed by disk address, and so already covering the shared bytes -- do
-//! not change. The destination's size and `nbytes` grow by what it gains,
-//! and its change and modification times move, as the kernel's clone
-//! moves them. It is one committed transaction on the top-level
-//! subvolume, through the same planner and commit as
-//! [`crate::truncate`].
+//! not change. The destination's size grows to cover what it gains, its
+//! `nbytes` is counted again from its items, and its change and
+//! modification times move, as the kernel's clone moves them. It is one
+//! committed transaction on the top-level subvolume, through the same
+//! planner and commit as [`crate::truncate`].
+//!
+//! What the destination held in the range is replaced, as the kernel's
+//! clone replaces it: an item wholly inside the range is deleted, and its
+//! extent released when the deleted items were all its references, or
+//! the items' references dropped from it when anything else still holds
+//! one; an item that runs into the range is cut short at its start, one
+//! that runs out of it starts again at its end, and one that runs through
+//! it is split in two, the second half adding a reference to the extent
+//! both halves name.
 //!
 //! The kernel's rules for the range hold here too: both offsets are whole
 //! sectors, and so is the length unless it runs to the source's end, in
@@ -22,21 +31,21 @@
 //! source's end, as `FICLONERANGE` does. A file may be cloned into itself
 //! where the two ranges do not overlap.
 //!
-//! A write into either copy afterwards is refused, as a write into any
-//! shared extent is (#261); truncating or unlinking one drops its
-//! references and leaves the extents to the other (#262).
+//! A write into either copy afterwards copies the extent it lands in and
+//! drops that copy's reference (#261); truncating or unlinking one drops
+//! its references and leaves the extents to the other (#262).
 //!
 //! # What it refuses
 //!
-//! - a destination range that already holds data, or a destination with
-//!   inline data: replacing what is there means releasing it, which a
-//!   clone does not do yet;
+//! - a destination with inline data: replacing or keeping it beside the
+//!   clone means moving that data into an extent, which a clone does not
+//!   do yet;
 //! - inline data in the source range, and encrypted or otherwise encoded
 //!   extents;
-//! - an extent whose references are kept as items of their own, or would
-//!   be once this one is added -- the kernel files them so past about 33
-//!   references at a 16 KiB node -- since filing a reference that way is
-//!   not written;
+//! - an extent the clone adds a reference to whose references are kept as
+//!   items of their own, or would be once this one is added -- the kernel
+//!   files them so past about 33 references at a 16 KiB node -- since
+//!   filing a reference that way is not written;
 //! - a volume without the no-holes feature, where a hole in the range
 //!   would have to be recorded as an item;
 //! - growing a destination whose last sector is partly past its end, as
@@ -48,13 +57,15 @@
 //! A range that breaks the kernel's rules is refused the same way as what
 //! is not written yet, with [`Error::UnsupportedFeature`] naming the rule.
 
+use std::collections::BTreeMap;
+
 use crate::backref::{EXTENT_DATA_REF, SHARED_DATA_REF};
 use crate::chunk::{objectid, DiskKey};
 use crate::error::{Error, Result};
 use crate::fs::{file_extent as fe, Filesystem, EXTENT_DATA_KEY};
-use crate::inode::{offsets as io, INODE_ITEM_KEY, INODE_NODATASUM};
+use crate::inode::{offsets as io, Inode, INODE_ITEM_KEY, INODE_NODATASUM};
 use crate::leaf_edit::OwnedItem;
-use crate::transaction::{DataShare, DataWrite, ItemEdit};
+use crate::transaction::{DataRelease, DataShare, DataWrite, ItemEdit};
 use crate::write::window_inside_extent;
 
 /// `BTRFS_FILE_EXTENT_INLINE`.
@@ -63,9 +74,10 @@ const INLINE: u8 = 0;
 impl Filesystem {
     /// Clone `len` bytes of regular file `src`, from `src_offset`, into
     /// regular file `dst` at `dst_offset`, as one committed transaction:
-    /// the two then share those extents. A `len` of zero clones to the end
-    /// of `src`. `src` and `dst` may be the same file when the two ranges
-    /// do not overlap.
+    /// the two then share those extents, and whatever `dst` held in the
+    /// range is replaced. A `len` of zero clones to the end of `src`.
+    /// `src` and `dst` may be the same file when the two ranges do not
+    /// overlap.
     ///
     /// # Errors
     ///
@@ -82,6 +94,17 @@ impl Filesystem {
         dst_offset: u64,
         len: u64,
     ) -> Result<()> {
+        let (source, target) = self.remap_inodes(src, dst)?;
+        let range = self.clone_span(src, &source, src_offset, dst, &target, dst_offset, len)?;
+        let Some(span) = range else {
+            return Ok(());
+        };
+        self.remap(src, src_offset, dst, &target, dst_offset, span)
+    }
+
+    /// The two inodes a clone joins, once both are regular
+    /// files on a writable top-level subvolume that may be joined.
+    fn remap_inodes(&self, src: u64, dst: u64) -> Result<(Inode, Inode)> {
         self.require_writable_top_level()?;
         let source = self.read_inode(src)?;
         let target = self.read_inode(dst)?;
@@ -102,13 +125,26 @@ impl Filesystem {
                     .into(),
             ));
         }
+        Ok((source, target))
+    }
 
-        let range = self.clone_span(src, &source, src_offset, dst, &target, dst_offset, len)?;
-        let Some(Span { len, span }) = range else {
-            return Ok(());
-        };
+    /// Put clones of `src`'s items over `span` from `src_offset` into
+    /// `dst` at `dst_offset`, replacing what `dst` holds there, as one
+    /// committed transaction, moving `dst`'s change and modification
+    /// times as the kernel's clone moves them.
+    #[allow(clippy::too_many_arguments)]
+    fn remap(
+        &mut self,
+        src: u64,
+        src_offset: u64,
+        dst: u64,
+        target: &Inode,
+        dst_offset: u64,
+        span: Span,
+    ) -> Result<()> {
+        let Span { len, span } = span;
         let dst_items = extent_items(self.items_of(dst)?);
-        refuse_destination(dst, &dst_items, dst_offset, span)?;
+        refuse_inline_destination(dst, &dst_items)?;
         let new_size = target.size.max(dst_offset + len);
         let sector = u64::from(self.sb.sectorsize);
         if new_size > target.size && !target.size.is_multiple_of(sector) && !dst_items.is_empty() {
@@ -119,39 +155,69 @@ impl Filesystem {
             )));
         }
 
+        // What the destination holds in the range goes first; a clone's
+        // item put under the key of one deleted replaces it.
+        let cut = cut_range(dst, &dst_items, dst_offset, dst_offset + span)?;
+        let mut edits = Edits::new();
+        for edit in cut.edits {
+            edits.insert(order(&edit.key()), edit);
+        }
+        let (releases, unrefs) = self.drop_covered(dst, &cut.covered)?;
+        for (k, _) in &cut.covered {
+            edits.insert(order(k), ItemEdit::Delete(*k));
+        }
+        let mut shares = Vec::new();
+        for (bytenr, ref_offset) in cut.splits {
+            let (_, extent_len, _) = self.extent_item(bytenr)?;
+            self.refuse_keyed_data_refs(bytenr)?;
+            shares.push(DataShare {
+                bytenr,
+                len: extent_len,
+                ref_offset,
+            });
+        }
+
         let src_items = if src == dst {
-            dst_items
+            dst_items.clone()
         } else {
             extent_items(self.items_of(src)?)
         };
-        let mut edits = Vec::new();
-        let mut shares = Vec::new();
-        let mut gained = 0u64;
         for (k, d) in &src_items {
             let Some(clone) = self.clone_item(src, k, d, src_offset, span, dst_offset)? else {
                 continue;
             };
-            gained += clone.num_bytes;
             shares.push(clone.share);
-            edits.push(ItemEdit::Put(OwnedItem {
-                key: DiskKey {
-                    objectid: dst,
-                    key_type: EXTENT_DATA_KEY,
-                    offset: clone.file_offset,
-                },
-                data: clone.data,
-            }));
+            let key = DiskKey {
+                objectid: dst,
+                key_type: EXTENT_DATA_KEY,
+                offset: clone.file_offset,
+            };
+            edits.insert(
+                order(&key),
+                ItemEdit::Put(OwnedItem {
+                    key,
+                    data: clone.data,
+                }),
+            );
         }
+        let nbytes = counted_bytes(&dst_items, &edits)?;
+        let released: Vec<(u64, u64)> = releases
+            .iter()
+            .map(|r| (r.old, r.old + r.old_len))
+            .collect();
+        let csum_edits = if released.is_empty() {
+            Vec::new()
+        } else {
+            self.csum_edits(&released, &[], false)?
+        };
 
         let generation = self.next_generation()?;
         let now = crate::namespace::now();
         let mut raw = self.raw_inode(dst)?;
-        let nbytes = le64(&raw, io::NBYTES)
-            .checked_add(gained)
-            .ok_or_else(|| refused(format!("inode {dst}'s byte count would overflow")))?;
         raw[io::SIZE..io::SIZE + 8].copy_from_slice(&new_size.to_le_bytes());
         raw[io::NBYTES..io::NBYTES + 8].copy_from_slice(&nbytes.to_le_bytes());
         crate::namespace::touch(&mut raw, generation, now, &[io::CTIME, io::MTIME]);
+        let mut edits: Vec<ItemEdit> = edits.into_values().collect();
         edits.push(ItemEdit::Put(OwnedItem {
             key: DiskKey {
                 objectid: dst,
@@ -166,10 +232,70 @@ impl Filesystem {
             ino: dst,
             time: now,
             edits,
+            csum_edits,
+            releases,
+            unrefs,
             shares,
             ..Default::default()
         };
         self.commit_write(write, generation)
+    }
+
+    /// What deleting the destination's items wholly inside a clone's range
+    /// does to their extents: the releases of those the deleted items were
+    /// the only references to, and the references dropped from those
+    /// anything else still holds -- another file, another item of this
+    /// one, or a leaf a snapshot shares, as [`Filesystem::truncate`]
+    /// decides it.
+    fn drop_covered(
+        &self,
+        dst: u64,
+        covered: &[(DiskKey, Vec<u8>)],
+    ) -> Result<(Vec<DataRelease>, Vec<DataRelease>)> {
+        let mut by_extent: BTreeMap<u64, Vec<&(DiskKey, Vec<u8>)>> = BTreeMap::new();
+        for item in covered {
+            let bytenr = le64(&item.1, fe::DISK_BYTENR);
+            if bytenr != 0 {
+                by_extent.entry(bytenr).or_default().push(item);
+            }
+        }
+        let mut releases = Vec::new();
+        let mut unrefs = Vec::new();
+        for (bytenr, items) in by_extent {
+            let (refs, extent_len, _) = self.extent_item(bytenr)?;
+            let mut drops = Vec::new();
+            let mut leaf_shared = false;
+            for (k, d) in items {
+                let offset = le64(d, fe::OFFSET);
+                let num = le64(d, fe::NUM_BYTES);
+                // A compressed extent's window is in its decoded bytes,
+                // which its on-disk length does not bound.
+                if d[fe::COMPRESSION] == 0
+                    && !window_inside_extent(bytenr + offset, num, bytenr, extent_len)
+                {
+                    return Err(refused(format!(
+                        "inode {dst}: the item at {} references [{}, +{num}), outside the \
+                         {extent_len}-byte extent the extent tree records at {bytenr}",
+                        k.offset,
+                        bytenr + offset
+                    )));
+                }
+                drops.push(DataRelease {
+                    old: bytenr,
+                    old_len: extent_len,
+                    // The kernel's subtraction, which wraps for a window
+                    // further into its extent than its file offset.
+                    old_ref_offset: k.offset.wrapping_sub(offset),
+                });
+                leaf_shared |= self.leaf_shared(self.written_tree(), k)?;
+            }
+            if refs == drops.len() as u64 && !leaf_shared {
+                releases.extend(drops);
+            } else {
+                unrefs.extend(drops);
+            }
+        }
+        Ok((releases, unrefs))
     }
 
     /// The range a clone covers, checked against the kernel's rules, or
@@ -324,7 +450,6 @@ impl Filesystem {
         data[fe::NUM_BYTES..fe::NUM_BYTES + 8].copy_from_slice(&(to - from).to_le_bytes());
         Ok(Some(ClonedItem {
             file_offset,
-            num_bytes: to - from,
             data,
             share: DataShare {
                 bytenr,
@@ -358,6 +483,7 @@ impl Filesystem {
 /// How much a clone covers: `len` bytes of file, and `span` bytes of
 /// extent items -- `len` rounded up to the sector when it runs to the
 /// source's end.
+#[derive(Debug, Clone, Copy)]
 struct Span {
     len: u64,
     span: u64,
@@ -366,20 +492,13 @@ struct Span {
 /// One destination item a clone puts, and the reference it adds.
 struct ClonedItem {
     file_offset: u64,
-    num_bytes: u64,
     data: Vec<u8>,
     share: DataShare,
 }
 
-/// Refuse a destination with inline data, or with any extent item over
-/// `[dst_offset, dst_offset + span)`.
-fn refuse_destination(
-    dst: u64,
-    items: &[(DiskKey, Vec<u8>)],
-    dst_offset: u64,
-    span: u64,
-) -> Result<()> {
-    let dst_end = dst_offset + span;
+/// Refuse a destination with inline data, or with an extent item too
+/// short to read.
+fn refuse_inline_destination(dst: u64, items: &[(DiskKey, Vec<u8>)]) -> Result<()> {
     for (k, d) in items {
         if d.get(fe::TYPE) == Some(&INLINE) {
             return Err(refused(format!(
@@ -387,25 +506,118 @@ fn refuse_destination(
                  into an extent, which is not written yet"
             )));
         }
-        let num = d
-            .get(fe::NUM_BYTES..fe::NUM_BYTES + 8)
-            .map(|_| le64(d, fe::NUM_BYTES))
-            .ok_or_else(|| {
-                refused(format!(
-                    "inode {dst}: the extent item at {} is {} bytes, too short to read",
-                    k.offset,
-                    d.len()
-                ))
-            })?;
-        if k.offset < dst_end && dst_offset < k.offset.saturating_add(num) {
+        if d.len() < fe::REGULAR_SIZE || !matches!(d[fe::TYPE], 1 | 2) {
             return Err(refused(format!(
-                "inode {dst} already holds data at {} in the range cloned into, and replacing \
-                 it is not implemented",
-                k.offset
+                "inode {dst}: the extent item at {} is of type {:?} and {} bytes, which \
+                 cloning does not handle",
+                k.offset,
+                d.get(fe::TYPE),
+                d.len()
             )));
         }
     }
     Ok(())
+}
+
+/// What replacing `[lo, hi)` does to a destination's own items, before
+/// the clone's are put there.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Cut {
+    /// Items that run into or out of the range, or through it: each cut
+    /// short at the range's start, started again at its end -- under a new
+    /// key, the old one deleted -- or both, as two items.
+    edits: Vec<ItemEdit>,
+    /// Items wholly inside the range, which the clone deletes.
+    covered: Vec<(DiskKey, Vec<u8>)>,
+    /// For each item split in two, the extent its halves both name and
+    /// the reference offset they share: the second half adds one to it.
+    splits: Vec<(u64, u64)>,
+}
+
+/// What replacing `[lo, hi)` of inode `dst` does to each of its
+/// `EXTENT_DATA` items, as the kernel's clone drops the range.
+///
+/// An item keeps its reference offset, its key offset less its offset into
+/// the extent, however it is cut, since both move together.
+fn cut_range(dst: u64, items: &[(DiskKey, Vec<u8>)], lo: u64, hi: u64) -> Result<Cut> {
+    let mut cut = Cut::default();
+    for (k, d) in items {
+        let start = k.offset;
+        let num = le64(d, fe::NUM_BYTES);
+        let end = start.checked_add(num).ok_or_else(|| {
+            refused(format!(
+                "inode {dst}: the extent item at {start} runs past the largest file offset"
+            ))
+        })?;
+        if end <= lo || start >= hi {
+            continue;
+        }
+        if lo <= start && end <= hi {
+            cut.covered.push((*k, d.clone()));
+            continue;
+        }
+        let bytenr = le64(d, fe::DISK_BYTENR);
+        let offset = le64(d, fe::OFFSET);
+        if start < lo {
+            let mut front = d.clone();
+            front[fe::NUM_BYTES..fe::NUM_BYTES + 8].copy_from_slice(&(lo - start).to_le_bytes());
+            cut.edits.push(ItemEdit::Put(OwnedItem {
+                key: *k,
+                data: front,
+            }));
+        } else {
+            cut.edits.push(ItemEdit::Delete(*k));
+        }
+        if end > hi {
+            let mut back = d.clone();
+            back[fe::OFFSET..fe::OFFSET + 8]
+                .copy_from_slice(&(offset + (hi - start)).to_le_bytes());
+            back[fe::NUM_BYTES..fe::NUM_BYTES + 8].copy_from_slice(&(end - hi).to_le_bytes());
+            cut.edits.push(ItemEdit::Put(OwnedItem {
+                key: DiskKey { offset: hi, ..*k },
+                data: back,
+            }));
+            if start < lo && bytenr != 0 {
+                cut.splits.push((bytenr, start.wrapping_sub(offset)));
+            }
+        }
+    }
+    Ok(cut)
+}
+
+/// A change's edits of a destination's items, by key, so a later edit of
+/// one key replaces an earlier one.
+type Edits = BTreeMap<(u64, u8, u64), ItemEdit>;
+
+/// A key in the order the tree sorts it.
+fn order(k: &DiskKey) -> (u64, u8, u64) {
+    (k.objectid, k.key_type, k.offset)
+}
+
+/// The inode's `nbytes` once `edits` apply to its `EXTENT_DATA` items:
+/// every item that has an extent at its `num_bytes`, as `btrfs check`
+/// counts it. Inline items are refused before this is asked.
+fn counted_bytes(items: &[(DiskKey, Vec<u8>)], edits: &Edits) -> Result<u64> {
+    let mut after: BTreeMap<(u64, u8, u64), &[u8]> = items
+        .iter()
+        .map(|(k, d)| (order(k), d.as_slice()))
+        .collect();
+    for (at, edit) in edits {
+        match edit {
+            ItemEdit::Delete(_) => after.remove(at),
+            ItemEdit::Put(item) => after.insert(*at, item.data.as_slice()),
+        };
+    }
+    after.values().try_fold(0u64, |total, d| {
+        let bytes = if le64(d, fe::DISK_BYTENR) == 0 {
+            0
+        } else {
+            le64(d, fe::NUM_BYTES)
+        };
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| refused("the destination's byte count would overflow".into()))
+    })
 }
 
 /// The `EXTENT_DATA` items among an inode's.
@@ -443,27 +655,88 @@ mod tests {
         )
     }
 
-    #[test]
-    fn a_destination_range_clear_of_every_item_is_accepted() {
-        let items = vec![item(0, 1, 8192), item(16384, 2, 4096)];
-        refuse_destination(257, &items, 8192, 8192).unwrap();
-        refuse_destination(257, &items, 20480, 4096).unwrap();
+    /// `item` with its offset into the extent set.
+    fn windowed(offset: u64, num: u64, within: u64) -> (DiskKey, Vec<u8>) {
+        let (k, mut d) = item(offset, 1, num);
+        d[fe::OFFSET..fe::OFFSET + 8].copy_from_slice(&within.to_le_bytes());
+        (k, d)
+    }
+
+    fn put((key, data): (DiskKey, Vec<u8>)) -> ItemEdit {
+        ItemEdit::Put(OwnedItem { key, data })
     }
 
     #[test]
-    fn a_destination_range_over_an_item_is_refused() {
+    fn a_destination_range_clear_of_every_item_cuts_nothing() {
         let items = vec![item(0, 1, 8192), item(16384, 2, 4096)];
-        for (at, span) in [(4096, 4096), (12288, 8192), (0, 1 << 20)] {
-            let err = refuse_destination(257, &items, at, span).unwrap_err();
-            assert!(err.to_string().contains("already holds data"), "{err}");
-        }
+        assert_eq!(cut_range(257, &items, 8192, 16384).unwrap(), Cut::default());
+        assert_eq!(
+            cut_range(257, &items, 20480, 24576).unwrap(),
+            Cut::default()
+        );
+    }
+
+    #[test]
+    fn items_over_a_destination_range_are_cut_short_started_again_split_or_deleted() {
+        // One item runs into the range, one lies inside it and one runs
+        // out of it.
+        let items = vec![
+            item(0, 1, 8192),
+            item(8192, 2, 4096),
+            windowed(12288, 8192, 4096),
+        ];
+        let cut = cut_range(257, &items, 4096, 16384).unwrap();
+        assert_eq!(
+            cut,
+            Cut {
+                edits: vec![
+                    put(item(0, 1, 4096)),
+                    ItemEdit::Delete(items[2].0),
+                    put(windowed(16384, 4096, 8192)),
+                ],
+                covered: vec![items[1].clone()],
+                splits: Vec::new(),
+            }
+        );
+
+        // One item runs through the range: two halves naming one extent
+        // at one reference offset, the second adding a reference to it.
+        let through = vec![windowed(4096, 16384, 8192)];
+        let cut = cut_range(257, &through, 8192, 12288).unwrap();
+        assert_eq!(
+            cut,
+            Cut {
+                edits: vec![
+                    put(windowed(4096, 4096, 8192)),
+                    put(windowed(12288, 8192, 16384))
+                ],
+                covered: Vec::new(),
+                splits: vec![(1 << 20, 4096u64.wrapping_sub(8192))],
+            }
+        );
     }
 
     #[test]
     fn a_destination_holding_inline_data_is_refused() {
         let (k, mut d) = item(0, 1, 4096);
         d[fe::TYPE] = INLINE;
-        let err = refuse_destination(257, &[(k, d)], 1 << 20, 4096).unwrap_err();
+        let err = refuse_inline_destination(257, &[(k, d)]).unwrap_err();
         assert!(err.to_string().contains("inline"), "{err}");
+    }
+
+    #[test]
+    fn nbytes_counts_the_items_left_and_put_but_not_holes() {
+        let items = vec![item(0, 1, 8192), item(8192, 1, 4096)];
+        let mut hole = item(12288, 1, 4096);
+        hole.1[fe::DISK_BYTENR..fe::DISK_BYTENR + 8].copy_from_slice(&0u64.to_le_bytes());
+        let edits: Edits = [
+            ItemEdit::Delete(items[1].0),
+            put(hole.clone()),
+            put(item(16384, 1, 4096)),
+        ]
+        .into_iter()
+        .map(|e| (order(&e.key()), e))
+        .collect();
+        assert_eq!(counted_bytes(&items, &edits).unwrap(), 12288);
     }
 }
