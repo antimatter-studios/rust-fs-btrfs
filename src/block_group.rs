@@ -565,7 +565,7 @@ impl Filesystem {
 
         // One walk of the extent tree for every group, rather than one
         // per group.
-        let groups: Vec<BlockGroup> = self
+        let mut groups: Vec<BlockGroup> = self
             .block_groups()?
             .into_iter()
             .filter(|g| {
@@ -574,6 +574,7 @@ impl Filesystem {
                     && self.block_group_is_writable(g)
             })
             .collect();
+        groups.sort_by_key(|g| self.on_leaving_device(g));
         for runs in self.free_extents_by_group(&groups)? {
             for run in runs {
                 best_free = best_free.max(usable_in(run, nodesize));
@@ -611,6 +612,18 @@ impl Filesystem {
                         .get(&stripe.devid)
                         .is_some_and(|device| device.is_writable())
             })
+        })
+    }
+
+    /// Whether `group` has a stripe on the device a relocation is moving
+    /// chunks off (#702). The tree block allocator asks such a group last:
+    /// the first transaction of the first relocation has nowhere else to
+    /// put its blocks, and every later one has the chunks already moved.
+    pub(crate) fn on_leaving_device(&self, group: &BlockGroup) -> bool {
+        self.leaving.is_some_and(|devid| {
+            self.map
+                .chunk_for(group.start)
+                .is_some_and(|chunk| chunk.stripes.iter().any(|s| s.devid == devid))
         })
     }
 
