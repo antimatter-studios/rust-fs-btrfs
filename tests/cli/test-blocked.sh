@@ -36,6 +36,15 @@ refused 2 resize 20Q -- "not a size"
 refused 2 resize 0 --force -- "not a size"
 refused 2 resize -x -- "not a size"
 
+# What balance cannot read is a wrong command line, and a kernel filter it
+# does not implement says so; both before the image is opened (#402).
+refused 2 balance -- "-d, -m or both"
+refused 2 balance -dconvert=raid7 -- "not a profile"
+refused 2 balance -dusage=101 -- "percentage"
+refused 2 balance -mprofiles=single\|mirror -- "not a profile"
+refused 2 balance -dfrobnicate -- "not a balance filter"
+refused 3 balance -dlimit=2 -- "not implemented: the balance filter limit"
+
 # Positioned writes are a missing capability, including position zero.
 # A missing image proves refusal happens before opening the target.
 refused 3 write --at 0 /f -- "not implemented: positioned write"

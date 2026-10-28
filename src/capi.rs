@@ -1959,6 +1959,73 @@ pub unsafe extern "C" fn fs_btrfs_resize(fs: *mut fs_btrfs_fs, size: u64) -> c_i
     })
 }
 
+/// `fs_btrfs_balance`'s `convert` for "convert to single", which has no
+/// profile bit of its own: the kernel's `BTRFS_AVAIL_ALLOC_BIT_SINGLE`.
+pub const FS_BTRFS_BALANCE_SINGLE: u64 = crate::balance::AVAIL_ALLOC_BIT_SINGLE;
+
+/// Relocate every block group holding any of `kinds` (chunk type bits:
+/// 1 data, 2 system, 4 metadata) into a newly allocated chunk, each as
+/// committed transactions of its own (#402). `convert` is 0 to keep each
+/// group's profile, or the profile each new chunk gets as the kernel's
+/// balance spells it: [`FS_BTRFS_BALANCE_SINGLE`], or one profile bit
+/// (`1 << 5` for DUP). A group already in that profile stays where it is.
+///
+/// Returns how many groups were relocated, or -1 with the error recorded:
+/// EROFS on a read-only handle, EINVAL for no kinds, an unknown kind or a
+/// `convert` naming no single profile, and ENOTSUP for a group relocation
+/// refuses (a system group, a conversion other than single to DUP or DUP
+/// to single, several devices), with nothing written.
+///
+/// # Safety
+///
+/// `fs` must be a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_balance(fs: *mut fs_btrfs_fs, kinds: u64, convert: u64) -> i64 {
+    use crate::chunk::block_group as bg;
+    use crate::ChunkProfile;
+    guard(-1, || {
+        let Some(fs) = (unsafe { handle_mut(fs) }) else {
+            return -1;
+        };
+        if kinds == 0 || kinds & !bg::TYPE_MASK != 0 {
+            set_error(
+                format!("kinds {kinds:#x}: name data (1), system (2) or metadata (4)"),
+                EINVAL,
+            );
+            return -1;
+        }
+        let convert = match convert {
+            0 => None,
+            FS_BTRFS_BALANCE_SINGLE => Some(ChunkProfile::Single),
+            bits if bits & !bg::PROFILE_MASK == 0 && bits.count_ones() == 1 => {
+                match ChunkProfile::from_type(bg::DATA | bits) {
+                    Ok(profile) => Some(profile),
+                    Err(e) => {
+                        record(&e);
+                        return -1;
+                    }
+                }
+            }
+            bits => {
+                set_error(format!("convert {bits:#x} names no single profile"), EINVAL);
+                return -1;
+            }
+        };
+        let balance = crate::balance::Balance {
+            kinds,
+            convert,
+            ..Default::default()
+        };
+        match fs.balance(&[balance]) {
+            Ok(moved) => moved.len() as i64,
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
+}
+
 // ---------------------------------------------------------------------
 // Subvolumes
 //

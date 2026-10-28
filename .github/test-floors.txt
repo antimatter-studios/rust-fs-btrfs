@@ -48,6 +48,10 @@ btree_oracle              4
 capi                      39
 capi_pool                 5
 capi_subvol               4
+# Two executed: every errno fs_btrfs_balance documents, each leaving the
+# image byte-identical, and data converted to DUP and back through the
+# call, judged by check, filesystem df and the kernel's read (#402).
+capi_balance_kernel       2
 # The C ABI subvolume create, and the kernel judging it (#267).
 capi_subvol_create_kernel 1
 # One no-tool C ABI scope case and one kernel case through the C ABI alone (#520).
@@ -58,6 +62,10 @@ capi                      42
 chore_manifest            15
 chunk_tree_items          3
 ci_profile                67
+# Three executed: fs.btrfs balance -d twice, -dconvert=dup with
+# -mconvert=single, and two refusals that leave the image as it was,
+# judged by check, filesystem df and the kernel's report (#402).
+cli_balance_kernel        3
 cli_dispatch              15
 cli_docs                  2
 # One unit contract and two independent-kernel export cases (#540).

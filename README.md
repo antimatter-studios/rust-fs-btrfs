@@ -78,6 +78,7 @@ missing target or a part of the path that is not a directory).
 | `truncate PATH BYTES` | sets a file's length as one transaction: shrinking releases what lies past the new end, growing records a hole; the cases still refused, with exit 3, are the Writing section of [docs/features.md](docs/features.md) |
 | `set label VALUE` | writes the label (at most 255 bytes) into every superblock copy, each with a fresh checksum; a pool of several devices is refused |
 | `resize SIZE [--force]` | grows or shrinks a single-device filesystem as one transaction: `20G`, `+1G`, `-512M` or `max` (all of the device). An image file is made longer first and cut after a shrink; a shrink needs `--force`. A chunk past the new end, which only a balance could move, and a pool of several devices are refused with exit 3 ([#264][i264]) |
+| `balance [-d[FILTERS]] [-m[FILTERS]]` | relocates every data (`-d`) or metadata (`-m`) block group the filters select into a newly allocated chunk and removes the old one, as `btrfs balance start` spells it: `convert=PROFILE` gives the new chunk another profile (single to dup or dup to single, one device), `profiles=single\|dup` and `usage=PERCENT` narrow the selection, and a group already in the target profile stays where it is (`soft`, always). Every group selected is checked before the first moves; a system group, another conversion and a pool are refused with exit 3, leaving the image as it was ([#402][i402]) |
 | `subvolume create [--mode OCTAL] PATH` | an empty subvolume in a directory of the top-level subvolume, mode 0755 unless `--mode` says otherwise, committed as one transaction; the report carries its `id`, and `ls` marks it `subvolume: true`. A name already there or a missing parent exits 4; a read-only top level, a volume with quotas enabled or a top level carrying a `btrfs.*` property exits 3 ([#267][i267]) |
 | `subvolume set-read-only ID true\|false` | makes subvolume ID read-only, or writable again, as `btrfs property set ro` does; an id no subvolume has exits 4 |
 | `subvolume set-default ID` | makes subvolume ID the one a mount without `subvol=` shows, as `btrfs subvolume set-default` does; an id no subvolume has exits 4 |
@@ -153,6 +154,7 @@ and the kernel read back exactly the bytes written.
 [i261]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/261
 [i264]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/264
 [i267]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/267
+[i402]: https://github.com/antimatter-studios/rust-fs-btrfs/issues/402
 
 ## Test contract
 

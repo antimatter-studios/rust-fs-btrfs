@@ -2,7 +2,7 @@
 //! without mounting it.
 //!
 //! The verbs are the shared set: `ls`, `stat`, `read`, `export`, `xattr`, `write`, `mkdir`,
-//! `get`/`info`, `set`, `resize`, and the names and lengths this library
+//! `get`/`info`, `set`, `resize`, `balance`, and the names and lengths this library
 //! can change: `create`, `ln`, `rm`, `rmdir`, `mv`, `truncate`. `subvolume`
 //! creates a subvolume and sets its read-only flag or the default one. Metadata is
 //! JSON (or `--text`); file content is raw bytes. A case the library
@@ -25,9 +25,10 @@ use std::sync::Arc;
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command as Cmd};
 
 use super::device;
+use fs_btrfs::balance::Balance;
 use fs_btrfs::inode::{FileType, Inode};
 use fs_btrfs::superblock::{compat_ro, incompat};
-use fs_btrfs::{ChecksumType, Error, Filesystem, Superblock};
+use fs_btrfs::{ChecksumType, ChunkProfile, Error, Filesystem, Superblock};
 use fs_core::cli::{transfer, CliError, Format, Json, Outcome, Tool};
 
 pub const TOOL: Tool = Tool {
@@ -446,12 +447,49 @@ fn command() -> Cmd {
                      with exit 3 (rust-fs-btrfs#264), leaving the image as it was.",
                 ),
         )
+        .subcommand(balance_command())
         .subcommand(subvolume_command())
         .after_help(
             "Examples:\n  fs.btrfs disk.img ls /\n  \
              fs.btrfs disk.img read /etc/fstab > fstab\n  \
              fs.btrfs disk.img get label --text\n  \
              fs.btrfs --offset 1048576 whole-disk.img info",
+        )
+}
+
+/// `balance -d[FILTERS] -m[FILTERS]`, spelled as `btrfs balance start`
+/// spells it (#402).
+fn balance_command() -> Cmd {
+    let filters = |id: &'static str, short: char, what: &'static str| {
+        Arg::new(id)
+            .short(short)
+            .long(id)
+            .value_name("FILTERS")
+            .num_args(0..=1)
+            .default_missing_value("")
+            .help(format!(
+                "Relocate the {what} block groups the filters select: convert=PROFILE, \
+                 profiles=P1|P2, usage=PERCENT, soft; none selects them all"
+            ))
+    };
+    Cmd::new("balance")
+        .about("Relocate block groups into new chunks, converting their profile on the way")
+        .arg(filters("data", 'd', "data"))
+        .arg(filters("metadata", 'm', "metadata"))
+        .after_help(
+            "Examples:\n  fs.btrfs disk.img balance -d\n  \
+             fs.btrfs disk.img balance -dconvert=dup\n  \
+             fs.btrfs disk.img balance -dusage=50 -mconvert=single\n\n\
+             Each block group selected is moved into a newly allocated chunk and its old \
+             chunk removed, as committed transactions of its own. convert= gives the new \
+             chunk another profile; a group already in it stays where it is, as \
+             btrfs-progs' soft modifier leaves it, which is always so here. profiles= takes \
+             only groups in those profiles, usage= only groups less than that many per cent \
+             full. Which groups is decided once, and every one is checked before the first \
+             moves: a system group, a conversion other than single to dup or dup to single, \
+             and a filesystem of several devices are refused with exit 3 \
+             (rust-fs-btrfs#304), leaving the image as it was. The kernel's devid, drange, \
+             vrange, limit and stripes filters are not implemented (exit 3).",
         )
 }
 
@@ -631,6 +669,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         ),
         "set" => set(target, offset, sub),
         "resize" => resize(target, offset, sub),
+        "balance" => balance(target, offset, sub),
         "subvolume" => subvolume(target, offset, sub),
         other => unreachable!("clap knows no verb {other}"),
     }
@@ -1191,6 +1230,104 @@ fn resize(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Outcome, C
         .map_err(|e| CliError::failed(format!("{name}: reading the size back: {e}")))?;
     Ok(Outcome::report(report(total, dev.size_bytes()))
         .with_text(format!("{name} resized from {current} to {total} bytes")))
+}
+
+/// A profile as `btrfs balance` names it.
+fn profile_named(filter: &str, name: &str) -> Result<ChunkProfile, CliError> {
+    use ChunkProfile::*;
+    [
+        Single, Dup, Raid0, Raid1, Raid1c3, Raid1c4, Raid10, Raid5, Raid6,
+    ]
+    .into_iter()
+    .find(|p| p.name().eq_ignore_ascii_case(name))
+    .ok_or_else(|| {
+        CliError::usage(format!(
+            "balance {filter}: {name} is not a profile (single, dup, raid0, raid1, raid1c3, \
+             raid1c4, raid10, raid5 or raid6)"
+        ))
+    })
+}
+
+/// One `-d` or `-m` argument: the groups of `kinds` its filters select.
+fn balance_filters(flag: &str, kinds: u64, spec: &str) -> Result<Balance, CliError> {
+    let mut balance = Balance {
+        kinds,
+        ..Default::default()
+    };
+    for filter in spec.split(',').filter(|f| !f.is_empty()) {
+        let shown = format!("{flag}{filter}");
+        match filter.split_once('=') {
+            Some(("convert", name)) => balance.convert = Some(profile_named(&shown, name)?),
+            Some(("profiles", names)) => {
+                balance.profiles = Some(
+                    names
+                        .split('|')
+                        .map(|name| profile_named(&shown, name))
+                        .collect::<Result<_, _>>()?,
+                )
+            }
+            Some(("usage", percent)) => {
+                balance.usage = Some(
+                    percent
+                        .parse::<u8>()
+                        .ok()
+                        .filter(|p| *p <= 100)
+                        .ok_or_else(|| {
+                            CliError::usage(format!(
+                                "balance {shown}: usage takes a percentage from 0 to 100"
+                            ))
+                        })?,
+                )
+            }
+            // A group already in the profile asked for is always left where
+            // it is, which is what soft asks for.
+            None if filter == "soft" => {}
+            Some((name @ ("devid" | "drange" | "vrange" | "limit" | "stripes"), _)) => {
+                return Err(CliError::not_implemented(format!(
+                    "the balance filter {name}"
+                )))
+            }
+            _ => {
+                return Err(CliError::usage(format!(
+                    "balance {shown}: not a balance filter (convert=, profiles=, usage= or soft)"
+                )))
+            }
+        }
+    }
+    Ok(balance)
+}
+
+/// Relocate the block groups `-d` and `-m` select, each into a new chunk.
+fn balance(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Outcome, CliError> {
+    use fs_btrfs::chunk::block_group as bg;
+    let mut balances = Vec::new();
+    for (id, flag, kinds) in [("data", "-d", bg::DATA), ("metadata", "-m", bg::METADATA)] {
+        if let Some(spec) = sub.get_one::<String>(id) {
+            balances.push(balance_filters(flag, kinds, spec)?);
+        }
+    }
+    if balances.is_empty() {
+        return Err(CliError::usage(
+            "balance: name the groups to relocate with -d, -m or both",
+        ));
+    }
+    let name = target.to_string_lossy();
+    let mut fs = Filesystem::mount_rw(device::open_rw(target, offset)?)
+        .map_err(|e| btrfs_error(name.as_bytes(), e))?;
+    let moved = fs
+        .balance(&balances)
+        .map_err(|e| btrfs_error(name.as_bytes(), e))?;
+    let report = Json::object([(
+        "relocated",
+        Json::Arr(
+            moved
+                .iter()
+                .map(|m| Json::object([("from", Json::from(m.from)), ("to", Json::from(m.to))]))
+                .collect(),
+        ),
+    )]);
+    Ok(Outcome::report(report)
+        .with_text(format!("{name}: {} block group(s) relocated", moved.len())))
 }
 
 /// `path` as its directory, resolved, and its last component.

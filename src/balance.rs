@@ -67,6 +67,14 @@
 //! Metadata relocation also refuses mixed data and metadata groups,
 //! shared tree blocks and a log tree awaiting replay before allocating
 //! the replacement chunk (#579).
+//!
+//! # Balancing
+//!
+//! [`Filesystem::balance`] is what reaches users, through
+//! `fs_btrfs_balance` and `fs.btrfs balance` (#402): each [`Balance`]
+//! selects groups by kind, profile and usage, and names the profile they
+//! convert to, and every group selected is relocated in turn. The
+//! selection is made once and checked whole before the first group moves.
 
 use crate::block_group::BlockGroup;
 use crate::chunk::{
@@ -194,6 +202,20 @@ pub fn profile_bits(profile: ChunkProfile) -> u64 {
     }
 }
 
+/// `BTRFS_AVAIL_ALLOC_BIT_SINGLE`: how the kernel's balance arguments say
+/// "convert to single", which has no profile bit of its own (#402).
+pub const AVAIL_ALLOC_BIT_SINGLE: u64 = 1 << 48;
+
+/// One block group a balance moved: where it was, and where its contents
+/// went (#402).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Relocated {
+    /// The old group's start, gone once it was emptied.
+    pub from: u64,
+    /// The new group's start.
+    pub to: u64,
+}
+
 /// One data extent of a block group, and every file item naming it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupExtent {
@@ -292,6 +314,52 @@ impl Filesystem {
             .iter()
             .map(DataExtent::public)
             .collect())
+    }
+
+    /// Relocate every block group one of `balances` selects, each into a
+    /// newly allocated chunk, and return what moved where (#402).
+    ///
+    /// A group is relocated as the first of `balances` that selects it
+    /// says: with its `convert`, or in its own profile. Which groups is
+    /// decided once, before anything moves, so the chunks this allocates
+    /// are never relocated in turn; and every one of them is checked
+    /// against what [`Filesystem::relocate_block_group`] refuses before the
+    /// first is touched. Each is then relocated in turn, as committed
+    /// transactions of its own.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] unless mounted with [`Filesystem::mount_rw`],
+    /// and [`Error::UnsupportedFeature`] for a selected group that
+    /// [`Filesystem::relocate_block_group`] would refuse, with nothing
+    /// written. An error while a group is being moved stops the balance
+    /// there: the groups before it are moved, and that group is left as
+    /// [`Filesystem::relocate_block_group`] says.
+    pub fn balance(&mut self, balances: &[Balance]) -> Result<Vec<Relocated>> {
+        if self.writable.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        let mut selected: Vec<(BlockGroup, Option<ChunkProfile>)> = Vec::new();
+        for group in self.block_groups()? {
+            for balance in balances {
+                if balance.selects(&group)? {
+                    selected.push((group, balance.convert));
+                    break;
+                }
+            }
+        }
+        for (group, convert) in &selected {
+            self.refuse_unrelocatable(group, *convert)?;
+        }
+        let mut out = Vec::with_capacity(selected.len());
+        for (group, convert) in selected {
+            let to = self.relocate_block_group(group.start, convert)?;
+            out.push(Relocated {
+                from: group.start,
+                to,
+            });
+        }
+        Ok(out)
     }
 
     /// Relocate the data or metadata block group at `start` into a new
