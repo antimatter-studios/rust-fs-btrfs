@@ -351,7 +351,7 @@ fn release_cli_gaps(yaml: &str, pin: &str, toolchain: &str) -> Vec<String> {
 }
 
 /// The `version` of the `rust-fs-core` dependency in Cargo.toml.
-fn am_fs_core_pin() -> String {
+fn fs_core_pin() -> String {
     let manifest =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
             .expect("read Cargo.toml");
@@ -380,7 +380,7 @@ fn pinned_toolchain() -> String {
 
 #[test]
 fn the_release_workflow_ships_the_tarballs_through_cores_release_cli() {
-    let gaps = release_cli_gaps(&workflow(), &am_fs_core_pin(), &pinned_toolchain());
+    let gaps = release_cli_gaps(&workflow(), &fs_core_pin(), &pinned_toolchain());
     assert!(
         gaps.is_empty(),
         "{WORKFLOW} must ship the command-line tarballs by calling rust-fs-core's \
