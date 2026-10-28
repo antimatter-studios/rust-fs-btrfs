@@ -1673,18 +1673,18 @@ pub unsafe extern "C" fn fs_btrfs_truncate(
 
 /// Clone `len` bytes of the regular file at `src`, from `src_offset`,
 /// into the regular file at `dst` at `dst_offset`, as one committed
-/// transaction (#269): the two share those extents, and no data is
-/// copied. A `len` of zero clones to the end of `src`, as `FICLONERANGE`
-/// does; `src` and `dst` may be one file when the ranges do not overlap.
+/// transaction (#269): the two share those extents, no data is copied,
+/// and whatever `dst` held in the range is replaced. A `len` of zero
+/// clones to the end of `src`, as `FICLONERANGE` does; `src` and `dst`
+/// may be one file when the ranges do not overlap.
 ///
 /// Returns 0, or -1 with the error recorded: ENOENT for no such path,
 /// EISDIR for anything but a regular file, EROFS on a read-only handle,
 /// and ENOTSUP for a range the kernel's rules refuse (offsets that are
 /// not whole sectors, a length that is not either and does not reach the
 /// end of `src`, a range past that end) and for what cannot be written
-/// yet: a destination range that already holds data, inline data, an
-/// extent whose references are kept as items of their own, a volume
-/// without no-holes.
+/// yet: inline data, an extent the clone adds a reference to whose
+/// references are kept as items of their own, a volume without no-holes.
 ///
 /// # Safety
 ///
@@ -1719,6 +1719,62 @@ pub unsafe extern "C" fn fs_btrfs_clone_range(
                 -1
             }
         }
+    })
+}
+
+/// Deduplicate `len` bytes of the regular file at `dst`, from
+/// `dst_offset`, against the regular file at `src` from `src_offset`, as
+/// `FIDEDUPERANGE` does (#269): when the two ranges hold the same bytes,
+/// `dst`'s range is replaced by a clone of `src`'s in one committed
+/// transaction, and `dst`'s times do not move.
+///
+/// Returns 0 when the ranges were the same, with the number of bytes now
+/// shared stored through `deduped` (a length that is not whole sectors is
+/// cut down to whole sectors unless both ranges run to their files'
+/// ends); 1 when they differ, with nothing written and 0 stored; or -1
+/// with the error recorded, as [`fs_btrfs_clone_range`] records it, and
+/// ENOTSUP for a range that does not lie inside both files.
+///
+/// # Safety
+///
+/// `fs` must be a live handle, `src` and `dst` NUL-terminated, and
+/// `deduped` null or writable.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_dedupe_range(
+    fs: *mut fs_btrfs_fs,
+    src: *const c_char,
+    src_offset: u64,
+    dst: *const c_char,
+    dst_offset: u64,
+    len: u64,
+    deduped: *mut u64,
+) -> c_int {
+    guard(-1, || {
+        let Some(fs) = (unsafe { handle_mut(fs) }) else {
+            return -1;
+        };
+        let Some(src) = (unsafe { borrow_bytes(src, "src") }) else {
+            return -1;
+        };
+        let Some(dst) = (unsafe { borrow_bytes(dst, "dst") }) else {
+            return -1;
+        };
+        let compared = fs.lookup_path_bytes(src).and_then(|from| {
+            let to = fs.lookup_path_bytes(dst)?;
+            fs.dedupe_range(from.ino, src_offset, to.ino, dst_offset, len)
+        });
+        let (status, bytes) = match compared {
+            Ok(Some(bytes)) => (0, bytes),
+            Ok(None) => (1, 0),
+            Err(e) => {
+                record(&e);
+                return -1;
+            }
+        };
+        if !deduped.is_null() {
+            unsafe { deduped.write(bytes) };
+        }
+        status
     })
 }
 
