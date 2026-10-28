@@ -74,6 +74,11 @@ cli_export_kernel         2
 cli_export_tree           1
 cli_export_tree_kernel    2
 cli_fsck_oracle           4
+# fs.btrfs import: seven no-tool cases on this crate's mkfs volume, and three
+# the kernel and btrfs check judge -- a read-back, a full volume and a kill
+# between persist and publish (#431).
+cli_import                7
+cli_import_kernel         3
 cli_label_kernel          2
 # One find comparison covers nested subvolumes and an ancestor snapshot (#466);
 # damaged copies add a revisit test and an unreadable-directory test (#467).
