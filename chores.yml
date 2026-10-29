@@ -528,6 +528,10 @@ tasks:
       # durable by an fsync of / alone, which logs the file only as an
       # inode that exists
       - test-disks/dirtylog/btrfs-dirty-log-createdlink.img
+      # a committed symbolic link, character and block devices, FIFO and
+      # socket, each losing its one name, and / alone fsynced, which leaves
+      # each unlogged for replay to delete
+      - test-disks/dirtylog/btrfs-dirty-log-nodesremoved.img
       # the volume the command-line tools are tested against, labelled
       # CLITEST, with a manifest of what the kernel wrote into it
       - test-disks/cli/btrfs-cli.img

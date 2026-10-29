@@ -518,7 +518,9 @@ impl Filesystem {
     ///   the log lacks is removed; its inode, if the log does not hold it
     ///   and that was its last name, is deleted with its data, whether the
     ///   name was in an `INODE_REF` or an `INODE_EXTREF` item (#478). An
-    ///   empty directory losing its name is removed with its items (#410).
+    ///   empty directory losing its name is removed with its items (#410),
+    ///   and so is a symbolic link or a device, FIFO or socket node losing
+    ///   its last (#394).
     ///   A regular file the log does not hold, losing one name of several,
     ///   drops that name's `INODE_REF` record and one link (#411).
     ///   A logged name the directory lacks is added.
@@ -1150,12 +1152,15 @@ impl Filesystem {
                         }
                         // A directory goes only empty, as `rmdir` left it:
                         // no names of its own and no size counting any (#410).
+                        // A regular file, a symbolic link with the inline
+                        // extent holding its target, and a device, FIFO or
+                        // socket node go with whatever items they hold (#394).
                         let removable = if inode.is_dir() {
                             inode.size == 0
                                 && tree.find_all(root, child, dir::DIR_ITEM_KEY)?.is_empty()
                                 && tree.find_all(root, child, DIR_INDEX_KEY)?.is_empty()
                         } else {
-                            inode.is_regular_file()
+                            inode.file_type().is_some()
                         };
                         if !only || !removable || inode.nlink != 1 || !removed_inodes.insert(child)
                         {
