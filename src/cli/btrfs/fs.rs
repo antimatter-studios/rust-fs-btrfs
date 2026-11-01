@@ -1,7 +1,7 @@
 //! `fs.btrfs <target> <verb>`: an errand inside a Btrfs image or device,
 //! without mounting it.
 //!
-//! The verbs are the shared set: `ls`, `stat`, `read`, `export`, `xattr`, `write`, `mkdir`,
+//! The verbs are the shared set: `ls`, `stat`, `read`, `export`, `import`, `xattr`, `write`, `mkdir`,
 //! `get`/`info`, `set`, `resize`, and the names and lengths this library
 //! can change: `create`, `ln`, `rm`, `rmdir`, `mv`, `truncate`. `defragment`
 //! rewrites a file's runs of extents as one. `subvolume` creates, snapshots
@@ -192,6 +192,34 @@ fn command() -> Cmd {
                      to its source's. --preserve=times sets the stored access and modification \
                      times. Symlink times are not set. --verify reads each staged file back \
                      before publication.",
+                ),
+        )
+        .subcommand(
+            Cmd::new("import")
+                .about("Copy a local file, stdin or with --recursive a local tree into the image")
+                .args(super::import::args())
+                .after_help(
+                    "Examples:\n  fs.btrfs disk.img import notes.txt /notes.txt\n  \
+                     fs.btrfs disk.img import --replace --verify backup.tar /backup.tar\n  \
+                     tar cf - etc | fs.btrfs disk.img import - /etc.tar\n  \
+                     fs.btrfs disk.img import --recursive etc /etc\n\n\
+                     The bytes go to a staged file beside PATH, in fixed chunks, each \
+                     written copy-on-write and committed. PATH appears only when the copy \
+                     is complete: the staged file is published by a rename, one committed \
+                     transaction, so PATH holds the old file or the whole new one, never \
+                     part of one. A failure, a full volume or a signal unlinks the staged \
+                     file and leaves PATH as it was. An existing PATH is refused unless \
+                     --replace is given, and replaced only by that rename, never removed \
+                     first. A crash between the last write and the rename leaves the old \
+                     file and the staged one, .fs-btrfs-import-PID-N.partial, which rm \
+                     removes.\n\n\
+                     The report includes the byte count and SHA-256. --verify reads the \
+                     staged file back through a fresh open of TARGET and compares both \
+                     before the rename. --recursive imports a tree with the shared tree \
+                     transfer, merging into directories already there, --max-depth \
+                     bounding the walk. Paths inside a subvolume other than the top level \
+                     are refused with exit 3, as are links, times and holes \
+                     (--preserve), which this sink does not keep yet.",
                 ),
         )
         .subcommand(
@@ -702,6 +730,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
                 export(&root, &request, transfer::ExportOptions::from_matches(sub)?)
             }
         }
+        "import" => super::import::import(target, offset, sub),
         "write" if sub.get_one::<u64>("at").is_some() => Err(CliError::not_implemented(
             "positioned write (--at) is not supported",
         )),
@@ -1421,13 +1450,13 @@ fn refuse_non_empty(fs: &Filesystem, dir: u64, name: &[u8], path: &[u8]) -> Resu
 
 /// A byte string for a person to read. Never fed back into a lookup:
 /// two distinct names can show the same.
-fn show(bytes: &[u8]) -> String {
+pub(super) fn show(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// A library error about `what`: exit 3 when the library refused (it
 /// cannot do this, or will not), exit 1 when something failed.
-fn btrfs_error(what: &[u8], e: Error) -> CliError {
+pub(super) fn btrfs_error(what: &[u8], e: Error) -> CliError {
     let message = format!("{}: {e}", show(what));
     match e {
         Error::UnsupportedFeature(_) | Error::ReadOnly => CliError::refused(message),
@@ -1449,7 +1478,7 @@ fn read_error(what: &[u8], e: Error) -> CliError {
 /// the path that is not a directory, is the volume's state refusing it, the
 /// CLI contract's exit 4 (EXIT_REFUSED); every other error is
 /// [`btrfs_error`]'s.
-fn state_error(what: &[u8], e: Error) -> CliError {
+pub(super) fn state_error(what: &[u8], e: Error) -> CliError {
     match e {
         Error::NotFound | Error::NotADirectory => {
             CliError::refused_by_state(format!("{}: {e}", show(what)))

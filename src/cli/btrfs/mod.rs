@@ -10,4 +10,5 @@
 pub mod device;
 pub mod fs;
 pub mod fsck;
+pub mod import;
 pub mod mkfs;
