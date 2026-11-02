@@ -127,9 +127,10 @@ chore_min_version: 0.10.0
 #                                                    cold (51 lines of
 #                                                    cargo), run 36616794750;
 #                                                    was 361 / 19,014
-#     kernel    2,427 / 225,509    3,200 / 300,000   ~30% beyond the #668
-#                                                    queue prefix, run
-#                                                    40361645452 (#689).
+#     kernel    3,270 / 199,732    4,250 / 300,000   ~30% over #729's run
+#                                                    41536536333. Before it,
+#                                                    the #668 queue prefix,
+#                                                    run 40361645452 (#689).
 #                                                    Previously all 61
 #                                                    kernel tests passed at
 #                                                    542dd4e, including both
@@ -672,9 +673,15 @@ tasks:
     # registry race stopped the tier (#688). Keep that evidence: 3200 /
     # 300000 allows about 30% beyond the measured prefix for the remaining
     # targets and cold-build variation (#689).
+    #
+    # Re-measured on #729's dispatched run 41536536333 (2026-11-02): every
+    # test passed, but the kernel log printed 3270 lines and 199732 bytes
+    # against 3200 lines. Balance's two kernel targets print 77 of those
+    # lines. About 30% over that is 4250 lines; 300000 bytes still covers
+    # the bytes with about 50% to spare.
     cmds:
       - test-disks/build-fixtures.sh --check
-      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 3200 300000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 4250 300000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
