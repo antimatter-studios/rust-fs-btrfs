@@ -5,7 +5,7 @@
 //! tests/relocate_metadata_group_kernel.rs.
 
 use fs_btrfs::block_group::BlockGroup;
-use fs_btrfs::chunk::block_group::SYSTEM;
+use fs_btrfs::chunk::block_group::{DUP, SYSTEM};
 use fs_btrfs::{mkfs, ChunkProfile, Error, Filesystem};
 use fs_btrfs_test_support::temp_path;
 use fs_core::{BlockDevice, FileDevice};
@@ -122,6 +122,24 @@ fn a_dup_metadata_group_converts_to_single_and_back() {
     }
 }
 
+/// A DUP metadata group relocated without a conversion stays DUP (#702): it
+/// was refused while only single chunks could be allocated.
+#[test]
+fn a_dup_metadata_group_relocates_in_its_own_profile() {
+    let scratch = Scratch::new("own-profile");
+    let mut fs = mount_rw(&scratch.0);
+    let metadata = metadata_group(&fs);
+    assert_ne!(metadata.flags & DUP, 0, "the fixture's metadata is DUP");
+    let new = fs.relocate_block_group(metadata.start, None).unwrap();
+    let moved = fs
+        .block_groups()
+        .unwrap()
+        .into_iter()
+        .find(|g| g.start == new)
+        .expect("the new group");
+    assert_ne!(moved.flags & DUP, 0, "the new group stays DUP");
+}
+
 #[test]
 fn other_metadata_conversions_and_the_system_group_are_refused_before_writing() {
     let scratch = Scratch::new("refused");
@@ -136,7 +154,6 @@ fn other_metadata_conversions_and_the_system_group_are_refused_before_writing() 
         .expect("a system group");
     for (start, profile, reason) in [
         (metadata.start, Some(ChunkProfile::Raid1), "converting"),
-        (metadata.start, None, "only single"),
         (system.start, Some(ChunkProfile::Single), "system"),
     ] {
         let error = fs.relocate_block_group(start, profile).unwrap_err();

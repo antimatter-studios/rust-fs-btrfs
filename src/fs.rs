@@ -491,6 +491,13 @@ pub struct Filesystem {
     /// new tree block may be placed in (#574): a copy-on-write that put a
     /// block back into it would undo the move it is part of.
     pub(crate) emptying: Option<u64>,
+    /// The device a relocation is moving chunks off (#702). No new chunk
+    /// stripe is placed on it, and the tree block allocator takes a group
+    /// on it only when no other has room: a block put back on it has to be
+    /// moved again before the device can leave. Unlike [`Self::emptying`]
+    /// it survives [`Self::remount_rw`], because one relocation is several
+    /// committed transactions.
+    pub(crate) leaving: Option<u64>,
 }
 
 /// Tree blocks a mount keeps: 1024, 16 MiB at the default 16 KiB node.
@@ -883,6 +890,7 @@ impl Filesystem {
             Self::mount_rw(Arc::clone(device))?
         };
         fs.compression = self.compression;
+        fs.leaving = self.leaving;
         Ok(fs)
     }
 
@@ -1495,6 +1503,7 @@ impl Filesystem {
             compression: crate::compression::Compression::None,
             pinned: Vec::new(),
             emptying: None,
+            leaving: None,
         };
         Ok(fs)
     }
@@ -1964,6 +1973,7 @@ impl Filesystem {
             compression: self.compression,
             pinned: Vec::new(),
             emptying: None,
+            leaving: None,
         };
         Ok(fs)
     }
