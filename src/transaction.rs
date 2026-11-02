@@ -788,11 +788,12 @@ impl Filesystem {
     /// superblock's own chunk array has to be able to reach them, and
     /// every other tree's in a METADATA one (#264), so `owner` decides
     /// which groups are asked. A group a relocation is emptying is never
-    /// asked (#574).
+    /// asked (#574), and one on a device chunks are being moved off is
+    /// asked last (#702).
     fn next_free_block_for(&self, owner: u64, taken: &BTreeSet<u64>) -> Result<u64> {
         let nodesize = self.sb.nodesize as u64;
         let system = owner == objectid::CHUNK_TREE;
-        let groups: Vec<_> = self
+        let mut groups: Vec<_> = self
             .block_groups()?
             .into_iter()
             .filter(|g| self.block_group_is_writable(g))
@@ -806,6 +807,7 @@ impl Filesystem {
                 }
             })
             .collect();
+        groups.sort_by_key(|g| self.on_leaving_device(g));
 
         for runs in self.free_extents_by_group(&groups)? {
             for run in runs {

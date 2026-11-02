@@ -245,29 +245,19 @@ fn a_kernel_written_metadata_group_converts_to_dup_and_back() {
 }
 
 #[test]
-fn unsupported_metadata_profiles_are_refused_before_allocation() {
-    for (name, profile, conversion, reason) in [
-        ("dup", "dup", None, "only single"),
-        (
-            "conversion",
-            "single",
-            Some(ChunkProfile::Raid1),
-            "converting",
-        ),
-    ] {
-        let scratch = Scratch::new(&format!("relocate-metadata-{name}"), profile);
-        let image = scratch.image();
-        let before = digest(&image);
-        let mut fs = mount_rw(&image);
-        let group = metadata_group(&fs);
-        let error = fs
-            .relocate_block_group(group.start, conversion)
-            .unwrap_err();
-        assert!(
-            matches!(&error, Error::UnsupportedFeature(why) if why.contains(reason)),
-            "expected {reason}: {error}"
-        );
-        drop(fs);
-        assert_eq!(digest(&image), before, "profile refusal wrote to the image");
-    }
+fn an_unsupported_metadata_conversion_is_refused_before_allocation() {
+    let scratch = Scratch::new("relocate-metadata-conversion", "single");
+    let image = scratch.image();
+    let before = digest(&image);
+    let mut fs = mount_rw(&image);
+    let group = metadata_group(&fs);
+    let error = fs
+        .relocate_block_group(group.start, Some(ChunkProfile::Raid1))
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::UnsupportedFeature(why) if why.contains("converting")),
+        "expected converting: {error}"
+    );
+    drop(fs);
+    assert_eq!(digest(&image), before, "profile refusal wrote to the image");
 }
