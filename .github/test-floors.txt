@@ -252,6 +252,8 @@ seed_write_kernel         1
 scrub_parity_oracle       4
 scrub_repair_kernel       7
 resize_kernel             2
+# A file whose extent records fill whole extent tree leaves is removed (#724).
+rm_many_extents_kernel    1
 shared_tree_block_release 2
 simple_quota_oracle       3
 snapshot_shared_write     1

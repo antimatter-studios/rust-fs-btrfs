@@ -1623,6 +1623,47 @@ impl Filesystem {
             });
         }
 
+        // An extent tree leaf the change empties is not rendered, but the
+        // records it held are released all the same, so they count (#724).
+        // The planner saw these edits empty it; anything left means they no
+        // longer do, and removing the leaf would lose those items.
+        for rewrite in &plan.removed {
+            if rewrite.owner != objectid::EXTENT_TREE || rewrite.level != 0 {
+                continue;
+            }
+            let block = self.read_tree_block(rewrite.old)?;
+            let owned: Vec<OwnedItem> = block
+                .body
+                .items()
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|item| {
+                    block.item_data(item).map(|data| OwnedItem {
+                        key: item.key,
+                        data: data.to_vec(),
+                    })
+                })
+                .collect();
+            let left = self.apply_records(
+                rewrite.old,
+                owned,
+                data,
+                Moves {
+                    plan,
+                    backrefs: &backrefs,
+                },
+                generation,
+                &mut applied,
+            )?;
+            if !left.is_empty() {
+                return Err(Error::UnsupportedFeature(format!(
+                    "the plan removes the extent tree leaf at {}, which still holds {} items",
+                    rewrite.old,
+                    left.len()
+                )));
+            }
+        }
+
         // Each tree the change makes: one leaf, at the block the plan gave
         // it, holding everything the change put in it (#267).
         if plan.created.len() != data.new_trees.len() {
