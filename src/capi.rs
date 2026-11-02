@@ -1805,6 +1805,62 @@ pub unsafe extern "C" fn fs_btrfs_clone_range(
     })
 }
 
+/// Deduplicate `len` bytes of the regular file at `dst`, from `dst_offset`,
+/// against the regular file at `src` from `src_offset`, as `FIDEDUPERANGE`
+/// does (#712): when the two ranges hold the same bytes, `dst`'s range is
+/// replaced by a clone of `src`'s in one committed transaction, and `dst`'s
+/// times do not move.
+///
+/// Returns 0 when the ranges were the same, with `len` stored through
+/// `deduped`, as the kernel reports it even where fewer bytes are shared; 1
+/// when they differ, with nothing written and 0 stored; or -1 with the error
+/// recorded, as [`fs_btrfs_clone_range`] records it, and ENOTSUP for an
+/// offset that is not whole sectors or a range that does not lie inside both
+/// files.
+///
+/// # Safety
+///
+/// `fs` must be a live handle, `src` and `dst` NUL-terminated, and
+/// `deduped` null or writable.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_dedupe_range(
+    fs: *mut fs_btrfs_fs,
+    src: *const c_char,
+    src_offset: u64,
+    dst: *const c_char,
+    dst_offset: u64,
+    len: u64,
+    deduped: *mut u64,
+) -> c_int {
+    guard(-1, || {
+        let Some(fs) = (unsafe { handle_mut(fs) }) else {
+            return -1;
+        };
+        let Some(src) = (unsafe { borrow_bytes(src, "src") }) else {
+            return -1;
+        };
+        let Some(dst) = (unsafe { borrow_bytes(dst, "dst") }) else {
+            return -1;
+        };
+        let compared = fs.lookup_path_bytes(src).and_then(|from| {
+            let to = fs.lookup_path_bytes(dst)?;
+            fs.dedupe_range(from.ino, src_offset, to.ino, dst_offset, len)
+        });
+        let (status, bytes) = match compared {
+            Ok(Some(bytes)) => (0, bytes),
+            Ok(None) => (1, 0),
+            Err(e) => {
+                record(&e);
+                return -1;
+            }
+        };
+        if !deduped.is_null() {
+            unsafe { deduped.write(bytes) };
+        }
+        status
+    })
+}
+
 /// What [`fs_btrfs_defragment`] did, as [`crate::defrag::Defragmented`]
 /// counts it.
 #[repr(C)]

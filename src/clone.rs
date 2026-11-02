@@ -24,6 +24,11 @@
 //! it is split in two, the second half adding a reference to the extent
 //! both halves name.
 //!
+//! A dedupe ([`Filesystem::dedupe_range`]) compares the two ranges first
+//! and, only when they hold the same bytes, makes the same clone. Its range
+//! must lie inside both files, so no file grows, and the destination's times
+//! do not move, since its contents do not change.
+//!
 //! The kernel's rules for the range hold here too: both offsets are whole
 //! sectors, and so is the length unless it runs to the source's end, in
 //! which case the source's last, partial sector is cloned whole and must
@@ -99,10 +104,131 @@ impl Filesystem {
         let Some(span) = range else {
             return Ok(());
         };
-        self.remap(src, src_offset, dst, &target, dst_offset, span)
+        self.remap(src, src_offset, dst, &target, dst_offset, span, true)
     }
 
-    /// The two inodes a clone joins, once both are regular
+    /// Deduplicate `len` bytes of inode `dst` from `dst_offset` against
+    /// inode `src` from `src_offset`, as the kernel's `FIDEDUPERANGE` does:
+    /// when the two ranges hold the same bytes, `dst`'s range is replaced by
+    /// a clone of `src`'s, as one committed transaction, and its times do
+    /// not move.
+    ///
+    /// Returns the length asked for, as the kernel reports it, or `None` when
+    /// the ranges differ, in which case nothing is written. Only whole
+    /// sectors are compared and shared, unless both ranges run to their
+    /// files' ends, so a length cut down to whole sectors is still reported
+    /// whole.
+    ///
+    /// # Errors
+    ///
+    /// As [`Filesystem::clone_range`], and [`Error::UnsupportedFeature`] for
+    /// an offset that is not whole sectors, a range that does not lie inside
+    /// both files, and ranges of one file that overlap.
+    pub fn dedupe_range(
+        &mut self,
+        src: u64,
+        src_offset: u64,
+        dst: u64,
+        dst_offset: u64,
+        len: u64,
+    ) -> Result<Option<u64>> {
+        let (source, target) = self.remap_inodes(src, dst)?;
+        let range = self.dedupe_span(src, &source, src_offset, dst, &target, dst_offset, len)?;
+        let Some(span) = range else {
+            return Ok(Some(len));
+        };
+        if !self.same_bytes(src, src_offset, dst, dst_offset, span.len)? {
+            return Ok(None);
+        }
+        self.remap(src, src_offset, dst, &target, dst_offset, span, false)?;
+        Ok(Some(len))
+    }
+
+    /// Whether `len` bytes of `a` from `a_offset` are the bytes of `b` from
+    /// `b_offset`, read a piece at a time.
+    fn same_bytes(&self, a: u64, a_offset: u64, b: u64, b_offset: u64, len: u64) -> Result<bool> {
+        const PIECE: u64 = 1 << 20;
+        let mut done = 0;
+        while done < len {
+            let n = PIECE.min(len - done) as usize;
+            let mut left = vec![0u8; n];
+            let mut right = vec![0u8; n];
+            for (ino, at, buf) in [(a, a_offset, &mut left), (b, b_offset, &mut right)] {
+                let read = self.read_at(ino, at + done, buf)?;
+                if read != n {
+                    return Err(refused(format!(
+                        "inode {ino} gave {read} bytes at {}, inside its size, where {n} were \
+                         asked for",
+                        at + done
+                    )));
+                }
+            }
+            if left != right {
+                return Ok(false);
+            }
+            done += n as u64;
+        }
+        Ok(true)
+    }
+
+    /// The range a dedupe covers, by the kernel's rules for `FIDEDUPERANGE`,
+    /// or `None` when it is empty: whole-sector offsets, both ranges inside
+    /// their files, and a length cut down to whole sectors unless both ranges
+    /// run to their files' ends.
+    #[allow(clippy::too_many_arguments)]
+    fn dedupe_span(
+        &self,
+        src: u64,
+        source: &Inode,
+        src_offset: u64,
+        dst: u64,
+        target: &Inode,
+        dst_offset: u64,
+        len: u64,
+    ) -> Result<Option<Span>> {
+        if len == 0 {
+            return Ok(None);
+        }
+        let sector = u64::from(self.sb.sectorsize);
+        for (ino, offset, size) in [
+            (src, src_offset, source.size),
+            (dst, dst_offset, target.size),
+        ] {
+            if offset >= size || offset.checked_add(len).is_none_or(|end| end > size) {
+                return Err(refused(format!(
+                    "a dedupe of {len} bytes at {offset} does not lie inside inode {ino}, which \
+                     ends at {size}"
+                )));
+            }
+        }
+        if !src_offset.is_multiple_of(sector) || !dst_offset.is_multiple_of(sector) {
+            return Err(refused(format!(
+                "a dedupe's offsets must be whole {sector}-byte sectors, and {src_offset} and \
+                 {dst_offset} are not both"
+            )));
+        }
+        // Both ranges at their files' ends: the source's last, partial
+        // sector is cloned whole, and lands on the destination's own.
+        let to_ends = src_offset + len == source.size && dst_offset + len == target.size;
+        let (len, span) = if to_ends {
+            (len, source.size.next_multiple_of(sector) - src_offset)
+        } else {
+            let whole = len - len % sector;
+            (whole, whole)
+        };
+        if len == 0 {
+            return Ok(None);
+        }
+        if src == dst && src_offset < dst_offset + span && dst_offset < src_offset + span {
+            return Err(refused(format!(
+                "a dedupe of inode {src} against itself from {src_offset} to {dst_offset} \
+                 overlaps the range it reads"
+            )));
+        }
+        Ok(Some(Span { len, span }))
+    }
+
+    /// The two inodes a clone or dedupe joins, once both are regular
     /// files on a writable top-level subvolume that may be joined.
     fn remap_inodes(&self, src: u64, dst: u64) -> Result<(Inode, Inode)> {
         self.require_writable_top_level()?;
@@ -130,8 +256,8 @@ impl Filesystem {
 
     /// Put clones of `src`'s items over `span` from `src_offset` into
     /// `dst` at `dst_offset`, replacing what `dst` holds there, as one
-    /// committed transaction, moving `dst`'s change and modification
-    /// times as the kernel's clone moves them.
+    /// committed transaction. `times` moves `dst`'s change and modification
+    /// times, as the kernel's clone moves them and its dedupe does not.
     #[allow(clippy::too_many_arguments)]
     fn remap(
         &mut self,
@@ -141,6 +267,7 @@ impl Filesystem {
         target: &Inode,
         dst_offset: u64,
         span: Span,
+        times: bool,
     ) -> Result<()> {
         let Span { len, span } = span;
         let dst_items = extent_items(self.items_of(dst)?);
@@ -216,7 +343,8 @@ impl Filesystem {
         let mut raw = self.raw_inode(dst)?;
         raw[io::SIZE..io::SIZE + 8].copy_from_slice(&new_size.to_le_bytes());
         raw[io::NBYTES..io::NBYTES + 8].copy_from_slice(&nbytes.to_le_bytes());
-        crate::namespace::touch(&mut raw, generation, now, &[io::CTIME, io::MTIME]);
+        let moved: &[usize] = if times { &[io::CTIME, io::MTIME] } else { &[] };
+        crate::namespace::touch(&mut raw, generation, now, moved);
         let mut edits: Vec<ItemEdit> = edits.into_values().collect();
         edits.push(ItemEdit::Put(OwnedItem {
             key: DiskKey {
