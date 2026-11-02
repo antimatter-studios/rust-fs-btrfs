@@ -38,13 +38,15 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Arg, ArgAction, ArgMatches};
 use fs_btrfs::inode::Inode;
 use fs_btrfs::{Error, Filesystem};
 use fs_core::cli::transfer::{
-    import_args_with_tree, import_tree_with_sparse, import_with_sparse, FileSink, ImportOptions,
-    ImportRequest, ImportTreeOptions, SparseOptions, TreeSink,
+    import_args_with_xattrs, import_tree_with_preserve, import_with_sparse, ExtendedAttribute,
+    FileSink, ImportOptions, ImportRequest, ImportTreeOptions, SparseOptions, TreeSink,
+    XattrOptions,
 };
 use fs_core::cli::{CliError, Outcome};
 
@@ -67,7 +69,7 @@ const GATHER: usize = 4 << 20;
 
 /// The arguments `import` takes: the shared tree set, and `--verify`.
 pub fn args() -> [Arg; 7] {
-    let [source, path, replace, recursive, depth, preserve] = import_args_with_tree();
+    let [source, path, replace, recursive, depth, preserve] = import_args_with_xattrs();
     [
         source,
         path,
@@ -418,6 +420,92 @@ impl TreeSink for Sink<'_> {
     fn format_name(&self) -> &str {
         "Btrfs"
     }
+
+    fn create_symbolic_link(&mut self, path: &Path, target: &Path) -> Result<(), CliError> {
+        let what = os_bytes(path.as_os_str()).to_vec();
+        let mut fs = self.mount_rw()?;
+        let (parent, name) = parent_of(&fs, &what)?;
+        fs.symlink(
+            parent.ino,
+            name,
+            os_bytes(target.as_os_str()),
+            parent.uid,
+            parent.gid,
+        )
+        .map_err(|e| state_error(&what, e))?;
+        self.rw = Some(fs);
+        Ok(())
+    }
+
+    fn create_hard_link(&mut self, path: &Path, existing: &Path) -> Result<(), CliError> {
+        let what = os_bytes(path.as_os_str()).to_vec();
+        let mut fs = self.mount_rw()?;
+        let ino = entry_ino(&fs, os_bytes(existing.as_os_str()))?;
+        let (parent, name) = parent_of(&fs, &what)?;
+        fs.link(ino, parent.ino, name)
+            .map_err(|e| state_error(&what, e))?;
+        self.rw = Some(fs);
+        Ok(())
+    }
+
+    fn set_times(
+        &mut self,
+        path: &Path,
+        accessed: Option<SystemTime>,
+        modified: Option<SystemTime>,
+    ) -> Result<(), CliError> {
+        let what = os_bytes(path.as_os_str()).to_vec();
+        let mut fs = self.mount_rw()?;
+        let ino = entry_ino(&fs, &what)?;
+        fs.set_times(ino, accessed.map(stored_time), modified.map(stored_time))
+            .map_err(|e| state_error(&what, e))?;
+        self.rw = Some(fs);
+        Ok(())
+    }
+
+    fn set_extended_attribute(
+        &mut self,
+        path: &Path,
+        attribute: &ExtendedAttribute,
+    ) -> Result<(), CliError> {
+        let what = os_bytes(path.as_os_str()).to_vec();
+        let mut fs = self.mount_rw()?;
+        let ino = entry_ino(&fs, &what)?;
+        fs.set_xattr(ino, os_bytes(&attribute.name), &attribute.value)
+            .map_err(|e| state_error(&what, e))?;
+        self.rw = Some(fs);
+        Ok(())
+    }
+}
+
+/// The inode `path` names, its last component not followed, so a symbolic
+/// link's own inode is the one a time or attribute lands on.
+fn entry_ino(fs: &Filesystem, path: &[u8]) -> Result<u64, CliError> {
+    if path.iter().all(|&b| b == b'/') {
+        return fs
+            .resolve_path_bytes(b"/")
+            .map(|found| found.inode.ino)
+            .map_err(|e| state_error(path, e));
+    }
+    let (parent, name) = parent_of(fs, path)?;
+    fs.lookup(parent.ino, name)
+        .map(|found| found.ino)
+        .map_err(|e| state_error(path, e))
+}
+
+/// A time as the inode stores it: seconds from the epoch, negative before it,
+/// and the nanoseconds after those seconds.
+fn stored_time(time: SystemTime) -> (i64, u32) {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(after) => (after.as_secs() as i64, after.subsec_nanos()),
+        Err(before) => {
+            let before = before.duration();
+            match before.subsec_nanos() {
+                0 => (-(before.as_secs() as i64), 0),
+                nanos => (-(before.as_secs() as i64) - 1, 1_000_000_000 - nanos),
+            }
+        }
+    }
 }
 
 /// `import [--recursive] [--replace] [--verify] SOURCE PATH`.
@@ -435,7 +523,8 @@ pub fn import(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Outcom
                 "--verify reads one staged file back; it does not apply to --recursive",
             ));
         }
-        return import_tree_with_sparse(&request, Some(&mut sink), tree, sparse);
+        let xattrs = XattrOptions::from_matches(sub)?;
+        return import_tree_with_preserve(&request, Some(&mut sink), tree, sparse, xattrs);
     }
     import_with_sparse(&request, options, sparse, Some(&mut sink))
 }
