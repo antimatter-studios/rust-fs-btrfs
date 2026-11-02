@@ -38,6 +38,9 @@ use std::process::Command;
 
 use fs_btrfs_test_support::fixture_dir;
 
+#[path = "common/fixture_magic.rs"]
+mod fixture_magic;
+
 /// What a full `chore fixtures` produces, asked of the builder itself.
 fn expected() -> Vec<String> {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-disks/build-fixtures.sh");
@@ -110,36 +113,7 @@ fn the_fixture_build_produced_every_artefact_it_names() {
 /// byte 0x40 of the superblock, which lives at 64 KiB.
 #[test]
 fn every_fixture_image_carries_the_btrfs_magic() {
-    const MAGIC_AT: u64 = 0x1_0000 + 0x40;
     let dir = fixture_dir();
-    let mut checked = 0;
-    for name in expected() {
-        if !name.ends_with(".img") {
-            continue;
-        }
-        let path = dir.join(&name);
-        let Ok(bytes) = std::fs::read(&path) else {
-            // Absence is the other test's failure, not this one's: it
-            // names all of them at once.
-            continue;
-        };
-        let at = MAGIC_AT as usize;
-        assert!(
-            bytes.len() > at + 8,
-            "{name} is {} bytes, which is shorter than one superblock",
-            bytes.len()
-        );
-        assert_eq!(
-            &bytes[at..at + 8],
-            b"_BHRfS_M",
-            "{name} has no btrfs superblock magic: it is not a btrfs filesystem, \
-             so whichever oracle reads it first will fail about itself instead"
-        );
-        checked += 1;
-    }
-    assert!(
-        checked > 0,
-        "no fixture image was checked, so this compared nothing"
-    );
+    let checked = fixture_magic::check_fixture_magic(&dir, expected());
     println!("{checked} fixture images carry the btrfs superblock magic");
 }
