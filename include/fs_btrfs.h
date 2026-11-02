@@ -459,6 +459,26 @@ int fs_btrfs_truncate(fs_btrfs_fs_t *fs, const char *path, uint64_t size);
 int fs_btrfs_clone_range(fs_btrfs_fs_t *fs, const char *src, uint64_t src_offset,
                          const char *dst, uint64_t dst_offset, uint64_t len);
 
+/*
+ * Deduplicate `len` bytes of the regular file at `dst` from `dst_offset`
+ * against the regular file at `src` from `src_offset`, as FIDEDUPERANGE
+ * does: when the two ranges hold the same bytes, `dst`'s range becomes a
+ * clone of `src`'s in one committed transaction, and `dst`'s times do not
+ * move. Only whole sectors are compared and shared, unless both ranges run
+ * to their files' ends.
+ *
+ * Returns 0 when the ranges were the same, storing `len` through `deduped`
+ * when it is not NULL, as the kernel reports it even where fewer bytes are
+ * shared; 1 when they differ, storing 0, with nothing written; or -1: ENOENT
+ * for no such path, EISDIR for anything but a regular file, EROFS on a
+ * read-only handle, ENOTSUP for an offset that is not whole sectors, a range
+ * that does not lie inside both files, ranges of one file that overlap, and
+ * what fs_btrfs_clone_range cannot write yet.
+ */
+int fs_btrfs_dedupe_range(fs_btrfs_fs_t *fs, const char *src, uint64_t src_offset,
+                          const char *dst, uint64_t dst_offset, uint64_t len,
+                          uint64_t *deduped);
+
 /* What fs_btrfs_defragment did. */
 typedef struct {
     uint64_t items_before; /* the file's extent items before, holes included */
