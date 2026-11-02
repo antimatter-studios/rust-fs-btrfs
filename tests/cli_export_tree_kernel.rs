@@ -185,7 +185,7 @@ fn a_kernel_tree_is_exported_with_its_links_identities_and_times() {
     let plain = dir.join("plain");
     let out = export_tree(&image, &[], &plain);
     let report = stdout(&out);
-    assert_eq!(out.status.code(), Some(1), "{report}{}", stderr(&out));
+    assert_eq!(out.status.code(), Some(5), "{report}{}", stderr(&out));
     let entries = seen.len() + 1;
     assert_eq!(
         json_field(&report, "completed"),
@@ -226,7 +226,7 @@ fn a_kernel_tree_is_exported_with_its_links_identities_and_times() {
     let dest = dir.join("preserved");
     let out = export_tree(&image, &["--preserve=links,times"], &dest);
     let report = stdout(&out);
-    assert_eq!(out.status.code(), Some(1), "the fifo is skipped: {report}");
+    assert_eq!(out.status.code(), Some(5), "the fifo is skipped: {report}");
     assert_eq!(
         json_field(&report, "completed"),
         (entries - 1).to_string(),
@@ -368,7 +368,7 @@ fn a_damaged_file_fails_alone_and_is_never_published_or_replaced() {
         };
         let out = export_tree(&image, flags, &dest);
         let report = stdout(&out);
-        assert_eq!(out.status.code(), Some(1), "{report}{}", stderr(&out));
+        assert_eq!(out.status.code(), Some(5), "{report}{}", stderr(&out));
         if !replace {
             assert_eq!(json_field(&report, "failed"), "1", "{report}");
         }

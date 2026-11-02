@@ -171,7 +171,7 @@ fn command() -> Cmd {
         .subcommand(
             Cmd::new("export")
                 .about("Copy a regular file, or with --recursive a directory tree")
-                .args(transfer::export_args_with_times())
+                .args(transfer::export_args_with_xattrs())
                 .after_help(
                     "Examples:\n  fs.btrfs disk.img export /backup.tar backup.tar\n  \
                      fs.btrfs disk.img export --replace /etc/hostname hostname\n  \
@@ -190,7 +190,8 @@ fn command() -> Cmd {
                      --preserve=links, which recreates their targets without following them \
                      and copies each regular inode once; a snapshot's files are never linked \
                      to its source's. --preserve=times sets the stored access and modification \
-                     times. Symlink times are not set. --verify reads each staged file back \
+                     times. Symlink times are not set. --preserve=xattrs copies extended \
+                     attributes. --verify reads each staged file back \
                      before publication.",
                 ),
         )
@@ -218,8 +219,9 @@ fn command() -> Cmd {
                      before the rename. --recursive imports a tree with the shared tree \
                      transfer, merging into directories already there, --max-depth \
                      bounding the walk. Paths inside a subvolume other than the top level \
-                     are refused with exit 3, as are links, times and holes \
-                     (--preserve), which this sink does not keep yet.",
+                     are refused with exit 3, as are holes under --preserve=sparse. \
+                     --preserve=links,times,xattrs keeps symbolic links, hard links, \
+                     access and modification times and extended attributes.",
                 ),
         )
         .subcommand(
@@ -714,7 +716,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
             let tree = transfer::TreeOptions::from_matches(sub)?;
             let root = device::mount(target, offset)?;
             if tree.recursive {
-                transfer::export_tree_with_times(
+                transfer::export_tree_with_xattrs(
                     &request,
                     &mut TreeExport {
                         root: &root,
@@ -725,6 +727,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
                     tree,
                     transfer::LinkOptions::from_matches(sub)?,
                     transfer::TimeOptions::from_matches(sub)?,
+                    transfer::XattrOptions::from_matches(sub)?,
                 )
             } else {
                 export(&root, &request, transfer::ExportOptions::from_matches(sub)?)
@@ -2134,6 +2137,29 @@ impl TreeExport<'_> {
 impl transfer::TreeSource for TreeExport<'_> {
     fn image_path(&self) -> Option<&Path> {
         Some(self.image)
+    }
+
+    fn extended_attributes(
+        &mut self,
+        path: &Path,
+    ) -> Result<Vec<transfer::ExtendedAttribute>, CliError> {
+        let (bytes, target) = self.resolve(path)?;
+        let entries = target
+            .fs(self.root)
+            .list_xattrs(target.inode.ino)
+            .map_err(|e| btrfs_error(&bytes, e))?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| transfer::ExtendedAttribute {
+                name: os_name(entry.name),
+                value: entry.value,
+            })
+            .collect())
+    }
+
+    /// Btrfs has no named streams.
+    fn named_streams(&mut self, _path: &Path) -> Result<Vec<transfer::NamedStream>, CliError> {
+        Ok(Vec::new())
     }
 
     fn symbolic_link(&mut self, path: &Path) -> Result<Option<transfer::SymbolicLink>, CliError> {

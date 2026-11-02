@@ -91,6 +91,7 @@ cli_ls_recursive_kernel   3
 cli_mkdir_kernel          2
 cli_mkfs_kernel           5
 cli_oracle                3
+cli_preserve_kernel       2
 cli_resize_kernel         3
 # One kernel stat case compares 17 paths, including nested subvolumes (#412).
 cli_stat_kernel           1

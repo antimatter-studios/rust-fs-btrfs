@@ -115,7 +115,7 @@ fn a_tree_is_exported_with_its_links_and_times() {
     let refusing = dir.join("refusing");
     let out = export_tree(&img, &[], &refusing);
     let report = stdout(&out);
-    assert_eq!(out.status.code(), Some(1), "{report}{}", stderr(&out));
+    assert_eq!(out.status.code(), Some(5), "{report}{}", stderr(&out));
     assert_eq!(json_field(&report, "completed"), "8", "{report}");
     assert_eq!(json_field(&report, "refused"), "2", "{report}");
     assert_eq!(json_field(&report, "failed"), "0", "{report}");
@@ -181,7 +181,7 @@ fn a_tree_is_exported_with_its_links_and_times() {
     let over = dir.join("over");
     let out = export_tree(&img, &["--preserve=links", "--max-depth", "3"], &over);
     let report = stdout(&out);
-    assert_eq!(out.status.code(), Some(1), "{report}");
+    assert_eq!(out.status.code(), Some(5), "{report}");
     assert_eq!(json_field(&report, "completed"), "9", "{report}");
     assert_eq!(json_field(&report, "failed"), "1", "{report}");
     assert!(item(&report, "/tree/a/b/c/deep").contains("maximum depth exceeded"));
