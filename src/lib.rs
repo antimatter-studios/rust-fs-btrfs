@@ -92,6 +92,7 @@ pub mod devices;
 pub mod dir;
 pub mod error;
 pub mod extent_write;
+pub mod fallocate;
 pub mod fs;
 pub mod inode;
 pub mod leaf_edit;
