@@ -453,7 +453,11 @@ pub struct VariantVerdict {
 /// The kernel's device registry is told to forget between variants.
 /// Every variant carries the same fsid and devid with a different
 /// generation, and a registry still holding the previous one's is a
-/// mount failure that has nothing to do with the bytes.
+/// mount failure that has nothing to do with the bytes, and would be graded
+/// as the kernel refusing them. The settle comes first, as in
+/// [`guest_script`]: a udev worker still scanning the variant just detached
+/// would put the record back after the forget (#742). A forget that fails
+/// stops the sweep, because every verdict after it could be that failure.
 #[track_caller]
 pub fn guest_kernel_read_variants(
     base: &std::path::Path,
@@ -524,7 +528,8 @@ variant() {{
         dd if="$2" of="$work/image" bs=65536 oflag=seek_bytes seek="$1" conv=notrunc status=none
         shift 2
     done
-    btrfs device scan --forget >/dev/null 2>&1 || true
+    udevadm settle
+    btrfs device scan --forget >/dev/null
     dmesg -C
     loop="$(losetup --find --show --read-only "$work/image")"
     if mount -t btrfs -o ro "$loop" "$mnt" 2> "$out/mount.err"; then
@@ -627,7 +632,9 @@ pub struct PoolRead {
 /// be told about every member first, which is what `btrfs device scan`
 /// over the loop devices does. The registry is told to forget before and
 /// after, so a member it remembers from another copy of the same pool
-/// (the same fsid, the same devids) cannot stand in for one of these.
+/// (the same fsid, the same devids) cannot stand in for one of these. The
+/// forget before attaching waits for udev and has to succeed, as in
+/// [`guest_script`] (#742).
 #[track_caller]
 pub fn guest_kernel_pool_read(images: &[&str], script: &str) -> PoolRead {
     pool_run(images, script, false)
@@ -694,7 +701,8 @@ cleanup() {{
     rm -rf "$work"
 }}
 trap cleanup EXIT
-btrfs device scan --forget >/dev/null 2>&1 || true
+udevadm settle
+btrfs device scan --forget >/dev/null
 i=0
 for img in {members}; do
     cp --sparse=always "$img" "$work/member-$i"
