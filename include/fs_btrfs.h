@@ -384,8 +384,7 @@ int fs_btrfs_subvol_delete(fs_btrfs_fs_t *fs, const char *path);
  * as `btrfs subvolume snapshot` does. Returns the snapshot's id, or 0:
  * ENOENT when no subvolume is at `source`, and for `path` as
  * fs_btrfs_subvol_create; EROFS on a read-only handle or top level;
- * ENOTSUP for a source whose tree is taller than one leaf
- * (rust-fs-btrfs#700), a handle on another subvolume or quotas enabled.
+ * ENOTSUP for a handle on another subvolume or quotas enabled.
  */
 uint64_t fs_btrfs_subvol_snapshot(fs_btrfs_fs_t *fs, const char *source,
                                   const char *path, int read_only);

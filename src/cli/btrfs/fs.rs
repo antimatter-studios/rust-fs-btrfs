@@ -641,9 +641,8 @@ fn subvolume_command() -> Cmd {
                      What `btrfs subvolume snapshot` does, committed as one transaction. The \
                      snapshot's parent must be a directory of the top-level subvolume, and the \
                      report carries its id. A source that is no subvolume, a name already \
-                     there or a missing parent is refused with exit 4; a read-only top level, \
-                     a volume with quotas enabled or a source whose tree is taller than one \
-                     leaf with exit 3 (rust-fs-btrfs#700).",
+                     there or a missing parent is refused with exit 4; a read-only top level or \
+                     a volume with quotas enabled with exit 3.",
                 ),
         )
         .subcommand(

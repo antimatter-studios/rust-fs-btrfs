@@ -8,5 +8,4 @@
   snapshot's id, or 0 with the error recorded; the command reports the id,
   and exits 4 for a source that is no subvolume, a name already there or a
   missing parent, and 3 for what the library refuses: a read-only top
-  level, a volume with quotas enabled or a source whose tree is taller
-  than one leaf (#700).
+  level or a volume with quotas enabled.

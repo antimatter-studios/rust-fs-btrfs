@@ -244,28 +244,109 @@ fn a_refused_snapshot_writes_nothing() {
     assert_eq!(image.digest(), before, "a refused snapshot wrote something");
 }
 
+/// A volume whose top level is too full for one leaf.
+fn tall(tag: &str) -> Scratch {
+    let image = Scratch::new(tag);
+    let mut fs = image.mount();
+    let root = fs.root_inode().unwrap().ino;
+    // Enough inodes that the top level's tree outgrows one leaf.
+    for i in 0..200 {
+        let name = format!("file-{i:04}");
+        let ino = fs.create(root, name.as_bytes(), 0o644, 0, 0).unwrap();
+        fs.write(ino, 0, &pattern(8192, i as u8)).unwrap();
+    }
+    image
+}
+
 #[test]
-fn a_source_tree_taller_than_a_leaf_is_refused_by_name() {
-    let image = Scratch::new("tall");
+fn a_source_tree_taller_than_a_leaf_reads_as_its_source() {
+    let image = tall("tall");
+    let source = contents(&image.mount_ro());
+    let snap = {
+        let mut fs = image.mount();
+        let root = fs.root_inode().unwrap().ino;
+        let generation = fs.superblock().generation;
+        let snap = fs
+            .create_snapshot(FS_TREE_OBJECTID, root, b"snap", false)
+            .expect("snapshot a tree taller than a leaf");
+        assert_eq!(
+            fs.superblock().generation,
+            generation + 1,
+            "one transaction"
+        );
+        snap
+    };
+    let fs = image.mount_ro();
+    assert_eq!(contents(&fs.open_subvolume(snap).unwrap()), source);
+    let mut top = source.clone();
+    top.push((b"snap".to_vec(), None));
+    top.sort();
+    assert_eq!(
+        contents(&fs),
+        top,
+        "the top level, with the snapshot's entry"
+    );
+}
+
+#[test]
+fn a_tall_source_written_after_its_snapshot_leaves_the_snapshot_alone() {
+    let image = tall("tall-written");
+    let source = contents(&image.mount_ro());
+    let snap = {
+        let mut fs = image.mount();
+        let root = fs.root_inode().unwrap().ino;
+        fs.create_snapshot(FS_TREE_OBJECTID, root, b"snap", false)
+            .unwrap()
+    };
     {
         let mut fs = image.mount();
         let root = fs.root_inode().unwrap().ino;
-        // Enough inodes that the top level's tree outgrows one leaf.
-        for i in 0..200 {
-            let name = format!("file-{i:04}");
-            fs.create(root, name.as_bytes(), 0o644, 0, 0).unwrap();
-        }
+        let ino = fs.lookup(root, b"file-0100").unwrap().ino;
+        fs.write(ino, 0, b"changed in the source").unwrap();
     }
+    let fs = image.mount_ro();
+    assert_eq!(
+        contents(&fs.open_subvolume(snap).unwrap()),
+        source,
+        "a write to the source reached the snapshot"
+    );
+    let root = fs.root_inode().unwrap().ino;
+    let ino = fs.lookup(root, b"file-0100").unwrap().ino;
+    assert_eq!(&fs.read_file(ino).unwrap()[..21], b"changed in the source");
+}
+
+/// A write through this crate into a tall snapshot is refused (#734), with
+/// nothing written: the kernel takes one, and this crate takes one into the
+/// source.
+#[test]
+fn a_write_into_a_tall_snapshot_is_refused() {
+    let image = tall("tall-snapshot-written");
+    let snap = {
+        let mut fs = image.mount();
+        let root = fs.root_inode().unwrap().ino;
+        fs.create_snapshot(FS_TREE_OBJECTID, root, b"snap", false)
+            .unwrap()
+    };
     let before = image.digest();
     {
-        let mut fs = image.mount();
-        let root = fs.root_inode().unwrap().ino;
-        match fs.create_snapshot(FS_TREE_OBJECTID, root, b"snap", false) {
-            Err(Error::UnsupportedFeature(why)) => {
-                assert!(why.contains("level"), "the refusal does not name it: {why}")
-            }
-            other => panic!("a tree taller than a leaf: {other:?}"),
-        }
+        let fs = image.mount();
+        let mut sv = fs.open_subvolume(snap).unwrap();
+        let root = sv.root_inode().unwrap().ino;
+        let ino = sv.lookup(root, b"file-0100").unwrap().ino;
+        assert!(
+            matches!(
+                sv.write(ino, 0, b"changed in the snapshot"),
+                Err(Error::UnsupportedFeature(_))
+            ),
+            "a data write"
+        );
+        assert!(
+            matches!(
+                sv.create(root, b"new", 0o644, 0, 0),
+                Err(Error::UnsupportedFeature(_))
+            ),
+            "a namespace change"
+        );
     }
-    assert_eq!(image.digest(), before, "a refused snapshot wrote something");
+    assert_eq!(image.digest(), before, "a refused write wrote something");
 }

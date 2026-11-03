@@ -998,7 +998,7 @@ impl Filesystem {
         use crate::inode::{offsets as io, INODE_ITEM_KEY, INODE_ITEM_SIZE, INODE_REF_KEY};
         use crate::leaf_edit::OwnedItem;
         use crate::namespace::now;
-        use crate::transaction::{ItemEdit, NewTree};
+        use crate::transaction::{ItemEdit, NewRoot, NewTree};
 
         self.require_writable_top_level()?;
         let items = self.root_tree_items()?;
@@ -1069,7 +1069,7 @@ impl Filesystem {
         dotdot.extend_from_slice(b"..");
         let new_trees = vec![NewTree {
             objectid: id,
-            items: vec![
+            root: NewRoot::Leaf(vec![
                 OwnedItem {
                     key: key(TOP_DIR, INODE_ITEM_KEY, 0),
                     data: inode,
@@ -1078,7 +1078,7 @@ impl Filesystem {
                     key: key(TOP_DIR, INODE_REF_KEY, TOP_DIR),
                     data: dotdot,
                 },
-            ],
+            ]),
         }];
 
         self.commit_write(
@@ -1106,9 +1106,17 @@ impl Filesystem {
     ///
     /// - the snapshot's root block is a copy of its source's, owned by the
     ///   new id, and the source keeps its own;
-    /// - each data extent the source's root leaf refers to gains a keyed
-    ///   reference from the snapshot, as `btrfs_inc_ref` gives one, so
-    ///   the two trees share the bytes until either is written;
+    /// - what that root points at gains a keyed reference from the
+    ///   snapshot, as `btrfs_inc_ref` gives one, so the two trees share it
+    ///   until either is written: each child of a root node, or each data
+    ///   extent a root leaf's items name;
+    /// - that reference goes inline in its record, unless the extent has a
+    ///   reference filed as an item of its own already or the record would
+    ///   reach the size past which the kernel keeps none inline, when it is
+    ///   an item of its own as well and the record only counts it;
+    /// - when the source is the top level, a block below its root that this
+    ///   transaction's entries for the snapshot land in is copied as a block
+    ///   the snapshot shares, so the snapshot holds what it pointed at;
     /// - the source's `last_snapshot` becomes the transaction, and the
     ///   snapshot's `ROOT_ITEM` is the source's with its own root block,
     ///   a new UUID, the source's UUID as its parent, the transaction as
@@ -1130,12 +1138,9 @@ impl Filesystem {
     /// [`Error::NotADirectory`] if `parent` is not one;
     /// [`Error::UnsupportedFeature`] for a name that is invalid or already
     /// present, a mount of a subvolume other than the top level, a
-    /// filesystem with no UUID tree or with quotas enabled, a source whose
-    /// tree is taller than one leaf (whose child blocks would each need a
-    /// reference from the snapshot, which is not written), a data extent
-    /// whose references are kept as items of their own or would outgrow
-    /// its record, and whatever the planner refuses. Nothing is written
-    /// unless everything is.
+    /// filesystem with no UUID tree or with quotas enabled, an extent or
+    /// tree block with no record, and whatever the planner refuses. Nothing
+    /// is written unless everything is.
     pub fn create_snapshot(
         &mut self,
         source: u64,
@@ -1143,13 +1148,14 @@ impl Filesystem {
         name: &[u8],
         read_only: bool,
     ) -> Result<u64> {
-        use crate::backref::{self, EXTENT_DATA_REF, SHARED_DATA_REF};
-        use crate::chunk::key_type::EXTENT_ITEM;
+        use crate::backref::{self, EXTENT_DATA_REF, TREE_BLOCK_REF};
+        use crate::chunk::key_type::{EXTENT_ITEM, METADATA_ITEM};
         use crate::chunk::objectid::{EXTENT_TREE, ROOT_TREE};
+        use crate::extent_write::data_ref_hash;
         use crate::fs::{file_extent as fe, EXTENT_DATA_KEY};
         use crate::leaf_edit::OwnedItem;
         use crate::namespace::now;
-        use crate::transaction::{ItemEdit, NewTree, RecordEdit};
+        use crate::transaction::{ItemEdit, NewRoot, NewTree, RecordEdit, TreeBlockRef};
         use root_item_more as m;
 
         self.require_writable_top_level()?;
@@ -1186,14 +1192,7 @@ impl Filesystem {
             ));
         }
         let block = self.read_tree_block(le64(&source_item, root_item::BYTENR))?;
-        if block.header.level != 0 {
-            return Err(Error::UnsupportedFeature(format!(
-                "subvolume {source}'s tree has its root at level {}, and snapshotting a tree \
-                 taller than one leaf, whose child blocks each gain a reference from the \
-                 snapshot, is not implemented",
-                block.header.level
-            )));
-        }
+        let ptrs: &[crate::btree::KeyPtr] = block.body.key_ptrs().unwrap_or(&[]);
         let leaf: Vec<OwnedItem> = block
             .body
             .items()
@@ -1233,20 +1232,50 @@ impl Filesystem {
                 ));
         }
         let mut records = Vec::with_capacity(refs.len());
+        let mut block_refs = Vec::with_capacity(ptrs.len());
+        // References filed as items of their own, as the kernel's
+        // `lookup_inline_extent_backref` sends them once it answers `-EAGAIN`.
+        let mut keyed_items: Vec<OwnedItem> = Vec::new();
         {
             let reader = self.pool_reader();
             let tree = reader.tree();
             let extent_root = self.tree_root(EXTENT_TREE)?;
             let limit = crate::transaction::max_inline_extent_item(self.sb.nodesize);
-            for (&(bytenr, len), names) in &refs {
-                for kind in [EXTENT_DATA_REF, SHARED_DATA_REF] {
-                    if !tree.find_all(extent_root, bytenr, kind)?.is_empty() {
-                        return Err(Error::UnsupportedFeature(format!(
-                            "the data extent at {bytenr} keeps its references as items of \
-                             their own, and filing the snapshot's that way is not implemented"
-                        )));
-                    }
+
+            // Each child of a root node gains the snapshot's reference; the
+            // child's own children and data are reached through it, so they
+            // gain nothing (#700).
+            for p in ptrs {
+                let level = block.header.level - 1;
+                let record = tree
+                    .search(
+                        extent_root,
+                        &key(p.blockptr, METADATA_ITEM, u64::from(level)),
+                    )?
+                    .ok_or_else(|| {
+                        Error::UnsupportedFeature(format!(
+                            "the tree block at {} subvolume {source}'s root points at has no \
+                             record at level {level}",
+                            p.blockptr
+                        ))
+                    })?;
+                // One byte of type and eight of tree.
+                let keyed = self.has_keyed_backrefs(p.blockptr)? || record.data.len() + 9 >= limit;
+                if keyed {
+                    keyed_items.push(OwnedItem {
+                        key: key(p.blockptr, TREE_BLOCK_REF, id),
+                        data: Vec::new(),
+                    });
                 }
+                block_refs.push(TreeBlockRef {
+                    bytenr: p.blockptr,
+                    level,
+                    tree: id,
+                    keyed,
+                });
+            }
+
+            for (&(bytenr, len), names) in &refs {
                 let before = tree
                     .search(extent_root, &key(bytenr, EXTENT_ITEM, len))?
                     .map(|i| i.data)
@@ -1257,15 +1286,52 @@ impl Filesystem {
                         ))
                     })?;
                 let mut after = before.clone();
+                let mut keyed = self.has_keyed_backrefs(bytenr)?;
+                // This extent's references already filed as items here: two
+                // items at one inode and offset count one reference twice.
+                let mut filed: std::collections::BTreeMap<(u64, u64), (u64, u32)> =
+                    std::collections::BTreeMap::new();
                 for &(ino, offset) in names {
-                    after = backref::add_inline_data_ref(EXTENT_ITEM, &after, id, ino, offset)?;
+                    let added = backref::add_inline_data_ref(EXTENT_ITEM, &after, id, ino, offset)?;
+                    // Counted up inline, or room for one more with no item
+                    // of its own in the way.
+                    if added.len() == after.len() || (!keyed && added.len() < limit) {
+                        after = added;
+                        continue;
+                    }
+                    keyed = true;
+                    after = backref::raise_total(EXTENT_ITEM, &after, 1)?;
+                    if let Some((_, count)) = filed.get_mut(&(ino, offset)) {
+                        *count = count.checked_add(1).ok_or_else(|| {
+                            Error::UnsupportedFeature(format!(
+                                "the data reference of inode {ino} at {offset} counts more items \
+                                 than it can"
+                            ))
+                        })?;
+                        continue;
+                    }
+                    // A taken hash files the reference at the next free key
+                    // offset, as `insert_extent_data_ref` does (#608).
+                    let mut at = data_ref_hash(id, ino, offset);
+                    while filed.values().any(|(o, _)| *o == at)
+                        || tree
+                            .search(extent_root, &key(bytenr, EXTENT_DATA_REF, at))?
+                            .is_some()
+                    {
+                        at = at.checked_add(1).ok_or_else(|| {
+                            Error::UnsupportedFeature(format!(
+                                "no key offset is free for a reference of the data extent at \
+                                 {bytenr}"
+                            ))
+                        })?;
+                    }
+                    filed.insert((ino, offset), (at, 1));
                 }
-                if after.len() > before.len() && after.len() >= limit {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "the data extent at {bytenr} would keep {} bytes of references inline, \
-                         and filing the snapshot's as an item of its own is not implemented",
-                        after.len()
-                    )));
+                for (&(ino, offset), &(at, count)) in &filed {
+                    keyed_items.push(OwnedItem {
+                        key: key(bytenr, EXTENT_DATA_REF, at),
+                        data: backref::keyed_data_ref_body(id, ino, offset, count),
+                    });
                 }
                 records.push(RecordEdit {
                     bytenr,
@@ -1318,6 +1384,19 @@ impl Filesystem {
             }),
         ));
         tree_edits.push(self.uuid_entry(uuid, id)?);
+        tree_edits.extend(
+            keyed_items
+                .into_iter()
+                .map(|item| (EXTENT_TREE, ItemEdit::Put(item))),
+        );
+        let new_root = if ptrs.is_empty() {
+            NewRoot::Leaf(leaf)
+        } else {
+            NewRoot::Node {
+                level: block.header.level,
+                ptrs: ptrs.to_vec(),
+            }
+        };
 
         self.commit_write(
             DataWrite {
@@ -1328,9 +1407,10 @@ impl Filesystem {
                 tree_edits,
                 new_trees: vec![NewTree {
                     objectid: id,
-                    items: leaf,
+                    root: new_root,
                 }],
                 records,
+                block_refs,
                 ..Default::default()
             },
             generation,
