@@ -13,9 +13,10 @@
 # fixture cannot be made, and that the driver's artefact list, the guest
 # recipes and chores.yml's `generates:` still describe the same build.
 #
-# The guest recipes are exercised with `mkfs.btrfs`, `btrfs` and `id`
-# stubbed, so this needs no VM, no root and no btrfs-progs — which is
-# what lets it run in the unit-shaped `chore test:scripts` tier.
+# The guest recipes are exercised with `mkfs.btrfs`, `btrfs`, `id` and the
+# guest's Linux-only `mountpoint` and `cp --sparse` stubbed, so this needs no
+# VM, no root, no btrfs-progs and no Linux host — which is what lets it run in
+# the unit-shaped `chore test:scripts` tier on any machine.
 #
 #   bash tests/scripts/fixture-builder.sh
 set -uo pipefail
@@ -60,6 +61,24 @@ STUB
 for tool in setfattr getfattr setfacl getfacl chattr lsattr losetup udevadm; do
     printf '#!/usr/bin/env bash\nexit 0\n' > "$sandbox/bin/$tool"
 done
+# The guest's cp is GNU's and the host's need not be: BSD cp refuses
+# --sparse=always, which stops a geometry run at its first publish. Only that
+# exact option is taken off. The copy is still real, so the counts below read
+# what it wrote, and any other option still reaches the host's cp, so a
+# misspelt one still fails the build.
+export FB_REAL_CP
+FB_REAL_CP="$(command -v cp)"
+cat > "$sandbox/bin/cp" <<'STUB'
+#!/usr/bin/env bash
+args=()
+for arg in "$@"; do
+    [ "$arg" = --sparse=always ] || args+=("$arg")
+done
+exec "$FB_REAL_CP" "${args[@]}"
+STUB
+# util-linux's, so a host without it stops at the recipes' exit trap. No recipe
+# run here mounts anything, so the answer is always that nothing is mounted.
+printf '#!/usr/bin/env bash\nexit 1\n' > "$sandbox/bin/mountpoint"
 chmod +x "$sandbox"/bin/*
 
 recipes() { PATH="$sandbox/bin:$PATH" bash "$RECIPES" "$@"; }
