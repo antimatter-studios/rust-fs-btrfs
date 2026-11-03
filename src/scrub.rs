@@ -479,9 +479,7 @@ impl Filesystem {
     /// copies already repaired repaired and the rest as they were: each
     /// copy is written whole before the next.
     pub fn scrub_repair(&self) -> Result<RepairReport> {
-        if !self.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.require_writable()?;
         let (scrub, allocated) = self.scrub_allocated()?;
         let geom = TreeGeometry::from_superblock(self.superblock());
         let mut repaired = Vec::new();

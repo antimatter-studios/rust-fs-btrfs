@@ -155,8 +155,9 @@ fs_btrfs_fs_t *fs_btrfs_mount_pool(const char *const *device_paths, size_t count
  *
  * Each handle keeps its own view of the volume. A write through a handle
  * after another handle of the same volume (this one, `fs`, or another
- * subvolume handle) has committed is refused with ESTALE and writes
- * nothing; release the handle and open it again to write.
+ * subvolume handle) has committed is refused with ESTALE, before any path
+ * it names is resolved, and writes nothing; release the handle and open it
+ * again to write.
  */
 fs_btrfs_fs_t *fs_btrfs_open_subvolume(fs_btrfs_fs_t *fs, uint64_t id);
 

@@ -344,9 +344,7 @@ impl Filesystem {
     /// there: the groups before it are moved, and that group is left as
     /// [`Filesystem::relocate_block_group`] says.
     pub fn balance(&mut self, balances: &[Balance]) -> Result<Vec<Relocated>> {
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.require_writable()?;
         let mut selected: Vec<(BlockGroup, Option<ChunkProfile>)> = Vec::new();
         for group in self.block_groups()? {
             for balance in balances {
@@ -397,9 +395,7 @@ impl Filesystem {
         start: u64,
         profile: Option<ChunkProfile>,
     ) -> Result<u64> {
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.require_writable()?;
         let group = self.block_group_at(start)?;
         let extents = self.refuse_unrelocatable(&group, profile)?;
         // The new chunk takes the converted profile, if any; the extents
@@ -454,9 +450,7 @@ impl Filesystem {
     /// mount writes, or no other member has room for the new chunk, each
     /// before anything is written.
     pub fn relocate_block_group_off(&mut self, start: u64, devid: u64) -> Result<u64> {
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.require_writable()?;
         if !self.writable_pool.contains_key(&devid) {
             return Err(Error::UnsupportedFeature(format!(
                 "device {devid} is not a member of this pool that this mount writes"
@@ -490,9 +484,7 @@ impl Filesystem {
     /// block, each before anything is written; and when no other metadata
     /// group has room for the copies.
     pub fn copy_tree_blocks_out_of(&mut self, start: u64) -> Result<()> {
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.require_writable()?;
         let group = self.block_group_at(start)?;
         let dirty = self.metadata_evacuation_blocks(&group)?;
         if dirty.is_empty() {

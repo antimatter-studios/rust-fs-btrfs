@@ -173,9 +173,10 @@ impl Filesystem {
     /// [module documentation](crate::devices) lists. Nothing is written
     /// unless everything is.
     pub fn add_device(&mut self, device: Arc<dyn BlockDevice>) -> Result<u64> {
-        if self.writable.is_none() || !device.is_writable() {
+        if !device.is_writable() {
             return Err(Error::ReadOnly);
         }
+        self.require_writable()?;
         let sectorsize = u64::from(self.sb.sectorsize);
         let size = device.size_bytes() - device.size_bytes() % sectorsize;
         if size <= RESERVED_BYTES {
@@ -276,9 +277,10 @@ impl Filesystem {
     /// and [`Error::UnsupportedFeature`] for every refusal the module
     /// documentation lists, each before anything is written.
     pub fn replace_device(&mut self, devid: u64, target: Arc<dyn BlockDevice>) -> Result<()> {
-        if self.writable.is_none() || !target.is_writable() {
+        if !target.is_writable() {
             return Err(Error::ReadOnly);
         }
+        self.require_writable()?;
         let source = if self.writable_pool.is_empty() {
             self.writable
                 .clone()
@@ -379,9 +381,7 @@ impl Filesystem {
     /// last device, and a device that holds a chunk, each before anything
     /// is written.
     pub fn remove_device(&mut self, devid: u64) -> Result<()> {
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.require_writable()?;
         let Some(device) = self.writable_pool.get(&devid).cloned() else {
             return Err(Error::UnsupportedFeature(
                 if self.writable_pool.is_empty() && devid == self.sb.dev_item.devid {
