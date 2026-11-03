@@ -1451,9 +1451,8 @@ pub unsafe extern "C" fn fs_btrfs_subvol_delete(
 /// Returns the snapshot's id, or 0 with the error recorded: ENOENT when
 /// no subvolume is at `source`, and for `path` as
 /// [`fs_btrfs_subvol_create`]; EROFS on a read-only handle or a
-/// read-only top level; ENOTSUP for a source whose tree is taller than
-/// one leaf (rust-fs-btrfs#700), a handle on a subvolume other than the
-/// top level and a volume with quotas enabled.
+/// read-only top level; ENOTSUP for a handle on a subvolume other than
+/// the top level and a volume with quotas enabled.
 ///
 /// # Safety
 ///

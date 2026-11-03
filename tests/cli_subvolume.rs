@@ -424,7 +424,7 @@ fn snapshot_refusals_name_their_reason_and_leave_the_image_as_it_was() {
 }
 
 #[test]
-fn snapshot_of_a_source_taller_than_a_leaf_is_refused_with_exit_3() {
+fn snapshot_of_a_source_taller_than_a_leaf_holds_what_its_source_held() {
     let img = volume("subvolume-snapshot-tall");
     // Enough inodes that the top level's tree outgrows one leaf.
     populate(&img, |fs, root| {
@@ -433,14 +433,13 @@ fn snapshot_of_a_source_taller_than_a_leaf_is_refused_with_exit_3() {
             fs.create(root, name.as_bytes(), 0o644, 0, 0).unwrap();
         }
     });
-    let before = std::fs::read(&img).unwrap();
-    let message = refused(
-        fs_btrfs(&img).args(["subvolume", "snapshot", "/", "/snap"]),
-        3,
-    );
-    assert!(message.contains("level"), "{message}");
-    assert!(
-        std::fs::read(&img).unwrap() == before,
-        "a refused snapshot changed the image"
-    );
+    let report = stdout(&ok(fs_btrfs(&img).args([
+        "subvolume",
+        "snapshot",
+        "/",
+        "/snap",
+    ])));
+    assert_eq!(json_field(&report, "created"), "true", "{report}");
+    let listing = stdout(&ok(fs_btrfs(&img).args(["ls", "/snap"])));
+    assert!(listing.contains("file-0199"), "{listing}");
 }

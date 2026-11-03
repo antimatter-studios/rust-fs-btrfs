@@ -545,6 +545,49 @@ pub fn add_inline_data_ref(
     Ok(out)
 }
 
+/// `body` with its total up by `count`, and nothing else: a reference filed
+/// as an item of its own rather than inline, which is what
+/// `insert_inline_extent_backref` does to the record when it answers
+/// `-EAGAIN` (#700).
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] for a total at its limit. And as
+/// [`refs_start`].
+pub fn raise_total(item_type: u8, body: &[u8], count: u64) -> Result<Vec<u8>> {
+    refs_start(item_type, body)?;
+    let total = u64::from_le_bytes(body[..8].try_into().expect("a fixed part"));
+    let total = total.checked_add(count).ok_or_else(|| {
+        Error::UnsupportedFeature("the extent's reference count is at its limit".into())
+    })?;
+    let mut out = body.to_vec();
+    out[..8].copy_from_slice(&total.to_le_bytes());
+    Ok(out)
+}
+
+/// `body` with an inline `TREE_BLOCK_REF` naming `tree` added where the
+/// kernel's scan would put it, and the item's total up by one (#700): what
+/// each child of a copied root gains from `btrfs_inc_ref`.
+///
+/// # Errors
+///
+/// As [`add_inline_keyed`], which refuses a tree the block already names.
+pub fn add_inline_tree_ref(item_type: u8, body: &[u8], tree: u64) -> Result<Vec<u8>> {
+    let added = add_inline_keyed(item_type, body, Keyed::Block { tree }, 1)?;
+    raise_total(item_type, &added, 1)
+}
+
+/// The body of a keyed `EXTENT_DATA_REF` item naming `tree`, `objectid` and
+/// `offset`, counting `count` references (#700).
+pub fn keyed_data_ref_body(tree: u64, objectid: u64, offset: u64, count: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(28);
+    for v in [tree, objectid, offset] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&count.to_le_bytes());
+    out
+}
+
 /// `body` with `count` shared references of type `kind` naming `parent`
 /// added inline, and the item's total up by `count` (#262): what a child
 /// of a block a snapshot shares gains when its tree copies that block. A
@@ -696,6 +739,47 @@ mod tests {
             objectid,
             offset,
         }
+    }
+
+    #[test]
+    fn a_new_tree_reference_goes_before_smaller_ids_and_counts_on_the_total() {
+        let mut body = header(1, crate::extent_write::EXTENT_FLAG_TREE_BLOCK);
+        body.extend_from_slice(&tree_ref(257));
+        let body = add_inline_tree_ref(key_type::METADATA_ITEM, &body, 258).unwrap();
+        let body = add_inline_tree_ref(key_type::METADATA_ITEM, &body, 5).unwrap();
+        let mut want = header(3, crate::extent_write::EXTENT_FLAG_TREE_BLOCK);
+        want.extend_from_slice(&tree_ref(258));
+        want.extend_from_slice(&tree_ref(257));
+        want.extend_from_slice(&tree_ref(5));
+        assert_eq!(body, want);
+        assert!(
+            add_inline_tree_ref(key_type::METADATA_ITEM, &body, 258).is_err(),
+            "a tree the block already names would count twice"
+        );
+    }
+
+    #[test]
+    fn raising_a_total_changes_nothing_else() {
+        let mut body = header(4, crate::extent_write::EXTENT_FLAG_TREE_BLOCK);
+        body.extend_from_slice(&tree_ref(257));
+        let mut want = header(9, crate::extent_write::EXTENT_FLAG_TREE_BLOCK);
+        want.extend_from_slice(&tree_ref(257));
+        assert_eq!(
+            raise_total(key_type::METADATA_ITEM, &body, 5).unwrap(),
+            want
+        );
+        let full = header(u64::MAX, crate::extent_write::EXTENT_FLAG_TREE_BLOCK);
+        assert!(raise_total(key_type::METADATA_ITEM, &full, 1).is_err());
+    }
+
+    #[test]
+    fn a_keyed_data_reference_is_the_three_names_and_a_count() {
+        let body = keyed_data_ref_body(258, 300, 4096, 2);
+        assert_eq!(body.len(), 28);
+        assert_eq!(
+            drop_keyed_data_ref(&body, 258, 300, 4096).unwrap().unwrap(),
+            keyed_data_ref_body(258, 300, 4096, 1)
+        );
     }
 
     #[test]

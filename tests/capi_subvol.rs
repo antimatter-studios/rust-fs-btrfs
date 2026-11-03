@@ -642,10 +642,10 @@ fn subvol_snapshot_refusals_change_nothing() {
     let _ = std::fs::remove_dir_all(image.parent().unwrap());
 }
 
-/// A source whose tree is taller than one leaf is refused with ENOTSUP,
-/// the refusal naming the tree's level (#700), and the image is unchanged.
+/// A source whose tree is taller than one leaf is snapshotted like any other
+/// (#700): the snapshot lists and reads what the source held.
 #[test]
-fn subvol_snapshot_refuses_a_source_taller_than_a_leaf() {
+fn subvol_snapshot_holds_a_source_taller_than_a_leaf() {
     let image = fresh("snapshot-tall");
     let fs = mount_rw(&image);
     // Enough inodes that the top level's tree outgrows one leaf.
@@ -658,20 +658,20 @@ fn subvol_snapshot_refuses_a_source_taller_than_a_leaf() {
             last_error()
         );
     }
+    put(fs, "/top.txt", b"in the top level");
     unsafe { fs_btrfs_umount(fs) };
-    let before = std::fs::read(&image).expect("read the image");
     let fs = mount_rw(&image);
-    assert_eq!(subvol_snapshot(fs, "/", "/snap", 0), 0);
-    assert_eq!(
-        fs_btrfs_last_errno(),
-        libc_errno::ENOTSUP,
-        "{}",
-        last_error()
-    );
-    assert!(last_error().contains("level"), "{}", last_error());
+    let snap = subvol_snapshot(fs, "/", "/snap", 0);
+    assert_ne!(snap, 0, "snapshot /: {}", last_error());
+    assert_eq!(fs_btrfs_last_errno(), 0);
     unsafe { fs_btrfs_umount(fs) };
-    let after = std::fs::read(&image).expect("read the image");
-    assert!(before == after, "a refused snapshot changed the image");
+
+    let c_img = cstr(image.to_str().unwrap());
+    let fs = unsafe { fs_btrfs_mount(c_img.as_ptr()) };
+    assert!(!fs.is_null(), "mount: {}", last_error());
+    assert_eq!(listing(fs, "/snap").len(), 201, "the snapshot's names");
+    assert_eq!(read_all(fs, "/snap/top.txt"), b"in the top level");
+    unsafe { fs_btrfs_umount(fs) };
     let _ = std::fs::remove_dir_all(image.parent().unwrap());
 }
 
