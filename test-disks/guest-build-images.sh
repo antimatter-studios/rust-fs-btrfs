@@ -59,7 +59,7 @@ done
 
 [ "$(id -u)" -eq 0 ] || { echo "guest-build-images.sh runs as root in the guest." >&2; exit 1; }
 
-for tool in mkfs.btrfs btrfs setfattr getfattr setfacl getfacl chattr lsattr python3 sha256sum losetup; do
+for tool in mkfs.btrfs btrfs setfattr getfattr setfacl getfacl chattr lsattr python3 sha256sum losetup udevadm; do
     command -v "$tool" >/dev/null || {
         echo "guest-build-images.sh: $tool is not in the guest." >&2
         echo "  It is installed by scripts/vm-setup.sh; 'chore vm:provision' applies it again." >&2
@@ -158,6 +158,37 @@ dump_super() {
 }
 
 note() { echo "[guest] $*"; }
+
+# Every mount in this file comes through here, so a refusal says what the
+# kernel said: `mount` itself only says that dmesg may have more, and the VM
+# is gone by the time anyone reads the job's log (#736).
+mount() {
+    local status=0
+    command mount "$@" || status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "guest-build-images: mount $* exited $status. The kernel's log, then the loop devices:" >&2
+        dmesg | tail -n 20 >&2 || true
+        losetup -a >&2 || true
+    fi
+    return "$status"
+}
+
+# mount_copy <mount arguments> — mount an image copied from one this kernel
+# has already seen. A copy has its original's filesystem identifier, and the
+# kernel refuses, with `File exists`, to scan a generation lower than the one
+# on record through a different device path (#736).
+#
+# THE ORDER MATTERS. udev scans every btrfs device it is told about. A scan
+# still running when the last filesystem was unmounted records that newer
+# generation, and holds the loop device open so that the next mount takes
+# another one. A forget ahead of that scan is undone by it, so settle first:
+# with the worker gone the loop device has detached, and nothing can scan the
+# old image again. tests/scripts/fixture-copy-mount.sh holds this.
+mount_copy() {
+    udevadm settle
+    btrfs device scan --forget >/dev/null
+    mount "$@"
+}
 
 # The features Debian's btrfs-progs cannot format (#270) are formatted by
 # the static release build scripts/vm-setup.sh installs beside it, called
@@ -969,13 +1000,13 @@ build_cow() {
         cp --sparse=always "$before" "$after"
 
         # The control: the same mount cycle, changing nothing.
-        mount -o loop "$control" "$MNT"
+        mount_copy -o loop "$control" "$MNT"
         sync
         umount "$MNT"
 
         # The change under study: one empty file, one sync. The smallest
         # metadata transaction there is.
-        mount -o loop "$after" "$MNT"
+        mount_copy -o loop "$after" "$MNT"
         touch "$MNT/one"
         sync
         umount "$MNT"
@@ -2582,8 +2613,7 @@ build_feature_verity() {
     }
     cp --sparse=always "$img" "$bad"
     dd if=/dev/urandom of="$bad" bs=1 seek=$((phys + 512)) count=64 conv=notrunc status=none
-    btrfs device scan --forget >/dev/null 2>&1 || true
-    mount -o loop,ro "$bad" "$MNT"
+    mount_copy -o loop,ro "$bad" "$MNT"
     first=refused whole=read
     dd if="$MNT/nodatasum/tamper.bin" of=/dev/null bs=4K count=1 status=none 2>/dev/null && first=read
     cat "$MNT/nodatasum/tamper.bin" > /dev/null 2>&1 || whole=refused
