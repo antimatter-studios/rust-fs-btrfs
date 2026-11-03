@@ -57,7 +57,7 @@ case "${1:-}" in
     *) exit 0 ;;
 esac
 STUB
-for tool in setfattr getfattr setfacl getfacl chattr lsattr losetup; do
+for tool in setfattr getfattr setfacl getfacl chattr lsattr losetup udevadm; do
     printf '#!/usr/bin/env bash\nexit 0\n' > "$sandbox/bin/$tool"
 done
 chmod +x "$sandbox"/bin/*
