@@ -70,7 +70,7 @@ if [ "\${CARGO_STUB:-}" = no-vm ]; then exit 0; fi
 case "\${CARGO_STUB:-pass}" in
     pass) exit 0 ;;
     fail) exit 101 ;;
-    hang) sleep 30 & wait \$! ;;
+    hang) : > "\$FLTH_TEST_STUB/cargo-ready"; sleep 30 & wait \$! ;;
 esac
 STUB
 chmod +x "$sandbox/bin/cargo" "$SUT/scripts/test.sh" "$H/scripts/"*.sh
@@ -118,10 +118,10 @@ set -m
 pid=$!
 set +m
 tries=0
-until [ "$(vm_state)" = running ] || [ "$tries" -ge 200 ]; do
+until [ -f "$FLTH_TEST_STUB/cargo-ready" ] || [ "$tries" -ge 200 ]; do
     sleep 0.05; tries=$(( tries + 1 ))
 done
-[ "$(vm_state)" = running ] && ok "the killed run had booted the VM first" \
+[ -f "$FLTH_TEST_STUB/cargo-ready" ] && ok "the killed run had booted the VM first" \
                             || fail "the killed run had booted the VM first (state: $(vm_state))"
 kill -TERM -- "-$pid" 2>/dev/null
 wait "$pid"; rc=$?
