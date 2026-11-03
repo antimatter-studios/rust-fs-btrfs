@@ -46,6 +46,13 @@ block_group_used          1
 bootstrap_chain           2
 btree_oracle              4
 capi                      39
+# Every errno fs_btrfs_balance documents, each leaving the image
+# byte-identical; a NULL handle; a group already in the profile; and data
+# relocated and converted there and back, on this crate's mkfs volume (#402).
+capi_balance              4
+# Data and metadata converted there and back through the call, judged by
+# check, filesystem df and the kernel's read (#402).
+capi_balance_kernel       1
 # The C ABI defragment, held to the library's on a twin image (#305).
 capi_defrag               3
 capi_pool                 5
@@ -65,6 +72,12 @@ capi                      42
 chore_manifest            15
 chunk_tree_items          3
 ci_profile                67
+# The filters as the tool spells them, on this crate's mkfs volume (#402).
+cli_balance               6
+# Three executed: fs.btrfs balance -d twice, -dconvert=dup with
+# -mconvert=single, and two refusals that leave the image as it was,
+# judged by check, filesystem df and the kernel's report (#402).
+cli_balance_kernel        3
 cli_dispatch              15
 cli_docs                  2
 # fs.btrfs defragment, held to the library's, and judged by the kernel (#305).
