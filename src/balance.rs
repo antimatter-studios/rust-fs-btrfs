@@ -1893,7 +1893,7 @@ mod tests {
 
         #[test]
         fn a_sprouted_pool_allocates_new_chunk_stripes_only_on_the_sprout() {
-            use fs_btrfs_test_support::{fixture, oracle, sha256_hex, temp_path};
+            use fs_btrfs_test_support::{fixture, guest_kernel_pool_check, sha256_hex, temp_path};
             use fs_core::{BlockDevice, FileDevice};
             use std::sync::Arc;
             let seed = std::path::PathBuf::from(temp_path!("chunk-seed.img"));
@@ -1924,14 +1924,7 @@ mod tests {
             }
             drop(fs);
             assert_eq!(sha256_hex(&std::fs::read(&seed).unwrap()), before);
-            let out = oracle("bash")
-                .arg(
-                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join("tests/support/check-pool.sh"),
-                )
-                .arg(&sprout)
-                .arg(&seed)
-                .output();
+            let out = guest_kernel_pool_check(&[sprout.to_str().unwrap(), seed.to_str().unwrap()]);
             assert!(
                 out.status.success(),
                 "btrfs check: {}{}",
