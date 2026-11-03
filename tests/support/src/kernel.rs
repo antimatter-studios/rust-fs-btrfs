@@ -135,6 +135,15 @@ fn run_locked(image: &str, script: &str, mount: Mount, clear_log: bool) -> Outpu
 /// Every step is checked, and the unmount happens on every path — a
 /// loop device left attached to an image the next test rewrites is a
 /// failure that lands somewhere else entirely.
+///
+/// The kernel forgets earlier scans before the loop device is attached. A
+/// copy has its original's filesystem identifier, and the kernel refuses
+/// with `File exists` to scan a generation lower than the one on record
+/// through a different device path, so a read-write mount of one copy can
+/// fail the mount of the next (#738). The settle comes first: a udev
+/// worker still scanning the last device would put the record back after
+/// the forget. `tests/kernel_oracle_forgets_scans.rs` forces the refusal,
+/// and `tests/scripts/kernel-helper-forget.sh` holds the order.
 fn guest_script(image: &str, script: &str, mount: Mount, run: &Run, clear_log: bool) -> String {
     let options = if mount == Mount::ReadOnly { "ro" } else { "rw" };
     // BEFORE the mount, not after it. The kernel does most of its
@@ -161,6 +170,8 @@ work="$(mktemp -d /var/tmp/fs-btrfs-kernel.XXXXXX)"
 mnt="$work/mnt"
 mkdir -p "$mnt"
 cp --sparse=always "$IMG" "$work/image"
+udevadm settle
+btrfs device scan --forget >/dev/null
 loop="$(losetup --find --show {losetup} "$work/image")"
 cleanup() {{
     mountpoint -q "$mnt" && umount "$mnt" || true

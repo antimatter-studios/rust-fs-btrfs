@@ -177,6 +177,9 @@ guest_scripts_drain_pipes 2
 hard_link_extref          5
 # Five cases in the file (#447, #448, #449); the first full run's count confirms it.
 incompat_feature_refusals 5
+# A copy mounts through the kernel oracle helper with a newer generation on
+# record: one case, in the guest (#738).
+kernel_oracle_forgets_scans 1
 kernel_readback           2
 leaf_edit_oracle          3
 leaf_split                1
