@@ -18,11 +18,13 @@ mod cli_support;
 use cli_support::*;
 use fs_btrfs::chunk::DiskKey;
 use fs_btrfs::Filesystem;
-use fs_btrfs_test_support::{fixture, oracle};
+use fs_btrfs_test_support::{fixture, oracle, temp_dir};
 use fs_core::{BlockRead, FileDevice};
-use std::os::unix::fs::FileExt;
+use std::ffi::OsStr;
+use std::ops::Deref;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// Fixtures the reference checker calls clean.
 const CLEAN: &[&str] = &[
@@ -42,6 +44,14 @@ const CLEAN: &[&str] = &[
 
 /// The populated fixture each damage is made in.
 const DAMAGED_FROM: &str = "btrfs-rich.img";
+
+/// What this binary's copies may hold on the disk at once, allocated.
+///
+/// One copy of the largest fixture checked here: btrfs-deep16k.img holds
+/// 113.9 MiB of its 2048 MiB, so 150 MiB is about 30% over it. A copy of every
+/// fixture is 11984 MiB when each one is written out in full, and on a runner
+/// with 14 GB free that ran out of disk part way through (#731).
+const SCRATCH_BUDGET_MIB: u64 = 150;
 
 fn fsck(image: &Path) -> (Option<i32>, String) {
     let out = tool("fsck.btrfs")
@@ -71,10 +81,84 @@ fn reference(image: &Path) -> (bool, String) {
     )
 }
 
-fn copy(name: &str, tag: &str) -> PathBuf {
-    let path = scratch_dir(&format!("fsck-{tag}")).join(name);
-    std::fs::copy(fixture(name), &path).unwrap_or_else(|e| panic!("copy {name}: {e}"));
-    path
+/// A fixture's copy, and this binary's one turn to hold one. Dropping it removes
+/// the copy and passes the turn on, so the tests running beside each other hold
+/// one copy between them and not one per case.
+struct ScratchCopy {
+    image: PathBuf,
+    _turn: MutexGuard<'static, ()>,
+}
+
+impl Deref for ScratchCopy {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.image
+    }
+}
+
+impl AsRef<OsStr> for ScratchCopy {
+    fn as_ref(&self) -> &OsStr {
+        self.image.as_os_str()
+    }
+}
+
+impl Drop for ScratchCopy {
+    fn drop(&mut self) {
+        // A copy left behind fails the next test to take a copy, on the budget.
+        if let Some(dir) = self.image.parent() {
+            if let Err(e) = std::fs::remove_dir_all(dir) {
+                eprintln!("remove {}: {e}", dir.display());
+            }
+        }
+    }
+}
+
+fn copy(name: &str, tag: &str) -> ScratchCopy {
+    static TURN: Mutex<()> = Mutex::new(());
+    // A test that failed holding the turn has already had its copy removed.
+    let turn = TURN.lock().unwrap_or_else(PoisonError::into_inner);
+    let image = scratch_dir(&format!("fsck-{tag}")).join(name);
+    let copy = ScratchCopy { image, _turn: turn };
+    copy_sparse(&fixture(name), &copy.image).unwrap_or_else(|e| panic!("copy {name}: {e}"));
+    assert_scratch_within_budget(name);
+    copy
+}
+
+/// The bytes `path` holds on the disk, and all it contains if it is a directory.
+/// A path another test has just removed holds none.
+fn allocated(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    let mut total = meta.blocks() * 512;
+    if meta.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            total += entries
+                .flatten()
+                .map(|entry| allocated(&entry.path()))
+                .sum::<u64>();
+        }
+    }
+    total
+}
+
+/// Fails the test when this binary's scratch holds more than its budget.
+#[track_caller]
+fn assert_scratch_within_budget(just_copied: &str) {
+    let mine = format!("cli-{}-fsck-", std::process::id());
+    let held: u64 = std::fs::read_dir(temp_dir())
+        .expect("read the scratch directory")
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&mine))
+        .map(|entry| allocated(&entry.path()))
+        .sum();
+    assert!(
+        held <= SCRATCH_BUDGET_MIB << 20,
+        "with {just_copied} copied, this binary's scratch holds {} MiB of the disk, over its \
+         budget of {SCRATCH_BUDGET_MIB} MiB: it holds more than one copy, or a copy is written \
+         out in full",
+        held >> 20
+    );
 }
 
 #[test]
@@ -209,6 +293,35 @@ fn every_damage_the_reference_finds_is_found() {
              --- btrfs check said:\n{said}"
         );
     }
+}
+
+#[test]
+fn a_sparse_copy_reads_the_same_bytes_and_keeps_its_holes() {
+    let dir = scratch_dir("fsck-sparse");
+    let from = dir.join("from");
+    let to = dir.join("to");
+    let file = std::fs::File::create(&from).unwrap();
+    // 64 MiB, ending in a hole: data at the start, and across the 1 MiB and
+    // 4 KiB edges a copy works in.
+    file.set_len(64 << 20).unwrap();
+    file.write_all_at(b"start", 0).unwrap();
+    file.write_all_at(&[0xa5; 8192], (1 << 20) - 4096).unwrap();
+    file.write_all_at(&[0x5a], (40 << 20) + 4095).unwrap();
+    drop(file);
+
+    copy_sparse(&from, &to).expect("copy");
+
+    assert!(
+        std::fs::read(&from).unwrap() == std::fs::read(&to).unwrap(),
+        "the copy reads differently from its source"
+    );
+    // Not exactly 16 KiB: APFS fills a gap of under about 1 MiB (1081344 bytes
+    // measured). A copy written out in full takes all 64 MiB.
+    let held = allocated(&to);
+    assert!(
+        held < 8 << 20,
+        "a copy with 16 KiB of data in 64 MiB takes {held} bytes of the disk"
+    );
 }
 
 #[test]

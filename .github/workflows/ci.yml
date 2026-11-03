@@ -265,6 +265,10 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+      # What this runner started with: about one job in fifty gets 14 GB where
+      # the rest get 86 GB (#731). The tiers each record what they use after it.
+      - name: Free disk at the start
+        run: df -h .
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings

@@ -10,6 +10,8 @@
 use fs_btrfs::chunk::DiskKey;
 use fs_btrfs::Filesystem;
 use fs_core::FileDevice;
+use std::fs::File;
+use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -53,6 +55,32 @@ pub fn scratch_dir(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
     dir
+}
+
+/// Copy `from` to `to`, leaving a hole wherever `from` reads as zeros.
+///
+/// `std::fs::copy` on Linux writes a sparse file out in full: a fixture holding
+/// 43 MiB takes all of its 600 MiB in the copy (#731). A copy reads the same
+/// bytes as its source, which is all a checker or a mount can see.
+pub fn copy_sparse(from: &Path, to: &Path) -> io::Result<()> {
+    const BLOCK: usize = 4096;
+    let mut source = File::open(from)?;
+    let target = File::create(to)?;
+    target.set_len(source.metadata()?.len())?;
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut at = 0u64;
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(());
+        }
+        for (index, block) in buffer[..read].chunks(BLOCK).enumerate() {
+            if block.iter().any(|&byte| byte != 0) {
+                target.write_all_at(block, at + (index * BLOCK) as u64)?;
+            }
+        }
+        at += read as u64;
+    }
 }
 
 /// A directory holding the binary under every name it answers to, as an
