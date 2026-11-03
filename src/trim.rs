@@ -112,9 +112,7 @@ impl Filesystem {
     /// [`Filesystem::trim_ranges`], and the first error `discard` returns,
     /// with the ranges before it discarded.
     pub fn trim(&self, discard: &mut dyn FnMut(&TrimRange) -> Result<()>) -> Result<TrimReport> {
-        if !self.is_writable() {
-            return Err(Error::ReadOnly);
-        }
+        self.require_writable()?;
         let ranges = self.trim_ranges()?;
         let mut bytes = 0u64;
         for range in &ranges {

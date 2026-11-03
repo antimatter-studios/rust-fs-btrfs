@@ -172,9 +172,7 @@ impl Filesystem {
         if self.writable.is_none() && self.subvolume_writes.is_some() {
             return self.writing_subvolume(|fs| fs.link(ino, parent, name));
         }
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.require_writable()?;
         let root = self.written_tree();
         let dir = self.writable_parent(parent, name)?;
         let target = self.read_inode(ino)?;
@@ -258,9 +256,7 @@ impl Filesystem {
         if self.writable.is_none() && self.subvolume_writes.is_some() {
             return self.writing_subvolume(|fs| fs.remove_name(parent, name, want_dir));
         }
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.require_writable()?;
         let root = self.written_tree();
         check_name(name)?;
         let dir = self.read_inode(parent)?;
@@ -345,9 +341,7 @@ impl Filesystem {
             return self
                 .writing_subvolume(|fs| fs.rename(old_parent, old_name, new_parent, new_name));
         }
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.require_writable()?;
         let root = self.written_tree();
         check_name(old_name)?;
         check_name(new_name)?;
@@ -993,11 +987,34 @@ impl Filesystem {
         out
     }
 
-    /// Refuse a read-only mount, and one whose tree is not tree 5.
-    pub(crate) fn require_writable_top_level(&self) -> Result<()> {
+    /// Refuse a read-only mount, and a handle another handle of the volume
+    /// has committed past (#715).
+    ///
+    /// Every write starts here, before it reads anything. A stale handle's
+    /// root tree is the one that other commit replaced, so its blocks may
+    /// already be reused, and a read through them fails with an error that
+    /// says nothing of the cause. The check in the commit stays, as the
+    /// last word on what reaches the disk.
+    pub(crate) fn require_writable(&self) -> Result<()> {
         if self.writable.is_none() {
             return Err(Error::ReadOnly);
         }
+        self.refuse_stale()
+    }
+
+    /// Refuse a write through a stale handle, leaving a read-only handle to
+    /// be refused by the write itself. For a caller that has to read before
+    /// it can start the write, such as the C ABI resolving a path (#715).
+    pub(crate) fn refuse_stale_write(&self) -> Result<()> {
+        if self.writable.is_none() && self.subvolume_writes.is_none() {
+            return Ok(());
+        }
+        self.refuse_stale()
+    }
+
+    /// Refuse a read-only mount, and one whose tree is not tree 5.
+    pub(crate) fn require_writable_top_level(&self) -> Result<()> {
+        self.require_writable()?;
         let top = self.tree_root(objectid::FS_TREE)?;
         if top != self.fs_tree_root {
             return Err(Error::UnsupportedFeature(

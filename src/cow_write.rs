@@ -184,9 +184,7 @@ impl Filesystem {
         if self.writable.is_none() && self.subvolume_writes.is_some() {
             return self.writing_subvolume(|fs| fs.write(ino, offset, data));
         }
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.require_writable()?;
         if data.is_empty() {
             return Ok(0);
         }

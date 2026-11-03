@@ -75,9 +75,7 @@ impl Filesystem {
     /// needs to know whether it met a shared extent or a compressed one,
     /// not merely that the write was declined.
     pub fn write_at(&self, ino: u64, offset: u64, data: &[u8]) -> Result<usize> {
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.require_writable()?;
         if data.is_empty() {
             return Ok(0);
         }

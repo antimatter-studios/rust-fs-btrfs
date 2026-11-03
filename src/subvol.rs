@@ -647,9 +647,7 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] for a received subvolume made writable
     /// or a transaction the planner refuses.
     pub fn set_subvolume_read_only(&mut self, id: u64, read_only: bool) -> Result<()> {
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.require_writable()?;
         if !is_subvolume_id(id) {
             return Err(Error::NotFound);
         }
@@ -726,9 +724,7 @@ impl Filesystem {
         use crate::dir::{name_hash, DIR_ITEM_KEY};
         use crate::superblock::incompat::DEFAULT_SUBVOL;
         use crate::transaction::ROOT_TREE_DIR_OBJECTID;
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.require_writable()?;
         if !self.subvolumes()?.iter().any(|s| s.id == id) {
             return Err(Error::NotFound);
         }

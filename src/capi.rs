@@ -1226,6 +1226,9 @@ pub unsafe extern "C" fn fs_btrfs_write_file(
         let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
+        if !unsafe { refuse_stale_write(fs) } {
+            return -1;
+        }
         // Mutable: a copy-on-write commit reopens the mount on the new
         // generation. The header already forbids sharing a handle across
         // threads without the caller's own lock.
@@ -1302,13 +1305,37 @@ fn new_name<'a>(fs: &Filesystem, path: &'a [u8]) -> Option<(Inode, &'a [u8])> {
     }
 }
 
-/// The handle as a mutable filesystem, or `None` with EIO recorded.
+/// The handle as a mutable filesystem, or `None` with EIO recorded for a
+/// NULL handle and ESTALE for a stale one.
+///
+/// Every write takes its handle from here, or calls [`refuse_stale_write`]
+/// itself, before it resolves a path: a stale handle's trees may already be
+/// reused, so a path resolved through them says nothing true (#715).
 unsafe fn handle_mut<'a>(fs: *mut fs_btrfs_fs) -> Option<&'a mut Filesystem> {
     if fs.is_null() {
         set_error("fs is NULL".into(), EIO);
         return None;
     }
+    if !unsafe { refuse_stale_write(fs) } {
+        return None;
+    }
     Some(&mut unsafe { &mut *fs }.fs)
+}
+
+/// Whether a write may go on through this handle: `false` with ESTALE
+/// recorded when another handle has committed past it. A NULL handle is left
+/// for the caller's own check.
+unsafe fn refuse_stale_write(fs: *mut fs_btrfs_fs) -> bool {
+    if fs.is_null() {
+        return true;
+    }
+    match unsafe { &*fs }.fs.refuse_stale_write() {
+        Ok(()) => true,
+        Err(e) => {
+            record(&e);
+            false
+        }
+    }
 }
 
 /// Create an empty regular file at `path` with permission bits `mode`
@@ -1465,6 +1492,9 @@ pub unsafe extern "C" fn fs_btrfs_subvol_snapshot(
     read_only: c_int,
 ) -> u64 {
     guard(0, || {
+        if !unsafe { refuse_stale_write(fs) } {
+            return 0;
+        }
         let Some(source) = (unsafe { subvolume_named(fs, source) }) else {
             return 0;
         };
@@ -2397,6 +2427,9 @@ pub unsafe extern "C" fn fs_btrfs_subvol_set_readonly(
     read_only: c_int,
 ) -> c_int {
     guard(-1, || {
+        if !unsafe { refuse_stale_write(fs) } {
+            return -1;
+        }
         let Some(id) = (unsafe { subvolume_named(fs, path) }) else {
             return -1;
         };
@@ -2456,6 +2489,9 @@ pub unsafe extern "C" fn fs_btrfs_subvol_set_default(
     path: *const c_char,
 ) -> c_int {
     guard(-1, || {
+        if !unsafe { refuse_stale_write(fs) } {
+            return -1;
+        }
         let Some(id) = (unsafe { subvolume_named(fs, path) }) else {
             return -1;
         };

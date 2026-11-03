@@ -108,7 +108,8 @@ pub enum Error {
     /// The volume was committed through another handle after this one
     /// read its superblock (#599). Committing from the older view would
     /// write over that commit and use its generation again, so nothing
-    /// was written; open the handle again to write.
+    /// was written; open the handle again to write. A write is refused
+    /// before it reads through the handle's root tree (#715).
     Stale {
         /// The generation this handle read.
         handle: u64,

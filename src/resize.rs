@@ -55,6 +55,7 @@ impl Filesystem {
     /// documentation](crate::resize) lists. Nothing is written unless
     /// everything is.
     pub fn resize(&mut self, size: u64) -> Result<()> {
+        self.require_writable()?;
         let Some(device) = self.writable.clone() else {
             return Err(Error::ReadOnly);
         };
