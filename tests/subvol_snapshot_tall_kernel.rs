@@ -18,6 +18,12 @@
 //! - the kernel must delete one side and clean it up, walking every
 //!   reference this crate wrote, with the other side intact and the volume
 //!   still clean.
+//!
+//! And writes through this crate into those snapshots (#734), which copy the
+//! path they reach as `update_ref_for_cow` copies it: the kernel makes the
+//! same write on a copy of the image and this crate's references are held to
+//! the kernel's, the source keeps its bytes and its blocks, and the kernel
+//! then reads, writes and deletes both sides.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1082,4 +1088,896 @@ fn scribble_small(
         data.extend_from_slice(tail.as_bytes());
     }
     (script, after)
+}
+
+/// One block of a tree, from `dump-tree`: its owner, and for a node its
+/// pointers by the objectid of each key.
+#[derive(Debug)]
+struct Dumped {
+    owner: u64,
+    free: Option<u64>,
+    ptrs: Vec<(u64, u64)>,
+    inos: Vec<u64>,
+}
+
+/// Every block `dump-tree` prints of a tree, by address, with the root's
+/// address.
+#[track_caller]
+fn blocks_of(image: &Path, id: u64) -> (u64, BTreeMap<u64, Dumped>) {
+    let dump = dump_tree(image, &id.to_string());
+    let mut root = None;
+    let mut out: BTreeMap<u64, Dumped> = BTreeMap::new();
+    let mut current = None;
+    for line in dump.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let opens_block = line.starts_with("node ") || line.starts_with("leaf ");
+        if opens_block && words.contains(&"owner") {
+            let at: u64 = words[1].parse().expect("a block's address");
+            let owner = word_after(line, "owner")
+                .and_then(|w| w.parse().ok())
+                .unwrap_or_else(|| panic!("no numeric owner in {line:?}"));
+            let free = (line.starts_with("leaf "))
+                .then(|| word_after(line, "space")?.parse().ok())
+                .flatten();
+            out.insert(
+                at,
+                Dumped {
+                    owner,
+                    free,
+                    ptrs: Vec::new(),
+                    inos: Vec::new(),
+                },
+            );
+            root.get_or_insert(at);
+            current = Some(at);
+            continue;
+        }
+        let Some(block) = current.and_then(|at| out.get_mut(&at)) else {
+            continue;
+        };
+        let trimmed = line.trim_start();
+        if words.first() == Some(&"key") {
+            let objectid = trimmed
+                .strip_prefix("key (")
+                .and_then(|k| k.split_whitespace().next())
+                .and_then(|o| o.parse().ok());
+            let ptr = word_after(line, "block").and_then(|b| b.parse().ok());
+            if let (Some(objectid), Some(ptr)) = (objectid, ptr) {
+                block.ptrs.push((objectid, ptr));
+            }
+        } else if words.first() == Some(&"item") {
+            let ino = trimmed
+                .split("key (")
+                .nth(1)
+                .and_then(|k| k.split_whitespace().next())
+                .and_then(|o| o.parse().ok());
+            if let Some(ino) = ino {
+                block.inos.push(ino);
+            }
+        }
+    }
+    (
+        root.unwrap_or_else(|| panic!("no block of tree {id}:\n{dump}")),
+        out,
+    )
+}
+
+/// The blocks a descent for inode `ino`'s items passes, from the root down.
+#[track_caller]
+fn path_to(blocks: &(u64, BTreeMap<u64, Dumped>), ino: u64) -> Vec<u64> {
+    let (root, blocks) = blocks;
+    let mut path = vec![*root];
+    loop {
+        let at = path[path.len() - 1];
+        let ptrs = &blocks[&at].ptrs;
+        if ptrs.is_empty() {
+            return path;
+        }
+        // The last child whose first key's objectid is below the inode's
+        // own, unless one starts with it: a parent names its children by
+        // their first keys, and the inode's items open with its own.
+        let next = ptrs
+            .iter()
+            .rev()
+            .find(|(objectid, _)| *objectid <= ino)
+            .unwrap_or(&ptrs[0])
+            .1;
+        path.push(next);
+    }
+}
+
+/// Hold a write through this crate to what the issue asks of the path it
+/// reaches: each block below the snapshot's root is the snapshot's own copy,
+/// and the source's tree did not move.
+#[track_caller]
+fn assert_path_copied(
+    image: &Path,
+    (source, source_before): (u64, &(u64, BTreeMap<u64, Dumped>)),
+    (snap, snap_before): (u64, &(u64, BTreeMap<u64, Dumped>)),
+    ino: u64,
+) {
+    let source_now = blocks_of(image, source);
+    assert_eq!(
+        source_now.0, source_before.0,
+        "the source's root moved in a write into its snapshot"
+    );
+    assert_eq!(
+        source_now.1.keys().collect::<Vec<_>>(),
+        source_before.1.keys().collect::<Vec<_>>(),
+        "a block of the source moved in a write into its snapshot"
+    );
+    let snap_now = blocks_of(image, snap);
+    let path = path_to(&snap_now, ino);
+    let path_before = path_to(snap_before, ino);
+    for at in &path {
+        assert_eq!(
+            snap_now.1[at].owner, snap,
+            "the block at {at} on the snapshot's path is not its own: {path:?}"
+        );
+        assert!(
+            !path_before.contains(at),
+            "the block at {at} was not copied: {path_before:?} became {path:?}"
+        );
+    }
+}
+
+/// Every data extent a tree's items name.
+#[track_caller]
+fn data_extents(image: &Path, id: u64) -> Vec<u64> {
+    let dump = dump_tree(image, &id.to_string());
+    let mut out: Vec<u64> = dump
+        .lines()
+        .filter(|l| l.contains("extent data disk byte"))
+        .filter_map(|l| word_after(l, "byte")?.parse().ok())
+        .filter(|at| *at != 0)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Hold this image's references to what the kernel left in `measured` after
+/// the same change: every child of the source's root names the same trees,
+/// and every data extent the source names counts the same.
+#[track_caller]
+fn assert_references_match(image: &Path, measured: &Path, source: u64, snap: u64) {
+    let (ours, theirs) = (dump_tree(image, "2"), dump_tree(measured, "2"));
+    for child in root_children(image, source) {
+        let (a, b) = (block_record(&ours, child), block_record(&theirs, child));
+        assert_eq!(a.total, a.listed(), "the child at {child}: {a:?}");
+        assert_eq!(
+            (a.names(source), a.names(snap), a.total),
+            (b.names(source), b.names(snap), b.total),
+            "the source's child at {child}: {a:?} here, {b:?} from the kernel"
+        );
+    }
+    for at in data_extents(image, source) {
+        assert_eq!(
+            data_refs(&ours, at, snap),
+            data_refs(&theirs, at, snap),
+            "the snapshot's references of the data extent at {at}, here and from the kernel"
+        );
+        assert_eq!(
+            data_refs(&ours, at, source),
+            data_refs(&theirs, at, source),
+            "the source's references of the data extent at {at}, here and from the kernel"
+        );
+    }
+}
+
+/// [`scribble`] as a shell loop, whose length does not grow with the tree: a
+/// command line naming thousands of files is past what the guest's shell takes.
+fn scribble_in_a_loop(
+    tree: &str,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> (String, BTreeMap<String, Vec<u8>>) {
+    let (_, after) = scribble(tree, files);
+    let mut script = format!(
+        "for f in {tree}/*; do n=${{f##*/}}; if [ -f \"$f\" ] && [ \"$n\" != big ]; then \
+         printf '{tree}-%s' \"$n\" >> \"$f\"; fi; done\n"
+    );
+    if files.contains_key("big") {
+        let mark = format!("{tree:8.8}");
+        script.push_str(&format!(
+            "printf '{mark}' | dd of={tree}/big bs=1 seek=4096 conv=notrunc status=none\n"
+        ));
+    }
+    (script, after)
+}
+
+/// Have the kernel confirm the state of both sides, write into both, delete
+/// `dropped`, and read `kept` back, with `btrfs check` after each.
+#[track_caller]
+fn assert_kernel_takes_it_from_here(
+    scratch: &Scratch,
+    (dropped, dropped_files): (&str, &BTreeMap<String, Vec<u8>>),
+    (kept, kept_files): (&str, &BTreeMap<String, Vec<u8>>),
+) {
+    let out = guest_kernel_read_ok(
+        &scratch.image_str(),
+        "reading both sides",
+        &format!("cd \"$MNT\"\n{}{}", sum(dropped), sum(kept)),
+    );
+    assert_kernel_read(&out, dropped, dropped_files);
+    assert_kernel_read(&out, kept, kept_files);
+
+    let (write_kept, kept_after) = scribble_in_a_loop(kept, kept_files);
+    let (write_dropped, dropped_after) = scribble_in_a_loop(dropped, dropped_files);
+    let script = format!(
+        "cd \"$MNT\"\n{write_dropped}{write_kept}sync\n{}{}",
+        sum(dropped),
+        sum(kept)
+    );
+    let out = guest_kernel_write_ok(&scratch.image_str(), "writing into both sides", &script);
+    assert_kernel_read(&out, dropped, &dropped_after);
+    assert_kernel_read(&out, kept, &kept_after);
+    assert_btrfs_check_clean(&scratch.image, "after the kernel wrote into both sides");
+
+    let script = format!(
+        "cd \"$MNT\"\nbtrfs subvolume delete {dropped} >/dev/null\n\
+         btrfs subvolume sync . >/dev/null && echo synced\n{}",
+        sum(kept)
+    );
+    let out = guest_kernel_write_ok(&scratch.image_str(), "deleting one side", &script);
+    assert!(
+        out.lines().any(|l| l.trim() == "synced"),
+        "the cleaner did not finish:\n{out}"
+    );
+    assert_kernel_read(&out, kept, &kept_after);
+    assert_btrfs_check_clean(
+        &scratch.image,
+        "after the kernel's cleaner dropped one side",
+    );
+}
+
+/// Write `data` over all of `name` in the tree `sv` writes, and record it.
+fn overwrite(
+    sv: &mut Filesystem,
+    files: &mut BTreeMap<String, Vec<u8>>,
+    name: &str,
+    data: Vec<u8>,
+) -> u64 {
+    let root = sv.root_inode().unwrap().ino;
+    let ino = sv.lookup(root, name.as_bytes()).unwrap().ino;
+    sv.write(ino, 0, &data)
+        .unwrap_or_else(|e| panic!("writing {name}: {e:?}"));
+    files.insert(name.to_string(), data);
+    ino
+}
+
+/// A write through this crate into a snapshot of a tree of level one: the
+/// kernel makes the same write on a copy, and every reference this crate
+/// leaves must be the one the kernel left. Then every kind of change, each
+/// judged by `btrfs check`, and the kernel reads, writes and deletes.
+fn write_into_a_tall_snapshot(tag: &str, kernel_snapshot: bool) {
+    let scratch = Scratch::new(tag);
+    let contents = files();
+    let tall = {
+        let mut fs = scratch.mount();
+        let root = fs.root_inode().unwrap().ino;
+        let tall = fs.create_subvolume(root, b"tall", 0o755, 0, 0).unwrap();
+        fill(&mut fs.open_subvolume(tall).unwrap(), &contents);
+        tall
+    };
+    let snap = if kernel_snapshot {
+        let out = guest_kernel_write_ok(
+            &scratch.image_str(),
+            "the kernel's snapshot",
+            r#"
+cd "$MNT"
+btrfs subvolume snapshot tall snap >/dev/null
+sync
+printf 'snap-id %s\n' "$(btrfs inspect-internal rootid snap)"
+"#,
+        );
+        printed_id(&out, "snap-id ")
+    } else {
+        let mut fs = scratch.mount();
+        let root = fs.root_inode().unwrap().ino;
+        fs.create_snapshot(tall, root, b"snap", false).unwrap()
+    };
+    assert_btrfs_check_clean(&scratch.image, "with the snapshot taken");
+    let source_before = blocks_of(&scratch.image, tall);
+    let snap_before = blocks_of(&scratch.image, snap);
+
+    // The same whole-extent overwrite, by the kernel, on a copy.
+    let replacement = pattern(8192, 201);
+    let source = scratch.dir.join("replacement");
+    std::fs::write(&source, &replacement).expect("write the replacement");
+    let measured = scratch.copy("measured.img");
+    guest_kernel_write_ok(
+        &measured,
+        "the kernel's write into the snapshot",
+        &format!(
+            "cd \"$MNT\"\ndd if={} of=snap/f0008 bs=8192 conv=notrunc status=none\nsync\n",
+            source.display()
+        ),
+    );
+    let measured = PathBuf::from(measured);
+    assert_btrfs_check_clean(&measured, "after the kernel's write");
+
+    let mut snap_files = contents.clone();
+    let ino = {
+        let fs = scratch.mount();
+        let mut sv = fs.open_subvolume(snap).unwrap();
+        overwrite(&mut sv, &mut snap_files, "f0008", replacement)
+    };
+    assert_btrfs_check_clean(&scratch.image, "after a data write into the snapshot");
+    assert_path_copied(
+        &scratch.image,
+        (tall, &source_before),
+        (snap, &snap_before),
+        ino,
+    );
+    assert_references_match(&scratch.image, &measured, tall, snap);
+
+    // Every other kind of change.
+    {
+        let fs = scratch.mount();
+        let mut sv = fs.open_subvolume(snap).unwrap();
+        let root = sv.root_inode().unwrap().ino;
+
+        // Into the middle of the largest extent.
+        let big = sv.lookup(root, b"big").unwrap().ino;
+        sv.write(big, 4096, b"middle of a big extent").unwrap();
+        snap_files.get_mut("big").unwrap()[4096..4118].copy_from_slice(b"middle of a big extent");
+
+        // An inline file grows.
+        let grown = pattern(512, 77);
+        overwrite(&mut sv, &mut snap_files, "f0001", grown);
+
+        // A new file, in leaves the snapshot has not copied yet.
+        let new = sv.create(root, b"new", 0o644, 0, 0).unwrap();
+        sv.write(new, 0, &pattern(16384, 91)).unwrap();
+        snap_files.insert("new".to_string(), pattern(16384, 91));
+
+        // The last name of a file with an extent of its own goes.
+        sv.unlink(root, b"f0016").unwrap();
+        snap_files.remove("f0016");
+
+        // A rename onto a file with an extent of its own.
+        sv.rename(root, b"f0024", root, b"f0032").unwrap();
+        let moved = snap_files.remove("f0024").unwrap();
+        snap_files.insert("f0032".to_string(), moved);
+
+        // A directory, and a truncate past the extent's start.
+        sv.mkdir(root, b"dir", 0o755, 0, 0).unwrap();
+        let cut = sv.lookup(root, b"f0040").unwrap().ino;
+        sv.truncate(cut, 100).unwrap();
+        snap_files.get_mut("f0040").unwrap().truncate(100);
+    }
+    assert_btrfs_check_clean(&scratch.image, "after every kind of change in the snapshot");
+    {
+        let fs = scratch.mount_ro();
+        assert_read_here(&fs.open_subvolume(tall).unwrap(), "tall", &contents);
+        assert_read_here(&fs.open_subvolume(snap).unwrap(), "snap", &snap_files);
+    }
+
+    assert_kernel_takes_it_from_here(&scratch, ("snap", &snap_files), ("tall", &contents));
+}
+
+/// This crate's snapshot of a tree of level one, written through this crate.
+#[test]
+fn a_write_here_into_a_snapshot_taken_here_copies_its_path() {
+    write_into_a_tall_snapshot("write-own", false);
+}
+
+/// The kernel's snapshot of the same tree, written through this crate.
+#[test]
+fn a_write_here_into_a_snapshot_the_kernel_took_copies_its_path() {
+    write_into_a_tall_snapshot("write-kernels", true);
+}
+
+/// The top level as the source, and a snapshot of that snapshot: three trees
+/// reach blocks the top level owns, and each writes in turn. The source's
+/// objectid is the lowest there is, the case the old placement got wrong
+/// for every other tree.
+#[test]
+fn every_side_of_a_tall_top_level_and_its_snapshots_takes_a_write_here() {
+    let scratch = Scratch::new("write-chain");
+    let contents = files();
+    fill(&mut scratch.mount(), &contents);
+    let (snap, snap2) = {
+        let mut fs = scratch.mount();
+        let root = fs.root_inode().unwrap().ino;
+        let snap = fs
+            .create_snapshot(FS_TREE_OBJECTID, root, b"snap", false)
+            .unwrap();
+        let snap2 = fs.create_snapshot(snap, root, b"snap2", false).unwrap();
+        (snap, snap2)
+    };
+    assert_btrfs_check_clean(&scratch.image, "with the snapshots taken");
+
+    let mut top_files = contents.clone();
+    let mut snap_files = contents.clone();
+    let mut snap2_files = contents.clone();
+
+    // The newest first, through blocks two trees above it own or share.
+    {
+        let fs = scratch.mount();
+        let mut sv = fs.open_subvolume(snap2).unwrap();
+        overwrite(&mut sv, &mut snap2_files, "f0008", pattern(8192, 1));
+        overwrite(&mut sv, &mut snap2_files, "f0240", pattern(8192, 2));
+    }
+    assert_btrfs_check_clean(&scratch.image, "after writing the snapshot of the snapshot");
+    {
+        let fs = scratch.mount();
+        let mut sv = fs.open_subvolume(snap).unwrap();
+        overwrite(&mut sv, &mut snap_files, "f0008", pattern(8192, 3));
+        overwrite(&mut sv, &mut snap_files, "f0120", pattern(8192, 4));
+    }
+    assert_btrfs_check_clean(&scratch.image, "after writing the first snapshot");
+    {
+        let mut fs = scratch.mount();
+        overwrite(&mut fs, &mut top_files, "f0008", pattern(8192, 5));
+        overwrite(&mut fs, &mut top_files, "f0240", pattern(8192, 6));
+    }
+    assert_btrfs_check_clean(&scratch.image, "after writing the top level");
+    // And back, into what the others have since written around.
+    {
+        let fs = scratch.mount();
+        let mut sv = fs.open_subvolume(snap).unwrap();
+        overwrite(&mut sv, &mut snap_files, "f0240", pattern(8192, 7));
+    }
+    assert_btrfs_check_clean(&scratch.image, "after writing the first snapshot again");
+
+    {
+        let fs = scratch.mount_ro();
+        assert_read_here(&fs.open_subvolume(snap).unwrap(), "snap", &snap_files);
+        assert_read_here(&fs.open_subvolume(snap2).unwrap(), "snap2", &snap2_files);
+    }
+    let script = format!(
+        "cd \"$MNT\"\n{}{}\nbtrfs subvolume delete snap >/dev/null\n\
+         btrfs subvolume sync . >/dev/null && echo synced\n{}",
+        sum("snap"),
+        sum("snap2"),
+        sum("snap2"),
+    );
+    let out = guest_kernel_write_ok(&scratch.image_str(), "reading, then deleting", &script);
+    assert_kernel_read(&out, "snap2", &snap2_files);
+    assert!(
+        out.lines().any(|l| l.trim() == "synced"),
+        "the cleaner did not finish:\n{out}"
+    );
+    assert_btrfs_check_clean(&scratch.image, "after the kernel's cleaner dropped one");
+    let out = guest_kernel_read_ok(
+        &scratch.image_str(),
+        "reading the top level",
+        &format!("cd \"$MNT\"\n{}", sum(".")),
+    );
+    assert_kernel_read(&out, ".", &top_files);
+}
+
+/// How many files take a tree on 4 KiB nodes to level two: a level-one node
+/// holds 121 leaves, each about ten of these files.
+const FILES_FOR_LEVEL_TWO: usize = 2400;
+
+/// A subvolume of level two on 4 KiB nodes, the kernel having written it,
+/// and a sparse file `sparse` of `sparse_extents` one-sector extents when
+/// that is more than none. Returns its id and what it holds.
+fn level_two(scratch: &Scratch, sparse_extents: usize) -> (u64, BTreeMap<String, Vec<u8>>) {
+    let mut contents = BTreeMap::new();
+    for i in 0..FILES_FOR_LEVEL_TWO {
+        let len = if i % 8 == 0 { 8192 } else { 64 };
+        contents.insert(format!("f{i:04}"), pattern(len, i as u8));
+    }
+    // One process in the guest, as `pattern` writes them: a file each through
+    // the host's share takes the whole budget of a loaded machine. In name
+    // order, so that neighbouring names are neighbouring inodes.
+    let mut script = format!(
+        r#"cd "$MNT"
+btrfs subvolume create tall >/dev/null
+python3 - <<'PY'
+import os
+for i in range({FILES_FOR_LEVEL_TWO}):
+    n = 8192 if i % 8 == 0 else 64
+    with open("tall/f%04d" % i, "wb") as f:
+        f.write(bytes((j * 31 + i) & 255 for j in range(n)))
+extents = {sparse_extents}
+if extents:
+    fd = os.open("tall/sparse", os.O_CREAT | os.O_WRONLY, 0o644)
+    for i in range(extents):
+        os.pwrite(fd, b"sparse%04d" % i, i * 8192)
+    os.close(fd)
+PY
+sync
+"#
+    );
+    if sparse_extents > 0 {
+        let mut sparse = vec![0u8; (sparse_extents - 1) * 8192 + 10];
+        for i in 0..sparse_extents {
+            sparse[i * 8192..i * 8192 + 10].copy_from_slice(format!("sparse{i:04}").as_bytes());
+        }
+        contents.insert("sparse".to_string(), sparse);
+    }
+    script.push_str("printf 'tall-id %s\\n' \"$(btrfs inspect-internal rootid tall)\"\n");
+    let out = guest_kernel_write_ok(&scratch.image_str(), "the kernel's fill", &script);
+    let tall = printed_id(&out, "tall-id ");
+    let (root, blocks) = blocks_of(&scratch.image, tall);
+    assert!(
+        !blocks[&blocks[&root].ptrs[0].1].ptrs.is_empty(),
+        "the premise: tree {tall} is of level two"
+    );
+    (tall, contents)
+}
+
+/// Inodes of `files`, by name, in the tree `fs` reads.
+fn inode_of(fs: &Filesystem, name: &str) -> u64 {
+    let root = fs.root_inode().unwrap().ino;
+    fs.lookup(root, name.as_bytes()).unwrap().ino
+}
+
+/// A tree of level two: a child of a copied block is not itself recorded as
+/// shared, so the walk meets blocks that only become shared as it copies
+/// their parents. Then the source writes first, leaving blocks that refer to
+/// their children by address, and the snapshot writes through them to both a
+/// block the source copied and one it did not.
+#[test]
+fn a_tree_of_level_two_takes_writes_on_both_sides_in_either_order() {
+    let scratch = Scratch::small_nodes("write-level-two");
+    let (tall, contents) = level_two(&scratch, 0);
+    let snap = {
+        let mut fs = scratch.mount();
+        let root = fs.root_inode().unwrap().ino;
+        fs.create_snapshot(tall, root, b"snap", false).unwrap()
+    };
+    assert_btrfs_check_clean(&scratch.image, "with the snapshot taken");
+
+    // The first write copies a whole path of two blocks below the root.
+    let replacement = pattern(8192, 203);
+    let source = scratch.dir.join("replacement");
+    std::fs::write(&source, &replacement).expect("write the replacement");
+    let measured = scratch.copy("measured.img");
+    guest_kernel_write_ok(
+        &measured,
+        "the kernel's write into the snapshot",
+        &format!(
+            "cd \"$MNT\"\ndd if={} of=snap/f0800 bs=8192 conv=notrunc status=none\nsync\n",
+            source.display()
+        ),
+    );
+    let measured = PathBuf::from(measured);
+    let source_before = blocks_of(&scratch.image, tall);
+    let snap_before = blocks_of(&scratch.image, snap);
+    let mut snap_files = contents.clone();
+    let mut tall_files = contents.clone();
+    let ino = {
+        let fs = scratch.mount();
+        let mut sv = fs.open_subvolume(snap).unwrap();
+        overwrite(&mut sv, &mut snap_files, "f0800", replacement)
+    };
+    assert_btrfs_check_clean(&scratch.image, "after the first write into the snapshot");
+    assert_eq!(
+        path_to(&blocks_of(&scratch.image, snap), ino).len(),
+        3,
+        "the premise: three blocks from the root to the leaf"
+    );
+    assert_path_copied(
+        &scratch.image,
+        (tall, &source_before),
+        (snap, &snap_before),
+        ino,
+    );
+    assert_references_match(&scratch.image, &measured, tall, snap);
+
+    // The source writes under a node the snapshot has not copied: the old
+    // node and leaf now refer to their children by address.
+    let far = "f1600";
+    let near = "f1640";
+    {
+        let fs = scratch.mount();
+        let mut sv = fs.open_subvolume(tall).unwrap();
+        overwrite(&mut sv, &mut tall_files, far, pattern(8192, 11));
+    }
+    assert_btrfs_check_clean(&scratch.image, "after the source wrote first");
+    let (ino_far, ino_near) = {
+        let fs = scratch.mount_ro();
+        let sv = fs.open_subvolume(snap).unwrap();
+        (inode_of(&sv, far), inode_of(&sv, near))
+    };
+    let shared = blocks_of(&scratch.image, snap);
+    let (path_far, path_near) = (path_to(&shared, ino_far), path_to(&shared, ino_near));
+    assert_eq!(
+        path_far.len(),
+        3,
+        "the premise: three blocks to {far}: {path_far:?} ends at {:?}",
+        shared.1[&path_far[path_far.len() - 1]]
+    );
+    assert_eq!(
+        path_far[1], path_near[1],
+        "the premise: {far} and {near} are under one node"
+    );
+    assert_ne!(
+        path_far[2], path_near[2],
+        "the premise: {far} and {near} are in different leaves"
+    );
+
+    // The snapshot writes to a leaf the source did not copy, under a node
+    // it did: the leaf is named by the old node's address and by the
+    // source, and the copy takes the address's reference away.
+    {
+        let fs = scratch.mount();
+        let mut sv = fs.open_subvolume(snap).unwrap();
+        overwrite(&mut sv, &mut snap_files, near, pattern(8192, 12));
+    }
+    assert_btrfs_check_clean(&scratch.image, "after the snapshot wrote beside the source");
+    // And to the leaf it did: the snapshot holds its last reference.
+    {
+        let fs = scratch.mount();
+        let mut sv = fs.open_subvolume(snap).unwrap();
+        overwrite(&mut sv, &mut snap_files, far, pattern(8192, 13));
+    }
+    assert_btrfs_check_clean(
+        &scratch.image,
+        "after the snapshot wrote where the source had",
+    );
+    // The source again, through what is left to it alone.
+    {
+        let fs = scratch.mount();
+        let mut sv = fs.open_subvolume(tall).unwrap();
+        overwrite(&mut sv, &mut tall_files, near, pattern(8192, 14));
+        overwrite(&mut sv, &mut tall_files, "f0800", pattern(8192, 15));
+    }
+    assert_btrfs_check_clean(&scratch.image, "after the source wrote again");
+
+    {
+        let fs = scratch.mount_ro();
+        assert_read_here(&fs.open_subvolume(tall).unwrap(), "tall", &tall_files);
+        assert_read_here(&fs.open_subvolume(snap).unwrap(), "snap", &snap_files);
+    }
+    assert_kernel_takes_it_from_here(&scratch, ("tall", &tall_files), ("snap", &snap_files));
+}
+
+/// A leaf holding nothing but one file's extents, emptied through the
+/// snapshot: the source still reads the leaf, so it stays for it while it
+/// leaves the snapshot's tree, and the source's file keeps every byte.
+#[test]
+fn a_truncate_in_a_snapshot_empties_leaves_the_source_keeps() {
+    let scratch = Scratch::small_nodes("write-empties");
+    let extents = 300;
+    let (tall, contents) = level_two(&scratch, extents);
+    let snap = {
+        let mut fs = scratch.mount();
+        let root = fs.root_inode().unwrap().ino;
+        fs.create_snapshot(tall, root, b"snap", false).unwrap()
+    };
+    assert_btrfs_check_clean(&scratch.image, "with the snapshot taken");
+    let sparse = {
+        let fs = scratch.mount_ro();
+        let sv = fs.open_subvolume(tall).unwrap();
+        inode_of(&sv, "sparse")
+    };
+    let blocks = blocks_of(&scratch.image, snap);
+    let whole = blocks
+        .1
+        .values()
+        .filter(|b| b.ptrs.is_empty() && b.inos.iter().all(|i| *i == sparse))
+        .count();
+    assert!(
+        whole > 0,
+        "the premise: a leaf holds only that file's items"
+    );
+    let source_before = blocks_of(&scratch.image, tall);
+    {
+        let fs = scratch.mount();
+        let mut sv = fs.open_subvolume(snap).unwrap();
+        sv.truncate(sparse, 0).expect("truncate the sparse file");
+    }
+    assert_btrfs_check_clean(&scratch.image, "after the truncate emptied shared leaves");
+    let source_now = blocks_of(&scratch.image, tall);
+    assert_eq!(source_now.0, source_before.0, "the source's root moved");
+    assert_eq!(
+        source_now.1.keys().collect::<Vec<_>>(),
+        source_before.1.keys().collect::<Vec<_>>(),
+        "a block of the source moved"
+    );
+    let dump = dump_tree(&scratch.image, &snap.to_string());
+    assert!(
+        !dump.contains(&format!("key ({sparse} EXTENT_DATA ")),
+        "the snapshot's file still has extents"
+    );
+
+    let mut snap_files = contents.clone();
+    snap_files.insert("sparse".to_string(), Vec::new());
+    let out = guest_kernel_read_ok(
+        &scratch.image_str(),
+        "reading both sides",
+        &format!("cd \"$MNT\"\n{}{}", sum("tall"), sum("snap")),
+    );
+    assert_kernel_read(&out, "tall", &contents);
+    assert_kernel_read(&out, "snap", &snap_files);
+    let script = "cd \"$MNT\"\nbtrfs subvolume delete snap >/dev/null\n\
+                  btrfs subvolume sync . >/dev/null && echo synced\n";
+    let out = guest_kernel_write_ok(&scratch.image_str(), "deleting the snapshot", script);
+    assert!(
+        out.lines().any(|l| l.trim() == "synced"),
+        "the cleaner did not finish:\n{out}"
+    );
+    assert_btrfs_check_clean(
+        &scratch.image,
+        "after the kernel's cleaner dropped the snapshot",
+    );
+}
+
+/// A leaf the source copied, so that it refers to its children by address,
+/// which a write in the snapshot fills past one block: the leaf stays for
+/// nobody, and both halves are the snapshot's own.
+#[test]
+fn a_leaf_named_by_address_splits_when_a_snapshot_fills_it() {
+    let scratch = Scratch::small_nodes("write-split");
+    let (tall, contents) = level_two(&scratch, 0);
+    let snap = {
+        let mut fs = scratch.mount();
+        let root = fs.root_inode().unwrap().ino;
+        fs.create_snapshot(tall, root, b"snap", false).unwrap()
+    };
+    assert_btrfs_check_clean(&scratch.image, "with the snapshot taken");
+
+    // A leaf with too little room for an inline file to grow, and one of
+    // the small files in it.
+    let inodes: BTreeMap<u64, String> = {
+        let fs = scratch.mount_ro();
+        let sv = fs.open_subvolume(tall).unwrap();
+        contents
+            .iter()
+            .filter(|(_, data)| data.len() == 64)
+            .map(|(name, _)| (inode_of(&sv, name), name.clone()))
+            .collect()
+    };
+    let blocks = blocks_of(&scratch.image, snap);
+    let growth = 1500u64;
+    let name = blocks
+        .1
+        .values()
+        .filter(|b| b.ptrs.is_empty() && b.free.is_some_and(|f| f < growth))
+        .find_map(|b| {
+            // Neither end of the leaf: the file's items are all in it.
+            let (first, last) = (*b.inos.first()?, *b.inos.last()?);
+            b.inos
+                .iter()
+                .filter(|i| **i != first && **i != last)
+                .find_map(|i| inodes.get(i))
+        })
+        .expect("the premise: a nearly full leaf holds a small file")
+        .clone();
+
+    // The source copies that leaf, keeping the file's size, and so its room.
+    let mut tall_files = contents.clone();
+    let mut snap_files = contents.clone();
+    {
+        let fs = scratch.mount();
+        let mut sv = fs.open_subvolume(tall).unwrap();
+        overwrite(&mut sv, &mut tall_files, &name, pattern(64, 99));
+    }
+    assert_btrfs_check_clean(&scratch.image, "after the source copied the leaf");
+    let leaves = |image: &Path| {
+        let (_, blocks) = blocks_of(image, snap);
+        blocks.values().filter(|b| b.ptrs.is_empty()).count()
+    };
+    let before = leaves(&scratch.image);
+    {
+        let fs = scratch.mount();
+        let mut sv = fs.open_subvolume(snap).unwrap();
+        overwrite(
+            &mut sv,
+            &mut snap_files,
+            &name,
+            pattern(growth as usize, 100),
+        );
+    }
+    assert_btrfs_check_clean(&scratch.image, "after the snapshot's write split the leaf");
+    assert_eq!(
+        leaves(&scratch.image),
+        before + 1,
+        "the premise: the write split one leaf"
+    );
+    {
+        let fs = scratch.mount_ro();
+        assert_read_here(&fs.open_subvolume(tall).unwrap(), "tall", &tall_files);
+        assert_read_here(&fs.open_subvolume(snap).unwrap(), "snap", &snap_files);
+    }
+    assert_kernel_takes_it_from_here(&scratch, ("snap", &snap_files), ("tall", &tall_files));
+}
+
+/// A leaf naming one extent through many files, whose references the copy
+/// files as items of their own, as the kernel's did: this crate's references
+/// must match the kernel's on a copy of the image.
+#[test]
+fn a_copied_leaf_files_keyed_data_references_where_the_kernel_does() {
+    let scratch = Scratch::new("write-keyed");
+    let data = pattern(64 << 10, 53);
+    let source = scratch.dir.join("source");
+    std::fs::write(&source, &data).expect("write the source bytes");
+    let replacement = pattern(64 << 10, 54);
+    let replacement_file = scratch.dir.join("replacement");
+    std::fs::write(&replacement_file, &replacement).expect("write the replacement");
+    let mut script = format!(
+        "cd \"$MNT\"\nbtrfs subvolume create tall >/dev/null\ncat {} > tall/o\nsync\n",
+        source.display()
+    );
+    let mut contents = BTreeMap::new();
+    contents.insert("o".to_string(), data.clone());
+    for i in 1..=120 {
+        script.push_str(&format!("cp --reflink=always tall/o tall/r{i:03}\n"));
+        contents.insert(format!("r{i:03}"), data.clone());
+    }
+    script.push_str("sync\nprintf 'tall-id %s\\n' \"$(btrfs inspect-internal rootid tall)\"\n");
+    let out = guest_kernel_write_ok(&scratch.image_str(), "the kernel's reflinks", &script);
+    let tall = printed_id(&out, "tall-id ");
+    assert!(
+        root_is_node(&dump_tree(&scratch.image, &tall.to_string())),
+        "the premise: the source is tall"
+    );
+    let extent = first_data_extent(&scratch.image, tall);
+    let snap = {
+        let mut fs = scratch.mount();
+        let root = fs.root_inode().unwrap().ino;
+        fs.create_snapshot(tall, root, b"snap", false).unwrap()
+    };
+    assert_btrfs_check_clean(&scratch.image, "with the snapshot taken");
+
+    let measured = scratch.copy("measured.img");
+    guest_kernel_write_ok(
+        &measured,
+        "the kernel's write into the snapshot",
+        &format!(
+            "cd \"$MNT\"\ndd if={} of=snap/r060 bs=64k conv=notrunc status=none\nsync\n",
+            replacement_file.display()
+        ),
+    );
+    let measured = PathBuf::from(measured);
+    assert_btrfs_check_clean(&measured, "after the kernel's write");
+    let kernel = data_refs(&dump_tree(&measured, "2"), extent, snap);
+    assert!(
+        kernel.2 > 0,
+        "the premise: the kernel files some as items of their own: {kernel:?}"
+    );
+
+    let mut snap_files = contents.clone();
+    {
+        let fs = scratch.mount();
+        let mut sv = fs.open_subvolume(snap).unwrap();
+        overwrite(&mut sv, &mut snap_files, "r060", replacement);
+    }
+    assert_btrfs_check_clean(&scratch.image, "after the write copied the leaf");
+    assert_eq!(
+        data_refs(&dump_tree(&scratch.image, "2"), extent, snap),
+        kernel,
+        "the snapshot's references of the extent, here and from the kernel"
+    );
+
+    assert_kernel_takes_it_from_here_reflinks(&scratch, &contents, &snap_files);
+}
+
+/// As [`assert_kernel_takes_it_from_here`], for a tree of reflinks.
+#[track_caller]
+fn assert_kernel_takes_it_from_here_reflinks(
+    scratch: &Scratch,
+    tall_files: &BTreeMap<String, Vec<u8>>,
+    snap_files: &BTreeMap<String, Vec<u8>>,
+) {
+    let out = guest_kernel_read_ok(
+        &scratch.image_str(),
+        "reading both sides",
+        &format!("cd \"$MNT\"\n{}{}", sum("tall"), sum("snap")),
+    );
+    assert_kernel_read(&out, "tall", tall_files);
+    assert_kernel_read(&out, "snap", snap_files);
+    let (write_snap, snap_after) = scribble_reflinks("snap", snap_files);
+    let script = format!(
+        "cd \"$MNT\"\n{write_snap}sync\n{}btrfs subvolume delete tall >/dev/null\n\
+         btrfs subvolume sync . >/dev/null && echo synced\n{}",
+        sum("snap"),
+        sum("snap"),
+    );
+    let out = guest_kernel_write_ok(&scratch.image_str(), "writing, then deleting", &script);
+    assert_kernel_read(&out, "snap", &snap_after);
+    assert!(
+        out.lines().any(|l| l.trim() == "synced"),
+        "the cleaner did not finish:\n{out}"
+    );
+    assert_btrfs_check_clean(
+        &scratch.image,
+        "after the kernel's cleaner dropped the source",
+    );
 }

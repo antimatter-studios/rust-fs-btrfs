@@ -18,8 +18,9 @@
 //! backref" and wanted keyed references for every extent under the leaf.
 //! So the move converts each shared reference naming the old block into
 //! the keyed one the new block's children carry, with the same count:
-//! [`take_inline_shared`] takes the shared one out, and
-//! [`add_inline_keyed`] puts the keyed one in.
+//! [`take_inline_shared`] takes the shared one out, and the keyed one goes
+//! where the kernel would file it, as [`add_inline_keyed`] or
+//! [`add_inline_data_ref`] puts it inline, or as an item of its own.
 //!
 //! References live inline in the extent item when there is room, as a
 //! type byte followed by a payload, and otherwise as items of their own
@@ -196,16 +197,6 @@ pub enum Keyed {
         /// item's key offset less its offset into the extent.
         offset: u64,
     },
-}
-
-impl Keyed {
-    /// The shared reference type this replaces.
-    pub fn shared_kind(&self) -> u8 {
-        match self {
-            Keyed::Block { .. } => SHARED_BLOCK_REF,
-            Keyed::Data { .. } => SHARED_DATA_REF,
-        }
-    }
 }
 
 /// The count a shared reference carries: one for a tree block, the
@@ -452,6 +443,52 @@ pub fn lower_total(item_type: u8, body: &[u8]) -> Result<Vec<u8>> {
     let mut out = body.to_vec();
     out[..8].copy_from_slice(&(total - 1).to_le_bytes());
     Ok(out)
+}
+
+/// An extent record's `body` with `count` off its total, for references
+/// taken away by another edit that adds references back or leaves others
+/// counted (#734). Unlike [`lower_total`] this can reach zero, which only a
+/// reference added straight after it makes right: the caller's render checks
+/// the record it leaves.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] when the total is less than `count`: the
+/// record does not count what it lists. And as [`refs_start`].
+pub fn reduce_total(item_type: u8, body: &[u8], count: u64) -> Result<Vec<u8>> {
+    refs_start(item_type, body)?;
+    let total = u64::from_le_bytes(body[..8].try_into().expect("a fixed part"));
+    let left = total.checked_sub(count).ok_or_else(|| {
+        Error::UnsupportedFeature(format!(
+            "the extent's record counts {total} references, and {count} were to come off"
+        ))
+    })?;
+    let mut out = body.to_vec();
+    out[..8].copy_from_slice(&left.to_le_bytes());
+    Ok(out)
+}
+
+/// Whether `body` holds an inline `EXTENT_DATA_REF` from inode `objectid` in
+/// `tree` at file offset `offset`: a new one is then counted there, however
+/// long the item is (#734).
+///
+/// # Errors
+///
+/// As [`inline_refs`].
+pub fn holds_inline_data_ref(
+    item_type: u8,
+    body: &[u8],
+    tree: u64,
+    objectid: u64,
+    offset: u64,
+) -> Result<bool> {
+    let mut fields = Vec::with_capacity(24);
+    for v in [tree, objectid, offset] {
+        fields.extend_from_slice(&v.to_le_bytes());
+    }
+    Ok(inline_refs(item_type, body)?
+        .iter()
+        .any(|r| r.kind == EXTENT_DATA_REF && r.payload[..24] == fields[..]))
 }
 
 /// `body` with one more reference from the file item of inode `objectid`
@@ -1072,6 +1109,26 @@ mod tests {
 
     const BLOCK: u64 = crate::extent_write::EXTENT_FLAG_TREE_BLOCK;
     const DATA: u64 = crate::extent_write::EXTENT_FLAG_DATA;
+
+    #[test]
+    fn a_total_comes_down_to_zero_and_no_further() {
+        let body = header(2, DATA);
+        let one = reduce_total(key_type::EXTENT_ITEM, &body, 1).unwrap();
+        assert_eq!(u64::from_le_bytes(one[..8].try_into().unwrap()), 1);
+        let zero = reduce_total(key_type::EXTENT_ITEM, &body, 2).unwrap();
+        assert_eq!(u64::from_le_bytes(zero[..8].try_into().unwrap()), 0);
+        assert!(reduce_total(key_type::EXTENT_ITEM, &body, 3).is_err());
+    }
+
+    #[test]
+    fn an_inline_data_reference_is_found_by_all_three_fields() {
+        let body =
+            add_inline_data_ref(key_type::EXTENT_ITEM, &header(0, DATA), 256, 300, 0).unwrap();
+        assert!(holds_inline_data_ref(key_type::EXTENT_ITEM, &body, 256, 300, 0).unwrap());
+        assert!(!holds_inline_data_ref(key_type::EXTENT_ITEM, &body, 257, 300, 0).unwrap());
+        assert!(!holds_inline_data_ref(key_type::EXTENT_ITEM, &body, 256, 301, 0).unwrap());
+        assert!(!holds_inline_data_ref(key_type::EXTENT_ITEM, &body, 256, 300, 4096).unwrap());
+    }
 
     #[test]
     fn a_copied_shared_block_keeps_the_other_trees_reference_alone() {

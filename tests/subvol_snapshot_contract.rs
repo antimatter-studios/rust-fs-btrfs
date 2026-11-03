@@ -315,38 +315,93 @@ fn a_tall_source_written_after_its_snapshot_leaves_the_snapshot_alone() {
     assert_eq!(&fs.read_file(ino).unwrap()[..21], b"changed in the source");
 }
 
-/// A write through this crate into a tall snapshot is refused (#734), with
-/// nothing written: the kernel takes one, and this crate takes one into the
-/// source.
+/// A write through this crate into a tall snapshot copies the path it reaches
+/// (#734): a data write and a namespace change both land in the snapshot, and
+/// the source keeps every byte.
 #[test]
-fn a_write_into_a_tall_snapshot_is_refused() {
+fn a_write_into_a_tall_snapshot_lands_there_and_leaves_the_source_alone() {
     let image = tall("tall-snapshot-written");
+    let source = contents(&image.mount_ro());
     let snap = {
         let mut fs = image.mount();
         let root = fs.root_inode().unwrap().ino;
         fs.create_snapshot(FS_TREE_OBJECTID, root, b"snap", false)
             .unwrap()
     };
-    let before = image.digest();
     {
         let fs = image.mount();
         let mut sv = fs.open_subvolume(snap).unwrap();
         let root = sv.root_inode().unwrap().ino;
         let ino = sv.lookup(root, b"file-0100").unwrap().ino;
+        sv.write(ino, 0, b"changed in the snapshot")
+            .expect("a data write");
+        let new = sv
+            .create(root, b"new", 0o644, 0, 0)
+            .expect("a namespace change");
+        sv.write(new, 0, b"new in the snapshot")
+            .expect("a data write into a new file");
+    }
+    let fs = image.mount_ro();
+    let root = fs.root_inode().unwrap().ino;
+    let mut top = source.clone();
+    top.push((b"snap".to_vec(), None));
+    top.sort();
+    assert_eq!(
+        contents(&fs),
+        top,
+        "the source, after a write to its snapshot"
+    );
+    let sv = fs.open_subvolume(snap).unwrap();
+    let sv_root = sv.root_inode().unwrap().ino;
+    let ino = sv.lookup(sv_root, b"file-0100").unwrap().ino;
+    assert_eq!(
+        &sv.read_file(ino).unwrap()[..23],
+        b"changed in the snapshot"
+    );
+    let new = sv.lookup(sv_root, b"new").unwrap().ino;
+    assert_eq!(sv.read_file(new).unwrap(), b"new in the snapshot");
+    assert!(
+        fs.lookup(root, b"new").is_err(),
+        "a name created in the snapshot reached the source"
+    );
+}
+
+/// A write a tall snapshot has no room for fails with nothing written, and a
+/// read-only snapshot refuses one the same way (#734).
+#[test]
+fn a_write_a_tall_snapshot_cannot_take_writes_nothing() {
+    let image = tall("tall-snapshot-full");
+    let (snap, read_only) = {
+        let mut fs = image.mount();
+        let root = fs.root_inode().unwrap().ino;
+        (
+            fs.create_snapshot(FS_TREE_OBJECTID, root, b"snap", false)
+                .unwrap(),
+            fs.create_snapshot(FS_TREE_OBJECTID, root, b"ro", true)
+                .unwrap(),
+        )
+    };
+    let before = image.digest();
+    {
+        let fs = image.mount();
+        let generation = fs.superblock().generation;
+        let mut sv = fs.open_subvolume(snap).unwrap();
+        let root = sv.root_inode().unwrap().ino;
+        let ino = sv.lookup(root, b"file-0100").unwrap().ino;
+        let too_much = vec![7u8; 256 << 20];
         assert!(
-            matches!(
-                sv.write(ino, 0, b"changed in the snapshot"),
-                Err(Error::UnsupportedFeature(_))
-            ),
-            "a data write"
+            sv.write(ino, 0, &too_much).is_err(),
+            "a write past the volume's size"
         );
+        assert_eq!(sv.superblock().generation, generation, "nothing committed");
+
+        let mut ro = fs.open_subvolume(read_only).unwrap();
+        let root = ro.root_inode().unwrap().ino;
+        let ino = ro.lookup(root, b"file-0100").unwrap().ino;
         assert!(
-            matches!(
-                sv.create(root, b"new", 0o644, 0, 0),
-                Err(Error::UnsupportedFeature(_))
-            ),
-            "a namespace change"
+            matches!(ro.write(ino, 0, b"refused"), Err(Error::ReadOnly)),
+            "a write into a read-only snapshot"
         );
     }
-    assert_eq!(image.digest(), before, "a refused write wrote something");
+    assert_eq!(image.digest(), before, "a failed write wrote something");
 }
