@@ -375,7 +375,7 @@ impl Filesystem {
     /// anything else still holds -- another file, another item of this
     /// one, or a leaf a snapshot shares, as [`Filesystem::truncate`]
     /// decides it.
-    fn drop_covered(
+    pub(crate) fn drop_covered(
         &self,
         dst: u64,
         covered: &[(DiskKey, Vec<u8>)],
@@ -592,7 +592,7 @@ impl Filesystem {
     /// Refuse an extent whose references are kept, at least in part, as
     /// items of their own: the kernel adds no inline reference to one, and
     /// filing a new reference as an item is not written.
-    fn refuse_keyed_data_refs(&self, bytenr: u64) -> Result<()> {
+    pub(crate) fn refuse_keyed_data_refs(&self, bytenr: u64) -> Result<()> {
         let root = self.tree_root(objectid::EXTENT_TREE)?;
         let reader = self.pool_reader();
         let tree = reader.tree();
@@ -650,16 +650,16 @@ fn refuse_inline_destination(dst: u64, items: &[(DiskKey, Vec<u8>)]) -> Result<(
 /// What replacing `[lo, hi)` does to a destination's own items, before
 /// the clone's are put there.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct Cut {
+pub(crate) struct Cut {
     /// Items that run into or out of the range, or through it: each cut
     /// short at the range's start, started again at its end -- under a new
     /// key, the old one deleted -- or both, as two items.
-    edits: Vec<ItemEdit>,
+    pub(crate) edits: Vec<ItemEdit>,
     /// Items wholly inside the range, which the clone deletes.
-    covered: Vec<(DiskKey, Vec<u8>)>,
+    pub(crate) covered: Vec<(DiskKey, Vec<u8>)>,
     /// For each item split in two, the extent its halves both name and
     /// the reference offset they share: the second half adds one to it.
-    splits: Vec<(u64, u64)>,
+    pub(crate) splits: Vec<(u64, u64)>,
 }
 
 /// What replacing `[lo, hi)` of inode `dst` does to each of its
@@ -667,7 +667,7 @@ struct Cut {
 ///
 /// An item keeps its reference offset, its key offset less its offset into
 /// the extent, however it is cut, since both move together.
-fn cut_range(dst: u64, items: &[(DiskKey, Vec<u8>)], lo: u64, hi: u64) -> Result<Cut> {
+pub(crate) fn cut_range(dst: u64, items: &[(DiskKey, Vec<u8>)], lo: u64, hi: u64) -> Result<Cut> {
     let mut cut = Cut::default();
     for (k, d) in items {
         let start = k.offset;
@@ -715,17 +715,17 @@ fn cut_range(dst: u64, items: &[(DiskKey, Vec<u8>)], lo: u64, hi: u64) -> Result
 
 /// A change's edits of a destination's items, by key, so a later edit of
 /// one key replaces an earlier one.
-type Edits = BTreeMap<(u64, u8, u64), ItemEdit>;
+pub(crate) type Edits = BTreeMap<(u64, u8, u64), ItemEdit>;
 
 /// A key in the order the tree sorts it.
-fn order(k: &DiskKey) -> (u64, u8, u64) {
+pub(crate) fn order(k: &DiskKey) -> (u64, u8, u64) {
     (k.objectid, k.key_type, k.offset)
 }
 
 /// The inode's `nbytes` once `edits` apply to its `EXTENT_DATA` items:
 /// every item that has an extent at its `num_bytes`, as `btrfs check`
 /// counts it. Inline items are refused before this is asked.
-fn counted_bytes(items: &[(DiskKey, Vec<u8>)], edits: &Edits) -> Result<u64> {
+pub(crate) fn counted_bytes(items: &[(DiskKey, Vec<u8>)], edits: &Edits) -> Result<u64> {
     let mut after: BTreeMap<(u64, u8, u64), &[u8]> = items
         .iter()
         .map(|(k, d)| (order(k), d.as_slice()))
@@ -749,7 +749,7 @@ fn counted_bytes(items: &[(DiskKey, Vec<u8>)], edits: &Edits) -> Result<u64> {
 }
 
 /// The `EXTENT_DATA` items among an inode's.
-fn extent_items(items: Vec<(DiskKey, Vec<u8>)>) -> Vec<(DiskKey, Vec<u8>)> {
+pub(crate) fn extent_items(items: Vec<(DiskKey, Vec<u8>)>) -> Vec<(DiskKey, Vec<u8>)> {
     items
         .into_iter()
         .filter(|(k, _)| k.key_type == EXTENT_DATA_KEY)

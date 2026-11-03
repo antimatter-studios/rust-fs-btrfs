@@ -1523,7 +1523,7 @@ fn inline_move_leaves_gap(offset: u64, sector: u64) -> bool {
 /// A regular `EXTENT_DATA` item referencing the whole of the `len` bytes
 /// stored as `disk_len` at `bytenr`, written in transaction `generation`
 /// (#357).
-fn regular_extent_item(
+pub(crate) fn regular_extent_item(
     generation: u64,
     bytenr: u64,
     disk_len: u64,

@@ -894,8 +894,10 @@ impl Filesystem {
             Error::UnsupportedFeature("the change's plan does not move the root tree".into())
         })?;
         let released: i128 = write.releases.iter().map(|r| i128::from(r.old_len)).sum();
-        let delta =
-            plan.usage_delta(u64::from(self.sb.nodesize)) - released + write.records_usage_delta();
+        let added: i128 = write.adds.iter().map(|a| i128::from(a.disk_len)).sum();
+        let delta = plan.usage_delta(u64::from(self.sb.nodesize)) - released
+            + added
+            + write.records_usage_delta();
         let bytes_used = match delta {
             0 => None,
             d => Some(

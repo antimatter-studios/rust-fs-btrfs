@@ -158,6 +158,12 @@ extent_window_write       3
 extent_write_oracle       3
 # The last-link oracle adds inline and regular-data cases in one test (#511).
 extref_namespace_kernel   2
+# Preallocated and punched through the C ABI, held to the kernel's own
+# fallocate over twin files, and an inline file refused (#713).
+fallocate_kernel          2
+# The edges of the same: partial sectors in holes and preallocated items,
+# compressed and nodatacow files, and what is refused (#713).
+fallocate_edges_kernel    2
 fixture_magic_validation  8
 fixtures_present          2
 free_space_oracle         4

@@ -1805,6 +1805,75 @@ pub unsafe extern "C" fn fs_btrfs_clone_range(
     })
 }
 
+/// [`fs_btrfs_fallocate`]'s mode: the file's size does not move, as
+/// `FALLOC_FL_KEEP_SIZE` asks.
+pub const FS_BTRFS_FALLOC_KEEP_SIZE: u32 = 0x01;
+/// [`fs_btrfs_fallocate`]'s mode: the range is punched out rather than
+/// preallocated, as `FALLOC_FL_PUNCH_HOLE` asks. It must come with
+/// [`FS_BTRFS_FALLOC_KEEP_SIZE`], as it must for the kernel.
+pub const FS_BTRFS_FALLOC_PUNCH_HOLE: u32 = 0x02;
+
+/// Preallocate or punch out `len` bytes of the regular file at `path`, from
+/// `offset`, as `fallocate(2)` does (#713), in the same numbering of `mode`.
+///
+/// A mode of 0 or [`FS_BTRFS_FALLOC_KEEP_SIZE`] gives each hole of the range,
+/// rounded out to whole sectors, a preallocated extent, which reads as zeros
+/// until it is written, and leaves what already holds data alone; without
+/// [`FS_BTRFS_FALLOC_KEEP_SIZE`] the size grows to cover the range.
+/// [`FS_BTRFS_FALLOC_PUNCH_HOLE`] with [`FS_BTRFS_FALLOC_KEEP_SIZE`] takes the
+/// range's whole sectors out of the file, releasing each extent nothing else
+/// refers to, and zeros any part of a sector at the range's edges. The size
+/// does not move.
+///
+/// Returns 0, or -1 with the error recorded: ENOENT for no such path, EISDIR
+/// for anything but a regular file, EROFS on a read-only handle, and ENOTSUP
+/// for a mode other than those, a length of zero, a range past the largest
+/// file offset, and what cannot be written yet: inline data, a volume without
+/// no-holes, a subvolume other than the top level, part of a sector in a
+/// `nodatacow` file's regular extent or in a preallocated extent another
+/// reference may read, and space no data block group holds in one piece.
+///
+/// # Safety
+///
+/// `fs` must be a live handle and `path` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_btrfs_fallocate(
+    fs: *mut fs_btrfs_fs,
+    path: *const c_char,
+    mode: u32,
+    offset: u64,
+    len: u64,
+) -> c_int {
+    guard(-1, || {
+        let Some(fs) = (unsafe { handle_mut(fs) }) else {
+            return -1;
+        };
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
+            return -1;
+        };
+        let keep_size = mode & FS_BTRFS_FALLOC_KEEP_SIZE != 0;
+        let changed =
+            fs.lookup_path_bytes(path)
+                .and_then(|inode| match mode & !FS_BTRFS_FALLOC_KEEP_SIZE {
+                    0 => fs.fallocate(inode.ino, offset, len, keep_size),
+                    FS_BTRFS_FALLOC_PUNCH_HOLE if keep_size => {
+                        fs.punch_hole(inode.ino, offset, len)
+                    }
+                    _ => Err(Error::UnsupportedFeature(format!(
+                        "fallocate mode {mode:#x} is not a preallocation or a punched hole that \
+                     keeps the size"
+                    ))),
+                });
+        match changed {
+            Ok(()) => 0,
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
+}
+
 /// Deduplicate `len` bytes of the regular file at `dst`, from `dst_offset`,
 /// against the regular file at `src` from `src_offset`, as `FIDEDUPERANGE`
 /// does (#712): when the two ranges hold the same bytes, `dst`'s range is

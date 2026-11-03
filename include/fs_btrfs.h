@@ -479,6 +479,31 @@ int fs_btrfs_dedupe_range(fs_btrfs_fs_t *fs, const char *src, uint64_t src_offse
                           const char *dst, uint64_t dst_offset, uint64_t len,
                           uint64_t *deduped);
 
+/* fs_btrfs_fallocate's mode, numbered as fallocate(2) numbers it. */
+#define FS_BTRFS_FALLOC_KEEP_SIZE 0x01
+#define FS_BTRFS_FALLOC_PUNCH_HOLE 0x02
+
+/*
+ * Preallocate or punch out `len` bytes of the regular file at `path`, from
+ * `offset`, as fallocate(2) does. A mode of 0 or FS_BTRFS_FALLOC_KEEP_SIZE
+ * gives each hole of the range, rounded out to whole sectors, a preallocated
+ * extent, which reads as zeros until it is written, and leaves what already
+ * holds data alone; without FS_BTRFS_FALLOC_KEEP_SIZE the size grows to cover
+ * the range. FS_BTRFS_FALLOC_PUNCH_HOLE with FS_BTRFS_FALLOC_KEEP_SIZE takes
+ * the range's whole sectors out of the file, releasing each extent nothing
+ * else refers to, and zeros any part of a sector at the range's edges. The
+ * size does not move.
+ * Returns 0, or -1: ENOENT for no such path, EISDIR for anything but a
+ * regular file, EROFS on a read-only handle, ENOTSUP for a mode other than
+ * those, a length of zero, a range past the largest file offset, and what
+ * cannot be written yet: inline data, a volume without the no-holes feature,
+ * a subvolume other than the top level, part of a sector in a nodatacow file's
+ * regular extent or in a preallocated extent another reference may read, and
+ * space no data block group holds in one piece.
+ */
+int fs_btrfs_fallocate(fs_btrfs_fs_t *fs, const char *path, uint32_t mode, uint64_t offset,
+                       uint64_t len);
+
 /* What fs_btrfs_defragment did. */
 typedef struct {
     uint64_t items_before; /* the file's extent items before, holes included */

@@ -179,7 +179,9 @@ chore_min_version: 0.10.0
 #                                                    both measured locally.
 #                                                    Was 72 / 3,400 -> 95 /
 #                                                    4,450 on 2026-09-26
-#     vm        1,783 / 103,604    2,320 / 135,000   ~30% over a conservative
+#     vm        2,324 / 123,797    3,020 / 161,000   ~30% over run 41587753376
+#                                                    (#713). Before it, a
+#                                                    conservative
 #                                                    projection through #533
 #                                                    (851b6b2). Cold queue
 #                                                    run 39074893971 (#486)
@@ -737,7 +739,10 @@ tasks:
         # add 7 wrapper lines each, allowing 512 bytes each (6144 total).
         # No savings from removed output are credited. The conservative
         # projection is 1783 / 103604; allow ~30% over the whole chain.
-        bash ../rust-fs-core/scripts/tier.sh test:vm vm 2320 135000 -- \
+        # Re-measured when #713 added two test targets: run 41587753376, every
+        # test passing, printed 2324 lines / 123797 bytes. About 30% over that
+        # is 3020 lines and 161000 bytes.
+        bash ../rust-fs-core/scripts/tier.sh test:vm vm 3020 161000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
 
   test:
