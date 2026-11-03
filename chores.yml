@@ -252,7 +252,9 @@ vars:
   # disposable (v0.3.0), a halt that hangs is forced and concurrent ups of
   # one machine wait for the boot under way (v0.4.0), and a boot that fails
   # prints its console (v0.4.1).
-  LINUX_HARNESS_REF: v0.5.1
+  # v0.5.5 lets a host admit more than one VM (FLTH_SLOT_COUNT). v0.5.6 gives
+  # back what a guest deletes and says what stopped a lost guest.
+  LINUX_HARNESS_REF: v0.5.6
 
 # The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
 # harness is a sibling that `chore siblings` itself checks out: without

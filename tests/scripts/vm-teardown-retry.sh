@@ -93,6 +93,8 @@ chmod +x "$sandbox/bin/cargo" "$SUT/scripts/test.sh" "$H/scripts/"*.sh
 
 export PATH="$sandbox/bin:$PATH"
 export FLTH_TEST_STUB="$sandbox/stub"
+# The stub engine runs guest scripts with this interpreter (harness v0.5.4).
+export FLTH_TEST_GUEST_BASH="${FLTH_TEST_GUEST_BASH:-bash}"
 export FLTH_CACHE_DIR="$sandbox/cache"
 export FLTH_STATE_DIR="$sandbox/state"
 unset FLTH_CONFIG FLTH_KEEP_VM FLTH_GUEST FLTH_SLOT_WAIT FLTH_SLOT_BOOT_GRACE FS_BTRFS_TEST_TMPDIR
