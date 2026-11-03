@@ -624,6 +624,8 @@ tasks:
     # kept, and reading it is a choice rather than a toll. `--verbose`
     # streams it live.
     #
+    # disk-watch.sh records the free space around the tier (#731).
+    #
     # NO `vm:up` HERE, deliberately. The first oracle call in each test
     # process brings the VM up (idempotent, milliseconds when it is
     # already running) and every later call rides one shared SSH
@@ -635,7 +637,7 @@ tasks:
     cmds:
       - scripts/tools.sh --check
       - test-disks/build-fixtures.sh --check
-      - '../rust-fs-core/scripts/tier.sh test:oracle oracle 775 42500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
+      - 'scripts/disk-watch.sh oracle ../rust-fs-core/scripts/tier.sh test:oracle oracle 775 42500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
 
   test:kernel:
     desc: 'The driver writes, THE KERNEL reads back: our images loop-mounted by Linux in the guest'
@@ -692,7 +694,7 @@ tasks:
     # that is 4250 lines and 260000 bytes.
     cmds:
       - test-disks/build-fixtures.sh --check
-      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 4250 260000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - 'scripts/disk-watch.sh kernel ../rust-fs-core/scripts/tier.sh test:kernel kernel 4250 260000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
@@ -802,7 +804,7 @@ tasks:
       # suite in #668 measured 1891 / 104526 in the complete guest run
       # (989 passing cases, 2026-10-26). That includes the guest wrapper;
       # 2500 / 140000 gives about 30% beyond it for the native tier (#689).
-      - '../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 2500 140000 -- scripts/test.sh --locked --release'
+      - 'scripts/disk-watch.sh suite ../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 2500 140000 -- scripts/test.sh --locked --release'
       - task: test:scripts
       # The command-line tools, built and staged from this checkout, then
       # tested as installed. A separate invocation because test:cli reads

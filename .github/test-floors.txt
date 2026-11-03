@@ -89,7 +89,7 @@ cli_export_kernel         2
 # A library-written tree, and two kernel trees: one whole, one damaged (#541).
 cli_export_tree           1
 cli_export_tree_kernel    2
-cli_fsck_oracle           4
+cli_fsck_oracle           5
 # fs.btrfs import: seven no-tool cases on this crate's mkfs volume, and three
 # the kernel and btrfs check judge -- a read-back, a full volume and a kill
 # between persist and publish (#431).
