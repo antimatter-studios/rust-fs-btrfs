@@ -139,8 +139,9 @@ compression_oracle        3
 # A write spanning a kept preallocated item's end and the file's end adds
 # one (#639). One write growing the checksum root two levels adds one (#650).
 # A write past a kept preallocated item and the refusals that stay add two
-# (#526).
-cow_write_oracle          35
+# (#526). The kernel's layouts for growing writes off a sector or from before
+# the item add one (#767).
+cow_write_oracle          36
 crash_consistency         3
 csum_oracle               6
 csum_width_populated      1
