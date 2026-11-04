@@ -76,5 +76,8 @@ jq_check "missing start is the not_found kind" '.code==1 and .kind=="not_found"'
 fs.btrfs --offset 1048576 "$SANDBOX/offset.img" ls -R / >"$SANDBOX/offset.json" 2>/dev/null
 check "offset walk succeeds" test $? -eq 0
 check "offset keeps the listing" cmp -s "$SANDBOX/tree.json" "$SANDBOX/offset.json"
+fs.btrfs ls --help >"$SANDBOX/help.txt" 2>&1
+check "ls --help states the default depth" grep -q 'default: 64' "$SANDBOX/help.txt"
+check "ls --help states the default entry count" grep -q 'default: 100000' "$SANDBOX/help.txt"
 check "every read and refusal leaves the image unchanged" cmp -s "$img" "$SANDBOX/before.img"
 finish

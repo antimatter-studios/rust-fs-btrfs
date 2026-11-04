@@ -30,6 +30,7 @@ use fs_btrfs::balance::Balance;
 use fs_btrfs::inode::{FileType, Inode};
 use fs_btrfs::superblock::{compat_ro, incompat};
 use fs_btrfs::{ChecksumType, ChunkProfile, Error, Filesystem, Superblock};
+use fs_core::cli::listing::{bound_reached, recursive_args, ListBounds};
 use fs_core::cli::{transfer, CliError, Format, Json, Outcome, Tool};
 
 pub const TOOL: Tool = Tool {
@@ -98,15 +99,7 @@ fn command() -> Cmd {
                     "List a directory: name, type, size, mode, mtime (a symlink's target, \
                      and which entries are subvolumes)",
                 )
-                .arg(Arg::new("recursive").long("recursive").short('R')
-                    .action(ArgAction::SetTrue)
-                    .help("Walk depth first, names sorted as bytes; never follow a symlink"))
-                .arg(Arg::new("max-depth").long("max-depth").value_name("N")
-                    .value_parser(value_parser!(u64)).requires("recursive")
-                    .help("How deep --recursive may go (default: 64); a directory's entries are depth 1"))
-                .arg(Arg::new("limit").long("limit").value_name("N")
-                    .value_parser(value_parser!(u64)).requires("recursive")
-                    .help("How many entries --recursive may list (default: 100000)"))
+                .args(recursive_args())
                 .arg(
                     Arg::new("path")
                         .value_name("PATH")
@@ -1765,10 +1758,6 @@ fn ls(root: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
     Ok(Outcome::report(Json::Arr(entries)).with_text(text))
 }
 
-/// The shared finite defaults for a recursive listing.
-const MAX_DEPTH: u64 = 64;
-const LIMIT: u64 = 100_000;
-
 fn recursive_entry(
     fs: &Filesystem,
     path: &[u8],
@@ -1816,16 +1805,13 @@ fn walk(
     root: &Arc<Filesystem>,
     found: fs_btrfs::subvol::PathTarget,
     start: Vec<u8>,
-    (max_depth, limit): (u64, u64),
+    ListBounds { max_depth, limit }: ListBounds,
     entries: &mut Vec<Json>,
 ) -> Result<(), CliError> {
-    let reached = |bound: &str, value: u64, at: &[u8]| {
-        CliError::failed(format!("{bound} {value} reached at {}", show(at)))
-    };
     let fs = found.tree.map(Arc::new).unwrap_or_else(|| Arc::clone(root));
     if !found.inode.is_dir() {
         if limit == 0 {
-            return Err(reached("--limit", limit, &start));
+            return Err(bound_reached("--limit", limit, &show(&start)));
         }
         entries.push(recursive_entry(&fs, &start, 0, &found.inode, false, false));
         return Ok(());
@@ -1842,10 +1828,10 @@ fn walk(
         let path = child_path(parent, &child.name);
         let depth = *parent_depth + 1;
         if entries.len() as u64 >= limit {
-            return Err(reached("--limit", limit, &path));
+            return Err(bound_reached("--limit", limit, &show(&path)));
         }
         if depth > max_depth {
-            return Err(reached("--max-depth", max_depth, &path));
+            return Err(bound_reached("--max-depth", max_depth, &show(&path)));
         }
         let subvolume = !child.is_inode();
         let (fs, tree, inode) = if subvolume {
@@ -1897,12 +1883,7 @@ fn ls_recursive(
     let found = root
         .resolve_path_bytes(path)
         .map_err(|e| read_error(path, e))?;
-    let bounds = (
-        sub.get_one::<u64>("max-depth")
-            .copied()
-            .unwrap_or(MAX_DEPTH),
-        sub.get_one::<u64>("limit").copied().unwrap_or(LIMIT),
-    );
+    let bounds = ListBounds::from_matches(sub);
     let mut start = Vec::new();
     for component in path.split(|b| *b == b'/').filter(|c| !c.is_empty()) {
         start.push(b'/');
