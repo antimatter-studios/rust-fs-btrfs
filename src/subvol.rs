@@ -405,7 +405,8 @@ impl Filesystem {
     /// subvolume's tree in their transaction: [`Filesystem::create`],
     /// [`Filesystem::mkdir`], [`Filesystem::symlink`], [`Filesystem::link`],
     /// [`Filesystem::unlink`], [`Filesystem::rmdir`], [`Filesystem::rename`],
-    /// [`Filesystem::truncate`] and copy-on-write [`Filesystem::write`]. After
+    /// [`Filesystem::truncate`], [`Filesystem::fallocate`],
+    /// [`Filesystem::punch_hole`] and copy-on-write [`Filesystem::write`]. After
     /// each commit it is this subvolume's handle on the new generation.
     ///
     /// # Errors

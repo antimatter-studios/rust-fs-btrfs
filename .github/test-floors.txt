@@ -64,6 +64,9 @@ capi_subvol               10
 capi_subvol_create_kernel 1
 # The C ABI snapshot, and the kernel judging it (#267).
 capi_subvol_snapshot_kernel 1
+# Two executed in the local red run for #735: preallocation and hole punching
+# through a selected subvolume handle both fail with ENOTSUP before the fix.
+capi_subvol_fallocate_contract 2
 # One no-tool C ABI scope case and one kernel case through the C ABI alone (#520).
 capi_subvol_write_contract 1
 capi_subvol_write_kernel  1
@@ -164,8 +167,9 @@ extref_namespace_kernel   2
 # fallocate over twin files, and an inline file refused (#713).
 fallocate_kernel          2
 # The edges of the same: partial sectors in holes and preallocated items,
-# compressed and nodatacow files, and what is refused (#713).
-fallocate_edges_kernel    2
+# compressed and nodatacow files, what is refused (#713), and the same ranges
+# through a selected subvolume's handle: three executed in the guest (#735).
+fallocate_edges_kernel    3
 fixture_magic_validation  8
 fixtures_present          2
 free_space_oracle         4
