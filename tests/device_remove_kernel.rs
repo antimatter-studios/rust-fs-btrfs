@@ -24,6 +24,7 @@
 
 use fs_btrfs::error::Error;
 use fs_btrfs::fs::Filesystem;
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{
     fixture, guest_kernel_pool_read, guest_kernel_pool_write, guest_kernel_write_ok, oracle,
     sha256_hex, temp_path, PoolRead,
@@ -68,7 +69,7 @@ impl Scratch {
     fn copy(&self, name: &str) -> PathBuf {
         let src = fixture(name);
         let image = self.0.join(name);
-        std::fs::copy(&src, &image).unwrap_or_else(|e| panic!("copying {}: {e}", src.display()));
+        copy_sparse(&src, &image).unwrap_or_else(|e| panic!("copying {}: {e}", src.display()));
         image
     }
 

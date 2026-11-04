@@ -156,9 +156,14 @@ chore_min_version: 0.10.0
 #                                                    its wrapper (#689).
 #                                                    The native tier runs
 #                                                    every target once.
-#     scripts     175 /   9,115      230 /  11,900   ~30%: one line per
+#     scripts     232 /  12,205      300 /  15,900   ~30%: one line per
 #                                                    assertion, so it grows
-#                                                    with the guards. 175 /
+#                                                    with the guards. 223 /
+#                                                    11,744 on x86_64 CI, run
+#                                                    41777793760, plus #747's
+#                                                    fixture-copies-sparse.sh
+#                                                    (9 lines / 461 bytes).
+#                                                    Was 175 /
 #                                                    9,115 on x86_64 CI, run
 #                                                    41611928706, with #736's
 #                                                    fixture-copy-mount.sh
@@ -862,7 +867,7 @@ tasks:
     cmds:
       - |
         set -eu
-        bash ../rust-fs-core/scripts/tier.sh test:scripts scripts 230 11900 -- bash -c '
+        bash ../rust-fs-core/scripts/tier.sh test:scripts scripts 300 15900 -- bash -c '
           set -eu
           for t in tests/scripts/*.sh; do
             echo "== $t"

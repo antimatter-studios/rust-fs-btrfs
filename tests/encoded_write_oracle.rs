@@ -25,6 +25,7 @@ mod cli_support;
 
 use cli_support::*;
 use fs_btrfs::Filesystem;
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{assert_btrfs_check_clean, fixture, sha256_hex};
 use fs_core::FileDevice;
 use std::sync::Arc;
@@ -132,7 +133,7 @@ fn the_received_extents_are_compressed() {
 #[test]
 fn the_received_volume_is_clean_to_both_checkers() {
     let image = scratch_dir("encoded-clean").join("btrfs-encoded.img");
-    std::fs::copy(fixture(IMAGE), &image).expect("copy the received volume");
+    copy_sparse(fixture(IMAGE), &image).expect("copy the received volume");
     assert_btrfs_check_clean(&image, "encoded");
 
     let out = tool("fsck.btrfs")

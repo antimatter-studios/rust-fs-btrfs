@@ -10,6 +10,7 @@
 mod cli_support;
 
 use cli_support::*;
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{assert_btrfs_check_clean, dump_super, fixture, guest_kernel_read_ok};
 
 fn label_of(dump: &str) -> String {
@@ -21,7 +22,7 @@ fn label_of(dump: &str) -> String {
 #[test]
 fn a_new_label_is_the_one_the_kernel_and_the_reference_tools_read() {
     let image = scratch_dir("label").join("btrfs-default.img");
-    std::fs::copy(fixture("btrfs-default.img"), &image).expect("copy the fixture");
+    copy_sparse(fixture("btrfs-default.img"), &image).expect("copy the fixture");
 
     ok(tool("fs.btrfs")
         .arg(&image)
@@ -56,7 +57,7 @@ fn a_new_label_is_the_one_the_kernel_and_the_reference_tools_read() {
 #[test]
 fn a_label_too_long_is_refused_and_nothing_changes() {
     let image = scratch_dir("label-long").join("btrfs-default.img");
-    std::fs::copy(fixture("btrfs-default.img"), &image).expect("copy the fixture");
+    copy_sparse(fixture("btrfs-default.img"), &image).expect("copy the fixture");
     let before = std::fs::read(&image).unwrap();
     let out = tool("fs.btrfs")
         .arg(&image)
@@ -79,7 +80,7 @@ fn a_label_too_long_is_refused_and_nothing_changes() {
 fn a_misplaced_primary_is_refused_without_changing_the_image() {
     use std::io::{Read, Seek, SeekFrom, Write};
     let image = scratch_dir("label-misplaced").join("btrfs-default.img");
-    std::fs::copy(fixture("btrfs-default.img"), &image).expect("copy the fixture");
+    copy_sparse(fixture("btrfs-default.img"), &image).expect("copy the fixture");
     let expected = label_of(&dump_super(&image));
     let mut file = std::fs::OpenOptions::new()
         .read(true)

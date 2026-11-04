@@ -26,6 +26,7 @@
 //! kernel's read-only scrub does not check parity.
 
 use fs_btrfs::fs::Filesystem;
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{fixture, guest_kernel_pool_read, sha256_hex, temp_path};
 use fs_core::{BlockDevice, BlockRead, FileDevice};
 use std::collections::BTreeMap;
@@ -51,7 +52,7 @@ impl Scratch {
         std::fs::create_dir_all(&dir).unwrap();
         for i in 1..=count {
             let src = fixture(&format!("btrfs-{profile}-nosum-{i}.img"));
-            std::fs::copy(&src, dir.join(format!("{i}.img")))
+            copy_sparse(&src, dir.join(format!("{i}.img")))
                 .unwrap_or_else(|e| panic!("copying {}: {e}", src.display()));
         }
         Self(dir, count)

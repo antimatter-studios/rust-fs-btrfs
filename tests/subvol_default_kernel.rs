@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::superblock::incompat::DEFAULT_SUBVOL;
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, dump_super, fixture, guest_kernel_probe, guest_kernel_read_ok,
 };
@@ -47,7 +48,7 @@ fn the_default_subvolume_is_what_a_plain_kernel_mount_shows() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create the scratch directory");
     let image = dir.join("btrfs-subvol.img");
-    std::fs::copy(fixture("btrfs-subvol.img"), &image).expect("copy the fixture");
+    copy_sparse(fixture("btrfs-subvol.img"), &image).expect("copy the fixture");
     let image_str = image.to_str().expect("a UTF-8 scratch path").to_string();
 
     let sub = {

@@ -24,6 +24,7 @@
 //! same `ok` as one that exercised every entry point.
 
 use fs_btrfs::capi::*;
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{fixture, temp_path, Image};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::PathBuf;
@@ -925,7 +926,7 @@ impl WritableCopy {
     fn of(image: &str, name: &str) -> Self {
         let src = fixture(image);
         let dst = PathBuf::from(temp_path!("{name}"));
-        std::fs::copy(&src, &dst)
+        copy_sparse(&src, &dst)
             .unwrap_or_else(|e| panic!("copy {} to {}: {e}", src.display(), dst.display()));
         WritableCopy(dst)
     }

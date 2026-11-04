@@ -37,6 +37,7 @@
 use fs_btrfs::chunk::DiskKey;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::scrub::ScrubTarget;
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, fixture, guest_kernel_pool_read, guest_kernel_read_ok, le64,
     sha256_hex, temp_path,
@@ -60,7 +61,7 @@ impl Scratch {
             std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::copy(fixture("scrub/btrfs-scrub.img"), dir.join("fs.img"))
+        copy_sparse(fixture("scrub/btrfs-scrub.img"), dir.join("fs.img"))
             .expect("copying the scrub fixture");
         Self(dir)
     }
@@ -188,8 +189,7 @@ impl PoolScratch {
             .enumerate()
             .map(|(i, src)| {
                 let to = dir.join(format!("{}.img", i + 1));
-                std::fs::copy(src, &to)
-                    .unwrap_or_else(|e| panic!("copying {}: {e}", src.display()));
+                copy_sparse(src, &to).unwrap_or_else(|e| panic!("copying {}: {e}", src.display()));
                 to
             })
             .collect();

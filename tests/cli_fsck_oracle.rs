@@ -18,7 +18,7 @@ mod cli_support;
 use cli_support::*;
 use fs_btrfs::chunk::DiskKey;
 use fs_btrfs::Filesystem;
-use fs_btrfs_test_support::{fixture, oracle, temp_dir};
+use fs_btrfs_test_support::{copy_sparse, fixture, oracle, temp_dir};
 use fs_core::{BlockRead, FileDevice};
 use std::ffi::OsStr;
 use std::ops::Deref;
@@ -119,7 +119,7 @@ fn copy(name: &str, tag: &str) -> ScratchCopy {
     let turn = TURN.lock().unwrap_or_else(PoisonError::into_inner);
     let image = scratch_dir(&format!("fsck-{tag}")).join(name);
     let copy = ScratchCopy { image, _turn: turn };
-    copy_sparse(&fixture(name), &copy.image).unwrap_or_else(|e| panic!("copy {name}: {e}"));
+    copy_sparse(fixture(name), &copy.image).unwrap_or_else(|e| panic!("copy {name}: {e}"));
     assert_scratch_within_budget(name);
     copy
 }

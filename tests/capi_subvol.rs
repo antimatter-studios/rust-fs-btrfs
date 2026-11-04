@@ -8,6 +8,7 @@
 //! kernel; its manifest records what the kernel read at each path.
 
 use fs_btrfs::capi::*;
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::fixture;
 use std::ffi::{c_void, CStr, CString};
 
@@ -92,7 +93,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create the scratch directory");
     let image = dir.join("btrfs-subvol.img");
-    std::fs::copy(fixture("btrfs-subvol.img"), &image).expect("copy the fixture");
+    copy_sparse(fixture("btrfs-subvol.img"), &image).expect("copy the fixture");
     image
 }
 
