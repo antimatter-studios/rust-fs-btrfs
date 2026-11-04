@@ -128,7 +128,10 @@ chore_min_version: 0.10.0
 #                                                    cold (51 lines of
 #                                                    cargo), run 36616794750;
 #                                                    was 361 / 19,014
-#     kernel    3,271 / 199,874    4,250 / 260,000   ~30% over run 41567697498
+#     kernel    4,341 / 288,816    5,650 / 375,500   ~30% over queue run
+#                                                    41911452972. Before it
+#                                                    3,271 / 199,874, ~30% over
+#                                                    run 41567697498
 #                                                    (#635). Before it, the
 #                                                    #668 queue prefix, run
 #                                                    40361645452 (#689).
@@ -700,9 +703,14 @@ tasks:
     # dispatched run 41567697498, attempt 2 (2026-11-03): every test passed,
     # and the kernel log printed 3271 lines and 199874 bytes. About 30% over
     # that is 4250 lines and 260000 bytes.
+    #
+    # Re-measured on merge queue runs 41903708910 and 41911452972 (2026-11-04):
+    # every test passed, and the kernel log printed 4321 and 4341 lines and
+    # 287346 and 288816 bytes. About 30% over the larger is 5650 lines and
+    # 375500 bytes.
     cmds:
       - test-disks/build-fixtures.sh --check
-      - 'scripts/disk-watch.sh kernel ../rust-fs-core/scripts/tier.sh test:kernel kernel 4250 260000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - 'scripts/disk-watch.sh kernel ../rust-fs-core/scripts/tier.sh test:kernel kernel 5650 375500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
