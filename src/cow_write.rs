@@ -52,12 +52,14 @@
 //!    past the end moves `size` to where it stops (#432). One that starts
 //!    past the end leaves a gap, an implicit hole with no item; first, as
 //!    the kernel does, the old last sector is copied with zeros past the
-//!    old end when the write does not cover it (#433). Without the
-//!    no-holes feature, explicit hole items keep the ranges before and
-//!    after each fill, trimmed or split in the same transaction (#434),
-//!    and the gap a write past the end leaves is a hole item of its own,
-//!    from the sector after the old end to the one the write starts in,
-//!    as the kernel inserts it (#436).
+//!    old end when the write does not cover it (#433), and is allocated
+//!    when it lay in a hole (#526). Without the no-holes feature, explicit
+//!    hole items keep the ranges before and after each fill, trimmed or
+//!    split in the same transaction (#434), and the gap a write past the
+//!    end leaves is a hole item of its own, from the sector after the old
+//!    end to the one the write starts in, beside any hole item already
+//!    ending there and around any item already past the end, as the kernel
+//!    inserts it (#436, #526).
 //!
 //! The data goes to every mirror first; then the tree blocks, a flush,
 //! the superblocks and a flush, in [`Filesystem::commit`]'s order. Until
@@ -70,11 +72,11 @@
 //!
 //! - an emptied tree block a snapshot shares; empty unshared leaves and
 //!   nodes leave their tree, and an empty root becomes a leaf (#546–#548);
-//! - a write past the end of a file, on a volume **without the no-holes
-//!   feature**, whose gap an extent item past the end (a preallocated one)
-//!   already reaches into, unless one preallocated item holds the old end,
-//!   the gap and the write, which is then written where its extent lies
-//!   and moves only the size (#603);
+//! - a write past the end of a file that reaches a preallocated item kept
+//!   past the end, unless one preallocated item holds a sector-aligned old
+//!   end, the gap and the write, which is then written where its extent
+//!   lies and moves only the size (#603): an unaligned old end, or a write
+//!   from before the item into it, is refused (#526);
 //! - a **preallocated** extent the write cuts off a sector boundary, or one
 //!   another reference shares, or an **inline** one the write does not
 //!   lie within, or one that is encrypted or encoded: each changes the
@@ -312,14 +314,16 @@ impl Filesystem {
         // it makes one: that sector is copied too, reading as zeros past
         // the old end (#433). A volume without no-holes records that gap
         // as a hole item, from the sector after the old end to the one the
-        // write starts in, as the kernel's extend does (#436).
+        // write starts in, as the kernel's extend does (#436): beside a
+        // hole item already ending there, and around any item already past
+        // the end (#526).
         // Moved inline data's copy covers the first sector, so it leaves no
         // tail; it also covers every sector up to the write's unless the
         // write starts clear of the sector after it, which leaves a gap
         // (#592).
         let sector = u64::from(self.sb.sectorsize);
         let mut tail = None;
-        let mut gap = None;
+        let mut gaps = Vec::new();
         if end > inode.size && (!move_inline || inline_move_leaves_gap(offset, sector)) {
             if !move_inline && offset > inode.size && !inode.size.is_multiple_of(sector) {
                 tail = Some(inode.size);
@@ -329,9 +333,7 @@ impl Filesystem {
                     Error::UnsupportedFeature(format!("inode {ino}: size overflows"))
                 })?;
                 let to = offset - offset % sector;
-                if from < to {
-                    gap = Some((self.cow_gap_start(ino, from)?, to));
-                }
+                gaps = self.cow_gaps(ino, from, to)?;
             }
         }
 
@@ -402,7 +404,7 @@ impl Filesystem {
         // Remove or trim explicit holes before inserting the new data
         // items: a fill at a hole's start replaces its original key.
         let mut edits = self.cow_hole_edits(ino, &targets, generation)?;
-        if let Some((from, to)) = gap {
+        for &(from, to) in &gaps {
             edits.push(ItemEdit::Put(OwnedItem {
                 key: DiskKey {
                     objectid: ino,
@@ -523,7 +525,7 @@ impl Filesystem {
             let keys = std::iter::once((INODE_ITEM_KEY, 0))
                 .chain(targets.iter().map(|t| (EXTENT_DATA_KEY, t.start)))
                 .chain(write.adds.iter().map(|a| (EXTENT_DATA_KEY, a.file_offset)))
-                .chain(gap.map(|(from, _)| (EXTENT_DATA_KEY, from)));
+                .chain(gaps.iter().map(|&(from, _)| (EXTENT_DATA_KEY, from)));
             for (key_type, key_offset) in keys {
                 let key = DiskKey {
                     objectid: ino,
@@ -955,15 +957,17 @@ impl Filesystem {
         Ok(Some(data.len()))
     }
 
-    /// Refuse a gap past the end of a file that an extent item already
-    /// reaches into — a preallocated extent kept past the end — as the
-    /// hole item recording the gap would overlap it (#436). When a hole
-    /// ends exactly where the new gap starts, reuse its key so the put
-    /// extends that item instead of adding an adjacent hole (#602).
-    fn cow_gap_start(&self, ino: u64, from: u64) -> Result<u64> {
+    /// The spans of `[from, to)`, the gap a write past the end leaves, that
+    /// no extent item covers: each is a hole item of its own. The kernel's
+    /// extend inserts one for each range it finds no item in, and merges it
+    /// with nothing, so a hole item ending at `from` stays as it is (#526),
+    /// and an item already past the end, preallocated with `fallocate
+    /// --keep-size` or a hole beside one, stays where it lies.
+    fn cow_gaps(&self, ino: u64, from: u64, to: u64) -> Result<Vec<(u64, u64)>> {
         use crate::fs::file_extent as fe;
         use crate::superblock::le64;
-        let mut start = from;
+        let mut gaps = Vec::new();
+        let mut covered = from;
         for (key, data) in self.items_of(ino)? {
             // Inline data (type 0) only ever lies within the file's size.
             if key.key_type != EXTENT_DATA_KEY
@@ -973,18 +977,18 @@ impl Filesystem {
                 continue;
             }
             let end = key.offset.saturating_add(le64(&data, fe::NUM_BYTES));
-            if end > from {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino}: an extent item past the end reaches into the gap a write \
-                     past the end leaves, which a hole item cannot record without overlapping it"
-                )));
+            if end <= covered || key.offset >= to {
+                continue;
             }
-            if end == from && data[fe::TYPE] == EXTENT_REGULAR && le64(&data, fe::DISK_BYTENR) == 0
-            {
-                start = key.offset;
+            if key.offset > covered {
+                gaps.push((covered, key.offset));
             }
+            covered = end;
         }
-        Ok(start)
+        if covered < to {
+            gaps.push((covered, to));
+        }
+        Ok(gaps)
     }
 
     /// Preserve what remains of explicit hole items around the sectors
@@ -1113,15 +1117,12 @@ impl Filesystem {
         // A write past the end of a file whose end is partway through a
         // sector copies the item holding that sector first, which reads as
         // zeros past the old end (#433). The planning below then starts
-        // past it; a hole there needs nothing, as it reads as zeros.
+        // past it. A hole there is filled too: the kernel's extend zeroes
+        // that sector through the page cache whatever lies under it, and
+        // writing it back allocates it (#526).
         let mut spans = Vec::with_capacity(2);
         if let Some(size) = tail {
-            if pieces
-                .iter()
-                .any(|p| size >= p.start && size < p.start + p.len)
-            {
-                spans.push((size, size + 1));
-            }
+            spans.push((size, size + 1));
         }
         spans.push((pos, end));
         for (mut pos, end) in spans {
@@ -1151,16 +1152,26 @@ impl Filesystem {
                         .min()
                         .unwrap_or(u64::MAX);
                     let stop = end.div_ceil(sector).saturating_mul(sector).min(next);
-                    out.push(Target {
-                        start,
-                        len: stop - start,
-                        extent_start: 0,
-                        extent_len: 0,
-                        extent_offset: 0,
-                        shared: false,
-                        hole: true,
-                        inline: 0,
-                    });
+                    // The old last sector and a write starting in the sector
+                    // after it are written back as one range, as the kernel
+                    // writes adjacent dirty sectors back as one extent.
+                    match out.last_mut() {
+                        Some(last)
+                            if last.hole && last.inline == 0 && last.start + last.len == start =>
+                        {
+                            last.len = stop - last.start;
+                        }
+                        _ => out.push(Target {
+                            start,
+                            len: stop - start,
+                            extent_start: 0,
+                            extent_len: 0,
+                            extent_offset: 0,
+                            shared: false,
+                            hole: true,
+                            inline: 0,
+                        }),
+                    }
                     pos = stop;
                     continue;
                 };
@@ -1626,7 +1637,7 @@ mod tests {
     /// The independent comparison is the sparse EOF case in
     /// cow_write_oracle.rs; this checks the planner before it allocates.
     #[test]
-    fn old_eof_zeroing_is_planned_only_for_data_backed_sectors() {
+    fn old_eof_zeroing_is_planned_for_a_sector_in_a_hole_too() {
         use crate::{fs::file_extent as fe, mkfs, superblock::le64, Filesystem};
         use fs_core::{BlockDevice, BlockRead, FileDevice};
         use std::{path::PathBuf, sync::Arc};
@@ -1682,26 +1693,28 @@ mod tests {
             let targets = fs
                 .plan_cow_targets(ino, Some(OLD_SIZE), offset, offset + len, false)
                 .unwrap();
-            let mut expected = Vec::new();
-            if name == "backed" {
-                expected.push((0, 40_960, false));
-            }
             let start = offset / 4096 * 4096;
-            expected.push((start, (offset + len).next_multiple_of(4096) - start, true));
+            let stop = (offset + len).next_multiple_of(4096);
+            let expected = match name {
+                "backed" => vec![(0, 40_960, false), (start, stop - start, true)],
+                // Written back with the sector after it as one extent.
+                "next" | "same" => vec![(36_864, stop - 36_864, true)],
+                _ => vec![(36_864, 4096, true), (start, stop - start, true)],
+            };
             assert_eq!(
                 targets
                     .iter()
                     .map(|t| (t.start, t.len, t.hole))
                     .collect::<Vec<_>>(),
                 expected,
-                "{name}: only data-backed EOF and payload sectors may be copied"
+                "{name}: the old EOF sector and the payload's are the ones copied"
             );
         }
     }
 
     /// The kernel comparison for these shapes lives in cow_write_oracle.rs.
     #[test]
-    fn a_growing_write_extends_the_existing_trailing_hole() {
+    fn a_growing_write_records_its_gap_beside_the_trailing_hole() {
         use crate::{fs::file_extent as fe, mkfs, superblock::le64, Filesystem};
         use fs_core::{BlockDevice, BlockRead, FileDevice};
         use std::{path::PathBuf, sync::Arc};
@@ -1713,10 +1726,25 @@ mod tests {
             }
         }
 
-        for (name, old_size, data_len) in [
-            ("aligned", 32_768, 8192),
-            ("partial", 40_000, 8192),
-            ("sparse", 40_000, 0),
+        // Each file's hole items once it is written, and how many sectors
+        // it then holds: a file ending partway through a hole has that
+        // sector allocated too, so its old hole ends a sector earlier.
+        for (name, old_size, data_len, wanted, sectors) in [
+            (
+                "aligned",
+                32_768,
+                8192,
+                vec![(8192, 24_576), (32_768, 32_768)],
+                4,
+            ),
+            (
+                "partial",
+                40_000,
+                8192,
+                vec![(8192, 28_672), (40_960, 24_576)],
+                5,
+            ),
+            ("sparse", 40_000, 0, vec![(0, 36_864), (40_960, 24_576)], 3),
         ] {
             let image = Scratch(PathBuf::from(fs_btrfs_test_support::temp_path!(
                 "cow-grow-trailing-hole-{name}.img"
@@ -1763,12 +1791,11 @@ mod tests {
                 .map(|(key, data)| (key.offset, le64(&data, fe::NUM_BYTES)))
                 .collect();
             assert_eq!(
-                holes,
-                vec![(data_len as u64, 65_536 - data_len as u64)],
-                "{name}: the old hole and the new gap must be one item"
+                holes, wanted,
+                "{name}: the old hole and the new gap must stay two items"
             );
             let inode = fs.read_inode(ino).unwrap();
-            assert_eq!((inode.size, inode.nbytes), (70_536, data_len as u64 + 8192));
+            assert_eq!((inode.size, inode.nbytes), (70_536, sectors * 4096));
             let mut expected = vec![0x5a; data_len];
             expected.resize(65_536, 0);
             expected.extend_from_slice(&[0xc3; 5000]);
