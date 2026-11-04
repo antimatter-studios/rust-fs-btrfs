@@ -338,6 +338,15 @@ impl Filesystem {
             }
         }
         if !move_inline && end <= inode.size {
+            // A write that starts where no item records anything and reaches
+            // preallocation is copied through it, as a growing one is (#774).
+            if let Some(at) = self.prealloc_copied_from_hole(ino, offset, end)? {
+                let through = Copying {
+                    through: Some(at),
+                    ..Copying::default()
+                };
+                return self.write_cow_copying(inode, offset, data, false, through);
+            }
             if let Some(at) = self.prealloc_edge_within(ino, offset, end)? {
                 let first = usize::try_from(at - offset).map_err(|_| {
                     Error::UnsupportedFeature(format!("a write of {} bytes", data.len()))
@@ -1083,6 +1092,22 @@ impl Filesystem {
             .flat_map(|(k, d)| [k.offset, k.offset.saturating_add(le64(&d, fe::NUM_BYTES))])
             .filter(|&at| offset < at && at < end)
             .min())
+    }
+
+    /// Where a write over `[offset, end)`, within the file's size, is copied
+    /// through preallocation of `ino` from a hole, as
+    /// [`copied_through_from_hole`] finds it (#774).
+    fn prealloc_copied_from_hole(&self, ino: u64, offset: u64, end: u64) -> Result<Option<u64>> {
+        let sector = u64::from(self.sb.sectorsize);
+        let stop = end
+            .checked_next_multiple_of(sector)
+            .ok_or_else(|| Error::UnsupportedFeature("write range overflows".into()))?;
+        let spans = self.extent_spans(ino)?;
+        Ok(copied_through_from_hole(
+            &spans,
+            offset - offset % sector,
+            stop,
+        ))
     }
 
     /// The end of the preallocated extent item of `ino` that a write over
@@ -2157,6 +2182,21 @@ fn reach_of_prealloc(spans: &[Span], from: u64, stop: u64) -> Option<PreallocRea
     None
 }
 
+/// Where the sectors `[from, stop)` of a write within the file's size are
+/// copied through the preallocated items they reach: they start where no item
+/// records anything, and [`reach_of_prealloc`] finds them copied through, as
+/// the kernel's writeback does (#774). That item's start; `None` for a write
+/// that starts in any item, a hole item included, or reaches no preallocation
+/// that way.
+fn copied_through_from_hole(spans: &[Span], from: u64, stop: u64) -> Option<u64> {
+    if spans.iter().any(|s| s.holds(from)) {
+        return None;
+    }
+    reach_of_prealloc(spans, from, stop)
+        .filter(|reach| reach.through)
+        .map(|reach| reach.at)
+}
+
 fn kept_runs(
     offset: u64,
     data: &[u8],
@@ -2182,7 +2222,59 @@ fn kept_runs(
 
 #[cfg(test)]
 mod tests {
-    use super::{kept_runs, prealloc_end_split, reach_of_prealloc, PreallocReach, Span, SpanKind};
+    use super::{
+        copied_through_from_hole, kept_runs, prealloc_end_split, reach_of_prealloc, PreallocReach,
+        Span, SpanKind,
+    };
+
+    /// A write within the size is copied through preallocation only when it
+    /// starts where nothing is recorded and meets only preallocation after
+    /// (#774); a hole item, data or the preallocated item itself at its start
+    /// keep the paths they had.
+    #[test]
+    fn a_write_from_an_unrecorded_hole_into_preallocation_is_copied_through() {
+        let span = |start, end, kind| Span { start, end, kind };
+        let prealloc = span(65536, 131_072, SpanKind::Prealloc);
+        assert_eq!(
+            copied_through_from_hole(&[prealloc], 40960, 81920),
+            Some(65536),
+            "from a hole through part of the item"
+        );
+        assert_eq!(
+            copied_through_from_hole(&[prealloc], 40960, 135_168),
+            Some(65536),
+            "from a hole over the whole item"
+        );
+        assert_eq!(
+            copied_through_from_hole(&[span(0, 4096, SpanKind::Data), prealloc], 40960, 81920),
+            Some(65536),
+            "data before the hole does not hold the start"
+        );
+        for (case, spans, from, stop) in [
+            ("ends before the item", vec![prealloc], 40960, 65536),
+            ("starts in the item", vec![prealloc], 65536, 81920),
+            (
+                "an explicit hole item",
+                vec![span(0, 65536, SpanKind::Hole), prealloc],
+                40960,
+                81920,
+            ),
+            (
+                "starts in data",
+                vec![span(0, 65536, SpanKind::Data), prealloc],
+                40960,
+                81920,
+            ),
+            (
+                "data follows the item",
+                vec![prealloc, span(131_072, 139_264, SpanKind::Data)],
+                40960,
+                135_168,
+            ),
+        ] {
+            assert_eq!(copied_through_from_hole(&spans, from, stop), None, "{case}");
+        }
+    }
 
     /// A growing write that starts in a preallocated item and runs past its
     /// end is cut at that end (#639); every other write is not cut there.
