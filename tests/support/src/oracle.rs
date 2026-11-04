@@ -326,7 +326,7 @@ impl Oracle {
                 String::from_utf8_lossy(&out.stderr)
             );
         };
-        let (stdout, stderr) = run.streams();
+        let (stdout, stderr) = run.streams(&self.tool);
         assert!(
             code != 127,
             "the oracle tool `{}` is not installed in the harness VM. \
@@ -415,16 +415,18 @@ impl Oracle {
 }
 
 /// The three files one call leaves behind, named so that two calls —
-/// from two threads or two test binaries — never share one.
-pub(crate) struct Run {
-    pub(crate) dir: PathBuf,
-    pub(crate) stdout: PathBuf,
-    pub(crate) stderr: PathBuf,
-    pub(crate) status: PathBuf,
+/// from two threads or two test binaries — never share one. Public so
+/// that `tests/oracle_streams.rs` can check it without a VM.
+#[doc(hidden)]
+pub struct Run {
+    pub dir: PathBuf,
+    pub stdout: PathBuf,
+    pub stderr: PathBuf,
+    pub status: PathBuf,
 }
 
 impl Run {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let dir = crate::temp_dir().join("oracle");
         let name = format!(
@@ -448,9 +450,21 @@ impl Run {
         Some(code)
     }
 
-    pub(crate) fn streams(&self) -> (Vec<u8>, Vec<u8>) {
+    /// What `tool` wrote to its stdout and its stderr.
+    ///
+    /// The guest's shell redirect creates both files before the tool runs,
+    /// so a file that cannot be read after the call has a status is a fault.
+    /// Reading it as empty would look the same as a tool that printed
+    /// nothing (#762).
+    pub fn streams(&self, tool: &str) -> (Vec<u8>, Vec<u8>) {
         let read = |path: &PathBuf| {
-            let bytes = std::fs::read(path).unwrap_or_default();
+            let bytes = std::fs::read(path).unwrap_or_else(|error| {
+                panic!(
+                    "`{tool}` finished in the fs-linux-test-harness VM, but its captured \
+                     output {} could not be read: {error}. `chore vm:status` shows the VM.",
+                    path.display()
+                )
+            });
             let _ = std::fs::remove_file(path);
             bytes
         };

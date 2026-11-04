@@ -326,3 +326,5 @@ capi_two_handle_commit_kernel  1
 # Two executed: evidence lines name scratch files by $TMP, the full path
 # printed once (#635).
 evidence_paths 2
+# A call's captured output comes back as it is, or the call fails (#762).
+oracle_streams 4

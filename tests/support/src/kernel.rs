@@ -114,7 +114,7 @@ fn run_locked(image: &str, script: &str, mount: Mount, clear_log: bool) -> Outpu
             String::from_utf8_lossy(&out.stderr)
         );
     };
-    let (stdout, stderr) = run.streams();
+    let (stdout, stderr) = run.streams("the kernel oracle's script");
     crate::evidence(&format!(
         "[kernel vm] mount -t btrfs -o {} {image} -> {code}",
         match mount {
@@ -735,7 +735,7 @@ printf %s "$status" > {status}"#,
             String::from_utf8_lossy(&out.stderr)
         );
     };
-    let (stdout, stderr) = run.streams();
+    let (stdout, stderr) = run.streams("the pool oracle's script");
     let check_text = std::fs::read_to_string(&check).unwrap_or_default();
     let check_code = std::fs::read_to_string(&check_status)
         .ok()

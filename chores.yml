@@ -98,12 +98,13 @@ chore_min_version: 0.10.0
 #   warm, 957 on the first run in a fresh guest.
 #
 #     tier      measured          budget            headroom, and why
-#     unit        669 /  42,273      850 /  55,000   ~30%: cold local unit run
-#                                                    on 2026-10-18 for #615,
-#                                                    commit 6eea85c: 513 cases
-#                                                    pass, including six new
-#                                                    multi-way split cases.
-#                                                    Warm: 618 / 40,323.
+#     unit        863 /  54,291    1,125 /  70,600   ~30%: cold local unit run
+#                                                    on 2026-11-04 for #762: 611
+#                                                    cases pass. main before it
+#                                                    was already 853 / 53,676
+#                                                    cold, over the old 850.
+#                                                    Warm on CI: 791 / 50,511
+#                                                    (run 41777793760).
 #     images      384 /  18,065      500 /  23,500   ~30%. 384 / 18,065 is
 #                                                    CI's aarch64 job with
 #                                                    #301's
@@ -605,7 +606,7 @@ tasks:
     # rather than listed here. CI runs this job with no fixtures present,
     # which is what proves the split.
     cmds:
-      - 'EXPECT_OVERFLOW_CHECKS=1 ../rust-fs-core/scripts/tier.sh test:unit unit 850 55000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
+      - 'EXPECT_OVERFLOW_CHECKS=1 ../rust-fs-core/scripts/tier.sh test:unit unit 1125 70600 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
 
   test:images:
     desc: 'The tests that read a fixture but need no VM — what a host without KVM can still run'
