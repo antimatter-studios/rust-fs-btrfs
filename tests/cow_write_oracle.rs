@@ -2579,9 +2579,10 @@ fn extent_kind_and_refs(image: &Path, ino: u64, offset: u64) -> (String, u64, u6
     let tree = dump_tree(image, "5");
     let lines: Vec<&str> = tree.lines().collect();
     let needle = format!("key ({ino} EXTENT_DATA {offset})");
+    // Items only: a node's child pointer can carry the item's key.
     let at = lines
         .iter()
-        .position(|l| l.contains(&needle))
+        .position(|l| l.trim_start().starts_with("item ") && l.contains(&needle))
         .unwrap_or_else(|| panic!("inode {ino} has no extent item at {offset}\n{tree}"));
     let body: Vec<&str> = lines[at + 1..]
         .iter()
@@ -5120,30 +5121,104 @@ fn a_growing_write_past_space_preallocated_past_the_end_leaves_it_preallocated()
     }
 }
 
-/// The growing writes into space preallocated past the end that stay refused,
-/// each named by the error it meets and recorded in the features row (#526):
-/// an old end partway through a sector, a write ending partway through a
-/// sector inside the item, and a write from before the item running into it.
-/// Nothing may have been committed: the generation stays, the file reads as it
-/// did, and `btrfs check` and a kernel read-back accept the volume.
+/// Every `EXTENT_DATA` item of inode `ino`, as `btrfs inspect-internal
+/// dump-tree` prints it: its offset, its kind, the on-disk length of the extent
+/// it names, its offset into that extent and its `num_bytes`. The extent's
+/// length and the offset say whether a write stayed where a preallocated extent
+/// lies or went to a new extent, which the item's offset and length alone do
+/// not.
+fn extent_windows(image: &Path, ino: u64) -> Vec<(u64, String, u64, u64, u64)> {
+    let tree = dump_tree(image, "5");
+    let lines: Vec<&str> = tree.lines().collect();
+    let needle = format!("key ({ino} EXTENT_DATA ");
+    let mut items = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        // Items only: a node's child pointer can carry the item's key.
+        if !line.trim_start().starts_with("item ") {
+            continue;
+        }
+        let Some((_, key)) = line.split_once(&needle) else {
+            continue;
+        };
+        let offset: u64 = key.split(')').next().unwrap().parse().unwrap();
+        let body: Vec<&str> = lines[at + 1..]
+            .iter()
+            .copied()
+            .take_while(|l| !l.contains(" key ("))
+            .collect();
+        let field = |phrase: &str, word: &str| -> u64 {
+            let line = body.iter().find(|l| l.contains(phrase)).unwrap();
+            let mut words = line.split_whitespace();
+            assert!(words.any(|w| w == word), "no {word} in {line}");
+            words.next().unwrap().parse().unwrap()
+        };
+        let kind = body
+            .iter()
+            .find_map(|l| {
+                let open = l.find(" type ")?;
+                let rest = &l[open..];
+                Some(rest[rest.find('(')? + 1..rest.find(')')?].to_string())
+            })
+            .unwrap_or_else(|| panic!("no type for inode {ino} at {offset}: {body:?}"));
+        items.push((
+            offset,
+            kind,
+            field(" data disk byte", "nr"),
+            field(" data offset", "offset"),
+            field(" data offset", "nr"),
+        ));
+    }
+    items
+}
+
+/// The growing writes into space `fallocate --keep-size` preallocated past the
+/// end that the kernel writes off a sector or from before the item (#767). An
+/// old end partway through a sector rewrites that sector and leaves the item
+/// alone; a write ending, or starting, partway through a sector takes that whole
+/// sector in place, reading as zeros around the write. A write starting before
+/// the item runs into it two ways: where an item records the hole it starts in
+/// and that item ends at the preallocated one, the kernel copies the hole's
+/// sectors and writes the rest in place; where nothing records the hole, it
+/// copies everything from the hole through the end of the write into one new
+/// extent, and the preallocated item starts again after it, or goes. The kernel
+/// makes the same write into a control on a volume of each kind, so the driver
+/// is held to its items, kinds, extents, reference counts, `size` and `nbytes`;
+/// `btrfs check --check-data-csum` and a scrub judge the digests, and the kernel
+/// reads the old data, zeros and the write.
 #[test]
-fn a_growing_write_into_kept_preallocation_refuses_what_it_cannot_write() {
-    const SECTOR: u64 = 4096;
+fn a_growing_write_into_kept_preallocation_off_a_sector_or_from_before_it_matches_the_kernel() {
+    const KEPT: u64 = 65_536;
+    // Name, old size, where the item starts, where the write starts, its length.
     let cases = [
         ("odd-old-end", 40_000u64, 40_960u64, 50_000u64, 5000usize),
         ("odd-write-end", 16_384, 16_384, 16_384, 5000),
         ("into-item", 16_384, 65_536, 16_384, 65_536),
+        ("odd-start", 16_384, 16_384, 18_000, 5000),
+        ("in-far-item", 16_384, 65_536, 70_000, 5000),
+        ("tail-into", 40_000, 40_960, 40_500, 5000),
+        ("tail-next", 40_000, 40_960, 40_960, 5000),
+        ("gap-into", 40_000, 65_536, 50_000, 30_000),
+        ("aligned-gap-into", 16_384, 65_536, 30_000, 40_000),
+        ("adjacent-hole", 16_384, 65_536, 62_000, 18_000),
+        ("odd-adjacent", 40_000, 65_536, 62_000, 18_000),
+        ("through", 16_384, 65_536, 20_000, 120_000),
+        ("odd-past-item", 40_000, 40_960, 100_000, 10_000),
     ];
     let mut script = String::new();
-    for (name, old, kept_at, _, _) in cases {
+    for (name, old, kept_at, at, len) in cases {
         script.push_str(&format!(
-            "head -c {old} /dev/urandom > \"$MNT/{name}\"\nsync\n\
-             fallocate -n -o {kept_at} -l {} \"$MNT/{name}\"\nsync\n",
-            16 * SECTOR
+            "head -c {old} /dev/urandom | tee \"$MNT/{name}\" > \"$MNT/{name}-control\"\n\
+             sync\n\
+             for f in {name} {name}-control; do \
+             fallocate -n -o {kept_at} -l {KEPT} \"$MNT/$f\"; done\n\
+             sync\n\
+             head -c {len} /dev/zero | tr '\\000' '\\132' \
+             | dd of=\"$MNT/{name}-control\" bs={len} iflag=fullblock oflag=seek_bytes seek={at} conv=notrunc status=none\n\
+             sync\n"
         ));
     }
     for features in ["^no-holes", "no-holes"] {
-        let scratch = Scratch::made("cow-grow-kept-refused", "crc32c", features, &script);
+        let scratch = Scratch::made("cow-grow-into-kept", "crc32c", features, &script);
         let image = scratch.image();
         let mut fs = mount_rw(&image);
         let mut expected = BTreeMap::new();
@@ -5155,11 +5230,132 @@ fn a_growing_write_into_kept_preallocation_refuses_what_it_cannot_write() {
                 kind, "prealloc",
                 "the kernel did not preallocate past {name}'s end"
             );
+            let mut bytes = fs.read_file(ino).unwrap();
+            bytes.resize((at + len as u64).max(old) as usize, 0);
+            bytes[at as usize..at as usize + len].fill(0x5a);
+            assert_eq!(
+                fs.write(ino, at, &vec![0x5a; len])
+                    .unwrap_or_else(|e| panic!("{features} {name}: {e}")),
+                len
+            );
+            assert_eq!(fs.read_file(ino).unwrap(), bytes, "{features} {name}");
+            expected.insert(name, bytes);
+            let control = ino_of(&fs, &format!("{name}-control"));
+            let (a, b) = (fs.read_inode(ino).unwrap(), fs.read_inode(control).unwrap());
+            assert_eq!(
+                (a.size, a.nbytes),
+                (b.size, b.nbytes),
+                "{features} {name}: size and nbytes differ from the kernel's write"
+            );
+            let (ours, theirs) = (extent_windows(&image, ino), extent_windows(&image, control));
+            assert_eq!(
+                ours, theirs,
+                "{features} {name}: extent items differ from the kernel's write"
+            );
+            for (item, _, disk_len, _, _) in &theirs {
+                if *disk_len == 0 {
+                    continue;
+                }
+                let (_, _, refs) = extent_kind_and_refs(&image, ino, *item);
+                let (_, _, their_refs) = extent_kind_and_refs(&image, control, *item);
+                assert_eq!(
+                    refs, their_refs,
+                    "{features} {name}'s item at {item}: reference count"
+                );
+            }
+        }
+        drop(fs);
+        let checked = oracle("btrfs")
+            .args(["check", "--readonly", "--check-data-csum"])
+            .arg(&image)
+            .output();
+        assert_eq!(
+            checked.status.code(),
+            Some(0),
+            "btrfs check --check-data-csum after growing writes into kept preallocation, {features}:\n{}{}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
+        );
+        guest_kernel_write_ok(
+            &image.to_string_lossy(),
+            "scrub after growing writes into kept preallocation",
+            "btrfs scrub start -B \"$MNT\" >/dev/null",
+        );
+        let names: Vec<String> = cases
+            .iter()
+            .flat_map(|c| [c.0.to_string(), format!("{}-control", c.0)])
+            .collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let seen = kernel_view(
+            &image,
+            "after growing writes into kept preallocation",
+            &names,
+        );
+        for (name, _, _, _, _) in cases {
+            assert_eq!(
+                seen[name].0,
+                sha256_hex(&expected[name]),
+                "{features} {name}: wrong bytes"
+            );
+            assert_eq!(
+                seen[name].0,
+                seen[&format!("{name}-control")].0,
+                "{features} {name}: differs from kernel control"
+            );
+        }
+    }
+}
+
+/// The growing writes reaching preallocated space that stay refused, each named
+/// by the error it meets and recorded in the features row: a write that crosses
+/// a hole into an item kept past the end from a regular sector it dirties, its
+/// own or the old last one, whose items the kernel cuts or joins differently
+/// from the whole item's copy made here, and a write past an old end lying
+/// partway through a sector of a preallocated item, which a shrinking truncate
+/// leaves. Nothing may have been
+/// committed: the generation stays, the file reads as it did, and `btrfs check`
+/// and a kernel read-back accept the volume.
+#[test]
+fn a_growing_write_into_kept_preallocation_refuses_what_it_cannot_write() {
+    const SECTOR: u64 = 4096;
+    let kept = |name: &str, old: u64, kept_at: u64| {
+        format!(
+            "head -c {old} /dev/urandom > \"$MNT/{name}\"\nsync\n\
+             fallocate -n -o {kept_at} -l {} \"$MNT/{name}\"\nsync\n",
+            16 * SECTOR
+        )
+    };
+    // Name, old size, where the write starts, its length, the offset refused.
+    let cases = [
+        (
+            "old-sector-over-hole",
+            40_000u64,
+            40_960u64,
+            30_000usize,
+            65_536u64,
+        ),
+        ("own-sector-over-hole", 16_384, 12_288, 60_000, 65_536),
+        ("old-end-in-item", 40_000, 50_000, 5000, 40_000),
+    ];
+    let script = format!(
+        "{}{}fallocate -l 65536 \"$MNT/old-end-in-item\"\nsync\n\
+         truncate -s 40000 \"$MNT/old-end-in-item\"\nsync\n",
+        kept("old-sector-over-hole", 40_000, 65_536),
+        kept("own-sector-over-hole", 16_384, 65_536),
+    );
+    for features in ["^no-holes", "no-holes"] {
+        let scratch = Scratch::made("cow-grow-kept-refused", "crc32c", features, &script);
+        let image = scratch.image();
+        let mut fs = mount_rw(&image);
+        let mut expected = BTreeMap::new();
+        for (name, old, at, len, refused_at) in cases {
+            let ino = ino_of(&fs, name);
+            assert_eq!(fs.read_inode(ino).unwrap().size, old, "{name}");
             let bytes = fs.read_file(ino).unwrap();
             let generation = fs.superblock().generation;
             let refused = fs.write(ino, at, &vec![0x5a; len]).unwrap_err().to_string();
             assert!(
-                refused.contains(&format!("offset {}", at.max(kept_at)))
+                refused.contains(&format!("offset {refused_at}"))
                     && refused.contains("inline or preallocated"),
                 "{features} {name}: the refusal must name the preallocated offset: {refused}"
             );

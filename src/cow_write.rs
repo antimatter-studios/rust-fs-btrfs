@@ -72,11 +72,19 @@
 //!
 //! - an emptied tree block a snapshot shares; empty unshared leaves and
 //!   nodes leave their tree, and an empty root becomes a leaf (#546–#548);
-//! - a write past the end of a file that reaches a preallocated item kept
-//!   past the end, unless one preallocated item holds a sector-aligned old
-//!   end, the gap and the write, which is then written where its extent
-//!   lies and moves only the size (#603): an unaligned old end, or a write
-//!   from before the item into it, is refused (#526);
+//! - a growing write that crosses a hole into a preallocated item kept past
+//!   the end from a regular sector it dirties, its own or the file's old
+//!   last one: the kernel joins the old last sector to the hole's sectors in
+//!   one extent, and cuts a regular item around a write starting inside it,
+//!   where the copy here is of the whole item. One that does not is written
+//!   as the kernel writes it (#603, #767): a write inside the item goes where its extent lies,
+//!   in whole sectors reading as zeros around it, after the old last sector
+//!   is copied; a write from a hole no item records copies everything to
+//!   its last sector into one new extent, and the item starts again after
+//!   it or goes; a write from a hole item ending at the item, or a regular
+//!   item ending there, is written in two at that edge;
+//! - an old end partway through a sector of a preallocated item, which a
+//!   shrinking truncate leaves, when the write starts past that sector;
 //! - a **preallocated** extent the write cuts off a sector boundary, or one
 //!   another reference shares, or an **inline** one the write does not
 //!   lie within, or one that is encrypted or encoded: each changes the
@@ -109,7 +117,7 @@ use crate::fs::{Filesystem, EXTENT_DATA_KEY, EXTENT_PREALLOC, EXTENT_REGULAR};
 use crate::inode::{Inode, INODE_ITEM_KEY, INODE_NODATACOW, INODE_NODATASUM};
 use crate::leaf_edit::OwnedItem;
 use crate::super_write::Commit;
-use crate::transaction::{DataAdd, DataMove, DataShare, DataWrite, ItemEdit};
+use crate::transaction::{DataAdd, DataMove, DataRelease, DataShare, DataWrite, ItemEdit};
 use crate::write::window_inside_extent;
 
 /// How many rounds a write's plan has to close over its own bookkeeping.
@@ -158,6 +166,64 @@ struct Piece {
     bytes: Vec<u8>,
     /// Its compression type, as the item records it.
     compression: u8,
+}
+
+/// How a copy-on-write write differs from the ordinary one.
+#[derive(Debug, Clone, Copy, Default)]
+struct Copying {
+    /// Leave the size where it is: the write is the zeros past the old end of
+    /// the last sector, ahead of a write elsewhere (#767).
+    keep_size: bool,
+    /// The start of the preallocated item the write reaches from a hole, which
+    /// the copy runs on over, to the write's last sector (#767).
+    through: Option<u64>,
+}
+
+/// What a copy does to the preallocated items it runs over (#767).
+#[derive(Debug, Default)]
+struct PreallocCuts {
+    /// Each item deleted, and each one's remainder put back.
+    edits: Vec<ItemEdit>,
+    /// Each extent whose one item goes.
+    releases: Vec<DataRelease>,
+    /// How many bytes of `nbytes` those items no longer cover.
+    bytes: u64,
+}
+
+/// What an extent item holds, as far as a growing write's path depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpanKind {
+    /// A preallocated extent.
+    Prealloc,
+    /// An explicit hole, on a volume without no-holes.
+    Hole,
+    /// Written data, compressed or not.
+    Data,
+}
+
+/// The file range one extent item covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Span {
+    start: u64,
+    end: u64,
+    kind: SpanKind,
+}
+
+impl Span {
+    fn holds(&self, at: u64) -> bool {
+        self.start <= at && at < self.end
+    }
+}
+
+/// How a write reaches a preallocated item it starts before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreallocReach {
+    /// Where that item starts.
+    at: u64,
+    /// The write copies on through it, rather than being written in two here.
+    through: bool,
+    /// A hole lies between the write's start and the item.
+    over_hole: bool,
 }
 
 impl Filesystem {
@@ -266,32 +332,11 @@ impl Filesystem {
         // the regular sectors to a new extent and the preallocated ones
         // where their extent lies (#638).
         // A growing write into space preallocated past the end, with
-        // `fallocate --keep-size`, is written where that extent lies as
-        // one within the size is, when one preallocated item holds the
-        // old end, any gap before the write and the write itself: the gap
-        // stays preallocated, and only the size moves (#603).
-        if !move_inline
-            && end > inode.size
-            && inode.size.is_multiple_of(u64::from(self.sb.sectorsize))
-            && self.prealloc_holds(ino, offset.min(inode.size), end)?
-        {
-            if let Some(written) = self.write_prealloc(inode, offset, data, summed)? {
-                return Ok(written);
-            }
-        }
-        // A growing write that starts in a preallocated item, kept past the
-        // end with `fallocate --keep-size`, and runs past that item's end
-        // is written in two at that end: the part in the item where its
-        // extent lies, as above, and the rest as any growing write (#639).
+        // `fallocate --keep-size`, or one running past or into such an item
+        // (#603, #639, #767).
         if !move_inline && end > inode.size {
-            if let Some(at) = self.prealloc_end_within(ino, offset, end)? {
-                let first = usize::try_from(at - offset).map_err(|_| {
-                    Error::UnsupportedFeature(format!("a write of {} bytes", data.len()))
-                })?;
-                let before = self.write_cow(inode, offset, &data[..first], false)?;
-                let inode = self.read_inode(ino)?;
-                let after = self.write_cow(&inode, at, &data[first..], false)?;
-                return Ok(before + after);
+            if let Some(written) = self.write_growing_into_prealloc(inode, offset, data, summed)? {
+                return Ok(written);
             }
         }
         if !move_inline && end <= inode.size {
@@ -308,6 +353,144 @@ impl Filesystem {
                 return Ok(written);
             }
         }
+        self.write_cow_copying(inode, offset, data, move_inline, Copying::default())
+    }
+
+    /// A growing write that reaches a preallocated item, written as the
+    /// kernel's writeback writes it. `None` when it reaches none, or reaches
+    /// one in a way the planner then refuses by name; nothing is committed
+    /// before a refusal this can foresee.
+    ///
+    /// - One preallocated item holds the write (#603, #767): it goes where
+    ///   that extent lies, in whole sectors, and any gap before it stays as
+    ///   it is. An old last sector the write does not reach is first copied
+    ///   with zeros past the old end, as the kernel's extend zeroes it. That
+    ///   commit leaves the size alone, so the file reads as it did until the
+    ///   write's own commit.
+    /// - It starts in such an item and runs past that item's end: it is
+    ///   written in two at that end (#639).
+    /// - It starts before such an item and runs into it (#767): as
+    ///   [`reach_of_prealloc`] finds, in two at the item's start, or copied
+    ///   through the item into one new extent.
+    fn write_growing_into_prealloc(
+        &mut self,
+        inode: &Inode,
+        offset: u64,
+        data: &[u8],
+        summed: bool,
+    ) -> Result<Option<usize>> {
+        let ino = inode.ino;
+        let sector = u64::from(self.sb.sectorsize);
+        let end = offset + data.len() as u64;
+        let from = offset - offset % sector;
+        let stop = end
+            .checked_next_multiple_of(sector)
+            .ok_or_else(|| Error::UnsupportedFeature("write range overflows".into()))?;
+        let next_after_size = inode
+            .size
+            .checked_next_multiple_of(sector)
+            .ok_or_else(|| Error::UnsupportedFeature(format!("inode {ino}: size overflows")))?;
+        let odd_size = !inode.size.is_multiple_of(sector);
+        let spans = self.extent_spans(ino)?;
+        if self.prealloc_holds(ino, from, stop)? {
+            let tail = odd_size && offset >= next_after_size;
+            if tail
+                && spans
+                    .iter()
+                    .any(|s| s.kind == SpanKind::Prealloc && s.holds(inode.size))
+            {
+                return Ok(None);
+            }
+            if !self.sb.has_no_holes()
+                && next_after_size < from
+                && !self.cow_gaps(ino, next_after_size, from)?.is_empty()
+            {
+                return Ok(None);
+            }
+            self.prealloc_write_refusal(ino, from, stop)?;
+            if tail {
+                let zeros = vec![0u8; (next_after_size - inode.size) as usize];
+                let keep_size = Copying {
+                    keep_size: true,
+                    ..Copying::default()
+                };
+                self.write_cow_copying(inode, inode.size, &zeros, false, keep_size)?;
+            }
+            let inode = self.read_inode(ino)?;
+            return self.write_prealloc(&inode, offset, data, summed);
+        }
+        if let Some(at) = self.prealloc_end_within(ino, offset, end)? {
+            return self.write_cow_in_two(inode, offset, data, at).map(Some);
+        }
+        let Some(reach) = reach_of_prealloc(&spans, from, stop) else {
+            return Ok(None);
+        };
+        // A dirty regular sector before a hole: the kernel's writeback joins
+        // the old last sector to the hole's sectors in one extent, and cuts a
+        // regular item around a write starting inside it. A copy here is of
+        // the whole item, to an extent of its own, so the items would differ.
+        let tail_abuts = odd_size && offset > inode.size && next_after_size == from;
+        let first = if tail_abuts {
+            next_after_size - sector
+        } else {
+            from
+        };
+        if reach.over_hole
+            && spans
+                .iter()
+                .any(|s| s.kind == SpanKind::Data && s.holds(first))
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}: offset {} is inline or preallocated, and reaching it across a \
+                 hole from a regular sector the write dirties is not implemented",
+                reach.at
+            )));
+        }
+        if reach.through {
+            let through = Copying {
+                through: Some(reach.at),
+                ..Copying::default()
+            };
+            return self
+                .write_cow_copying(inode, offset, data, false, through)
+                .map(Some);
+        }
+        self.prealloc_write_refusal(ino, reach.at, stop)?;
+        self.write_cow_in_two(inode, offset, data, reach.at)
+            .map(Some)
+    }
+
+    /// Write `data` at `offset` in two at `at`, each part taking its own path.
+    fn write_cow_in_two(
+        &mut self,
+        inode: &Inode,
+        offset: u64,
+        data: &[u8],
+        at: u64,
+    ) -> Result<usize> {
+        let first = usize::try_from(at - offset)
+            .map_err(|_| Error::UnsupportedFeature(format!("a write of {} bytes", data.len())))?;
+        let before = self.write_cow(inode, offset, &data[..first], false)?;
+        let inode = self.read_inode(inode.ino)?;
+        let after = self.write_cow(&inode, at, &data[first..], false)?;
+        Ok(before + after)
+    }
+
+    /// Write `data` at `offset` to new extents, as [`Filesystem::write`]
+    /// describes, `copying` saying how this write differs.
+    fn write_cow_copying(
+        &mut self,
+        inode: &Inode,
+        offset: u64,
+        data: &[u8],
+        move_inline: bool,
+        copying: Copying,
+    ) -> Result<usize> {
+        let ino = inode.ino;
+        let summed = inode.flags & INODE_NODATASUM == 0;
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| Error::UnsupportedFeature("write range overflows".into()))?;
         // A write that grows the file plans the sectors past its last
         // extent as a hole is (#432). One that starts past the end leaves a
         // gap, and the kernel zeroes the rest of the old last sector before
@@ -338,7 +521,29 @@ impl Filesystem {
         }
 
         // Every refusal before anything is allocated.
-        let targets = self.plan_cow_targets(ino, tail, offset, end, move_inline)?;
+        let mut targets = match copying.through {
+            Some(at) => self.plan_cow_targets(ino, tail, offset, at, move_inline)?,
+            None => self.plan_cow_targets(ino, tail, offset, end, move_inline)?,
+        };
+        // A write from a hole through a preallocated item: the hole's copy
+        // runs on to the write's last sector, over what it cuts (#767).
+        let cuts = match copying.through {
+            Some(at) => {
+                let stop = end.div_ceil(sector).saturating_mul(sector);
+                let last = targets
+                    .last_mut()
+                    .filter(|t| t.hole && t.start + t.len == at)
+                    .ok_or_else(|| {
+                        Error::UnsupportedFeature(format!(
+                            "inode {ino}: offset {at} is inline or preallocated, and the write \
+                             reaches it from something other than a hole"
+                        ))
+                    })?;
+                last.len = stop - last.start;
+                self.prealloc_cuts(ino, at, stop)?
+            }
+            None => PreallocCuts::default(),
+        };
 
         // Each copy: the item's bytes as they read now, with the write
         // laid over them. Past the end of the file the last sector reads
@@ -404,6 +609,8 @@ impl Filesystem {
         // Remove or trim explicit holes before inserting the new data
         // items: a fill at a hole's start replaces its original key.
         let mut edits = self.cow_hole_edits(ino, &targets, generation)?;
+        let cut_offsets: Vec<u64> = cuts.edits.iter().map(|e| e.key().offset).collect();
+        edits.extend(cuts.edits);
         for &(from, to) in &gaps {
             edits.push(ItemEdit::Put(OwnedItem {
                 key: DiskKey {
@@ -464,6 +671,7 @@ impl Filesystem {
                 released.push(span);
             }
         }
+        released.extend(cuts.releases.iter().map(|r| (r.old, r.old + r.old_len)));
         // A hole filled adds what it now covers to the inode's `nbytes`,
         // a write past the end moves its `size` there (#432), and the
         // inode item says so; the times move as for any write. A write
@@ -478,11 +686,16 @@ impl Filesystem {
                 .nbytes
                 .checked_add(filled)
                 .and_then(|n| n.checked_sub(moved))
+                .and_then(|n| n.checked_sub(cuts.bytes))
                 .ok_or_else(|| {
                     Error::UnsupportedFeature(format!("inode {ino}: nbytes overflows"))
                 })?;
             raw[io::NBYTES..io::NBYTES + 8].copy_from_slice(&nbytes.to_le_bytes());
-            let size = end.max(inode.size);
+            let size = if copying.keep_size {
+                inode.size
+            } else {
+                end.max(inode.size)
+            };
             raw[io::SIZE..io::SIZE + 8].copy_from_slice(&size.to_le_bytes());
             crate::namespace::touch(
                 &mut raw,
@@ -509,7 +722,7 @@ impl Filesystem {
             edits,
             default_subvol: None,
             csum_edits: self.csum_edits(&released, &contents, summed)?,
-            releases: Vec::new(),
+            releases: cuts.releases,
             unrefs: Vec::new(),
             ..Default::default()
         };
@@ -525,7 +738,8 @@ impl Filesystem {
             let keys = std::iter::once((INODE_ITEM_KEY, 0))
                 .chain(targets.iter().map(|t| (EXTENT_DATA_KEY, t.start)))
                 .chain(write.adds.iter().map(|a| (EXTENT_DATA_KEY, a.file_offset)))
-                .chain(gaps.iter().map(|&(from, _)| (EXTENT_DATA_KEY, from)));
+                .chain(gaps.iter().map(|&(from, _)| (EXTENT_DATA_KEY, from)))
+                .chain(cut_offsets.iter().map(|&at| (EXTENT_DATA_KEY, at)));
             for (key_type, key_offset) in keys {
                 let key = DiskKey {
                     objectid: ino,
@@ -763,9 +977,11 @@ impl Filesystem {
     /// write touching neither its first nor its last sector splits it in
     /// three (#537): preallocated before the write, regular for the
     /// written sectors, preallocated after, and the reference is counted
-    /// up by two. `None` when the write lies in no preallocated item, or
-    /// splits it off a sector boundary: the planner then refuses it by
-    /// name.
+    /// up by two. A growing write takes the whole sectors it touches, as the
+    /// kernel's page cache writes them, reading as zeros around it, and the
+    /// size moves only to where it stops (#767). `None` when the write lies in
+    /// no preallocated item, or splits it off a sector boundary: the planner
+    /// then refuses it by name.
     /// The first edge of a preallocated extent item of `ino` that lies
     /// strictly inside `[offset, end)`: where a write over that range
     /// leaves one item for another (#638). `None` when every preallocated
@@ -830,16 +1046,24 @@ impl Filesystem {
         use crate::inode::offsets as io;
         use crate::superblock::le64;
         let ino = inode.ino;
-        let len = data.len() as u64;
         let sector = u64::from(self.sb.sectorsize);
-        let end = offset + len;
-        let Some((key, item)) = self.items_of(ino)?.into_iter().find(|(k, d)| {
-            k.key_type == EXTENT_DATA_KEY
-                && d.len() >= fe::REGULAR_SIZE
-                && d[fe::TYPE] == EXTENT_PREALLOC
-                && k.offset <= offset
-                && end <= k.offset + le64(d, fe::NUM_BYTES)
-        }) else {
+        let written_end = offset + data.len() as u64;
+        let grows = written_end > inode.size;
+        // What goes to the extent: whole sectors for a growing write, whose
+        // sectors read as zeros around it, being preallocated or past the end.
+        let (offset, end) = if grows {
+            (
+                offset - offset % sector,
+                written_end.div_ceil(sector).saturating_mul(sector),
+            )
+        } else {
+            (offset, written_end)
+        };
+        let len = end - offset;
+        let mut bytes = vec![0u8; len as usize];
+        let into = (written_end - data.len() as u64 - offset) as usize;
+        bytes[into..into + data.len()].copy_from_slice(data);
+        let Some((key, item)) = self.prealloc_item_holding(ino, offset, end)? else {
             return Ok(None);
         };
         let item_end = key.offset + le64(&item, fe::NUM_BYTES);
@@ -849,32 +1073,7 @@ impl Filesystem {
         {
             return Ok(None);
         }
-        if item[fe::COMPRESSION] != 0
-            || item[fe::ENCRYPTION] != 0
-            || item[fe::OTHER_ENCODING..fe::OTHER_ENCODING + 2] != [0, 0]
-        {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino}: the preallocated extent item at {offset} is compressed, \
-                 encrypted or encoded, and writing one is not implemented"
-            )));
-        }
-        let extent_start = le64(&item, fe::DISK_BYTENR);
-        let at = extent_start + le64(&item, fe::OFFSET) + (offset - key.offset);
-        let (refs, extent_len, made) = self.extent_item(extent_start)?;
-        if !window_inside_extent(at, len, extent_start, extent_len) {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino}: offset {offset} maps to [{at}, +{len}), outside the \
-                 {extent_len}-byte extent the extent tree records at {extent_start}"
-            )));
-        }
-        let last_snapshot = self.root_last_snapshot(self.written_tree())?;
-        if refs != 1 || made <= last_snapshot {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino}: the preallocated extent at {extent_start} has {refs} references \
-                 or predates the snapshot taken at {last_snapshot}, and writing one another \
-                 reference may read is not implemented"
-            )));
-        }
+        let (extent_start, at, extent_len) = self.prealloc_window(ino, &key, &item, offset, len)?;
         let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
             Error::UnsupportedFeature("the generation counter is exhausted".into())
         })?;
@@ -927,8 +1126,8 @@ impl Filesystem {
         crate::namespace::touch(&mut raw, generation, now, &[io::CTIME, io::MTIME]);
         // Preallocated sectors already count in `nbytes`; a write past the
         // end moves only the size (#603).
-        if end > inode.size {
-            raw[io::SIZE..io::SIZE + 8].copy_from_slice(&end.to_le_bytes());
+        if grows {
+            raw[io::SIZE..io::SIZE + 8].copy_from_slice(&written_end.to_le_bytes());
         }
         edits.push(ItemEdit::Put(OwnedItem {
             key: DiskKey {
@@ -938,12 +1137,11 @@ impl Filesystem {
             },
             data: raw,
         }));
-        let csum_edits = self.csum_edits(&[], &[(at, data.to_vec())], summed)?;
-
         // The data, to every mirror, before the commit that makes the
         // item regular: until then the item still reads as zeros.
-        self.mirror_spans(at, data.len())?;
-        self.write_logical_all_mirrors(at, data)?;
+        self.mirror_spans(at, bytes.len())?;
+        self.write_logical_all_mirrors(at, &bytes)?;
+        let csum_edits = self.csum_edits(&[], &[(at, bytes)], summed)?;
         let write = DataWrite {
             root: self.written_tree(),
             ino,
@@ -955,6 +1153,169 @@ impl Filesystem {
         };
         self.commit_write(write, generation)?;
         Ok(Some(data.len()))
+    }
+
+    /// The preallocated extent item of `ino` holding the whole of
+    /// `[from, end)`.
+    fn prealloc_item_holding(
+        &self,
+        ino: u64,
+        from: u64,
+        end: u64,
+    ) -> Result<Option<(DiskKey, Vec<u8>)>> {
+        use crate::fs::file_extent as fe;
+        use crate::superblock::le64;
+        Ok(self.items_of(ino)?.into_iter().find(|(k, d)| {
+            k.key_type == EXTENT_DATA_KEY
+                && d.len() >= fe::REGULAR_SIZE
+                && d[fe::TYPE] == EXTENT_PREALLOC
+                && k.offset <= from
+                && end <= k.offset.saturating_add(le64(d, fe::NUM_BYTES))
+        }))
+    }
+
+    /// Check that `len` bytes at file offset `offset` of the preallocated
+    /// `item` can be written where its extent lies, and return that extent's
+    /// address, where the bytes go, and its length.
+    fn prealloc_window(
+        &self,
+        ino: u64,
+        key: &DiskKey,
+        item: &[u8],
+        offset: u64,
+        len: u64,
+    ) -> Result<(u64, u64, u64)> {
+        use crate::fs::file_extent as fe;
+        use crate::superblock::le64;
+        if item[fe::COMPRESSION] != 0
+            || item[fe::ENCRYPTION] != 0
+            || item[fe::OTHER_ENCODING..fe::OTHER_ENCODING + 2] != [0, 0]
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}: the preallocated extent item at {offset} is compressed, \
+                 encrypted or encoded, and writing one is not implemented"
+            )));
+        }
+        let extent_start = le64(item, fe::DISK_BYTENR);
+        let at = extent_start + le64(item, fe::OFFSET) + (offset - key.offset);
+        let (refs, extent_len, made) = self.extent_item(extent_start)?;
+        if !window_inside_extent(at, len, extent_start, extent_len) {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}: offset {offset} maps to [{at}, +{len}), outside the \
+                 {extent_len}-byte extent the extent tree records at {extent_start}"
+            )));
+        }
+        let last_snapshot = self.root_last_snapshot(self.written_tree())?;
+        if refs != 1 || made <= last_snapshot {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino}: the preallocated extent at {extent_start} has {refs} references \
+                 or predates the snapshot taken at {last_snapshot}, and writing one another \
+                 reference may read is not implemented"
+            )));
+        }
+        Ok((extent_start, at, extent_len))
+    }
+
+    /// The refusal a write to the preallocated item at `from` would meet, in
+    /// the part of `[from, end)` that item holds, found before anything is
+    /// committed for the sake of that write.
+    fn prealloc_write_refusal(&self, ino: u64, from: u64, end: u64) -> Result<()> {
+        use crate::fs::file_extent as fe;
+        use crate::superblock::le64;
+        if let Some((key, item)) = self.prealloc_item_holding(ino, from, from + 1)? {
+            let stop = end.min(key.offset + le64(&item, fe::NUM_BYTES));
+            self.prealloc_window(ino, &key, &item, from, stop - from)?;
+        }
+        Ok(())
+    }
+
+    /// What a copy over `[at, stop)` does to the preallocated items there
+    /// (#767), as the kernel's `btrfs_drop_extents` does it. An item wholly
+    /// inside goes, and its extent with it; one running past `stop` starts
+    /// again there, further into its extent, its reference unchanged, so the
+    /// sectors it no longer covers stay allocated and unreadable.
+    fn prealloc_cuts(&self, ino: u64, at: u64, stop: u64) -> Result<PreallocCuts> {
+        use crate::fs::file_extent as fe;
+        use crate::superblock::le64;
+        let last_snapshot = self.root_last_snapshot(self.written_tree())?;
+        let mut cuts = PreallocCuts::default();
+        for (key, item) in self.items_of(ino)? {
+            if key.key_type != EXTENT_DATA_KEY
+                || item.len() < fe::REGULAR_SIZE
+                || item[fe::TYPE] != EXTENT_PREALLOC
+                || key.offset < at
+                || key.offset >= stop
+            {
+                continue;
+            }
+            let len = le64(&item, fe::NUM_BYTES);
+            let extent_start = le64(&item, fe::DISK_BYTENR);
+            let extent_offset = le64(&item, fe::OFFSET);
+            let (refs, extent_len, made) = self.extent_item(extent_start)?;
+            let whole = key.offset + len <= stop;
+            if item[fe::COMPRESSION] != 0
+                || item[fe::ENCRYPTION] != 0
+                || item[fe::OTHER_ENCODING..fe::OTHER_ENCODING + 2] != [0, 0]
+                || made <= last_snapshot
+                || (whole && refs != 1)
+            {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino}: offset {} is inline or preallocated, and replacing an item \
+                     that is encoded, predates the snapshot taken at {last_snapshot}, or whose \
+                     extent has {refs} references is not implemented",
+                    key.offset
+                )));
+            }
+            cuts.edits.push(ItemEdit::Delete(key));
+            if whole {
+                cuts.bytes += len;
+                cuts.releases.push(DataRelease {
+                    old: extent_start,
+                    old_len: extent_len,
+                    old_ref_offset: key.offset.wrapping_sub(extent_offset),
+                });
+            } else {
+                let gone = stop - key.offset;
+                cuts.bytes += gone;
+                let mut rest = item;
+                rest[fe::OFFSET..fe::OFFSET + 8]
+                    .copy_from_slice(&(extent_offset + gone).to_le_bytes());
+                rest[fe::NUM_BYTES..fe::NUM_BYTES + 8].copy_from_slice(&(len - gone).to_le_bytes());
+                cuts.edits.push(ItemEdit::Put(OwnedItem {
+                    key: DiskKey {
+                        offset: stop,
+                        ..key
+                    },
+                    data: rest,
+                }));
+            }
+        }
+        Ok(cuts)
+    }
+
+    /// Every extent item of `ino` holding something other than inline data,
+    /// in file order.
+    fn extent_spans(&self, ino: u64) -> Result<Vec<Span>> {
+        use crate::fs::file_extent as fe;
+        use crate::superblock::le64;
+        Ok(self
+            .items_of(ino)?
+            .into_iter()
+            .filter(|(k, d)| {
+                k.key_type == EXTENT_DATA_KEY && d.len() >= fe::REGULAR_SIZE && d[fe::TYPE] != 0
+            })
+            .map(|(k, d)| Span {
+                start: k.offset,
+                end: k.offset.saturating_add(le64(&d, fe::NUM_BYTES)),
+                kind: if d[fe::TYPE] == EXTENT_PREALLOC {
+                    SpanKind::Prealloc
+                } else if le64(&d, fe::DISK_BYTENR) == 0 {
+                    SpanKind::Hole
+                } else {
+                    SpanKind::Data
+                },
+            })
+            .collect())
     }
 
     /// The spans of `[from, to)`, the gap a write past the end leaves, that
@@ -1586,6 +1947,46 @@ fn prealloc_end_split(items: &[(u64, u64)], offset: u64, end: u64) -> Option<u64
         .min()
 }
 
+/// How the sectors `[from, stop)` of a write, starting before any preallocated
+/// item they reach, come to that item in the kernel's writeback
+/// (`run_delalloc_nocow`), given the file's items in order (#767). `None` when
+/// they reach none, or reach one past data that is not this path's to write.
+///
+/// That walk takes items in turn. Data and a hole item are copied, and an item
+/// starting exactly where they end is judged next, so a preallocated one there
+/// is written where it lies: the write is cut at its start. Where nothing is
+/// recorded, the walk's next item is taken for the hole's end and then stepped
+/// over, and so is every item after it, so all of it is copied into one extent.
+fn reach_of_prealloc(spans: &[Span], from: u64, stop: u64) -> Option<PreallocReach> {
+    let mut at = from;
+    let mut over_hole = false;
+    let mut left = spans.iter().filter(|s| s.end > from && s.start < stop);
+    while let Some(span) = left.next() {
+        if span.start > at {
+            let only_prealloc =
+                span.kind == SpanKind::Prealloc && left.all(|s| s.kind == SpanKind::Prealloc);
+            return only_prealloc.then_some(PreallocReach {
+                at: span.start,
+                through: true,
+                over_hole: true,
+            });
+        }
+        match span.kind {
+            SpanKind::Prealloc => {
+                return (span.start > from).then_some(PreallocReach {
+                    at: span.start,
+                    through: false,
+                    over_hole,
+                });
+            }
+            SpanKind::Hole => over_hole = true,
+            SpanKind::Data => {}
+        }
+        at = span.end;
+    }
+    None
+}
+
 fn kept_runs(
     offset: u64,
     data: &[u8],
@@ -1611,7 +2012,7 @@ fn kept_runs(
 
 #[cfg(test)]
 mod tests {
-    use super::{kept_runs, prealloc_end_split};
+    use super::{kept_runs, prealloc_end_split, reach_of_prealloc, PreallocReach, Span, SpanKind};
 
     /// A growing write that starts in a preallocated item and runs past its
     /// end is cut at that end (#639); every other write is not cut there.
@@ -1632,6 +2033,53 @@ mod tests {
         let two = [(16384, 8192), (32768, 8192)];
         assert_eq!(prealloc_end_split(&two, 20480, 49152), Some(24576));
         assert_eq!(prealloc_end_split(&[], 0, 4096), None);
+    }
+
+    /// The kernel's account of each of these is in cow_write_oracle.rs.
+    #[test]
+    fn a_write_starting_before_a_preallocated_item_reaches_it_as_writeback_does() {
+        let span = |start, end, kind| Span { start, end, kind };
+        let data = span(0, 16_384, SpanKind::Data);
+        let kept = span(65_536, 131_072, SpanKind::Prealloc);
+        let reach = |at, through, over_hole| {
+            Some(PreallocReach {
+                at,
+                through,
+                over_hole,
+            })
+        };
+        // Nothing records the hole: copied through.
+        assert_eq!(
+            reach_of_prealloc(&[data, kept], 16_384, 81_920),
+            reach(65_536, true, true)
+        );
+        // A hole item ends at the item: in two at its start.
+        let hole = span(16_384, 65_536, SpanKind::Hole);
+        assert_eq!(
+            reach_of_prealloc(&[data, hole, kept], 16_384, 81_920),
+            reach(65_536, false, true)
+        );
+        // A hole item ends short of it: copied through.
+        let short = span(16_384, 28_672, SpanKind::Hole);
+        assert_eq!(
+            reach_of_prealloc(&[data, short, kept], 16_384, 81_920),
+            reach(65_536, true, true)
+        );
+        // Regular data ends at it: in two, with no hole between.
+        let next = span(16_384, 32_768, SpanKind::Prealloc);
+        assert_eq!(
+            reach_of_prealloc(&[data, next], 12_288, 24_576),
+            reach(16_384, false, false)
+        );
+        // Past a second item that is not preallocated: not written this way.
+        let after = span(131_072, 135_168, SpanKind::Data);
+        assert_eq!(
+            reach_of_prealloc(&[data, kept, after], 16_384, 140_000),
+            None
+        );
+        // Starting in the item, or reaching none.
+        assert_eq!(reach_of_prealloc(&[data, kept], 65_536, 81_920), None);
+        assert_eq!(reach_of_prealloc(&[data, kept], 16_384, 65_536), None);
     }
 
     /// The independent comparison is the sparse EOF case in
@@ -1709,6 +2157,107 @@ mod tests {
                 expected,
                 "{name}: the old EOF sector and the payload's are the ones copied"
             );
+        }
+    }
+
+    /// A growing write into space preallocated past the end is written when
+    /// it is off a sector or starts before the item (#767), on the kernel's
+    /// layout for a volume with no-holes, which cow_write_oracle.rs measures
+    /// against the kernel on a volume of each kind.
+    #[test]
+    fn a_growing_write_into_kept_preallocation_off_a_sector_or_from_before_it_is_written() {
+        use crate::{fs::file_extent as fe, mkfs, superblock::le64, Filesystem};
+        use fs_core::FileDevice;
+        use std::{path::PathBuf, sync::Arc};
+
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let image = Scratch(PathBuf::from(fs_btrfs_test_support::temp_path!(
+            "cow-grow-into-kept.img"
+        )));
+        std::fs::create_dir_all(image.0.parent().unwrap()).unwrap();
+        std::fs::File::create(&image.0)
+            .and_then(|f| f.set_len(128 << 20))
+            .unwrap();
+        let dev = Arc::new(FileDevice::open_rw(&image.0).unwrap());
+        mkfs::format(dev.as_ref(), &mkfs::Options::default()).unwrap();
+        let mut fs = Filesystem::mount_rw(dev).unwrap();
+        assert!(fs.superblock().has_no_holes());
+        let root = fs.lookup_path("/").unwrap().ino;
+        const KEPT: u64 = 65_536;
+        // Each item: its offset, whether it is preallocated, its length.
+        type Items = &'static [(u64, bool, u64)];
+        let cases: [(&str, usize, u64, u64, usize, Items); 3] = [
+            (
+                "odd-old-end",
+                40_000,
+                40_960,
+                50_000,
+                5000,
+                &[
+                    (0, false, 36_864),
+                    (36_864, false, 4096),
+                    (40_960, true, 8192),
+                    (49_152, false, 8192),
+                    (57_344, true, 49_152),
+                ],
+            ),
+            (
+                "odd-write-end",
+                16_384,
+                16_384,
+                16_384,
+                5000,
+                &[
+                    (0, false, 16_384),
+                    (16_384, false, 8192),
+                    (24_576, true, 57_344),
+                ],
+            ),
+            (
+                "into-item",
+                16_384,
+                65_536,
+                16_384,
+                65_536,
+                &[
+                    (0, false, 16_384),
+                    (16_384, false, 65_536),
+                    (81_920, true, 49_152),
+                ],
+            ),
+        ];
+        for (name, old, kept_at, at, len, items) in cases {
+            let ino = fs.create(root, name.as_bytes(), 0o644, 0, 0).unwrap();
+            fs.write(ino, 0, &vec![0x41; old]).unwrap();
+            fs.fallocate(ino, kept_at, KEPT, true).unwrap();
+            let mut bytes = vec![0x41; old];
+            bytes.resize(at as usize + len, 0);
+            bytes[at as usize..].fill(0x5a);
+            assert_eq!(
+                fs.write(ino, at, &vec![0x5a; len])
+                    .unwrap_or_else(|e| panic!("{name}: {e}")),
+                len
+            );
+            assert_eq!(fs.read_file(ino).unwrap(), bytes, "{name}");
+            let found: Vec<(u64, bool, u64)> = fs
+                .items_of(ino)
+                .unwrap()
+                .into_iter()
+                .filter(|(key, _)| key.key_type == super::EXTENT_DATA_KEY)
+                .map(|(key, data)| {
+                    (
+                        key.offset,
+                        data[fe::TYPE] == super::EXTENT_PREALLOC,
+                        le64(&data, fe::NUM_BYTES),
+                    )
+                })
+                .collect();
+            assert_eq!(found, items, "{name}: the items the kernel leaves");
         }
     }
 
