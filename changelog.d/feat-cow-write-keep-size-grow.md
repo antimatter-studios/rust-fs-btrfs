@@ -6,4 +6,4 @@
   the bytes are written where that extent lies, as a write within the size
   is, the gap stays preallocated and only the size moves, as the kernel
   does. A sector-unaligned old end, a write ending off a sector inside the
-  item, or one reaching past it is still refused.
+  item, or one starting before the item and running into it is still refused.

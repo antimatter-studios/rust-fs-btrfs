@@ -1768,12 +1768,14 @@ fn a_write_that_grows_a_file_without_no_holes_records_the_gap_as_a_hole_item() {
     }
 }
 
-/// A new gap adjoining an existing trailing hole extends that hole's item
-/// (#602, part of #526), including an EOF partway through a hole sector.
-/// The kernel writes identical controls; its item coverage, size, nbytes,
-/// byte readback and scrub are independent of this crate's interpretation.
+/// A new gap beside a trailing hole is a hole item of its own, as the
+/// kernel's extend inserts it (#526): it merges with nothing, so a file that
+/// ended at a hole item's end keeps two adjacent hole items. The kernel makes
+/// the same write into a control, so the items, `size` and `nbytes` the driver
+/// is held to are its own. One file ends on a sector, and two partway through
+/// the hole, whose last sector is then allocated as well.
 #[test]
-fn a_growing_write_coalesces_the_gap_with_the_trailing_hole() {
+fn a_growing_write_records_its_gap_beside_the_trailing_hole_as_the_kernel_does() {
     let cases = [
         ("aligned", 32_768, 8192),
         ("partial", 40_000, 8192),
@@ -1787,13 +1789,11 @@ fn a_growing_write_coalesces_the_gap_with_the_trailing_hole() {
         ));
     }
     script.push_str("sync\n");
-    for (name, _, data_len) in cases {
+    for (name, _, _) in cases {
         script.push_str(&format!(
             "head -c 5000 /dev/zero | tr '\\000' '\\303' \
              | dd of=\"$MNT/{name}-control\" bs=5000 iflag=fullblock oflag=seek_bytes seek=65536 conv=notrunc status=none\n\
-             sync\n\
-             fallocate --punch-hole --keep-size -o {data_len} -l {} \"$MNT/{name}-control\"\nsync\n",
-            65_536 - data_len
+             sync\n"
         ));
     }
     let scratch = Scratch::made("cow-grow-trailing-hole", "crc32c", "^no-holes", &script);
@@ -1824,20 +1824,10 @@ fn a_growing_write_coalesces_the_gap_with_the_trailing_hole() {
             (theirs.size, theirs.nbytes),
             "{name}"
         );
-        let kernel_holes = explicit_holes_to(&image, control, 73_728);
-        // The kernel may retain adjacent hole items at the old EOF.
-        // Check their complete coverage; our coalescing guarantee still
-        // requires exactly one item below.
-        let mut covered_to = data_len;
-        for (start, len) in kernel_holes {
-            assert_eq!(start, covered_to, "{name}: a gap in the kernel's hole");
-            covered_to += len;
-        }
-        assert_eq!(covered_to, 65_536);
         assert_eq!(
-            explicit_holes_to(&image, ino, 73_728),
-            vec![(data_len, 65_536 - data_len)],
-            "{name}: the old hole and the new gap must be one item"
+            extent_layout_to(&image, ino, 73_728),
+            extent_layout_to(&image, control, 73_728),
+            "{name}: extent items differ from the kernel's write"
         );
     }
     drop(fs);
@@ -1880,14 +1870,16 @@ fn a_growing_write_coalesces_the_gap_with_the_trailing_hole() {
     }
 }
 
-/// A hole at the old EOF needs no zeroing allocation (#601). The kernel
-/// independently grows twin files from a partial hole sector: into the
-/// next sector, several sectors away, and inside the old EOF sector
-/// itself (where only the sector the payload touches must be allocated).
-/// Compare every extent item's span and kind, inode size and nbytes,
-/// exact expected content hashes, data checksums and a kernel scrub.
+/// A file ending partway through a hole has that sector allocated when a
+/// write past the end grows it, as the kernel's extend zeroes it through the
+/// page cache whatever lies under it (#526). The kernel grows twin files from
+/// a partial hole sector: into the next sector, several sectors away, and
+/// inside the old EOF sector itself, on a volume with explicit hole items and
+/// on one without. Its controls have had the same writes and nothing else, so
+/// every extent item's span, `size` and `nbytes` the driver is held to are its
+/// own; data checksums, a scrub and the expected bytes judge the result.
 #[test]
-fn a_growing_write_keeps_an_untouched_old_eof_hole_sector_sparse() {
+fn a_growing_write_allocates_an_old_eof_sector_in_a_hole_as_the_kernel_does() {
     const OLD_SIZE: u64 = 40_000;
     const SECTOR: u64 = 4096;
     let cases = [
@@ -1910,119 +1902,97 @@ fn a_growing_write_keeps_an_untouched_old_eof_hole_sector_sparse() {
              | dd of=\"$MNT/{name}-control\" bs={len} iflag=fullblock oflag=seek_bytes seek={offset} conv=notrunc status=none\n\
              sync\n"
         ));
-        // Linux zeroes a partial old EOF with an allocated sector even
-        // when it was a hole. Restore that untouched zero sector to a
-        // hole, so this control independently checks the sparse result
-        // required here rather than Linux's EOF-zeroing policy.
-        if offset / SECTOR > OLD_SIZE / SECTOR {
-            script.push_str(&format!(
-                "fallocate --punch-hole --keep-size -o {} -l {SECTOR} \"$MNT/{name}-control\"\nsync\n",
-                OLD_SIZE / SECTOR * SECTOR
-            ));
-        }
     }
-    let scratch = Scratch::made("cow-sparse-eof", "crc32c", "^no-holes", &script);
-    let image = scratch.image();
-    let mut fs = mount_rw(&image);
-    assert!(!fs.superblock().has_no_holes(), "mkfs enabled NO_HOLES");
-    let mut expected = BTreeMap::new();
-    for (name, data_len, offset, len) in cases {
-        let ino = ino_of(&fs, name);
-        let before = fs.read_inode(ino).unwrap();
-        assert_eq!((before.size, before.nbytes), (OLD_SIZE, data_len));
-        assert_eq!(
-            before.flags & (fs_btrfs::write::INODE_NODATACOW | fs_btrfs::write::INODE_NODATASUM),
-            0,
-            "{name}: the kernel must have made a checksummed CoW file"
-        );
-        assert_eq!(
-            explicit_holes_to(&image, ino, OLD_SIZE.next_multiple_of(SECTOR)),
-            vec![(data_len, OLD_SIZE.next_multiple_of(SECTOR) - data_len)],
-            "{name}: old EOF must lie inside an explicit hole"
-        );
-        let mut bytes = fs.read_file(ino).unwrap();
-        bytes.resize(offset as usize, 0);
-        bytes.extend(std::iter::repeat_n(0xa5, len));
-        assert_eq!(fs.write(ino, offset, &vec![0xa5; len]).unwrap(), len);
-        assert_eq!(fs.read_file(ino).unwrap(), bytes, "{name}");
-        expected.insert(name, bytes);
+    for features in ["^no-holes", "no-holes"] {
+        let explicit = features == "^no-holes";
+        let scratch = Scratch::made("cow-sparse-eof", "crc32c", features, &script);
+        let image = scratch.image();
+        let mut fs = mount_rw(&image);
+        assert_eq!(fs.superblock().has_no_holes(), !explicit, "{features}");
+        let mut expected = BTreeMap::new();
+        for (name, data_len, offset, len) in cases {
+            let ino = ino_of(&fs, name);
+            let before = fs.read_inode(ino).unwrap();
+            assert_eq!((before.size, before.nbytes), (OLD_SIZE, data_len));
+            assert_eq!(
+                before.flags
+                    & (fs_btrfs::write::INODE_NODATACOW | fs_btrfs::write::INODE_NODATASUM),
+                0,
+                "{name}: the kernel must have made a checksummed CoW file"
+            );
+            if explicit {
+                assert_eq!(
+                    explicit_holes_to(&image, ino, OLD_SIZE.next_multiple_of(SECTOR)),
+                    vec![(data_len, OLD_SIZE.next_multiple_of(SECTOR) - data_len)],
+                    "{name}: old EOF must lie inside an explicit hole"
+                );
+            }
+            let mut bytes = fs.read_file(ino).unwrap();
+            bytes.resize(offset as usize, 0);
+            bytes.extend(std::iter::repeat_n(0xa5, len));
+            assert_eq!(fs.write(ino, offset, &vec![0xa5; len]).unwrap(), len);
+            assert_eq!(fs.read_file(ino).unwrap(), bytes, "{name}");
+            expected.insert(name, bytes);
 
-        let ours = fs.read_inode(ino).unwrap();
-        let control = ino_of(&fs, &format!("{name}-control"));
-        let theirs = fs.read_inode(control).unwrap();
-        let start = offset / SECTOR * SECTOR;
-        let end = (offset + len as u64).next_multiple_of(SECTOR);
-        assert_eq!(
-            (ours.size, ours.nbytes),
-            (theirs.size, theirs.nbytes),
-            "{name}: allocation differs from the kernel's write"
-        );
-        assert_eq!(
-            ours.nbytes - before.nbytes,
-            end - start,
-            "{name}: only payload sectors may be allocated"
-        );
-        let layout = vec![
-            (data_len, start - data_len, true),
-            (start, end - start, false),
-        ];
-        let mut wanted = Vec::new();
-        if data_len > 0 {
-            wanted.push((0, data_len, false));
+            let ours = fs.read_inode(ino).unwrap();
+            let control = ino_of(&fs, &format!("{name}-control"));
+            let theirs = fs.read_inode(control).unwrap();
+            assert_eq!(
+                (ours.size, ours.nbytes),
+                (theirs.size, theirs.nbytes),
+                "{features} {name}: allocation differs from the kernel's write"
+            );
+            assert_eq!(
+                extent_items(&image, ino),
+                extent_items(&image, control),
+                "{features} {name}: extent items differ from the kernel's write"
+            );
         }
-        wanted.extend(layout);
-        let kernel_layout = coalesced_layout(&extent_layout_to(&image, control, end));
-        assert_eq!(kernel_layout, wanted, "{name}: kernel extent items");
+        drop(fs);
+        let checked = oracle("btrfs")
+            .args(["check", "--readonly", "--check-data-csum"])
+            .arg(&image)
+            .output();
         assert_eq!(
-            extent_layout_to(&image, ino, end),
-            kernel_layout,
-            "{name}: extent items differ from the kernel's write"
+            checked.status.code(),
+            Some(0),
+            "btrfs check --check-data-csum after growth from a hole, {features}:\n{}{}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
         );
-    }
-    drop(fs);
-    let checked = oracle("btrfs")
-        .args(["check", "--readonly", "--check-data-csum"])
-        .arg(&image)
-        .output();
-    assert_eq!(
-        checked.status.code(),
-        Some(0),
-        "btrfs check --check-data-csum after sparse EOF growth:\n{}{}",
-        String::from_utf8_lossy(&checked.stdout),
-        String::from_utf8_lossy(&checked.stderr)
-    );
-    guest_kernel_write_ok(
-        &image.to_string_lossy(),
-        "scrub after sparse EOF growth",
-        "btrfs scrub start -B \"$MNT\" >/dev/null",
-    );
-    let names = [
-        "far",
-        "far-control",
-        "next",
-        "next-control",
-        "same",
-        "same-control",
-        "empty",
-        "empty-control",
-    ];
-    let seen = kernel_view(&image, "read back sparse EOF growth", &names);
-    let stats = kernel_stats(&image, "stat sparse EOF growth", &names);
-    for (name, _, _, _) in cases {
-        let control = format!("{name}-control");
-        assert_eq!(
-            seen[name].0,
-            sha256_hex(&expected[name]),
-            "{name}: wrong bytes"
+        guest_kernel_write_ok(
+            &image.to_string_lossy(),
+            "scrub after growth from a hole",
+            "btrfs scrub start -B \"$MNT\" >/dev/null",
         );
-        assert_eq!(
-            seen[name].0, seen[&control].0,
-            "{name}: kernel control differs"
-        );
-        assert_eq!(
-            stats[name], stats[&control],
-            "{name}: kernel size and blocks"
-        );
+        let names = [
+            "far",
+            "far-control",
+            "next",
+            "next-control",
+            "same",
+            "same-control",
+            "empty",
+            "empty-control",
+        ];
+        let seen = kernel_view(&image, "read back growth from a hole", &names);
+        let stats = kernel_stats(&image, "stat growth from a hole", &names);
+        for (name, _, _, _) in cases {
+            let control = format!("{name}-control");
+            assert_eq!(
+                seen[name].0,
+                sha256_hex(&expected[name]),
+                "{features} {name}: wrong bytes"
+            );
+            assert_eq!(
+                seen[name].0, seen[&control].0,
+                "{features} {name}: kernel control differs"
+            );
+            assert_eq!(
+                stats[name], stats[&control],
+                "{features} {name}: kernel size and blocks"
+            );
+        }
     }
 }
 
@@ -4418,10 +4388,12 @@ fn extent_items(image: &Path, ino: u64) -> Vec<(u64, u64, bool)> {
             assert!(words.any(|w| w == word), "no {word} in {line}");
             words.next().unwrap().parse().unwrap()
         };
+        // `extent data ...` for a regular item, `prealloc data ...` for a
+        // preallocated one.
         items.push((
             offset,
-            field("extent data offset", "nr"),
-            field("extent data disk byte", "byte") == 0,
+            field(" data offset", "nr"),
+            field(" data disk byte", "byte") == 0,
         ));
     }
     items
@@ -5027,4 +4999,194 @@ fn a_growing_write_into_space_preallocated_past_the_end_is_written_in_place() {
         seen[PAST].0, seen[PAST_CONTROL].0,
         "{PAST} does not read as its control"
     );
+}
+
+/// A write wholly past an item `fallocate --keep-size` preallocated past the
+/// end leaves that item preallocated and grows the file around it, as the
+/// kernel's extend does (#526). On a volume with explicit hole items the gap
+/// after the item is a hole item; one file ends on a sector, and the other
+/// partway through its last, which is copied with zeros past the old end. The
+/// kernel makes the same write into a control, so the items, their kinds and
+/// reference counts, `size` and `nbytes` are its own; `btrfs check
+/// --check-data-csum` and a scrub judge the digests, and the kernel reads the
+/// old data, zeros over the preallocated sectors and gap, and the write.
+#[test]
+fn a_growing_write_past_space_preallocated_past_the_end_leaves_it_preallocated() {
+    const KEPT: u64 = 16384;
+    const AT: u64 = 131_072;
+    const PART: usize = 8192;
+    let cases = [
+        ("kept-even", 16384u64, 16384u64),
+        ("kept-odd", 40_000, 40_960),
+    ];
+    let mut script = String::new();
+    for (name, old, kept_at) in cases {
+        script.push_str(&format!(
+            "head -c {old} /dev/urandom | tee \"$MNT/{name}\" > \"$MNT/{name}-control\"\n\
+             sync\n\
+             for f in {name} {name}-control; do \
+             fallocate -n -o {kept_at} -l {KEPT} \"$MNT/$f\"; done\n\
+             sync\n\
+             head -c {PART} /dev/zero | tr '\\000' '\\132' \
+             | dd of=\"$MNT/{name}-control\" bs={PART} iflag=fullblock oflag=seek_bytes seek={AT} conv=notrunc status=none\n\
+             sync\n"
+        ));
+    }
+    for features in ["^no-holes", "no-holes"] {
+        let scratch = Scratch::made("cow-grow-past-kept", "crc32c", features, &script);
+        let image = scratch.image();
+        let mut fs = mount_rw(&image);
+        let mut expected = BTreeMap::new();
+        for (name, old, kept_at) in cases {
+            let ino = ino_of(&fs, name);
+            assert_eq!(fs.read_inode(ino).unwrap().size, old, "{name}");
+            let (kind, before, _) = extent_kind_and_refs(&image, ino, kept_at);
+            assert_eq!(
+                kind, "prealloc",
+                "the kernel did not preallocate past {name}'s end"
+            );
+            let mut bytes = fs.read_file(ino).unwrap();
+            bytes.resize(AT as usize, 0);
+            bytes.extend_from_slice(&[0x5a; PART]);
+            assert_eq!(
+                fs.write(ino, AT, &[0x5a; PART])
+                    .unwrap_or_else(|e| panic!("{features}: a write past {name}'s kept item: {e}")),
+                PART
+            );
+            assert_eq!(fs.read_file(ino).unwrap(), bytes, "{features} {name}");
+            expected.insert(name, bytes);
+            let control = ino_of(&fs, &format!("{name}-control"));
+            let (a, b) = (fs.read_inode(ino).unwrap(), fs.read_inode(control).unwrap());
+            assert_eq!(
+                (a.size, a.nbytes),
+                (b.size, b.nbytes),
+                "{features} {name}: size and nbytes differ from the kernel's write"
+            );
+            let (ours, theirs) = (extent_items(&image, ino), extent_items(&image, control));
+            assert_eq!(
+                ours, theirs,
+                "{features} {name}: extent items differ from the kernel's write"
+            );
+            for &(item, _, hole) in theirs.iter().filter(|i| !i.2) {
+                assert!(!hole);
+                let (kind, bytenr, refs) = extent_kind_and_refs(&image, ino, item);
+                let (their_kind, _, their_refs) = extent_kind_and_refs(&image, control, item);
+                assert_eq!(
+                    (kind.as_str(), refs),
+                    (their_kind.as_str(), their_refs),
+                    "{features} {name}'s item at {item}: kind and reference count"
+                );
+                if item == kept_at {
+                    assert_eq!(bytenr, before, "{features} {name}: the kept item moved");
+                }
+            }
+        }
+        drop(fs);
+        let checked = oracle("btrfs")
+            .args(["check", "--readonly", "--check-data-csum"])
+            .arg(&image)
+            .output();
+        assert_eq!(
+            checked.status.code(),
+            Some(0),
+            "btrfs check --check-data-csum after a write past kept preallocation, {features}:\n{}{}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
+        );
+        guest_kernel_write_ok(
+            &image.to_string_lossy(),
+            "scrub after a write past kept preallocation",
+            "btrfs scrub start -B \"$MNT\" >/dev/null",
+        );
+        let names = [
+            "kept-even",
+            "kept-even-control",
+            "kept-odd",
+            "kept-odd-control",
+        ];
+        let seen = kernel_view(&image, "after a write past kept preallocation", &names);
+        for (name, _, _) in cases {
+            assert_eq!(
+                seen[name].0,
+                sha256_hex(&expected[name]),
+                "{features} {name}: wrong bytes"
+            );
+            assert_eq!(
+                seen[name].0,
+                seen[&format!("{name}-control")].0,
+                "{features} {name}: differs from kernel control"
+            );
+        }
+    }
+}
+
+/// The growing writes into space preallocated past the end that stay refused,
+/// each named by the error it meets and recorded in the features row (#526):
+/// an old end partway through a sector, a write ending partway through a
+/// sector inside the item, and a write from before the item running into it.
+/// Nothing may have been committed: the generation stays, the file reads as it
+/// did, and `btrfs check` and a kernel read-back accept the volume.
+#[test]
+fn a_growing_write_into_kept_preallocation_refuses_what_it_cannot_write() {
+    const SECTOR: u64 = 4096;
+    let cases = [
+        ("odd-old-end", 40_000u64, 40_960u64, 50_000u64, 5000usize),
+        ("odd-write-end", 16_384, 16_384, 16_384, 5000),
+        ("into-item", 16_384, 65_536, 16_384, 65_536),
+    ];
+    let mut script = String::new();
+    for (name, old, kept_at, _, _) in cases {
+        script.push_str(&format!(
+            "head -c {old} /dev/urandom > \"$MNT/{name}\"\nsync\n\
+             fallocate -n -o {kept_at} -l {} \"$MNT/{name}\"\nsync\n",
+            16 * SECTOR
+        ));
+    }
+    for features in ["^no-holes", "no-holes"] {
+        let scratch = Scratch::made("cow-grow-kept-refused", "crc32c", features, &script);
+        let image = scratch.image();
+        let mut fs = mount_rw(&image);
+        let mut expected = BTreeMap::new();
+        for (name, old, kept_at, at, len) in cases {
+            let ino = ino_of(&fs, name);
+            assert_eq!(fs.read_inode(ino).unwrap().size, old, "{name}");
+            let (kind, _, _) = extent_kind_and_refs(&image, ino, kept_at);
+            assert_eq!(
+                kind, "prealloc",
+                "the kernel did not preallocate past {name}'s end"
+            );
+            let bytes = fs.read_file(ino).unwrap();
+            let generation = fs.superblock().generation;
+            let refused = fs.write(ino, at, &vec![0x5a; len]).unwrap_err().to_string();
+            assert!(
+                refused.contains(&format!("offset {}", at.max(kept_at)))
+                    && refused.contains("inline or preallocated"),
+                "{features} {name}: the refusal must name the preallocated offset: {refused}"
+            );
+            assert_eq!(fs.superblock().generation, generation, "{features} {name}");
+            assert_eq!(fs.read_file(ino).unwrap(), bytes, "{features} {name}");
+            expected.insert(name, bytes);
+        }
+        drop(fs);
+        let checked = oracle("btrfs")
+            .args(["check", "--readonly", "--check-data-csum"])
+            .arg(&image)
+            .output();
+        assert_eq!(
+            checked.status.code(),
+            Some(0),
+            "btrfs check --check-data-csum after refused writes, {features}:\n{}{}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
+        );
+        let names: Vec<&str> = cases.iter().map(|c| c.0).collect();
+        let seen = kernel_view(&image, "after refused writes", &names);
+        for name in names {
+            assert_eq!(
+                seen[name].0,
+                sha256_hex(&expected[name]),
+                "{features} {name}: wrong bytes"
+            );
+        }
+    }
 }
