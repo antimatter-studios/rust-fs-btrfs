@@ -1,6 +1,6 @@
 //! Preallocating and punching a range of a file (#713).
 //!
-//! Each call is one committed transaction on the top-level subvolume,
+//! Each call is one committed transaction on the subvolume the handle reads,
 //! through the same planner and commit as [`crate::clone`], and leaves the
 //! items the kernel's `fallocate(2)` leaves.
 //!
@@ -57,14 +57,13 @@
 //!   reference may read, which the kernel copies;
 //! - encrypted or otherwise encoded extents;
 //! - splitting an extent whose references are kept as items of their own;
-//! - any subvolume other than the top level;
 //! - space no data block group holds in one piece: allocating a block group,
 //!   or a shorter extent than asked for, is not written;
 //! - a range past the largest file offset, and a length of zero.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::chunk::{objectid, DiskKey};
+use crate::chunk::DiskKey;
 use crate::clone::{counted_bytes, cut_range, extent_items, order, Cut, Edits};
 use crate::cow_write::regular_extent_item;
 use crate::error::{Error, Result};
@@ -133,6 +132,9 @@ impl Filesystem {
     /// documentation](crate::fallocate) lists. Nothing is written unless
     /// everything is.
     pub fn fallocate(&mut self, ino: u64, offset: u64, len: u64, keep_size: bool) -> Result<()> {
+        if self.writable.is_none() && self.subvolume_writes.is_some() {
+            return self.writing_subvolume(|fs| fs.fallocate(ino, offset, len, keep_size));
+        }
         let (inode, items) = self.range_to_change(ino, offset, len)?;
         let sector = u64::from(self.sb.sectorsize);
         let end = offset + len;
@@ -193,6 +195,9 @@ impl Filesystem {
     ///
     /// As [`Filesystem::fallocate`].
     pub fn punch_hole(&mut self, ino: u64, offset: u64, len: u64) -> Result<()> {
+        if self.writable.is_none() && self.subvolume_writes.is_some() {
+            return self.writing_subvolume(|fs| fs.punch_hole(ino, offset, len));
+        }
         let (inode, items) = self.range_to_change(ino, offset, len)?;
         let sector = u64::from(self.sb.sectorsize);
         let Some(plan) = plan_punch(&items, inode.size, sector, offset, offset + len) else {
@@ -213,12 +218,10 @@ impl Filesystem {
     /// The inode and extent items of a file whose range may be changed.
     fn range_to_change(&self, ino: u64, offset: u64, len: u64) -> Result<(Inode, ExtentItems)> {
         if self.subvolume_writes.is_some() {
-            return Err(refused(format!(
-                "inode {ino} is in a subvolume other than the top level, and a range of a file \
-                 is only preallocated or punched in the top level"
-            )));
+            self.require_writable()?;
+        } else {
+            self.require_writable_top_level()?;
         }
-        self.require_writable_top_level()?;
         let inode = self.read_inode(ino)?;
         if !inode.is_regular_file() {
             return Err(Error::NotAFile);
@@ -434,7 +437,7 @@ impl Filesystem {
             self.write_logical_all_mirrors(*at, bytes)?;
         }
         let write = DataWrite {
-            root: objectid::FS_TREE,
+            root: self.written_tree(),
             ino,
             adds,
             time: now,
@@ -506,8 +509,9 @@ impl Filesystem {
             .iter()
             .filter(|(_, d)| le64(d, fe::DISK_BYTENR) == bytenr)
             .count() as u64;
-        let last_snapshot = self.root_last_snapshot(objectid::FS_TREE)?;
-        if refs != ours || made <= last_snapshot || self.leaf_shared(objectid::FS_TREE, k)? {
+        let tree = self.written_tree();
+        let last_snapshot = self.root_last_snapshot(tree)?;
+        if refs != ours || made <= last_snapshot || self.leaf_shared(tree, k)? {
             return Err(refused(format!(
                 "inode {ino}: the preallocated extent at {bytenr} has {refs} references to this \
                  file's {ours} items or predates the snapshot taken at {last_snapshot}, and \

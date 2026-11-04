@@ -7,6 +7,5 @@
   dropping this file's reference to it. Part of a sector at a punched range's
   edge is zeroed, and a preallocation past a file ending partway through a
   sector rewrites that sector, each as the kernel does. Inline data, a volume
-  without no-holes, a subvolume other than the top level, and part of a sector
-  in a `nodatacow` file's regular extent or in a preallocated extent another
-  reference may read are refused.
+  without no-holes, and part of a sector in a `nodatacow` file's regular extent
+  or in a preallocated extent another reference may read are refused.

@@ -386,6 +386,157 @@ fn the_edges_of_a_range_leave_what_the_kernel_leaves() {
     assert_btrfs_check_clean(Path::new(&image), "after the kernel deleted the files");
 }
 
+#[test]
+fn ranges_on_a_selected_subvolume_match_the_kernel_and_preserve_its_snapshot() {
+    let scratch = Scratch::new("fallocate-subvolume");
+    let image = scratch.image();
+    let shared = case("a snapshotted regular extent", "", PUNCH, K, 8 * K);
+    let cases: Vec<&Case> = CASES.iter().chain([&shared]).collect();
+    let shared_index = CASES.len();
+    guest_kernel_write_ok(
+        &image,
+        "the selected subvolume's twins and snapshot",
+        &format!(
+            "btrfs subvolume create \"$MNT/sv\" >/dev/null\n\
+             head -c 65536 /dev/urandom > \"$MNT/top-file\"\n\
+             cp --reflink=never \"$MNT/top-file\" \"$MNT/sv/a{shared_index}\"\n\
+             cp --reflink=never \"$MNT/top-file\" \"$MNT/sv/k{shared_index}\"\n\
+             sync\nbtrfs subvolume snapshot -r \"$MNT/sv\" \"$MNT/snap\" >/dev/null\n{}",
+            make_script().replacen("cd \"$MNT\"", "cd \"$MNT/sv\"", 1)
+        ),
+    );
+    let ids = guest_kernel_read_ok(
+        &image,
+        "the selected subvolume and snapshot IDs",
+        "btrfs subvolume list \"$MNT\" | awk '$NF == \"sv\" { print $2 }'\n\
+         btrfs subvolume list \"$MNT\" | awk '$NF == \"snap\" { print $2 }'",
+    );
+    let ids: Vec<u64> = ids.lines().map(|line| line.parse().unwrap()).collect();
+    assert_eq!(ids.len(), 2);
+    let preserved = vec![
+        "top-file".to_string(),
+        format!("snap/a{shared_index}"),
+        format!("snap/k{shared_index}"),
+    ];
+    let before = kernel_reads(&image, &preserved);
+    let snapshot_before = dump_tree(Path::new(&image), &ids[1].to_string());
+
+    let top = unsafe { fs_btrfs_mount_rw(c(&image).as_ptr()) };
+    assert!(!top.is_null(), "mount_rw: {}", last_error());
+    let selected = unsafe { fs_btrfs_open_subvolume(top, ids[0]) };
+    assert!(!selected.is_null(), "open_subvolume: {}", last_error());
+    for (index, change) in cases.iter().enumerate() {
+        assert_eq!(
+            fallocate(
+                selected,
+                &format!("/a{index}"),
+                change.mode,
+                change.offset,
+                change.len
+            ),
+            0,
+            "subvolume case {index}, {}: {}",
+            change.what,
+            last_error()
+        );
+    }
+    unsafe {
+        fs_btrfs_umount(selected);
+        fs_btrfs_umount(top);
+    }
+    digests_clean(&image, "after the selected handle's range changes");
+
+    let mut kernel = String::from("cd \"$MNT/sv\"\n");
+    for (index, change) in cases.iter().enumerate() {
+        let flags = if change.mode & FS_BTRFS_FALLOC_PUNCH_HOLE != 0 {
+            "-p"
+        } else if change.mode & KEEP != 0 {
+            "-n"
+        } else {
+            ""
+        };
+        kernel.push_str(&format!(
+            "fallocate {flags} -o {} -l {} k{index}\n",
+            change.offset, change.len
+        ));
+    }
+    kernel.push_str("sync\n");
+    guest_kernel_write_ok(
+        &image,
+        "the kernel changes the subvolume's controls",
+        &kernel,
+    );
+    digests_clean(&image, "after the kernel's subvolume range changes");
+
+    let names: Vec<String> = (0..cases.len())
+        .flat_map(|index| [format!("sv/a{index}"), format!("sv/k{index}")])
+        .collect();
+    let seen = kernel_reads(&image, &names);
+    let tree = dump_tree(Path::new(&image), &ids[0].to_string());
+    let extents = dump_tree(Path::new(&image), "extent");
+    let references = |ino| {
+        // Matched as text: `dump-tree` names the top level's root FS_TREE, not 5.
+        let reference = format!("extent data backref root {} objectid {ino} ", ids[0]);
+        let mut found: Vec<(u64, u64)> = extents
+            .lines()
+            .filter(|line| line.contains(&reference))
+            .map(|line| (word_after(line, "offset"), word_after(line, "count")))
+            .collect();
+        found.sort_unstable();
+        found
+    };
+    let mut compare = String::from("cd \"$MNT\"\n");
+    for (index, change) in cases.iter().enumerate() {
+        let (ours, control) = (&seen[index * 2], &seen[index * 2 + 1]);
+        assert_eq!(
+            ours.2, control.2,
+            "{}: the kernel reads different bytes",
+            change.what
+        );
+        assert_eq!(
+            shape(&tree, ours.1),
+            shape(&tree, control.1),
+            "{}",
+            change.what
+        );
+        assert_eq!(references(ours.1), references(control.1), "{}", change.what);
+        compare.push_str(&format!("cmp sv/a{index} sv/k{index}\n"));
+    }
+    compare.push_str(&format!(
+        "cmp top-file snap/a{shared_index}\ncmp top-file snap/k{shared_index}\n"
+    ));
+    guest_kernel_read_ok(
+        &image,
+        "the kernel compares every byte of the twins",
+        &compare,
+    );
+    assert_eq!(kernel_reads(&image, &preserved), before);
+    let snapshot_after = dump_tree(Path::new(&image), &ids[1].to_string());
+    for (_, ino, _) in &before[1..] {
+        assert_eq!(shape(&snapshot_before, *ino), shape(&snapshot_after, *ino));
+    }
+
+    let top = unsafe { fs_btrfs_mount_rw(c(&image).as_ptr()) };
+    assert!(!top.is_null(), "remount_rw: {}", last_error());
+    let snapshot = unsafe { fs_btrfs_open_subvolume(top, ids[1]) };
+    assert!(!snapshot.is_null(), "open snapshot: {}", last_error());
+    for mode in [0, KEEP, PUNCH] {
+        assert_eq!(
+            fallocate(snapshot, &format!("/a{shared_index}"), mode, 0, 4096),
+            -1
+        );
+        assert_eq!(fs_btrfs_last_errno(), 30, "{}", last_error());
+    }
+    unsafe {
+        fs_btrfs_umount(snapshot);
+        fs_btrfs_umount(top);
+    }
+    digests_clean(
+        &image,
+        "after refusing range changes on the read-only snapshot",
+    );
+}
+
 /// What is refused changes nothing: the bytes read the same, and the checker
 /// has nothing to say.
 #[test]
@@ -402,7 +553,8 @@ fn what_is_not_written_yet_is_refused_and_changes_nothing() {
          fallocate -l 65536 snapped\n\
          sync\nbtrfs subvolume snapshot \"$MNT\" \"$MNT/snap\" >/dev/null\n\
          btrfs subvolume create \"$MNT/sub\" >/dev/null\n\
-         fallocate -l 4096 \"$MNT/sub/file\"\nsync",
+         fallocate -l 65536 \"$MNT/sub/file\"\n\
+         cp --reflink=always \"$MNT/sub/file\" \"$MNT/sub/other\"\nsync",
     );
     let fs = unsafe { fs_btrfs_mount_rw(c(&image).as_ptr()) };
     assert!(!fs.is_null(), "mount_rw: {}", last_error());
@@ -425,7 +577,7 @@ fn what_is_not_written_yet_is_refused_and_changes_nothing() {
     assert_eq!(fallocate(fs, "/other", 0, 1 << 30, 400 << 20), -1);
     assert_eq!(fs_btrfs_last_errno(), ENOTSUP, "{}", last_error());
 
-    // The subvolume's handle refuses a range too.
+    // The subvolume's handle refuses what the top level refuses.
     let ids = guest_kernel_read_ok(
         &image,
         "the subvolume's id",
@@ -434,8 +586,10 @@ fn what_is_not_written_yet_is_refused_and_changes_nothing() {
     let id: u64 = ids.trim().parse().unwrap();
     let sub = unsafe { fs_btrfs_open_subvolume(fs, id) };
     assert!(!sub.is_null(), "open_subvolume: {}", last_error());
-    assert_eq!(fallocate(sub, "/file", PUNCH, 0, 4096), -1);
+    let before = read(sub, "/file");
+    assert_eq!(fallocate(sub, "/file", PUNCH, K, 8 * K), -1);
     assert_eq!(fs_btrfs_last_errno(), ENOTSUP, "{}", last_error());
+    assert_eq!(read(sub, "/file"), before);
     unsafe {
         fs_btrfs_umount(sub);
         fs_btrfs_umount(fs);
