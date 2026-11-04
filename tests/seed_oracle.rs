@@ -15,6 +15,7 @@
 //! seed's before sprouting and the sprout's after.
 
 use fs_btrfs::fs::Filesystem;
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{
     fixture, guest_kernel_pool_check, guest_kernel_pool_read, guest_quote, sha256_hex, temp_path,
 };
@@ -31,7 +32,7 @@ fn device(name: &str) -> Arc<dyn BlockRead> {
 fn writable_copy(name: &str, tag: &str) -> Arc<dyn BlockDevice> {
     let copy = std::path::PathBuf::from(temp_path!("seed-{tag}-{name}"));
     let from = fixture(&format!("seed/{name}"));
-    std::fs::copy(&from, &copy).unwrap_or_else(|e| panic!("copying {}: {e}", from.display()));
+    copy_sparse(&from, &copy).unwrap_or_else(|e| panic!("copying {}: {e}", from.display()));
     Arc::new(FileDevice::open_rw(&copy).unwrap_or_else(|e| panic!("{}: {e}", copy.display())))
 }
 
@@ -133,7 +134,7 @@ fn the_sprouted_filesystem_given_for_writing_is_refused_naming_the_seed() {
     let fixture_seed = sha256_hex(&std::fs::read(fixture("seed/btrfs-seed.img")).expect("seed"));
     for (tag, seed_first) in [("seed-first", true), ("sprout-first", false)] {
         let seed_path = std::path::PathBuf::from(temp_path!("seed-rw-{tag}-btrfs-seed.img"));
-        std::fs::copy(fixture("seed/btrfs-seed.img"), &seed_path).expect("copying the seed");
+        copy_sparse(fixture("seed/btrfs-seed.img"), &seed_path).expect("copying the seed");
         let seed = Arc::new(FileDevice::open_rw(&seed_path).expect("open the seed copy"))
             as Arc<dyn BlockDevice>;
         let sprout = writable_copy("btrfs-sprout.img", tag);
@@ -156,7 +157,7 @@ fn the_sprouted_filesystem_given_for_writing_is_refused_naming_the_seed() {
 #[test]
 fn an_unrelated_device_given_for_writing_is_still_another_filesystem() {
     let default = std::path::PathBuf::from(temp_path!("seed-unrelated-btrfs-default.img"));
-    std::fs::copy(fixture("btrfs-default.img"), &default).expect("copying btrfs-default.img");
+    copy_sparse(fixture("btrfs-default.img"), &default).expect("copying btrfs-default.img");
     let other = Arc::new(FileDevice::open_rw(&default).expect("open")) as Arc<dyn BlockDevice>;
     match Filesystem::mount_pool_rw(vec![other, writable_copy("btrfs-sprout.img", "unrelated")]) {
         Ok(_) => panic!("an unrelated filesystem's device was accepted beside the sprout"),
@@ -174,7 +175,7 @@ fn new_data_and_tree_blocks_land_only_on_the_sprout() {
         ("btrfs-seed.img", &seed_path),
         ("btrfs-sprout.img", &sprout_path),
     ] {
-        std::fs::copy(fixture(&format!("seed/{name}")), copy).expect("copy the member");
+        copy_sparse(fixture(&format!("seed/{name}")), copy).expect("copy the member");
     }
     let before = sha256_hex(&std::fs::read(&seed_path).expect("read the seed"));
     let seed = Arc::new(FileDevice::open_rw(&seed_path).unwrap()) as Arc<dyn BlockDevice>;
@@ -284,7 +285,7 @@ fn a_subvolume_handle_on_the_sprouted_pool_keeps_writing_with_the_seed() {
         ("btrfs-seed.img", &seed_path),
         ("btrfs-sprout.img", &sprout_path),
     ] {
-        std::fs::copy(fixture(&format!("seed/{name}")), copy).expect("copy the member");
+        copy_sparse(fixture(&format!("seed/{name}")), copy).expect("copy the member");
     }
     let before = sha256_hex(&std::fs::read(&seed_path).expect("read the seed"));
     let seed = Arc::new(FileDevice::open_rw(&seed_path).unwrap()) as Arc<dyn BlockDevice>;
@@ -358,7 +359,7 @@ fn a_file_that_lives_on_the_seed_is_overwritten_onto_the_sprout() {
         ("btrfs-seed.img", &seed_path),
         ("btrfs-sprout.img", &sprout_path),
     ] {
-        std::fs::copy(fixture(&format!("seed/{name}")), copy).expect("copy the member");
+        copy_sparse(fixture(&format!("seed/{name}")), copy).expect("copy the member");
     }
     let before = sha256_hex(&std::fs::read(&seed_path).expect("read the seed"));
     let seed = Arc::new(FileDevice::open_rw(&seed_path).unwrap()) as Arc<dyn BlockDevice>;
@@ -475,7 +476,7 @@ fn pool_check_waits_for_kernel_readback_using_the_same_device_identities() {
     let seed = std::path::PathBuf::from(temp_path!("seed-registry-seed.img"));
     let sprout = std::path::PathBuf::from(temp_path!("seed-registry-sprout.img"));
     for (name, copy) in [("btrfs-seed.img", &seed), ("btrfs-sprout.img", &sprout)] {
-        std::fs::copy(fixture(&format!("seed/{name}")), copy).unwrap();
+        copy_sparse(fixture(&format!("seed/{name}")), copy).unwrap();
     }
     let ready = std::path::PathBuf::from(temp_path!("seed-registry.ready"));
     let release = std::path::PathBuf::from(temp_path!("seed-registry.release"));

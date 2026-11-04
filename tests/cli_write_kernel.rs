@@ -9,6 +9,7 @@
 mod cli_support;
 
 use cli_support::*;
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, fixture, guest_kernel_read_ok, guest_kernel_write_ok, oracle,
     sha256_hex,
@@ -41,7 +42,7 @@ fn manifest_file(path: &str) -> (usize, String) {
 #[test]
 fn a_nodatacow_overwrite_is_clean_to_btrfs_check_and_read_back_by_the_kernel() {
     let image = scratch_dir("write-kernel").join("btrfs-cli.img");
-    std::fs::copy(fixture("cli/btrfs-cli.img"), &image).expect("copy the fixture");
+    copy_sparse(fixture("cli/btrfs-cli.img"), &image).expect("copy the fixture");
     let (size, _) = manifest_file("/nocow/data.bin");
     let bytes = pattern(size, 225);
 

@@ -54,6 +54,7 @@ use fs_btrfs::fs::Filesystem;
 use fs_btrfs::send::{
     attr, cmd, command_name, parse_send_stream, Command, SendOptions, SendStream,
 };
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{
     fixture, guest_kernel_read_ok, guest_kernel_write_ok, guest_quote, sha256_hex,
 };
@@ -578,7 +579,7 @@ fn show_field(show: &str, name: &str) -> String {
 fn send_streams_agree_with_btrfs_send_and_btrfs_receive() {
     let out = scratch("full");
     let image = out.join("btrfs-send.img");
-    std::fs::copy(fixture("btrfs-default.img"), &image).expect("copy the fixture");
+    copy_sparse(fixture("btrfs-default.img"), &image).expect("copy the fixture");
     let image_str = image.to_str().expect("a UTF-8 scratch path").to_string();
 
     // The kernel populates, snapshots and sends.
@@ -659,7 +660,7 @@ fn send_streams_agree_with_btrfs_send_and_btrfs_receive() {
 fn incremental_streams_agree_with_btrfs_send_and_btrfs_receive() {
     let out = scratch("incremental");
     let image = out.join("btrfs-send-incremental.img");
-    std::fs::copy(fixture("btrfs-default.img"), &image).expect("copy the fixture");
+    copy_sparse(fixture("btrfs-default.img"), &image).expect("copy the fixture");
     let image_str = image.to_str().expect("a UTF-8 scratch path").to_string();
 
     // The kernel makes both snapshots and sends the difference.
@@ -841,7 +842,7 @@ fn shown_attrs(attrs: &[(u16, Vec<u8>)]) -> String {
 fn version_two_streams_pass_compressed_data_through_as_the_kernel_does() {
     let out = scratch("v2");
     let image = out.join("btrfs-send-v2.img");
-    std::fs::copy(fixture("btrfs-default.img"), &image).expect("copy the fixture");
+    copy_sparse(fixture("btrfs-default.img"), &image).expect("copy the fixture");
     let image_str = image.to_str().expect("a UTF-8 scratch path").to_string();
 
     guest_kernel_write_ok(

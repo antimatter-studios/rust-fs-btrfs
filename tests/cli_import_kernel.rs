@@ -25,6 +25,7 @@
 mod cli_support;
 
 use cli_support::*;
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, guest_kernel_read_ok, guest_kernel_write_ok, oracle, sha256_hex,
 };
@@ -272,7 +273,7 @@ fn an_import_killed_between_persist_and_publish_leaves_the_old_file_and_a_clean_
     // quick to catch.
     for attempt in 1..=5 {
         let image = dir.join(format!("kill-{attempt}.img"));
-        std::fs::copy(&base, &image).unwrap();
+        copy_sparse(&base, &image).unwrap();
         let mut child = tool("fs.btrfs")
             .arg(&image)
             .args(["import", "--replace", "--verify"])

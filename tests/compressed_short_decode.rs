@@ -38,6 +38,7 @@ use fs_btrfs::fs::Filesystem;
 use fs_btrfs::superblock::Superblock;
 use fs_btrfs::tree_write::stamp_checksum;
 use fs_btrfs::write::{INODE_NODATACOW, INODE_NODATASUM};
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{fixture, le64, sha256_hex, temp_path, Image};
 use fs_core::{BlockRead, FileDevice};
 use std::sync::Arc;
@@ -61,7 +62,7 @@ fn image(name: &str) -> std::path::PathBuf {
     let dir = std::path::PathBuf::from(temp_path!("short-decode-{name}"));
     std::fs::create_dir_all(&dir).unwrap();
     let img = dir.join("img");
-    std::fs::copy(fixture("btrfs-comp-lzo.img"), &img).unwrap();
+    copy_sparse(fixture("btrfs-comp-lzo.img"), &img).unwrap();
     img
 }
 

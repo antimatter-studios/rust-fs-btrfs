@@ -16,6 +16,7 @@ mod cli_support;
 use cli_support::*;
 use fs_btrfs::dir::{offsets, DIR_INDEX_KEY, MAX_NAME_LEN};
 use fs_btrfs::Filesystem;
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{guest_kernel_write, oracle, sha256_hex};
 use fs_core::FileDevice;
 use std::collections::BTreeMap;
@@ -154,7 +155,7 @@ find . -mindepth 1 -printf '/%P\0%y\0%s\0%i\0'
 /// by `edit`, its block rewritten with a fresh checksum in every mirror.
 fn damaged(tag: &str, subvolume: &str, dir: u64, name: &str, edit: impl Fn(&mut [u8])) -> PathBuf {
     let copy = scratch_dir(&format!("recursive-{tag}")).join("fs.img");
-    std::fs::copy(&kernel_tree().0, &copy).unwrap();
+    copy_sparse(&kernel_tree().0, &copy).unwrap();
     let tree = Filesystem::mount(Arc::new(FileDevice::open(copy.to_str().unwrap()).unwrap()))
         .unwrap()
         .subvolume_at(subvolume.as_bytes())

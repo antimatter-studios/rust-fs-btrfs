@@ -64,6 +64,7 @@ use std::sync::Arc;
 
 use fs_btrfs::superblock::SUPER_INFO_OFFSET;
 use fs_btrfs::{ChunkMap, Superblock};
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{fixture, temp_path, Image};
 use fs_core::FileDevice;
 
@@ -93,7 +94,7 @@ impl Scratch {
             std::process::id(),
             std::thread::current().id()
         ));
-        std::fs::copy(src, &path)
+        copy_sparse(src, &path)
             .unwrap_or_else(|e| panic!("copying {} to {}: {e}", src.display(), path.display()));
         Self(path)
     }

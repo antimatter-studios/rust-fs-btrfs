@@ -17,6 +17,7 @@
 //! letting it pass on no evidence.
 
 use fs_btrfs::Filesystem;
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, fixture, guest_kernel_read_ok, sha256_hex, temp_path,
 };
@@ -38,7 +39,7 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn from(source: &Path, name: &str) -> Self {
         let path = PathBuf::from(temp_path!("{name}"));
-        std::fs::copy(source, &path).expect("copy the fixture");
+        copy_sparse(source, &path).expect("copy the fixture");
         Scratch(path)
     }
     fn path(&self) -> &Path {

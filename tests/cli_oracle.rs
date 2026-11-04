@@ -13,6 +13,7 @@
 mod cli_support;
 
 use cli_support::*;
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{dump_super, dump_tree, fixture, oracle};
 use std::path::Path;
 
@@ -86,7 +87,7 @@ fn get_agrees_with_dump_super() {
 /// A scratch copy of the CLI volume.
 fn scratch_copy(tag: &str) -> std::path::PathBuf {
     let copy = scratch_dir(tag).join("btrfs-cli.img");
-    std::fs::copy(fixture("cli/btrfs-cli.img"), &copy).expect("copy the fixture");
+    copy_sparse(fixture("cli/btrfs-cli.img"), &copy).expect("copy the fixture");
     copy
 }
 

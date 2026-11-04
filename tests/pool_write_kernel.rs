@@ -21,6 +21,7 @@
 //! as the fixture's manifest says the kernel wrote it.
 
 use fs_btrfs::fs::Filesystem;
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{fixture, guest_kernel_pool_read, sha256_hex, temp_path};
 use fs_core::{BlockDevice, FileDevice};
 use std::collections::BTreeMap;
@@ -46,7 +47,7 @@ impl Scratch {
         std::fs::create_dir_all(&dir).unwrap();
         for member in ["a", "b"] {
             let src = fixture(&format!("btrfs-pool-{member}.img"));
-            std::fs::copy(&src, dir.join(format!("{member}.img")))
+            copy_sparse(&src, dir.join(format!("{member}.img")))
                 .unwrap_or_else(|e| panic!("copying {}: {e}", src.display()));
         }
         Self(dir)

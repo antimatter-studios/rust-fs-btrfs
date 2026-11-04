@@ -18,6 +18,7 @@ use fs_btrfs::fs::Filesystem;
 use fs_btrfs::inode::{INODE_ITEM_KEY, INODE_REF_KEY};
 use fs_btrfs::log_tree::{LoggedTree, DIR_LOG_INDEX_KEY};
 use fs_btrfs::Error;
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, dump_tree, fixture, guest_kernel_read_ok, guest_kernel_report,
     guest_kernel_write_ok, oracle, sha256_hex, temp_path,
@@ -256,7 +257,7 @@ fn the_log_holds_what_the_kernels_replay_produces() {
 
     // The oracle: the kernel replays a copy and reads both files back.
     let copy = PathBuf::from(temp_path!("log-tree-read-replayed.img"));
-    std::fs::copy(&image, &copy).expect("copying the fixture to replay on");
+    copy_sparse(&image, &copy).expect("copying the fixture to replay on");
     let replayed = guest_kernel_write_ok(
         &copy.to_string_lossy(),
         "log replay",
@@ -361,7 +362,7 @@ fn replays_as_the_kernel_does_then(
     let image = fixture(fixture_name);
 
     let theirs = PathBuf::from(temp_path!("{tag}-kernel-replay.img"));
-    std::fs::copy(&image, &theirs).expect("copying the fixture for the kernel to replay");
+    copy_sparse(&image, &theirs).expect("copying the fixture for the kernel to replay");
     guest_kernel_write_ok(
         &theirs.to_string_lossy(),
         &format!("{tag}: kernel replay"),
@@ -369,7 +370,7 @@ fn replays_as_the_kernel_does_then(
     );
 
     let ours = PathBuf::from(temp_path!("{tag}-our-replay.img"));
-    std::fs::copy(&image, &ours).expect("copying the fixture for this crate to replay");
+    copy_sparse(&image, &ours).expect("copying the fixture for this crate to replay");
     {
         let dev = Arc::new(FileDevice::open_rw(&ours).expect("open the copy read-write"));
         let fs = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>)
@@ -522,8 +523,8 @@ fn an_inode_only_log_replays_mode_and_identity_as_the_kernel_does() {
 
     let theirs = PathBuf::from(temp_path!("inode-only-kernel.img"));
     let ours = PathBuf::from(temp_path!("inode-only-crate.img"));
-    std::fs::copy(&image, &theirs).unwrap();
-    std::fs::copy(&image, &ours).unwrap();
+    copy_sparse(&image, &theirs).unwrap();
+    copy_sparse(&image, &ours).unwrap();
     let digest = |path: &std::path::Path| {
         use sha2::Digest;
         format!("{:x}", sha2::Sha256::digest(std::fs::read(path).unwrap()))
@@ -634,7 +635,7 @@ struct ScratchCopy(PathBuf);
 impl ScratchCopy {
     fn of(source: &Path, path: String) -> ScratchCopy {
         let guard = ScratchCopy(PathBuf::from(path));
-        std::fs::copy(source, &guard.0).expect("copy the fixture to scratch");
+        copy_sparse(source, &guard.0).expect("copy the fixture to scratch");
         guard
     }
 }

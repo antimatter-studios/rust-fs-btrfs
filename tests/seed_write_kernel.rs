@@ -7,6 +7,7 @@
 //! them, and mounts the sprout read-only before running the readback.
 
 use fs_btrfs::fs::Filesystem;
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{fixture, guest_kernel_pool_read, sha256_hex, temp_path};
 use fs_core::{BlockDevice, FileDevice};
 use std::path::PathBuf;
@@ -20,7 +21,7 @@ fn the_kernel_reads_back_a_file_written_into_a_seed_and_sprout_pair() {
         ("btrfs-seed.img", &seed_path),
         ("btrfs-sprout.img", &sprout_path),
     ] {
-        std::fs::copy(fixture(&format!("seed/{name}")), copy).expect("copy the member");
+        copy_sparse(fixture(&format!("seed/{name}")), copy).expect("copy the member");
     }
     let seed_before = sha256_hex(&std::fs::read(&seed_path).expect("read the seed copy"));
     let seed = Arc::new(FileDevice::open_rw(&seed_path).expect("open the seed copy"))

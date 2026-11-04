@@ -23,6 +23,7 @@
 //! inline reference waits for a guest that can make one.
 
 use fs_btrfs::fs::Filesystem;
+use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{fixture, sha256_hex, temp_path};
 use fs_core::{BlockDevice, FileDevice};
 use std::sync::Arc;
@@ -67,7 +68,7 @@ fn a_read_write_mount_is_refused_naming_simple_quotas() {
     let dir = std::path::PathBuf::from(temp_path!("squota-rw"));
     std::fs::create_dir_all(&dir).unwrap();
     let copy = dir.join("img");
-    std::fs::copy(image(), &copy).expect("copy the fixture");
+    copy_sparse(image(), &copy).expect("copy the fixture");
     let rw = FileDevice::open_rw(&copy).expect("open the copy for writing");
     match Filesystem::mount_rw(Arc::new(rw) as Arc<dyn BlockDevice>) {
         Ok(_) => panic!("a simple-quota volume must not mount for writing"),
