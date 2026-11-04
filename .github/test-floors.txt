@@ -214,6 +214,8 @@ namespace_kernel          2
 # two full ancestors (#513, #514, #515); CI verifies the new case executes.
 node_split_kernel         3
 node_write_oracle         4
+# Both guest argument encoders against written-out strings, without a VM (#765).
+oracle_encoding           4
 oracle_vm_fixtures        3
 pool_degraded             7
 pool_oracle               4
