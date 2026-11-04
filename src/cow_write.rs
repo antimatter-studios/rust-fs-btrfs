@@ -294,8 +294,18 @@ impl Filesystem {
                 return Ok(before + after);
             }
         }
+        let copied_prealloc = if !move_inline && end <= inode.size {
+            self.prealloc_after_unrecorded_hole(ino, offset, end)?
+        } else {
+            None
+        };
         if !move_inline && end <= inode.size {
-            if let Some(at) = self.prealloc_edge_within(ino, offset, end)? {
+            if let Some(at) = self.prealloc_edge_within(
+                ino,
+                offset,
+                end,
+                copied_prealloc.as_ref().map(|(key, _)| key.offset),
+            )? {
                 let first = usize::try_from(at - offset).map_err(|_| {
                     Error::UnsupportedFeature(format!("a write of {} bytes", data.len()))
                 })?;
@@ -338,7 +348,14 @@ impl Filesystem {
         }
 
         // Every refusal before anything is allocated.
-        let targets = self.plan_cow_targets(ino, tail, offset, end, move_inline)?;
+        let targets = self.plan_cow_targets(
+            ino,
+            tail,
+            offset,
+            end,
+            move_inline,
+            copied_prealloc.as_ref().map(|(key, _)| key.offset),
+        )?;
 
         // Each copy: the item's bytes as they read now, with the write
         // laid over them. Past the end of the file the last sector reads
@@ -404,6 +421,33 @@ impl Filesystem {
         // Remove or trim explicit holes before inserting the new data
         // items: a fill at a hole's start replaces its original key.
         let mut edits = self.cow_hole_edits(ino, &targets, generation)?;
+        let mut covered_prealloc = Vec::new();
+        let mut copied_prealloc_bytes = 0;
+        if let Some((key, mut item)) = copied_prealloc {
+            use crate::fs::file_extent as fe;
+            use crate::superblock::le64;
+            let item_end = key.offset + le64(&item, fe::NUM_BYTES);
+            let stop = end.div_ceil(sector).saturating_mul(sector).min(item_end);
+            copied_prealloc_bytes = stop - key.offset;
+            edits.push(ItemEdit::Delete(key));
+            if stop < item_end {
+                let into = le64(&item, fe::OFFSET) + copied_prealloc_bytes;
+                item[fe::GENERATION..fe::GENERATION + 8].copy_from_slice(&generation.to_le_bytes());
+                item[fe::OFFSET..fe::OFFSET + 8].copy_from_slice(&into.to_le_bytes());
+                item[fe::NUM_BYTES..fe::NUM_BYTES + 8]
+                    .copy_from_slice(&(item_end - stop).to_le_bytes());
+                edits.push(ItemEdit::Put(OwnedItem {
+                    key: DiskKey {
+                        offset: stop,
+                        ..key
+                    },
+                    data: item,
+                }));
+            } else {
+                covered_prealloc.push((key, item));
+            }
+        }
+        let (prealloc_releases, prealloc_unrefs) = self.drop_covered(ino, &covered_prealloc)?;
         for &(from, to) in &gaps {
             edits.push(ItemEdit::Put(OwnedItem {
                 key: DiskKey {
@@ -464,12 +508,25 @@ impl Filesystem {
                 released.push(span);
             }
         }
+        released.extend(
+            prealloc_releases
+                .iter()
+                .map(|release| (release.old, release.old + release.old_len)),
+        );
         // A hole filled adds what it now covers to the inode's `nbytes`,
         // a write past the end moves its `size` there (#432), and the
         // inode item says so; the times move as for any write. A write
         // inside the last sector past the end adds no sector, and still
         // moves the size.
-        let filled: u64 = targets.iter().filter(|t| t.hole).map(|t| t.len).sum();
+        let filled = targets
+            .iter()
+            .filter(|t| t.hole)
+            .map(|t| t.len)
+            .sum::<u64>()
+            .checked_sub(copied_prealloc_bytes)
+            .ok_or_else(|| {
+                Error::BadSuperblock(format!("inode {ino}: preallocation exceeds its copy"))
+            })?;
         if filled > 0 || end > inode.size {
             use crate::inode::offsets as io;
             let mut raw = self.raw_inode(ino)?;
@@ -509,8 +566,8 @@ impl Filesystem {
             edits,
             default_subvol: None,
             csum_edits: self.csum_edits(&released, &contents, summed)?,
-            releases: Vec::new(),
-            unrefs: Vec::new(),
+            releases: prealloc_releases,
+            unrefs: prealloc_unrefs,
             ..Default::default()
         };
 
@@ -525,6 +582,10 @@ impl Filesystem {
             let keys = std::iter::once((INODE_ITEM_KEY, 0))
                 .chain(targets.iter().map(|t| (EXTENT_DATA_KEY, t.start)))
                 .chain(write.adds.iter().map(|a| (EXTENT_DATA_KEY, a.file_offset)))
+                .chain(write.edits.iter().map(|edit| {
+                    let key = edit.key();
+                    (key.key_type, key.offset)
+                }))
                 .chain(gaps.iter().map(|&(from, _)| (EXTENT_DATA_KEY, from)));
             for (key_type, key_offset) in keys {
                 let key = DiskKey {
@@ -744,6 +805,48 @@ impl Filesystem {
         Ok(Some(data.len()))
     }
 
+    fn prealloc_after_unrecorded_hole(
+        &self,
+        ino: u64,
+        offset: u64,
+        end: u64,
+    ) -> Result<Option<(DiskKey, Vec<u8>)>> {
+        use crate::fs::file_extent as fe;
+        use crate::superblock::le64;
+        for (key, item) in self.items_of(ino)? {
+            if key.key_type != EXTENT_DATA_KEY {
+                continue;
+            }
+            if key.offset <= offset {
+                if item.len() < fe::REGULAR_SIZE
+                    || offset < key.offset.saturating_add(le64(&item, fe::NUM_BYTES))
+                {
+                    return Ok(None);
+                }
+                continue;
+            }
+            if key.offset >= end
+                || item.len() < fe::REGULAR_SIZE
+                || item[fe::TYPE] != EXTENT_PREALLOC
+            {
+                return Ok(None);
+            }
+            let bytenr = le64(&item, fe::DISK_BYTENR);
+            let at = bytenr.checked_add(le64(&item, fe::OFFSET)).ok_or_else(|| {
+                Error::BadSuperblock(format!("inode {ino}: preallocated address overflows"))
+            })?;
+            let (_, len, _) = self.extent_item(bytenr)?;
+            if !window_inside_extent(at, le64(&item, fe::NUM_BYTES), bytenr, len) {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino}: preallocated item at {} lies outside its extent at {bytenr}",
+                    key.offset
+                )));
+            }
+            return Ok(Some((key, item)));
+        }
+        Ok(None)
+    }
+
     /// Write `data` at `offset` into the preallocated extent item holding
     /// all of it, when that item is the extent's only reference. A write
     /// covering the whole item (#535) goes where the extent lies — they were never readable, and nothing reads them
@@ -770,7 +873,13 @@ impl Filesystem {
     /// strictly inside `[offset, end)`: where a write over that range
     /// leaves one item for another (#638). `None` when every preallocated
     /// item the range touches holds the whole of it, or none does.
-    fn prealloc_edge_within(&self, ino: u64, offset: u64, end: u64) -> Result<Option<u64>> {
+    fn prealloc_edge_within(
+        &self,
+        ino: u64,
+        offset: u64,
+        end: u64,
+        copied_start: Option<u64>,
+    ) -> Result<Option<u64>> {
         use crate::fs::file_extent as fe;
         use crate::superblock::le64;
         Ok(self
@@ -783,6 +892,7 @@ impl Filesystem {
             })
             .flat_map(|(k, d)| [k.offset, k.offset.saturating_add(le64(&d, fe::NUM_BYTES))])
             .filter(|&at| offset < at && at < end)
+            .filter(|&at| Some(at) != copied_start)
             .min())
     }
 
@@ -1067,6 +1177,7 @@ impl Filesystem {
         offset: u64,
         end: u64,
         move_inline: bool,
+        copied_prealloc: Option<u64>,
     ) -> Result<Vec<Target>> {
         let pieces = self.file_extents(ino)?;
         let mut out = Vec::new();
@@ -1149,6 +1260,7 @@ impl Filesystem {
                         .iter()
                         .map(|p| p.start)
                         .filter(|&s| s > pos)
+                        .filter(|&start| Some(start) != copied_prealloc)
                         .min()
                         .unwrap_or(u64::MAX);
                     let stop = end.div_ceil(sector).saturating_mul(sector).min(next);
@@ -1691,7 +1803,7 @@ mod tests {
             });
             assert_eq!(eof_in_hole, name != "backed", "{name}: fixture shape");
             let targets = fs
-                .plan_cow_targets(ino, Some(OLD_SIZE), offset, offset + len, false)
+                .plan_cow_targets(ino, Some(OLD_SIZE), offset, offset + len, false, None)
                 .unwrap();
             let start = offset / 4096 * 4096;
             let stop = (offset + len).next_multiple_of(4096);
