@@ -138,10 +138,13 @@ compression_oracle        3
 # harness guest on 2026-10-26 (tmp/logs/vm.log, 156.17 seconds).
 # A write spanning a kept preallocated item's end and the file's end adds
 # one (#639). One write growing the checksum root two levels adds one (#650).
+# All 38 passed in the Linux 6.1.0-42 harness guest on 2026-11-04,
+# including eleven crossing-write shapes on both volume kinds (#772, #773).
+# The ten-target guest proof executed 57 cases (126 lines, 7622 bytes).
 # A write past a kept preallocated item and the refusals that stay add two
 # (#526). The kernel's layouts for growing writes off a sector or from before
 # the item add one (#767).
-cow_write_oracle          36
+cow_write_oracle          38
 crash_consistency         3
 csum_oracle               6
 csum_width_populated      1
@@ -210,7 +213,10 @@ leaf_split_oracle         1
 # local unit tier executed 370 library cases at 727eb39 on 2026-10-19.
 # Two seed-header regression cases were added; the unit subset executed
 # 372 cases on 2026-10-26, with ten host cases left to the full suite.
-lib                       373
+# The host unit tier executed 404 library cases on 2026-11-04 after the
+# two preallocation crossing regressions, with ten host cases left to the
+# full suite (#772, #773).
+lib                       404
 link_extref_kernel        1
 log_tree_kernel           31
 lookup_by_name_key        1
