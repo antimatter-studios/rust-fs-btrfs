@@ -137,7 +137,10 @@ compression_oracle        3
 # one (#639). One write growing the checksum root two levels adds one (#650).
 # A write past a kept preallocated item and the refusals that stay add two
 # (#526).
-cow_write_oracle          35
+# Both hole representations of a within-size write into preallocation add
+# two (#774). All 37 passed on macOS with the Debian 12 harness kernel on
+# 2026-11-04 (tmp/logs/final-cow.log).
+cow_write_oracle          37
 crash_consistency         3
 csum_oracle               6
 csum_width_populated      1

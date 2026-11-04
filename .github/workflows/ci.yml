@@ -212,6 +212,54 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  hole-prealloc:
+    name: hole into preallocation (Linux kernel oracle)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-hole-prealloc-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - name: Both hole representations match the kernel
+        run: |
+          ../rust-fs-core/scripts/tier.sh hole-prealloc hole-prealloc 400 30000 -- \
+            scripts/test.sh --locked --release --test cow_write_oracle \
+            a_write_within_size_from_a_hole_into_preallocation -- --show-output
+          bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored hole-prealloc 2
+      - name: Keep the tier logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-${{ github.job }}
+          path: tmp/logs/
+          if-no-files-found: error
+          retention-days: 7
+
   fixtures:
     name: fixtures (harness VM, x86_64 KVM)
     needs: changes
@@ -608,7 +656,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, unit, fixtures, test, test-arm64, suite-in-vm, cli, semver]
+    needs: [changes, unit, hole-prealloc, fixtures, test, test-arm64, suite-in-vm, cli, semver]
     runs-on: ubuntu-latest
     steps:
       - name: Every job ran and succeeded

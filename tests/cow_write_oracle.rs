@@ -4359,6 +4359,114 @@ fn a_write_spanning_a_regular_extent_and_a_preallocated_item_is_written() {
     );
 }
 
+#[test]
+fn a_write_within_size_from_a_hole_into_preallocation_matches_the_no_holes_kernel() {
+    write_within_size_from_a_hole_into_preallocation("no-holes");
+}
+
+#[test]
+fn a_write_within_size_from_a_hole_into_preallocation_matches_the_explicit_holes_kernel() {
+    write_within_size_from_a_hole_into_preallocation("^no-holes");
+}
+
+fn write_within_size_from_a_hole_into_preallocation(features: &str) {
+    const OURS: &str = "hole-prealloc.bin";
+    const CONTROL: &str = "hole-prealloc-control.bin";
+    const SIZE: usize = 200000;
+    const AT: usize = 40960;
+    const LEN: usize = 40960;
+    let script = format!(
+        "for name in {OURS} {CONTROL}; do\n\
+         truncate -s {SIZE} \"$MNT/$name\"\n\
+         fallocate -n -o 65536 -l 65536 \"$MNT/$name\"\n\
+         done\n\
+         sync\n\
+         head -c {LEN} /dev/zero | tr '\\000' W | \
+         dd of=\"$MNT/{CONTROL}\" bs=4096 seek=10 conv=notrunc status=none\n\
+         sync"
+    );
+    let scratch = Scratch::made(
+        &format!("cow-write-hole-into-prealloc-{features}"),
+        "crc32c",
+        features,
+        &script,
+    );
+    let image = scratch.image();
+    let mut fs = mount_rw(&image);
+    let ours = ino_of(&fs, OURS);
+    let control = ino_of(&fs, CONTROL);
+    assert_eq!(
+        fs.write(ours, AT as u64, &[b'W'; LEN])
+            .unwrap_or_else(|error| panic!(
+                "{features}: write from a hole into preallocation: {error}"
+            )),
+        LEN
+    );
+    let mut expected = vec![0; SIZE];
+    expected[AT..AT + LEN].fill(b'W');
+    assert_eq!(
+        fs.read_file(ours).unwrap(),
+        expected,
+        "{features}: driver bytes"
+    );
+    let written = fs.read_inode(ours).unwrap();
+    let kernel = fs.read_inode(control).unwrap();
+    assert_eq!(
+        (written.size, written.nbytes),
+        (kernel.size, kernel.nbytes),
+        "{features}: size and nbytes differ from the kernel's"
+    );
+    drop(fs);
+
+    let ours_items = extent_items(&image, ours);
+    let control_items = extent_items(&image, control);
+    assert_eq!(
+        ours_items, control_items,
+        "{features}: extent items differ from the kernel's after a write from a hole into preallocation"
+    );
+    for &(offset, _, hole) in &ours_items {
+        if !hole {
+            let (kind, _, refs) = extent_kind_and_refs(&image, ours, offset);
+            let (kernel_kind, _, kernel_refs) = extent_kind_and_refs(&image, control, offset);
+            assert_eq!(
+                (kind, refs),
+                (kernel_kind, kernel_refs),
+                "{features}: kind and reference count at {offset} differ from the kernel's"
+            );
+        }
+    }
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert!(
+        checked.status.success(),
+        "{features}: btrfs check --readonly --check-data-csum:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after a write within size from a hole into preallocation",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+    let seen = kernel_view(
+        &image,
+        "read after a write within size from a hole into preallocation",
+        &[OURS, CONTROL],
+    );
+    assert_eq!(
+        seen[OURS].0,
+        sha256_hex(&expected),
+        "{features}: kernel bytes"
+    );
+    assert_eq!(
+        seen[CONTROL].0,
+        sha256_hex(&expected),
+        "{features}: control bytes"
+    );
+}
+
 /// Every `EXTENT_DATA` item of inode `ino`: its offset, its `num_bytes`, and
 /// whether it is a hole item, as `btrfs inspect-internal dump-tree` prints
 /// them. Unlike [`extent_layout_to`] it allows gaps, which a NO_HOLES
