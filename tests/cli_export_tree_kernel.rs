@@ -26,8 +26,11 @@ const DEPTH: usize = 33;
 /// Fill the volume, then print every path below `tree` as the kernel sees
 /// it: `M<TAB>path<TAB>type<TAB>dev<TAB>ino<TAB>nlink<TAB>atime_ns<TAB>
 /// mtime_ns<TAB>extra`, extra a file's SHA-256 or a symlink's target in
-/// hex. Every file is read before any path is stat'ed, so the access
-/// times printed are the ones reading left on disk.
+/// hex. After hashing, give each inode a distinct access time in 2100,
+/// retaining its modification time. These access times exceed both mtime
+/// and ctime and are not a day old, so relatime reads cannot change them.
+/// The manifest holds export to exact nanosecond preservation, not to
+/// how long a read takes or whether another reader runs before stat.
 const SCRIPT: &str = r#"cd "$MNT"
 mkdir tree
 cd tree
@@ -66,8 +69,18 @@ sums = {}
 for p in paths:
     if stat.S_ISREG(os.lstat(p).st_mode):
         sums[p] = hashlib.sha256(open(p, 'rb').read()).hexdigest()
+access_times = {}
+for path in paths:
+    metadata = os.lstat(path)
+    identity = (metadata.st_dev, metadata.st_ino)
+    if identity not in access_times:
+        access_time = 4102444800123456789 + len(access_times)
+        os.utime(path, ns=(access_time, metadata.st_mtime_ns), follow_symlinks=False)
+        access_times[identity] = access_time
 for p in paths:
     s = os.lstat(p)
+    assert s.st_atime_ns == access_times[(s.st_dev, s.st_ino)], p
+    assert s.st_atime_ns > max(s.st_mtime_ns, s.st_ctime_ns), p
     if stat.S_ISLNK(s.st_mode):
         kind, extra = 'symlink', os.readlink(p).encode().hex()
     elif stat.S_ISDIR(s.st_mode):
@@ -235,7 +248,8 @@ fn a_kernel_tree_is_exported_with_its_links_identities_and_times() {
     assert_eq!(json_field(&report, "skipped"), "1", "{report}");
     assert_eq!(json_field(&report, "refused"), "0", "{report}");
     assert_eq!(json_field(&report, "failed"), "0", "{report}");
-    // Every stat before any read, so reading cannot move an access time.
+    assert_files(&dest, &seen, &[]);
+    // Preserve exact source times even when content is read before stat.
     let local: BTreeMap<&String, std::fs::Metadata> = seen
         .iter()
         .filter(|(_, s)| s.kind != "other")
@@ -280,7 +294,6 @@ fn a_kernel_tree_is_exported_with_its_links_identities_and_times() {
     );
     assert_eq!(seen["sub/file"].identity.1, seen["snap/file"].identity.1);
     assert_ne!(seen["sub/file"].identity.0, seen["snap/file"].identity.0);
-    assert_files(&dest, &seen, &[]);
     assert_eq!(std::fs::read(dest.join("sub/file")).unwrap(), b"live");
     assert_eq!(std::fs::read(dest.join("snap/file")).unwrap(), b"snapshot");
 
