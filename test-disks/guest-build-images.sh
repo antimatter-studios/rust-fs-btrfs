@@ -59,7 +59,7 @@ done
 
 [ "$(id -u)" -eq 0 ] || { echo "guest-build-images.sh runs as root in the guest." >&2; exit 1; }
 
-for tool in mkfs.btrfs btrfs setfattr getfattr setfacl getfacl chattr lsattr python3 sha256sum losetup udevadm; do
+for tool in mkfs.btrfs btrfs setfattr getfattr setfacl getfacl chattr lsattr python3 sha256sum losetup udevadm flock; do
     command -v "$tool" >/dev/null || {
         echo "guest-build-images.sh: $tool is not in the guest." >&2
         echo "  It is installed by scripts/vm-setup.sh; 'chore vm:provision' applies it again." >&2
@@ -186,8 +186,64 @@ mount() {
 # old image again. tests/scripts/fixture-copy-mount.sh holds this.
 mount_copy() {
     udevadm settle
-    btrfs device scan --forget >/dev/null
+    forget_detached
     mount "$@"
+}
+
+# THE KERNEL'S DEVICE REGISTRY IS ONE FOR THE WHOLE GUEST (fs-linux-test-harness#157).
+# A pool of several devices mounts only when the kernel knows every member, and
+# formatting it or `btrfs device scan` is what tells it. A forget with no device
+# drops every member of every pool not mounted, whoever registered it, so on a
+# guest that other suites share, one build's forget between another's format
+# and mount fails that mount. Two copies of one pool also share a filesystem
+# identifier, which the registry holds once.
+#
+# So a pool's whole life in the registry, from its format or scan through its
+# mount to its unmount and the forget of its members, holds one lock for the
+# guest, and the rest of a build runs beside other builds as before. Every
+# forget names its devices, and takes the same lock. A build that has to wait
+# says whose pool it waits for.
+REGISTRY_DIR="${BTRFS_REGISTRY_DIR:-/run/rust-fs-btrfs-registry}"
+LOOP_DEV_DIR="${BTRFS_LOOP_DEV_DIR:-/dev}"
+REGISTRY_HELD=""
+
+registry_take() { # WHAT
+    mkdir -p "$REGISTRY_DIR"
+    exec 8>>"$REGISTRY_DIR/lock"
+    if ! flock -n 8; then
+        echo "[guest] $1: waiting for the kernel's device registry, held by $(cat "$REGISTRY_DIR/holder" 2>/dev/null || echo 'nobody it named')" >&2
+        flock 8
+    fi
+    printf 'pid %s, %s%s\n' "$$" "$1" "${FLTH_RUN_ROOT:+, run ${FLTH_RUN_ROOT##*/}}" > "$REGISTRY_DIR/holder"
+    REGISTRY_HELD="$1"
+}
+
+# registry_give <device>... — forget these, one by one, and let the next one in.
+registry_give() {
+    [ -n "$REGISTRY_HELD" ] || return 0
+    udevadm settle
+    local dev
+    for dev in "$@"; do
+        btrfs device scan --forget "$dev" >/dev/null 2>&1 || true
+    done
+    : > "$REGISTRY_DIR/holder"
+    flock -u 8
+    exec 8>&-
+    REGISTRY_HELD=""
+}
+
+# What a copy's earlier mounts left in the registry: every loop device no longer
+# attached, one by one, so nothing another build has attached is touched.
+forget_detached() {
+    local attached dev
+    registry_take "a copy's mount"
+    attached="$(losetup -a | cut -d: -f1)"
+    for dev in "$LOOP_DEV_DIR"/loop[0-9]*; do
+        [ -e "$dev" ] || continue
+        printf '%s\n' "$attached" | grep -qx "/dev/${dev##*/}" && continue
+        btrfs device scan --forget "$dev" >/dev/null 2>&1 || true
+    done
+    registry_give
 }
 
 # The features Debian's btrfs-progs cannot format (#270) are formatted by
@@ -1129,11 +1185,13 @@ build_pool() {
     lb=$(losetup --find --show "$b")
     pool_cleanup() {
         mountpoint -q "$MNT" && umount "$MNT" || true
+        registry_give "$la" "$lb"
         losetup -d "$la" 2>/dev/null || true
         losetup -d "$lb" 2>/dev/null || true
     }
     trap 'pool_cleanup; cleanup' EXIT
 
+    registry_take btrfs-pool
     mkfs.btrfs -f -d raid1 -m raid1 "$la" "$lb" >/dev/null
 
     # Content, so a reader has something to be right or wrong about. An
@@ -1167,6 +1225,7 @@ build_pool() {
       done ) > "$manifest"
 
     umount "$MNT"
+    registry_give "$la" "$lb"
     losetup -d "$la"
     losetup -d "$lb"
     trap cleanup EXIT
@@ -1218,10 +1277,12 @@ build_parity_pool() {
     done
     parity_cleanup() {
         mountpoint -q "$MNT" && umount "$MNT" || true
+        registry_give "${loops[@]}"
         for f in "${loops[@]}"; do losetup -d "$f" 2>/dev/null || true; done
     }
     trap 'parity_cleanup; cleanup' EXIT
 
+    registry_take "$name"
     mkfs.btrfs -f -d "$profile" -m "$profile" "${loops[@]}" >/dev/null 2>&1
 
     mount "${loops[0]}" "$MNT"
@@ -1262,6 +1323,7 @@ build_parity_pool() {
         echo "guest-build-images: btrfs check does not find the $profile pool clean" >&2
         exit 1
     }
+    registry_give "${loops[@]}"
     for f in "${loops[@]}"; do losetup -d "$f"; done
     trap cleanup EXIT
 
@@ -2618,7 +2680,8 @@ build_feature_verity() {
     dd if="$MNT/nodatasum/tamper.bin" of=/dev/null bs=4K count=1 status=none 2>/dev/null && first=read
     cat "$MNT/nodatasum/tamper.bin" > /dev/null 2>&1 || whole=refused
     umount "$MNT"
-    btrfs device scan --forget >/dev/null 2>&1 || true
+    udevadm settle
+    forget_detached
     [ "$first" = read ] && [ "$whole" = refused ] || {
         echo "guest-build-images: btrfs-verity-tampered: the kernel's first block $first, whole file $whole" >&2
         exit 1
@@ -2766,11 +2829,12 @@ build_scrub_parity() {
     done
     scrub_parity_cleanup() {
         mountpoint -q "$MNT" && umount "$MNT" || true
+        registry_give "${loops[@]}"
         for f in "${loops[@]}"; do losetup -d "$f" 2>/dev/null || true; done
-        btrfs device scan --forget >/dev/null 2>&1 || true
     }
     trap 'scrub_parity_cleanup; cleanup' EXIT
 
+    registry_take "btrfs-scrub-$profile"
     mkfs.btrfs -f -d "$profile" -m "$profile" "${loops[@]}" >/dev/null 2>&1
     mount "${loops[0]}" "$MNT"
     dd if=/dev/urandom of="$MNT/big.bin" bs=1M count=8 status=none
@@ -2836,9 +2900,9 @@ build_scrub_parity() {
         echo "$line" >> "$manifest"
     done
 
+    registry_give "${loops[@]}"
     for f in "${loops[@]}"; do losetup -d "$f"; done
     loops=()
-    btrfs device scan --forget >/dev/null 2>&1 || true
 
     # 64 bytes inside the element's first sector.
     local devid physical
@@ -2853,6 +2917,7 @@ build_scrub_parity() {
         copies+=("$f.kernel")
         loops+=("$(losetup --find --show "$f.kernel")")
     done
+    registry_take "btrfs-scrub-$profile, the kernel's scrub"
     btrfs device scan "${loops[@]}" >/dev/null
     mount "${loops[0]}" "$MNT"
     {
@@ -2860,9 +2925,9 @@ build_scrub_parity() {
         btrfs scrub start -B -R "$MNT" 2>&1 | sed 's/^/# /' || true
     } >> "$manifest"
     umount "$MNT"
+    registry_give "${loops[@]}"
     for f in "${loops[@]}"; do losetup -d "$f"; done
     loops=()
-    btrfs device scan --forget >/dev/null 2>&1 || true
     trap cleanup EXIT
 
     local before after
@@ -2938,11 +3003,12 @@ build_seed() {
     lp=$(losetup --find --show "$sprout")
     seed_cleanup() {
         mountpoint -q "$MNT" && umount "$MNT" || true
+        registry_give "$ls" "$lp"
         losetup -d "$ls" 2>/dev/null || true
         losetup -d "$lp" 2>/dev/null || true
-        btrfs device scan --forget >/dev/null 2>&1 || true
     }
     trap 'seed_cleanup; cleanup' EXIT
+    registry_take btrfs-seed
     # A seed mounts read-only; adding a device to it sprouts the new
     # filesystem, and the remount makes that one writable.
     mount "$ls" "$MNT"
@@ -2959,9 +3025,9 @@ build_seed() {
     sync
     manifest_of "$MNT" > "$pm"
     umount "$MNT"
+    registry_give "$ls" "$lp"
     losetup -d "$ls"
     losetup -d "$lp"
-    btrfs device scan --forget >/dev/null 2>&1 || true
     trap cleanup EXIT
 
     btrfs inspect-internal dump-super "$seed" | grep -q 'SEEDING' || {

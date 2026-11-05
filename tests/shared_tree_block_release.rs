@@ -48,11 +48,18 @@ fn shared_tree_block(image: &Path) -> u64 {
     panic!("the fixture holds no tree block with more than one reference, so it no longer holds the case");
 }
 
+/// Whether `line` is a leaf's item with this key, and not a node's pointer to
+/// the leaf that starts with it: a node prints `key (...) block N gen G` for
+/// each child, so a key that begins a leaf appears twice, and the pointer first.
+fn item_line(line: &str, key: &str) -> bool {
+    line.contains(key) && line.contains(" itemoff ")
+}
+
 fn extent_record(dump: &str, bytenr: u64) -> String {
     let lines: Vec<_> = dump.lines().collect();
     let at = lines
         .iter()
-        .position(|line| line.contains(&format!("key ({bytenr} EXTENT_ITEM ")))
+        .position(|line| item_line(line, &format!("key ({bytenr} EXTENT_ITEM ")))
         .expect("the data extent's record");
     lines[at + 1..]
         .iter()
@@ -96,12 +103,13 @@ fn snapshot_data_survives_truncate_unlink_and_replacing_rename() {
             original = fs.read_file(ino).unwrap();
             assert!(!original.is_empty(), "fixture must hold external data");
             let tree = dump_tree(&image, "5");
-            let file = tree
-                .split(&format!("key ({ino} EXTENT_DATA 0)"))
-                .nth(1)
+            let lines: Vec<&str> = tree.lines().collect();
+            let at = lines
+                .iter()
+                .position(|line| item_line(line, &format!("key ({ino} EXTENT_DATA 0)")))
                 .expect("the file's first extent");
-            bytenr = file
-                .lines()
+            bytenr = lines[at + 1..]
+                .iter()
                 .find(|line| line.contains("disk byte"))
                 .unwrap()
                 .split("disk byte ")

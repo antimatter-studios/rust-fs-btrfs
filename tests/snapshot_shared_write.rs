@@ -61,11 +61,12 @@ fn a_write_under_a_snapshot_is_refused_though_the_extent_counts_one_reference() 
     // THE CASE IS REAL: the file's extent reads one reference, as the
     // extent tree the kernel wrote records it, although the snapshot
     // reads it too.
+    // The item, not a node's pointer to the leaf it begins: both name its key.
     let fs_tree = dump_tree(&image, "5");
     let lines: Vec<&str> = fs_tree.lines().collect();
     let at = lines
         .iter()
-        .position(|l| l.contains(&format!("key ({ino} EXTENT_DATA 0)")))
+        .position(|l| l.contains(&format!("key ({ino} EXTENT_DATA 0)")) && l.contains(" itemoff "))
         .expect("the file's first extent");
     let bytenr = after(
         lines[at + 2..]
@@ -78,7 +79,7 @@ fn a_write_under_a_snapshot_is_refused_though_the_extent_counts_one_reference() 
     let lines: Vec<&str> = extents.lines().collect();
     let at = lines
         .iter()
-        .position(|l| l.contains(&format!("key ({bytenr} EXTENT_ITEM ")))
+        .position(|l| l.contains(&format!("key ({bytenr} EXTENT_ITEM ")) && l.contains(" itemoff "))
         .expect("the extent's item");
     assert_eq!(
         after(lines[at + 1], "refs"),
