@@ -49,7 +49,10 @@ sandbox="$(mktemp -d "$REPO/tmp/fixture-copy-mount.XXXXXX")"
 trap 'rm -rf "$sandbox"' EXIT
 mkdir -p "$sandbox/bin"
 
-export FCM_REAL_CP FCM_REAL_MKTEMP KERNEL="$sandbox/kernel"
+export FCM_REAL_CP FCM_REAL_MKTEMP KERNEL="$sandbox/kernel" BTRFS_REGISTRY_DIR="$sandbox/registry" BTRFS_LOOP_DEV_DIR="$sandbox/dev"
+# One loop device node, detached, which is where a copy's earlier mount left its record.
+mkdir -p "$sandbox/dev"
+: > "$sandbox/dev/loop1"
 FCM_REAL_CP="$(command -v cp)"
 FCM_REAL_MKTEMP="$(command -v mktemp)"
 
@@ -126,8 +129,9 @@ cat > "$sandbox/bin/btrfs" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in
     --version) echo "btrfs-progs v0 (stub)" ;;
-    "device scan --forget")
-        # A forget ahead of the worker is undone by the worker's scan.
+    "device scan --forget"*)
+        # A forget ahead of the worker is undone by the worker's scan. The model
+        # has one device, so forgetting it forgets every record.
         [ -f "$KERNEL/worker-running" ] || find "$KERNEL" -name 'fs[0-9]*' -type f -delete
         ;;
 esac
@@ -140,6 +144,12 @@ STUB
 cat > "$sandbox/bin/losetup" <<'STUB'
 #!/usr/bin/env bash
 echo "/dev/loop0: 0 0 (the stub loop device listing)"
+STUB
+cat > "$sandbox/bin/flock" <<'STUB'
+#!/usr/bin/env bash
+mode=LOCK_EX
+case "$1" in -n) mode="LOCK_EX|LOCK_NB"; shift ;; -u) mode=LOCK_UN; shift ;; esac
+exec perl -e 'use Fcntl ":flock"; open(my $f, ">&=", $ARGV[0]) or exit 2; flock($f, '"$mode"') or exit 1' "$1"
 STUB
 chmod +x "$sandbox"/bin/*
 
@@ -194,7 +204,7 @@ case "$rc:$out" in
     32:*"File exists"*) ok "a forget ahead of the udev worker does not hold" ;;
     *) fail "a forget ahead of the udev worker does not hold (status $rc)" ;;
 esac
-without '    btrfs device scan --forget >/dev/null'
+without '    forget_detached'
 run "$mutant" cow
 case "$rc:$out" in
     32:*"File exists"*) ok "a copy mounted with no forget is refused" ;;
