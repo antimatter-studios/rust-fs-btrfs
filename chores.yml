@@ -263,7 +263,17 @@ vars:
   # prints its console (v0.4.1).
   # v0.5.5 lets a host admit more than one VM (FLTH_SLOT_COUNT). v0.5.6 gives
   # back what a guest deletes and says what stopped a lost guest.
-  LINUX_HARNESS_REF: v0.5.6
+  # v0.5.8: a signal to a session stops everything its command started, and
+  # leaves the shares of a VM that stays up (harness #117, #130). v0.5.9 runs a
+  # `vm.sh run` or `vm.sh exec` command through `bash -c`, with no stdin.
+  # v0.6.1: the VM-free suite runs no real `sync` on the host (harness #191), so
+  # this repository's script guards over the stub engine stop flushing the
+  # machine's disks, and suites can share one guest through FLTH_SHARED_ROOT
+  # (harness #153). A macOS host now needs vagrant-notify-forwarder-christhomas
+  # 0.7.7 or newer, which `chore vm:host:check` says (harness #164).
+  # v0.6.2: the stub engine runs no real `sync` whatever PATH a guard sets
+  # (harness #202), and CI setup moves off a stalled Ubuntu mirror (harness #200).
+  LINUX_HARNESS_REF: v0.6.2
 
 # The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
 # harness is a sibling that `chore siblings` itself checks out: without
