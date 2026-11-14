@@ -157,22 +157,24 @@ jobs:
           SENDER: ${{ github.event.sender.login }}
           GH_ACTOR: ${{ github.actor }}
           CODE: ${{ steps.c.outputs.code }}
-          JOBS: unit semver
+          # unit: its vm-slot test reads the host's free memory (harness v0.6.2 vm-slot.sh), and our
+          # runners' nodes never have the 6 GiB it wants; cli needs `fixtures`, so a pick made here
+          # would expire. Both stay on GitHub-hosted runners.
+          JOBS: semver
         run: |
           set -euo pipefail
-          [ "$CODE" != true ] || JOBS="$JOBS cli"
           ours=true
           for who in "$ACTOR" "$GH_ACTOR" "$SENDER" "$AUTHOR"; do
             [ -z "$who" ] || [ "$who" = christhomas ] || ours=false
           done
           pick() {
-            $ours || { echo ubuntu-latest; return; }
+            $ours || { echo ubuntu-24.04; return; }
             r=$(curl -fsS --max-time 10 --get https://runner-gate.antimatter-studios.com/pick \
                   --data-urlencode "org=$ORG" --data-urlencode prefer=antimatter-vps-linux-x64 \
-                  --data-urlencode fallback=ubuntu-latest --data-urlencode "actor=$ACTOR" --data-urlencode "author=$AUTHOR" \
+                  --data-urlencode fallback=ubuntu-24.04 --data-urlencode "actor=$ACTOR" --data-urlencode "author=$AUTHOR" \
                   --data-urlencode "run=${{ github.run_id }}" --data-urlencode "attempt=${{ github.run_attempt }}" \
-                  --data-urlencode "job=$1") || r=ubuntu-latest
-            case "$r" in antimatter-vps-linux-x64|ubuntu-latest) echo "$r" ;; *) echo ubuntu-latest ;; esac
+                  --data-urlencode "job=$1") || r=ubuntu-24.04
+            case "$r" in antimatter-vps-linux-x64|ubuntu-24.04) echo "$r" ;; *) echo ubuntu-24.04 ;; esac
           }
           runners='{}'
           for job in $JOBS; do runners=$(jq -c --arg j "$job" --arg r "$(pick "$job")" '. + {($j): $r}' <<<"$runners"); done
@@ -182,7 +184,7 @@ jobs:
   unit:
     name: unit (no tools, no fixtures)
     needs: changes
-    runs-on: ${{ fromJSON(needs.changes.outputs.runners)['unit'] || 'ubuntu-24.04' }}
+    runs-on: ubuntu-24.04
     defaults:
       run:
         shell: bash
@@ -535,7 +537,7 @@ jobs:
   cli:
     name: cli (the installed tools, on PATH)
     needs: [fixtures, changes]
-    runs-on: ${{ fromJSON(needs.changes.outputs.runners)['cli'] || 'ubuntu-24.04' }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
       run:
@@ -619,7 +621,7 @@ jobs:
     # ../rust-fs-core/scripts/semver-check.sh.
     name: semver (public API against crates.io)
     needs: changes
-    runs-on: ${{ fromJSON(needs.changes.outputs.runners)['semver'] || 'ubuntu-latest' }}
+    runs-on: ${{ fromJSON(needs.changes.outputs.runners)['semver'] || 'ubuntu-24.04' }}
     timeout-minutes: 30
     env:
       # The version ../rust-fs-core/scripts/semver-check.sh expects. A prebuilt binary,
