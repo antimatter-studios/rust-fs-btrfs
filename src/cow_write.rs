@@ -72,19 +72,14 @@
 //!
 //! - an emptied tree block a snapshot shares; empty unshared leaves and
 //!   nodes leave their tree, and an empty root becomes a leaf (#546–#548);
-//! - a growing write that crosses a hole into a preallocated item kept past
-//!   the end from a regular sector it dirties, its own or the file's old
-//!   last one: the kernel joins the old last sector to the hole's sectors in
-//!   one extent, and cuts a regular item around a write starting inside it,
-//!   where the copy here is of the whole item. One that does not is written
-//!   as the kernel writes it (#603, #767): a write inside the item goes where its extent lies,
-//!   in whole sectors reading as zeros around it, after the old last sector
-//!   is copied; a write from a hole no item records copies everything to
-//!   its last sector into one new extent, and the item starts again after
-//!   it or goes; a write from a hole item ending at the item, or a regular
-//!   item ending there, is written in two at that edge;
-//! - an old end partway through a sector of a preallocated item, which a
-//!   shrinking truncate leaves, when the write starts past that sector;
+//! - a growing write that crosses a hole into kept preallocation from a
+//!   compressed or encoded regular extent. For an unencoded extent the dirty
+//!   sectors are copied and its untouched prefix is retained (#772). With an
+//!   old end partway through a sector, the dirty regular window joins the
+//!   adjacent hole's copy; with an aligned old end it stays separate. A
+//!   preallocated old last sector left by shrinking truncate is zeroed in
+//!   place in the write's transaction
+//!   (#773), without exposing its new reference to a second write;
 //! - a **preallocated** extent the write cuts off a sector boundary, or one
 //!   another reference shares, or an **inline** one the write does not
 //!   lie within, or one that is encrypted or encoded: each changes the
@@ -177,6 +172,7 @@ struct Copying {
     /// The start of the preallocated item the write reaches from a hole, which
     /// the copy runs on over, to the write's last sector (#767).
     through: Option<u64>,
+    sectors: bool,
 }
 
 /// What a copy does to the preallocated items it runs over (#767).
@@ -188,6 +184,8 @@ struct PreallocCuts {
     releases: Vec<DataRelease>,
     /// How many bytes of `nbytes` those items no longer cover.
     bytes: u64,
+    shares: Vec<DataShare>,
+    unrefs: Vec<DataRelease>,
 }
 
 /// What an extent item holds, as far as a growing write's path depends on it.
@@ -425,30 +423,20 @@ impl Filesystem {
         let Some(reach) = reach_of_prealloc(&spans, from, stop) else {
             return Ok(None);
         };
-        // A dirty regular sector before a hole: the kernel's writeback joins
-        // the old last sector to the hole's sectors in one extent, and cuts a
-        // regular item around a write starting inside it. A copy here is of
-        // the whole item, to an extent of its own, so the items would differ.
         let tail_abuts = odd_size && offset > inode.size && next_after_size == from;
         let first = if tail_abuts {
             next_after_size - sector
         } else {
             from
         };
-        if reach.over_hole
+        let sectors = reach.over_hole
             && spans
                 .iter()
-                .any(|s| s.kind == SpanKind::Data && s.holds(first))
-        {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino}: offset {} is inline or preallocated, and reaching it across a \
-                 hole from a regular sector the write dirties is not implemented",
-                reach.at
-            )));
-        }
+                .any(|s| s.kind == SpanKind::Data && s.holds(first));
         if reach.through {
             let through = Copying {
                 through: Some(reach.at),
+                sectors,
                 ..Copying::default()
             };
             return self
@@ -456,6 +444,23 @@ impl Filesystem {
                 .map(Some);
         }
         self.prealloc_write_refusal(ino, reach.at, stop)?;
+        if sectors {
+            let before = (reach.at - offset) as usize;
+            let written = self.write_cow_copying(
+                inode,
+                offset,
+                &data[..before],
+                false,
+                Copying {
+                    sectors: true,
+                    ..Copying::default()
+                },
+            )?;
+            let inode = self.read_inode(ino)?;
+            return self
+                .write_cow(&inode, reach.at, &data[before..], false)
+                .map(|after| Some(written + after));
+        }
         self.write_cow_in_two(inode, offset, data, reach.at)
             .map(Some)
     }
@@ -520,30 +525,54 @@ impl Filesystem {
             }
         }
 
+        let preallocated_tail = match tail {
+            Some(size) => self.prealloc_item_holding(
+                ino,
+                size - size % sector,
+                size.next_multiple_of(sector),
+            )?,
+            None => None,
+        };
+        if preallocated_tail.is_some() {
+            tail = None;
+        }
+
         // Every refusal before anything is allocated.
         let mut targets = match copying.through {
             Some(at) => self.plan_cow_targets(ino, tail, offset, at, move_inline)?,
             None => self.plan_cow_targets(ino, tail, offset, end, move_inline)?,
         };
+        let mut cuts = if copying.sectors {
+            let from = tail.unwrap_or(offset) / sector * sector;
+            self.dirty_regular_cuts(
+                ino,
+                &mut targets,
+                from,
+                end.next_multiple_of(sector),
+                !inode.size.is_multiple_of(sector),
+            )?
+        } else {
+            PreallocCuts::default()
+        };
         // A write from a hole through a preallocated item: the hole's copy
         // runs on to the write's last sector, over what it cuts (#767).
-        let cuts = match copying.through {
-            Some(at) => {
-                let stop = end.div_ceil(sector).saturating_mul(sector);
-                let last = targets
-                    .last_mut()
-                    .filter(|t| t.hole && t.start + t.len == at)
-                    .ok_or_else(|| {
-                        Error::UnsupportedFeature(format!(
-                            "inode {ino}: offset {at} is inline or preallocated, and the write \
+        if let Some(at) = copying.through {
+            let stop = end.div_ceil(sector).saturating_mul(sector);
+            let last = targets
+                .last_mut()
+                .filter(|t| t.hole && t.start + t.len == at)
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(format!(
+                        "inode {ino}: offset {at} is inline or preallocated, and the write \
                              reaches it from something other than a hole"
-                        ))
-                    })?;
-                last.len = stop - last.start;
-                self.prealloc_cuts(ino, at, stop)?
-            }
-            None => PreallocCuts::default(),
-        };
+                    ))
+                })?;
+            last.len = stop - last.start;
+            let prealloc = self.prealloc_cuts(ino, at, stop)?;
+            cuts.edits.extend(prealloc.edits);
+            cuts.releases.extend(prealloc.releases);
+            cuts.bytes += prealloc.bytes;
+        }
 
         // Each copy: the item's bytes as they read now, with the write
         // laid over them. Past the end of the file the last sector reads
@@ -602,6 +631,53 @@ impl Filesystem {
             Error::UnsupportedFeature("the generation counter is exhausted".into())
         })?;
 
+        let tail_contents = if let Some((key, item)) = preallocated_tail {
+            use crate::{fs::file_extent as fe, superblock::le64};
+            let from = inode.size / sector * sector;
+            let stop = from + sector;
+            let (extent_start, at, extent_len) =
+                self.prealloc_window(ino, &key, &item, from, sector)?;
+            let item_end = key.offset + le64(&item, fe::NUM_BYTES);
+            let parts: Vec<_> = [
+                (key.offset, from, false),
+                (from, stop, true),
+                (stop, item_end, false),
+            ]
+            .into_iter()
+            .filter(|(start, end, _)| start < end)
+            .collect();
+            for &(start, end, written) in &parts {
+                let mut part = item.clone();
+                if written {
+                    part[fe::TYPE] = EXTENT_REGULAR;
+                    part[fe::GENERATION..fe::GENERATION + 8]
+                        .copy_from_slice(&generation.to_le_bytes());
+                }
+                part[fe::OFFSET..fe::OFFSET + 8]
+                    .copy_from_slice(&(le64(&item, fe::OFFSET) + start - key.offset).to_le_bytes());
+                part[fe::NUM_BYTES..fe::NUM_BYTES + 8]
+                    .copy_from_slice(&(end - start).to_le_bytes());
+                cuts.edits.push(ItemEdit::Put(OwnedItem {
+                    key: DiskKey {
+                        offset: start,
+                        ..key
+                    },
+                    data: part,
+                }));
+            }
+            cuts.shares.extend(vec![
+                DataShare {
+                    bytenr: extent_start,
+                    len: extent_len,
+                    ref_offset: key.offset.wrapping_sub(le64(&item, fe::OFFSET)),
+                };
+                parts.len() - 1
+            ]);
+            Some((at, vec![0; sector as usize]))
+        } else {
+            None
+        };
+
         // The first piece of each item's copy takes the item's place; each
         // piece after it is a new extent with an item of its own (#357).
         let mut moves: Vec<DataMove> = Vec::with_capacity(targets.len());
@@ -653,11 +729,12 @@ impl Filesystem {
                 }));
             }
         }
-        let contents: Vec<(u64, Vec<u8>)> = news
+        let mut contents: Vec<(u64, Vec<u8>)> = news
             .iter()
             .copied()
             .zip(pieces.into_iter().map(|p| p.bytes))
             .collect();
+        contents.extend(tail_contents);
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -671,7 +748,12 @@ impl Filesystem {
                 released.push(span);
             }
         }
-        released.extend(cuts.releases.iter().map(|r| (r.old, r.old + r.old_len)));
+        for release in &cuts.releases {
+            let span = (release.old, release.old + release.old_len);
+            if !released.contains(&span) {
+                released.push(span);
+            }
+        }
         // A hole filled adds what it now covers to the inode's `nbytes`,
         // a write past the end moves its `size` there (#432), and the
         // inode item says so; the times move as for any write. A write
@@ -723,7 +805,8 @@ impl Filesystem {
             default_subvol: None,
             csum_edits: self.csum_edits(&released, &contents, summed)?,
             releases: cuts.releases,
-            unrefs: Vec::new(),
+            unrefs: cuts.unrefs,
+            shares: cuts.shares,
             ..Default::default()
         };
 
@@ -1227,6 +1310,93 @@ impl Filesystem {
             self.prealloc_window(ino, &key, &item, from, stop - from)?;
         }
         Ok(())
+    }
+
+    fn dirty_regular_cuts(
+        &self,
+        ino: u64,
+        targets: &mut Vec<Target>,
+        from: u64,
+        stop: u64,
+        join_tail: bool,
+    ) -> Result<PreallocCuts> {
+        use crate::{fs::file_extent as fe, superblock::le64};
+        let items = self.items_of(ino)?;
+        let mut cuts = PreallocCuts::default();
+        for target in targets.iter_mut().filter(|target| !target.hole) {
+            let (key, item) = items
+                .iter()
+                .find(|(key, _)| key.key_type == EXTENT_DATA_KEY && key.offset == target.start)
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(format!("inode {ino}: missing extent item"))
+                })?;
+            if item.len() < fe::REGULAR_SIZE
+                || item[fe::TYPE] != EXTENT_REGULAR
+                || item[fe::COMPRESSION] != 0
+                || item[fe::ENCRYPTION] != 0
+                || item[fe::OTHER_ENCODING..fe::OTHER_ENCODING + 2] != [0, 0]
+            {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino}: offset {} is not an unencoded regular extent",
+                    key.offset
+                )));
+            }
+            let start = target.start.max(from);
+            let end = (target.start + target.len).min(stop);
+            let mut kept = 0;
+            cuts.edits.push(ItemEdit::Delete(*key));
+            for (first, last) in [(target.start, start), (end, target.start + target.len)] {
+                if first < last {
+                    kept += 1;
+                    let mut part = item.clone();
+                    part[fe::OFFSET..fe::OFFSET + 8].copy_from_slice(
+                        &(le64(item, fe::OFFSET) + first - key.offset).to_le_bytes(),
+                    );
+                    part[fe::NUM_BYTES..fe::NUM_BYTES + 8]
+                        .copy_from_slice(&(last - first).to_le_bytes());
+                    cuts.edits.push(ItemEdit::Put(OwnedItem {
+                        key: DiskKey {
+                            offset: first,
+                            ..*key
+                        },
+                        data: part,
+                    }));
+                }
+            }
+            if kept == 0 {
+                let release = DataRelease {
+                    old: target.extent_start,
+                    old_len: target.extent_len,
+                    old_ref_offset: target.start.wrapping_sub(target.extent_offset),
+                };
+                if target.shared {
+                    cuts.unrefs.push(release);
+                } else {
+                    cuts.releases.push(release);
+                }
+            } else if kept == 2 {
+                cuts.shares.push(DataShare {
+                    bytenr: target.extent_start,
+                    len: target.extent_len,
+                    ref_offset: target.start.wrapping_sub(target.extent_offset),
+                });
+            }
+            cuts.bytes += end - start;
+            target.start = start;
+            target.len = end - start;
+            target.hole = true;
+        }
+        if join_tail {
+            if let Some(first) = targets.iter().position(|target| target.start == from) {
+                while first + 1 < targets.len()
+                    && targets[first].start + targets[first].len == targets[first + 1].start
+                    && targets[first + 1].hole
+                {
+                    targets[first].len += targets.remove(first + 1).len;
+                }
+            }
+        }
+        Ok(cuts)
     }
 
     /// What a copy over `[at, stop)` does to the preallocated items there
@@ -2158,6 +2328,117 @@ mod tests {
                 "{name}: the old EOF sector and the payload's are the ones copied"
             );
         }
+    }
+
+    #[test]
+    fn a_growing_write_across_a_hole_from_a_dirty_regular_sector_is_written() {
+        for (name, old, at, len, wanted) in [
+            (
+                "old-sector-over-hole",
+                40_000,
+                40_960,
+                30_000,
+                vec![
+                    (0, false, 40_960, 0, 36_864),
+                    (36_864, false, 36_864, 0, 36_864),
+                    (73_728, true, 65_536, 8192, 57_344),
+                ],
+            ),
+            (
+                "own-sector-over-hole",
+                16_384,
+                12_288,
+                60_000,
+                vec![
+                    (0, false, 16_384, 0, 12_288),
+                    (12_288, false, 4096, 0, 4096),
+                    (16_384, false, 57_344, 0, 57_344),
+                    (73_728, true, 65_536, 8192, 57_344),
+                ],
+            ),
+        ] {
+            growing_prealloc_write_matches_items(name, old, at, len, false, wanted);
+        }
+    }
+
+    #[test]
+    fn a_growing_write_past_an_old_end_inside_a_preallocated_sector_is_written() {
+        growing_prealloc_write_matches_items(
+            "old-end-in-item",
+            40_000,
+            50_000,
+            5000,
+            true,
+            vec![
+                (0, true, 65_536, 0, 36_864),
+                (36_864, false, 65_536, 36_864, 4096),
+                (49_152, false, 8192, 0, 8192),
+            ],
+        );
+    }
+
+    fn growing_prealloc_write_matches_items(
+        name: &str,
+        old: usize,
+        at: u64,
+        len: usize,
+        truncated: bool,
+        wanted: Vec<(u64, bool, u64, u64, u64)>,
+    ) {
+        use crate::{fs::file_extent as fe, mkfs, superblock::le64, Filesystem};
+        use fs_core::FileDevice;
+        use std::{path::PathBuf, sync::Arc};
+
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let image = Scratch(PathBuf::from(fs_btrfs_test_support::temp_path!(
+            "cow-crossing-{name}.img"
+        )));
+        std::fs::create_dir_all(image.0.parent().unwrap()).unwrap();
+        std::fs::File::create(&image.0)
+            .and_then(|file| file.set_len(128 << 20))
+            .unwrap();
+        let dev = Arc::new(FileDevice::open_rw(&image.0).unwrap());
+        mkfs::format(dev.as_ref(), &mkfs::Options::default()).unwrap();
+        let mut fs = Filesystem::mount_rw(dev).unwrap();
+        let root = fs.lookup_path("/").unwrap().ino;
+        let ino = fs.create(root, name.as_bytes(), 0o644, 0, 0).unwrap();
+        if truncated {
+            fs.fallocate(ino, 0, 65_536, false).unwrap();
+            fs.truncate(ino, old as u64).unwrap();
+        } else {
+            fs.write(ino, 0, &vec![0x41; old]).unwrap();
+            fs.fallocate(ino, 65_536, 65_536, true).unwrap();
+        }
+        let mut bytes = fs.read_file(ino).unwrap();
+        bytes.resize(at as usize + len, 0);
+        bytes[at as usize..].fill(0x5a);
+        assert_eq!(
+            fs.write(ino, at, &vec![0x5a; len])
+                .unwrap_or_else(|error| panic!("{name}: {error}")),
+            len
+        );
+        assert_eq!(fs.read_file(ino).unwrap(), bytes, "{name}");
+        let found: Vec<_> = fs
+            .items_of(ino)
+            .unwrap()
+            .into_iter()
+            .filter(|(key, _)| key.key_type == super::EXTENT_DATA_KEY)
+            .map(|(key, data)| {
+                (
+                    key.offset,
+                    data[fe::TYPE] == super::EXTENT_PREALLOC,
+                    le64(&data, fe::DISK_NUM_BYTES),
+                    le64(&data, fe::OFFSET),
+                    le64(&data, fe::NUM_BYTES),
+                )
+            })
+            .collect();
+        assert_eq!(found, wanted, "{name}: the items the kernel leaves");
     }
 
     /// A growing write into space preallocated past the end is written when

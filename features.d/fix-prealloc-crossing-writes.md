@@ -1,0 +1,4 @@
+## Writing
+
+| A growing copy-on-write write crossing a hole into kept preallocation from a dirty unencoded regular sector, preserving the kernel's extent windows on volumes with or without no-holes | Supported | Unreleased (#775) | #772 | `cow_write_oracle.rs::growing_writes_across_holes_and_past_preallocated_old_sectors_match_the_kernel`, `cow_write_oracle.rs::neighbouring_growing_crossing_writes_match_the_kernel` |
+| A growing copy-on-write write past an old end partway through a preallocated sector left by shrinking truncate, zeroing that sector in place in the same transaction as the write | Supported | Unreleased (#775) | #773 | `cow_write_oracle.rs::growing_writes_across_holes_and_past_preallocated_old_sectors_match_the_kernel`, `cow_write_oracle.rs::a_growing_write_into_kept_preallocation_refuses_what_it_cannot_write` |
