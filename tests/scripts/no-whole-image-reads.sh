@@ -34,7 +34,6 @@ while IFS=: read -r source count; do
         tests/send_stream_kernel.rs) expected=3 ;;     # size-capped kernel send streams
         tests/super_write_oracle.rs) expected=1 ;;     # captured 4 KiB superblock
         tests/support/src/lib.rs) expected=2 ;;       # helper and cap regression test
-        tests/support/src/oracle.rs) expected=1 ;;    # size-capped guest output
         *) expected=0 ;;
     esac
     if [ "$count" -eq "$expected" ]; then
@@ -43,4 +42,9 @@ while IFS=: read -r source count; do
         fail "$source has $count small read(s); allow-list expects $expected"
     fi
 done < <(rg -c 'read_small_file\(' "$REPO/tests" --glob '*.rs' || true)
+if [ "$(rg -c 'read_bounded_file\(' "$REPO/tests/support/src/oracle.rs" || true)" = 1 ]; then
+    ok 'oracle output has one reviewed 16 MiB bounded read'
+else
+    fail 'oracle output bounded-read allow-list changed'
+fi
 [ "$fails" -eq 0 ] || exit 1

@@ -458,7 +458,8 @@ impl Run {
     /// nothing (#762).
     pub fn streams(&self, tool: &str) -> (Vec<u8>, Vec<u8>) {
         let read = |path: &PathBuf| {
-            let bytes = crate::read_small_file(path).unwrap_or_else(|error| {
+            // Dump-tree output can exceed 1 MiB; it is command output, never an image.
+            let bytes = crate::read_bounded_file(path, 16 << 20).unwrap_or_else(|error| {
                 panic!(
                     "`{tool}` finished in the fs-linux-test-harness VM, but its captured \
                      output {} could not be read: {error}. `chore vm:status` shows the VM.",

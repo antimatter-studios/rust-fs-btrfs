@@ -372,20 +372,25 @@ pub fn sha256_file(path: impl AsRef<Path>) -> io::Result<String> {
 /// Read a genuinely small file in full. The limit also catches a test that
 /// accidentally passes a disk image through a small-output assertion.
 pub fn read_small_file(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
-    const MAX: u64 = 1 << 20;
+    read_bounded_file(path, 1 << 20)
+}
+
+/// Read non-image command output with an explicit upper bound.
+pub fn read_bounded_file(path: impl AsRef<Path>, max: u64) -> io::Result<Vec<u8>> {
+    let max = max.min(16 << 20);
     let file = fs::File::open(path)?;
-    if file.metadata()?.len() > MAX {
+    if file.metadata()?.len() > max {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "file exceeds the 1 MiB whole-read limit",
+            format!("file exceeds the {max} byte whole-read limit"),
         ));
     }
     let mut bytes = Vec::new();
-    file.take(MAX + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX {
+    file.take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "file grew beyond the 1 MiB whole-read limit",
+            format!("file grew beyond the {max} byte whole-read limit"),
         ));
     }
     Ok(bytes)
