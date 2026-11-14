@@ -217,8 +217,8 @@ jobs:
             exit 1
           fi
       - name: Shell guard prerequisites
-        # python3-yaml: the gate scripts import yaml; the self-hosted image lacks it.
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ripgrep python3-yaml
+        # python3-yaml (gate scripts import yaml) and procps (the harness slot scripts call ps): absent on the self-hosted image.
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ripgrep python3-yaml procps
       - name: chore lint
         run: chore lint
       - name: chore test:scripts
