@@ -120,6 +120,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       code: ${{ steps.c.outputs.code }}
+      runners: ${{ steps.runners.outputs.runners || '{}' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -142,9 +143,47 @@ jobs:
           esac
           echo "full pipeline: $code ($EVENT $REF)"
           echo "code=$code" >> "$GITHUB_OUTPUT"
+      # THE RUNNER GATE (autobalancer). One pick per gated job, made here so
+      # no job is added; ci-ok needs every gated job already. Gated: unit,
+      # semver and cli. Hosted: the VM jobs (fixtures, test, suite-in-vm need
+      # /dev/kvm), test-arm64, and ci-ok. A pick for a job that will not run
+      # holds a slot for 2 minutes, so cli is picked only on the full pipeline.
+      - name: Pick runners
+        id: runners
+        env:
+          ORG: ${{ github.repository_owner }}
+          ACTOR: ${{ github.triggering_actor }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          SENDER: ${{ github.event.sender.login }}
+          GH_ACTOR: ${{ github.actor }}
+          CODE: ${{ steps.c.outputs.code }}
+          # unit: its vm-slot test reads the host's free memory (harness v0.6.2 vm-slot.sh), and our
+          # runners' nodes never have the 6 GiB it wants; cli needs `fixtures`, so a pick made here
+          # would expire. Both stay on GitHub-hosted runners.
+          JOBS: semver
+        run: |
+          set -euo pipefail
+          ours=true
+          for who in "$ACTOR" "$GH_ACTOR" "$SENDER" "$AUTHOR"; do
+            [ -z "$who" ] || [ "$who" = christhomas ] || ours=false
+          done
+          pick() {
+            $ours || { echo ubuntu-24.04; return; }
+            r=$(curl -fsS --max-time 10 --get https://runner-gate.antimatter-studios.com/pick \
+                  --data-urlencode "org=$ORG" --data-urlencode prefer=antimatter-vps-linux-x64 \
+                  --data-urlencode fallback=ubuntu-24.04 --data-urlencode "actor=$ACTOR" --data-urlencode "author=$AUTHOR" \
+                  --data-urlencode "run=${{ github.run_id }}" --data-urlencode "attempt=${{ github.run_attempt }}" \
+                  --data-urlencode "job=$1") || r=ubuntu-24.04
+            case "$r" in antimatter-vps-linux-x64|ubuntu-24.04) echo "$r" ;; *) echo ubuntu-24.04 ;; esac
+          }
+          runners='{}'
+          for job in $JOBS; do runners=$(jq -c --arg j "$job" --arg r "$(pick "$job")" '. + {($j): $r}' <<<"$runners"); done
+          echo "$runners" | jq . | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "runners=$runners" >> "$GITHUB_OUTPUT"
 
   unit:
     name: unit (no tools, no fixtures)
+    needs: changes
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -180,7 +219,8 @@ jobs:
             exit 1
           fi
       - name: Shell guard prerequisites
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ripgrep
+        # python3-yaml (gate scripts import yaml) and procps (the harness slot scripts call ps): absent on the self-hosted image.
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ripgrep python3-yaml procps
       - name: chore lint
         run: chore lint
       - name: chore test:scripts
@@ -496,7 +536,7 @@ jobs:
 
   cli:
     name: cli (the installed tools, on PATH)
-    needs: fixtures
+    needs: [fixtures, changes]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
@@ -580,7 +620,8 @@ jobs:
     # not declare. Why, and what it cannot see, is at the top of
     # ../rust-fs-core/scripts/semver-check.sh.
     name: semver (public API against crates.io)
-    runs-on: ubuntu-latest
+    needs: changes
+    runs-on: ${{ fromJSON(needs.changes.outputs.runners)['semver'] || 'ubuntu-24.04' }}
     timeout-minutes: 30
     env:
       # The version ../rust-fs-core/scripts/semver-check.sh expects. A prebuilt binary,
