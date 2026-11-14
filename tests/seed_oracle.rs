@@ -131,7 +131,7 @@ fn a_device_that_is_not_the_sprouts_seed_is_refused() {
 /// unwritten.
 #[test]
 fn the_sprouted_filesystem_given_for_writing_is_refused_naming_the_seed() {
-    let fixture_seed = sha256_hex(&std::fs::read(fixture("seed/btrfs-seed.img")).expect("seed"));
+    let fixture_seed = fs_btrfs_test_support::sha256_file(fixture("seed/btrfs-seed.img")).unwrap();
     for (tag, seed_first) in [("seed-first", true), ("sprout-first", false)] {
         let seed_path = std::path::PathBuf::from(temp_path!("seed-rw-{tag}-btrfs-seed.img"));
         copy_sparse(fixture("seed/btrfs-seed.img"), &seed_path).expect("copying the seed");
@@ -147,7 +147,7 @@ fn the_sprouted_filesystem_given_for_writing_is_refused_naming_the_seed() {
             .unwrap_or_else(|e| panic!("{tag}: the sprouted filesystem was refused: {e}"));
         reads_every_file(&fs, "btrfs-sprout.manifest", tag);
         drop(fs);
-        let after = sha256_hex(&std::fs::read(&seed_path).expect("reading the seed copy"));
+        let after = fs_btrfs_test_support::sha256_file(&seed_path).unwrap();
         assert_eq!(after, fixture_seed, "{tag}: the seed device was written");
     }
 }
@@ -177,7 +177,7 @@ fn new_data_and_tree_blocks_land_only_on_the_sprout() {
     ] {
         copy_sparse(fixture(&format!("seed/{name}")), copy).expect("copy the member");
     }
-    let before = sha256_hex(&std::fs::read(&seed_path).expect("read the seed"));
+    let before = fs_btrfs_test_support::sha256_file(&seed_path).unwrap();
     let seed = Arc::new(FileDevice::open_rw(&seed_path).unwrap()) as Arc<dyn BlockDevice>;
     let sprout = Arc::new(FileDevice::open_rw(&sprout_path).unwrap()) as Arc<dyn BlockDevice>;
     let mut fs = Filesystem::mount_pool_rw(vec![seed, sprout]).expect("mount the pair");
@@ -259,7 +259,7 @@ fn new_data_and_tree_blocks_land_only_on_the_sprout() {
     );
     drop(fs);
     assert_eq!(
-        sha256_hex(&std::fs::read(&seed_path).unwrap()),
+        fs_btrfs_test_support::sha256_file(&seed_path).unwrap(),
         before,
         "seed changed"
     );
@@ -287,7 +287,7 @@ fn a_subvolume_handle_on_the_sprouted_pool_keeps_writing_with_the_seed() {
     ] {
         copy_sparse(fixture(&format!("seed/{name}")), copy).expect("copy the member");
     }
-    let before = sha256_hex(&std::fs::read(&seed_path).expect("read the seed"));
+    let before = fs_btrfs_test_support::sha256_file(&seed_path).unwrap();
     let seed = Arc::new(FileDevice::open_rw(&seed_path).unwrap()) as Arc<dyn BlockDevice>;
     let sprout = Arc::new(FileDevice::open_rw(&sprout_path).unwrap()) as Arc<dyn BlockDevice>;
     let mut fs = Filesystem::mount_pool_rw(vec![seed, sprout]).expect("mount the pair");
@@ -323,7 +323,7 @@ fn a_subvolume_handle_on_the_sprouted_pool_keeps_writing_with_the_seed() {
     assert_eq!(sub.read_file(ino).unwrap(), payload);
     drop(sub);
     assert_eq!(
-        sha256_hex(&std::fs::read(&seed_path).unwrap()),
+        fs_btrfs_test_support::sha256_file(&seed_path).unwrap(),
         before,
         "seed changed"
     );
@@ -361,7 +361,7 @@ fn a_file_that_lives_on_the_seed_is_overwritten_onto_the_sprout() {
     ] {
         copy_sparse(fixture(&format!("seed/{name}")), copy).expect("copy the member");
     }
-    let before = sha256_hex(&std::fs::read(&seed_path).expect("read the seed"));
+    let before = fs_btrfs_test_support::sha256_file(&seed_path).unwrap();
     let seed = Arc::new(FileDevice::open_rw(&seed_path).unwrap()) as Arc<dyn BlockDevice>;
     let sprout = Arc::new(FileDevice::open_rw(&sprout_path).unwrap()) as Arc<dyn BlockDevice>;
     let mut fs = Filesystem::mount_pool_rw(vec![seed, sprout]).expect("mount the pair");
@@ -396,7 +396,7 @@ fn a_file_that_lives_on_the_seed_is_overwritten_onto_the_sprout() {
     }
     drop(fs);
     assert_eq!(
-        sha256_hex(&std::fs::read(&seed_path).unwrap()),
+        fs_btrfs_test_support::sha256_file(&seed_path).unwrap(),
         before,
         "seed changed"
     );

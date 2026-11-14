@@ -143,7 +143,7 @@ fn a_dup_metadata_group_relocates_in_its_own_profile() {
 #[test]
 fn other_metadata_conversions_and_the_system_group_are_refused_before_writing() {
     let scratch = Scratch::new("refused");
-    let before = std::fs::read(&scratch.0).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&scratch.0).unwrap();
     let mut fs = mount_rw(&scratch.0);
     let metadata = metadata_group(&fs);
     let system = fs
@@ -163,8 +163,9 @@ fn other_metadata_conversions_and_the_system_group_are_refused_before_writing() 
         );
     }
     drop(fs);
-    assert!(
-        std::fs::read(&scratch.0).unwrap() == before,
-        "a refusal wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &scratch.0,
+        &before,
+        "a refusal wrote to the image",
     );
 }

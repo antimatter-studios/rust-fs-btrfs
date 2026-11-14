@@ -1,9 +1,7 @@
 //! Shared export compared with files and digests made by the Linux kernel.
 mod cli_support;
 use cli_support::*;
-use fs_btrfs_test_support::{
-    assert_btrfs_check_clean, dump_tree, guest_kernel_write_ok, oracle, sha256_hex,
-};
+use fs_btrfs_test_support::{assert_btrfs_check_clean, dump_tree, guest_kernel_write_ok, oracle};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
@@ -57,7 +55,7 @@ fn empty_multichunk_and_subvolume_exports_equal_the_kernel_digests() {
             .arg(&image)
             .args(["export", path])
             .arg(&dest));
-        let bytes = std::fs::read(&dest).unwrap_or_else(|error| {
+        let digest_of_file = fs_btrfs_test_support::sha256_file(&dest).unwrap_or_else(|error| {
             panic!(
                 "read {}: {error}; export stdout: {}; directory: {:?}",
                 dest.display(),
@@ -68,11 +66,12 @@ fn empty_multichunk_and_subvolume_exports_equal_the_kernel_digests() {
                     .collect::<Vec<_>>()
             )
         });
-        assert_eq!(&sha256_hex(&bytes), digest, "{path}");
+        let file_len = std::fs::metadata(&dest).unwrap().len();
+        assert_eq!(&digest_of_file, digest, "{path}");
         assert_eq!(json_field(&stdout(&out), "sha256"), *digest);
-        assert_eq!(json_field(&stdout(&out), "bytes"), bytes.len().to_string());
+        assert_eq!(json_field(&stdout(&out), "bytes"), file_len.to_string());
         assert_eq!(
-            bytes.len(),
+            file_len,
             match path.as_str() {
                 "/empty" => 0,
                 "/large" => 3145729,
@@ -83,7 +82,11 @@ fn empty_multichunk_and_subvolume_exports_equal_the_kernel_digests() {
         let raw = ok(tool("fs.btrfs")
             .arg(&image)
             .args(["export", path, "-", "--text"]));
-        assert_eq!(raw.stdout, bytes);
+        fs_btrfs_test_support::assert_file_bytes(
+            &dest,
+            &raw.stdout,
+            "exported bytes versus stdout",
+        );
         assert!(raw.stderr.is_empty());
         refused(
             tool("fs.btrfs")
@@ -92,13 +95,21 @@ fn empty_multichunk_and_subvolume_exports_equal_the_kernel_digests() {
                 .arg(&dest),
             1,
         );
-        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+        fs_btrfs_test_support::assert_file_bytes(
+            &dest,
+            &raw.stdout,
+            "refusal changed the destination",
+        );
         std::fs::write(&dest, b"old destination").unwrap();
         ok(tool("fs.btrfs")
             .arg(&image)
             .args(["export", "--replace", path])
             .arg(&dest));
-        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+        fs_btrfs_test_support::assert_file_bytes(
+            &dest,
+            &raw.stdout,
+            "replacement exported different bytes",
+        );
     }
     for path in ["/dir", "/link", "/fifo", "/missing"] {
         let dest = outdir.join("refused");
@@ -123,7 +134,10 @@ fn empty_multichunk_and_subvolume_exports_equal_the_kernel_digests() {
         .arg(&embedded)
         .args(["--offset", "4096", "export", "/large"])
         .arg(&dest));
-    assert_eq!(sha256_hex(&std::fs::read(dest).unwrap()), manifest[1].1);
+    assert_eq!(
+        fs_btrfs_test_support::sha256_file(dest).unwrap(),
+        manifest[1].1
+    );
 }
 
 #[test]
@@ -196,7 +210,10 @@ fn damaged_source_data_never_publishes_or_replaces_a_destination() {
             .arg(&dest),
         1,
     );
-    assert_eq!(std::fs::read(&dest).unwrap(), b"keep this file");
+    assert_eq!(
+        fs_btrfs_test_support::read_small_file(&dest).unwrap(),
+        b"keep this file"
+    );
     assert_eq!(
         std::fs::read_dir(outdir).unwrap().count(),
         1,

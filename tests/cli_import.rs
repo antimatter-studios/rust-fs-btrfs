@@ -199,12 +199,13 @@ fn an_existing_name_is_refused_unless_replace_is_given() {
     let new_path = source(&dir, "new", &new);
     ok(fs_btrfs(&img).arg("import").arg(&old_path).arg("/f"));
 
-    let before = std::fs::read(&img).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&img).unwrap();
     let why = refused(fs_btrfs(&img).arg("import").arg(&new_path).arg("/f"), 1);
     assert!(why.contains("--replace"), "{why}");
-    assert!(
-        std::fs::read(&img).unwrap() == before,
-        "a refused import changed the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &img,
+        &before,
+        "a refused import changed the image",
     );
 
     let out = ok(fs_btrfs(&img)
@@ -222,11 +223,11 @@ fn a_refused_import_leaves_the_image_byte_identical() {
     let dir = img.parent().unwrap().to_path_buf();
     ok(fs_btrfs(&img).args(["mkdir", "/dir"]));
     let src = source(&dir, "src", b"payload");
-    let before = std::fs::read(&img).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&img).unwrap();
 
     // No such parent; a parent that is a file; a directory to replace.
     ok(fs_btrfs(&img).arg("import").arg(&src).arg("/file"));
-    let with_file = std::fs::read(&img).unwrap();
+    let with_file = fs_btrfs_test_support::snapshot_image(&img).unwrap();
     assert!(refused(fs_btrfs(&img).arg("import").arg(&src).arg("/absent/f"), 4).contains("absent"));
     refused(fs_btrfs(&img).arg("import").arg(&src).arg("/file/f"), 4);
     let why = refused(
@@ -240,13 +241,15 @@ fn a_refused_import_leaves_the_image_byte_identical() {
     // A name Btrfs cannot hold.
     let long = format!("/{}", "n".repeat(256));
     refused(fs_btrfs(&img).arg("import").arg(&src).arg(&long), 3);
-    assert!(
-        std::fs::read(&img).unwrap() == with_file,
-        "a refused import changed the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &img,
+        &with_file,
+        "a refused import changed the image",
     );
-    assert_ne!(
-        with_file, before,
-        "the import before the refusals wrote nothing"
+    fs_btrfs_test_support::assert_images_differ(
+        with_file.path(),
+        before.path(),
+        "the import before the refusals wrote nothing",
     );
     assert!(staged(&img, "/").is_empty(), "{:?}", staged(&img, "/"));
 }

@@ -483,7 +483,7 @@ fn ranges_cloned_through_the_abi_share_their_extents_and_the_kernel_agrees() {
     );
 
     // Each refusal names its errno and writes nothing.
-    let unchanged = std::fs::read(&image).unwrap();
+    let unchanged = fs_btrfs_test_support::snapshot_image(&image).unwrap();
     // Offsets that are not whole sectors.
     refused(fs, "/multi", 100, "/blank", 0, 4096, ENOTSUP);
     refused(fs, "/multi", 0, "/blank", 100, 4096, ENOTSUP);
@@ -502,9 +502,10 @@ fn ranges_cloned_through_the_abi_share_their_extents_and_the_kernel_agrees() {
     refused(fs, "/multi", 0, "/dir", 0, 0, EISDIR);
     refused(fs, "/missing", 0, "/blank", 0, 0, ENOENT);
     refused(fs, "/multi", 0, "/missing", 0, 0, ENOENT);
-    assert!(
-        std::fs::read(&image).unwrap() == unchanged,
-        "a refused clone wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &unchanged,
+        "a refused clone wrote to the image",
     );
     unsafe { fs_btrfs_umount(fs) };
 
@@ -512,9 +513,10 @@ fn ranges_cloned_through_the_abi_share_their_extents_and_the_kernel_agrees() {
     assert!(!ro.is_null(), "mount: {}", last_error());
     refused(ro, "/multi", 0, "/blank", 0, 0, EROFS);
     unsafe { fs_btrfs_umount(ro) };
-    assert!(
-        std::fs::read(&image).unwrap() == unchanged,
-        "a read-only handle wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &unchanged,
+        "a read-only handle wrote to the image",
     );
 
     assert_btrfs_check_clean(

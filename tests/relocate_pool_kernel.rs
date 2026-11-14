@@ -407,15 +407,16 @@ fn a_relocation_off_a_device_that_cannot_be_made_is_refused_and_writes_nothing()
     // One device: there is no pool to move a group within.
     let mut fs = Filesystem::mount_rw(open_rw(&volume)).expect("mounts read-write");
     let group = data(&fs);
-    let before = std::fs::read(&volume).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&volume).unwrap();
     let msg = fs
         .relocate_block_group_off(group.start, 1)
         .expect_err("a group was moved off a volume's only device")
         .to_string();
     assert!(msg.contains("not a member"), "{msg}");
-    assert!(
-        std::fs::read(&volume).unwrap() == before,
-        "a refusal wrote to the volume"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &volume,
+        &before,
+        "a refusal wrote to the volume",
     );
 
     // A second device with no room for the group.
@@ -426,7 +427,10 @@ fn a_relocation_off_a_device_that_cannot_be_made_is_refused_and_writes_nothing()
         2
     );
     let images = [&volume, &small];
-    let before: Vec<Vec<u8>> = images.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    let before: Vec<_> = images
+        .iter()
+        .map(|p| fs_btrfs_test_support::snapshot_image(p).unwrap())
+        .collect();
     let msg = fs
         .relocate_block_group_off(group.start, 1)
         .expect_err("a group was moved onto a device with no room for it")
@@ -439,10 +443,10 @@ fn a_relocation_off_a_device_that_cannot_be_made_is_refused_and_writes_nothing()
     assert!(msg.contains("not a member"), "{msg}");
     drop(fs);
     for (path, bytes) in images.iter().zip(&before) {
-        assert!(
-            std::fs::read(path).unwrap() == *bytes,
-            "a refusal wrote to {}",
-            path.display()
+        fs_btrfs_test_support::assert_image_unchanged(
+            path,
+            bytes,
+            &format!("a refusal wrote to {}", path.display()),
         );
     }
 }

@@ -218,7 +218,7 @@ fn attributes_set_through_the_abi_are_clean_and_the_kernel_reads_them() {
     );
 
     // Each refusal names its errno and writes nothing.
-    let before = std::fs::read(&image).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&image).unwrap();
     refused(
         unsafe { fs_btrfs_removexattr(fs, c("/f").as_ptr(), c("user.absent").as_ptr()) },
         ENOENT,
@@ -244,9 +244,10 @@ fn attributes_set_through_the_abi_are_clean_and_the_kernel_reads_them() {
         EINVAL,
         "utimens with a whole second of nanoseconds",
     );
-    assert!(
-        std::fs::read(&image).unwrap() == before,
-        "a refused change wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &before,
+        "a refused change wrote to the image",
     );
     unsafe { fs_btrfs_umount(fs) };
 
@@ -264,9 +265,10 @@ fn attributes_set_through_the_abi_are_clean_and_the_kernel_reads_them() {
         "chmod read-only",
     );
     unsafe { fs_btrfs_umount(ro) };
-    assert!(
-        std::fs::read(&image).unwrap() == before,
-        "a read-only handle wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &before,
+        "a read-only handle wrote to the image",
     );
 
     assert_btrfs_check_clean(

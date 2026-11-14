@@ -55,13 +55,12 @@ fn image_with_flags(name: &str, bits: u64) -> (Scratch, std::path::PathBuf) {
         "mkfs.btrfs failed: {}",
         String::from_utf8_lossy(&made.stderr)
     );
-    let mut bytes = std::fs::read(&path).unwrap();
-    let sb = &mut bytes[SUPERBLOCK..SUPERBLOCK + 4096];
+    let mut sb = fs_btrfs_test_support::read_image_region(&path, SUPERBLOCK as u64, 4096).unwrap();
     let at = offsets::FLAGS;
     let flags = u64::from_le_bytes(sb[at..at + 8].try_into().unwrap());
     sb[at..at + 8].copy_from_slice(&(flags | bits).to_le_bytes());
-    stamp_checksum(sb, ChecksumType::Crc32c);
-    std::fs::write(&path, &bytes).unwrap();
+    stamp_checksum(&mut sb, ChecksumType::Crc32c);
+    fs_btrfs_test_support::write_image_region(&path, SUPERBLOCK as u64, &sb).unwrap();
     (scratch, path)
 }
 

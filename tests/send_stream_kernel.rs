@@ -590,7 +590,8 @@ fn send_streams_agree_with_btrfs_send_and_btrfs_receive() {
     );
 
     // --- Reading what the kernel wrote ---
-    let kernel_bytes = std::fs::read(out.join("kernel.stream")).expect("the kernel's stream");
+    let kernel_bytes = fs_btrfs_test_support::read_small_file(out.join("kernel.stream"))
+        .expect("the kernel's stream");
     let kernel = parse_send_stream(&kernel_bytes).expect("parse the kernel's stream");
     assert_eq!(kernel.version, 1);
     assert_eq!(kernel.commands.first().map(|c| c.cmd), Some(cmd::SUBVOL));
@@ -682,7 +683,8 @@ fn incremental_streams_agree_with_btrfs_send_and_btrfs_receive() {
     }
 
     // --- Reading what the kernel wrote ---
-    let kernel_bytes = std::fs::read(out.join("kernel.inc.stream")).expect("the kernel's stream");
+    let kernel_bytes = fs_btrfs_test_support::read_small_file(out.join("kernel.inc.stream"))
+        .expect("the kernel's stream");
     let kernel = parse_send_stream(&kernel_bytes).expect("parse the kernel's incremental stream");
     assert_eq!(kernel.commands.first().map(|c| c.cmd), Some(cmd::SNAPSHOT));
     assert_eq!(kernel.commands[0].path().unwrap(), b"snap2");
@@ -852,7 +854,8 @@ fn version_two_streams_pass_compressed_data_through_as_the_kernel_does() {
     );
 
     // --- Reading what the kernel wrote ---
-    let kernel_bytes = std::fs::read(out.join("kernel.stream")).expect("the kernel's stream");
+    let kernel_bytes = fs_btrfs_test_support::read_small_file(out.join("kernel.stream"))
+        .expect("the kernel's stream");
     let kernel = parse_send_stream(&kernel_bytes).expect("parse the kernel's version-2 stream");
     assert_eq!(kernel.version, 2);
     assert_matches_dump(&kernel, &read(&out.join("kernel.dump")), "snap");

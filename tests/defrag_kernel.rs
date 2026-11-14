@@ -175,12 +175,13 @@ fn defragmented_files_are_one_extent_and_the_checker_and_kernel_agree() {
 
     // A file that is one extent already: nothing to do, and nothing
     // committed.
-    let untouched = std::fs::read(&image).unwrap();
+    let untouched = fs_btrfs_test_support::snapshot_image(&image).unwrap();
     let done = fs.defragment(whole).unwrap();
     assert_eq!((done.runs, done.items_before, done.items_after), (0, 1, 1));
-    assert!(
-        std::fs::read(&image).unwrap() == untouched,
-        "defragmenting a file of one extent wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &untouched,
+        "defragmenting a file of one extent wrote to the image",
     );
 
     // The fragmented file: every extent into one.
@@ -276,14 +277,15 @@ fn defragmented_files_are_one_extent_and_the_checker_and_kernel_agree() {
     // and nothing written.
     let mut fs = mount_rw(&image);
     let other = ino_of(&fs, OTHER);
-    let snapshotted = std::fs::read(&image).unwrap();
+    let snapshotted = fs_btrfs_test_support::snapshot_image(&image).unwrap();
     match fs.defragment(other) {
         Err(Error::UnsupportedFeature(why)) => assert!(why.contains("snapshot"), "{why}"),
         other => panic!("defragmenting a snapshotted file was not refused: {other:?}"),
     }
     drop(fs);
-    assert!(
-        std::fs::read(&image).unwrap() == snapshotted,
-        "a refused defragment wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &snapshotted,
+        "a refused defragment wrote to the image",
     );
 }

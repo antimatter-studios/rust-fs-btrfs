@@ -88,7 +88,7 @@ fn a_write_under_a_snapshot_is_refused_though_the_extent_counts_one_reference() 
          reference count, so a refusal here would prove nothing new"
     );
 
-    let before = std::fs::read(&image).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&image).unwrap();
     {
         let dev = Arc::new(FileDevice::open_rw(&image).unwrap());
         let fs = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>).expect("mount rw");
@@ -102,9 +102,10 @@ fn a_write_under_a_snapshot_is_refused_though_the_extent_counts_one_reference() 
             "overwrote an extent the snapshot still reads: {got:?}"
         );
     }
-    assert!(
-        std::fs::read(&image).unwrap() == before,
-        "the refused write changed the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &before,
+        "the refused write changed the image",
     );
     let _ = std::fs::remove_file(&image);
 }

@@ -27,7 +27,9 @@ fn finished_call(stdout: &[u8], stderr: &[u8]) -> Run {
 /// its message must name the tool, the file and the error.
 fn removing_it_fails_the_call(run: &Run, stream: &Path) {
     fs::remove_file(stream).unwrap();
-    let error = fs::read(stream).unwrap_err().to_string();
+    let error = fs_btrfs_test_support::read_small_file(stream)
+        .unwrap_err()
+        .to_string();
 
     let failure = catch_unwind(AssertUnwindSafe(|| run.streams(TOOL)))
         .expect_err("a stream file that cannot be read was reported as empty output");

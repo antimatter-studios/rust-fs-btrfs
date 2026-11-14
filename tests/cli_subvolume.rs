@@ -159,11 +159,12 @@ fn refusals_name_their_reason_and_leave_the_image_as_it_was() {
     let img = volume("subvolume-refusals");
     ok(fs_btrfs(&img).args(["subvolume", "create", "/sv"]));
     ok(fs_btrfs(&img).args(["create", "/file"]));
-    let before = std::fs::read(&img).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&img).unwrap();
     let unchanged = |what: &str| {
-        assert!(
-            std::fs::read(&img).unwrap() == before,
-            "{what} changed the image"
+        fs_btrfs_test_support::assert_image_unchanged(
+            &img,
+            &before,
+            &format!("{what} changed the image"),
         );
     };
 
@@ -202,12 +203,13 @@ fn refusals_name_their_reason_and_leave_the_image_as_it_was() {
 
     // A read-only top-level subvolume: the library refuses, exit 3.
     ok(fs_btrfs(&img).args(["subvolume", "set-read-only", "5", "true"]));
-    let before = std::fs::read(&img).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&img).unwrap();
     let message = refused(fs_btrfs(&img).args(["subvolume", "create", "/new"]), 3);
     assert!(message.contains("/new"), "{message}");
-    assert!(
-        std::fs::read(&img).unwrap() == before,
-        "a read-only top level changed the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &img,
+        &before,
+        "a read-only top level changed the image",
     );
 }
 
@@ -257,11 +259,12 @@ fn delete_refusals_name_their_reason_and_leave_the_image_as_it_was() {
     ok(fs_btrfs(&img).args(["subvolume", "set-default", "257"]));
     ok(fs_btrfs(&img).args(["mkdir", "/plain"]));
     ok(fs_btrfs(&img).args(["create", "/file"]));
-    let before = std::fs::read(&img).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&img).unwrap();
     let unchanged = |what: &str| {
-        assert!(
-            std::fs::read(&img).unwrap() == before,
-            "{what} changed the image"
+        fs_btrfs_test_support::assert_image_unchanged(
+            &img,
+            &before,
+            &format!("{what} changed the image"),
         );
     };
 
@@ -281,12 +284,13 @@ fn delete_refusals_name_their_reason_and_leave_the_image_as_it_was() {
 
     // A read-only top-level subvolume: the library refuses, exit 3.
     ok(fs_btrfs(&img).args(["subvolume", "set-read-only", "5", "true"]));
-    let before = std::fs::read(&img).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&img).unwrap();
     let message = refused(fs_btrfs(&img).args(["subvolume", "delete", "/sv"]), 3);
     assert!(message.contains("/sv"), "{message}");
-    assert!(
-        std::fs::read(&img).unwrap() == before,
-        "a read-only top level changed the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &img,
+        &before,
+        "a read-only top level changed the image",
     );
 }
 
@@ -369,11 +373,12 @@ fn snapshot_refusals_name_their_reason_and_leave_the_image_as_it_was() {
     ok(fs_btrfs(&img).args(["subvolume", "create", "/sv"]));
     ok(fs_btrfs(&img).args(["mkdir", "/plain"]));
     ok(fs_btrfs(&img).args(["create", "/file"]));
-    let before = std::fs::read(&img).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&img).unwrap();
     let unchanged = |what: &str| {
-        assert!(
-            std::fs::read(&img).unwrap() == before,
-            "{what} changed the image"
+        fs_btrfs_test_support::assert_image_unchanged(
+            &img,
+            &before,
+            &format!("{what} changed the image"),
         );
     };
 
@@ -411,15 +416,16 @@ fn snapshot_refusals_name_their_reason_and_leave_the_image_as_it_was() {
 
     // A read-only top-level subvolume: the library refuses, exit 3.
     ok(fs_btrfs(&img).args(["subvolume", "set-read-only", "5", "true"]));
-    let before = std::fs::read(&img).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&img).unwrap();
     let message = refused(
         fs_btrfs(&img).args(["subvolume", "snapshot", "/sv", "/snap"]),
         3,
     );
     assert!(message.contains("/snap"), "{message}");
-    assert!(
-        std::fs::read(&img).unwrap() == before,
-        "a read-only top level changed the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &img,
+        &before,
+        "a read-only top level changed the image",
     );
 }
 

@@ -58,8 +58,8 @@ const GEOMETRIES: [(&str, &str); 2] = [("default geometry", ""), ("sha256+dup", 
 
 /// One captured superblock, whole.
 fn read_super(path: &Path) -> Vec<u8> {
-    let bytes =
-        std::fs::read(path).unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+    let bytes = fs_btrfs_test_support::read_small_file(path)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
     assert!(
         bytes.len() >= SUPERBLOCK_SIZE,
         "{} is {} bytes, which is shorter than a superblock. The capture is a `dd` of \

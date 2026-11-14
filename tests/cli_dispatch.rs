@@ -189,7 +189,10 @@ fn positioned_writes_are_refused_before_opening_the_target() {
         tool("fs.btrfs").args([target_arg, "write", "--at", "0", "/f"]),
         3,
     );
-    assert_eq!(std::fs::read(&target).unwrap(), original);
+    assert_eq!(
+        fs_btrfs_test_support::read_small_file(&target).unwrap(),
+        original
+    );
 
     let out = tool("fs.btrfs")
         .args(["--text", target_arg, "write", "--at", "0", "/f"])
@@ -198,7 +201,10 @@ fn positioned_writes_are_refused_before_opening_the_target() {
     assert_eq!(out.status.code(), Some(3));
     assert!(out.stdout.is_empty());
     assert!(stderr(&out).starts_with("fs.btrfs: not implemented: positioned write"));
-    assert_eq!(std::fs::read(&target).unwrap(), original);
+    assert_eq!(
+        fs_btrfs_test_support::read_small_file(&target).unwrap(),
+        original
+    );
 }
 
 #[test]

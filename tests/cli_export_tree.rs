@@ -98,7 +98,7 @@ fn want((sec, nsec): (i64, u32)) -> i128 {
 #[test]
 fn a_tree_is_exported_with_its_links_and_times() {
     let (dir, img) = volume("export-tree");
-    let before = std::fs::read(&img).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&img).unwrap();
 
     // Without --recursive a directory is refused, as before.
     let plain = dir.join("plain");
@@ -125,9 +125,12 @@ fn a_tree_is_exported_with_its_links_and_times() {
         assert!(entry.contains("--preserve=links"), "{entry}");
     }
     assert!(std::fs::symlink_metadata(refusing.join("link")).is_err());
-    assert_eq!(std::fs::read(refusing.join("top")).unwrap(), b"top\n");
     assert_eq!(
-        std::fs::read(refusing.join("a/b/c/deep")).unwrap(),
+        fs_btrfs_test_support::read_small_file(refusing.join("top")).unwrap(),
+        b"top\n"
+    );
+    assert_eq!(
+        fs_btrfs_test_support::read_small_file(refusing.join("a/b/c/deep")).unwrap(),
         deep_bytes()
     );
     assert_ne!(
@@ -159,7 +162,7 @@ fn a_tree_is_exported_with_its_links_and_times() {
         assert_eq!(std::fs::metadata(dest.join(name)).unwrap().ino(), top.ino());
     }
     assert_eq!(
-        std::fs::read(dest.join("a/b/c/deep")).unwrap(),
+        fs_btrfs_test_support::read_small_file(dest.join("a/b/c/deep")).unwrap(),
         deep_bytes()
     );
     for (local, (atime, mtime)) in [
@@ -188,9 +191,6 @@ fn a_tree_is_exported_with_its_links_and_times() {
     assert!(over.join("a/b/c").is_dir());
     assert!(std::fs::symlink_metadata(over.join("a/b/c/deep")).is_err());
 
-    assert!(
-        std::fs::read(&img).unwrap() == before,
-        "export changed the image"
-    );
+    fs_btrfs_test_support::assert_image_unchanged(&img, &before, "export changed the image");
     let _ = std::fs::remove_dir_all(&dir);
 }

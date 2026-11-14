@@ -458,7 +458,7 @@ impl Run {
     /// nothing (#762).
     pub fn streams(&self, tool: &str) -> (Vec<u8>, Vec<u8>) {
         let read = |path: &PathBuf| {
-            let bytes = std::fs::read(path).unwrap_or_else(|error| {
+            let bytes = crate::read_small_file(path).unwrap_or_else(|error| {
                 panic!(
                     "`{tool}` finished in the fs-linux-test-harness VM, but its captured \
                      output {} could not be read: {error}. `chore vm:status` shows the VM.",

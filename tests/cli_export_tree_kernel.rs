@@ -11,9 +11,7 @@
 mod cli_support;
 
 use cli_support::*;
-use fs_btrfs_test_support::{
-    assert_btrfs_check_clean, dump_tree, guest_kernel_write_ok, oracle, sha256_hex,
-};
+use fs_btrfs_test_support::{assert_btrfs_check_clean, dump_tree, guest_kernel_write_ok, oracle};
 use std::collections::BTreeMap;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt};
@@ -178,19 +176,16 @@ fn assert_files(dest: &Path, seen: &BTreeMap<String, Seen>, skip: &[&str]) {
         if s.kind != "file" || skip.contains(&path.as_str()) {
             continue;
         }
-        let bytes = std::fs::read(dest.join(path)).unwrap_or_else(|e| panic!("{path}: {e}"));
-        assert_eq!(
-            sha256_hex(&bytes),
-            s.extra,
-            "{path}: exported versus kernel"
-        );
+        let digest = fs_btrfs_test_support::sha256_file(dest.join(path))
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert_eq!(digest, s.extra, "{path}: exported versus kernel");
     }
 }
 
 #[test]
 fn a_kernel_tree_is_exported_with_its_links_identities_and_times() {
     let (image, seen) = source("export-tree-kernel");
-    let before = std::fs::read(&image).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&image).unwrap();
     let dir = scratch_dir("export-tree-kernel-dest");
 
     // Without --preserve=links symlinks are refused and the fifo skipped;
@@ -294,8 +289,14 @@ fn a_kernel_tree_is_exported_with_its_links_identities_and_times() {
     );
     assert_eq!(seen["sub/file"].identity.1, seen["snap/file"].identity.1);
     assert_ne!(seen["sub/file"].identity.0, seen["snap/file"].identity.0);
-    assert_eq!(std::fs::read(dest.join("sub/file")).unwrap(), b"live");
-    assert_eq!(std::fs::read(dest.join("snap/file")).unwrap(), b"snapshot");
+    assert_eq!(
+        fs_btrfs_test_support::read_small_file(dest.join("sub/file")).unwrap(),
+        b"live"
+    );
+    assert_eq!(
+        fs_btrfs_test_support::read_small_file(dest.join("snap/file")).unwrap(),
+        b"snapshot"
+    );
 
     // The depth bound: an exact fit at 34 is complete, one less fails the
     // deepest file alone.
@@ -311,11 +312,7 @@ fn a_kernel_tree_is_exported_with_its_links_identities_and_times() {
     assert!(over.join(&deepest).is_dir());
     assert!(!over.join(&deepest).join(format!("f{DEPTH}")).exists());
 
-    assert_eq!(
-        std::fs::read(&image).unwrap(),
-        before,
-        "export changed the image"
-    );
+    fs_btrfs_test_support::assert_image_unchanged(&image, &before, "export changed the image");
 }
 
 #[test]
@@ -389,7 +386,7 @@ fn a_damaged_file_fails_alone_and_is_never_published_or_replaced() {
         assert_files(&dest, &seen, &["big"]);
         if replace {
             assert_eq!(
-                std::fs::read(dest.join("big")).unwrap(),
+                fs_btrfs_test_support::read_small_file(dest.join("big")).unwrap(),
                 b"original destination",
                 "a failed replacement kept the original bytes"
             );

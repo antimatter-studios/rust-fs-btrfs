@@ -35,14 +35,6 @@ fn pattern(seed: u8) -> Vec<u8> {
         .collect()
 }
 
-fn count(haystack: &[u8], needle: &[u8]) -> usize {
-    haystack
-        .windows(needle.len())
-        .step_by(512)
-        .filter(|w| *w == needle)
-        .count()
-}
-
 #[test]
 fn a_nodatacow_write_on_a_dup_filesystem_reaches_both_copies() {
     // Inside the repository, because `mkfs.btrfs` reads the image from the
@@ -76,13 +68,12 @@ fn a_nodatacow_write_on_a_dup_filesystem_reaches_both_copies() {
     };
 
     // Mark the inode nodatacow + nodatasum in every copy of its leaf.
-    let mut bytes = std::fs::read(&img).unwrap();
-    let sb = Superblock::parse(&bytes[SUPERBLOCK..SUPERBLOCK + 4096]).unwrap();
+    let super_bytes =
+        fs_btrfs_test_support::read_image_region(&img, SUPERBLOCK as u64, 4096).unwrap();
+    let sb = Superblock::parse(&super_bytes).unwrap();
     let node = sb.nodesize as usize;
     let mut patched = 0;
-    let mut at = 0;
-    while at + node <= bytes.len() {
-        let block = &mut bytes[at..at + node];
+    fs_btrfs_test_support::edit_image_windows(&img, node, 4096, |_, block| {
         let owner = u64::from_le_bytes(
             block[header_offsets::OWNER..header_offsets::OWNER + 8]
                 .try_into()
@@ -122,17 +113,19 @@ fn a_nodatacow_write_on_a_dup_filesystem_reaches_both_copies() {
             if hit {
                 stamp_checksum(block, &sb);
                 patched += 1;
+                return true;
             }
         }
-        at += 4096;
-    }
+        false
+    })
+    .unwrap();
     assert_eq!(
         patched, 2,
         "fixture: `-m dup` keeps two copies of the fs-tree leaf"
     );
-    std::fs::write(&img, &bytes).unwrap();
+
     assert_eq!(
-        count(&bytes, &old[..512]),
+        fs_btrfs_test_support::count_image_sector_matches(&img, &old[..512]).unwrap(),
         2,
         "fixture: `-d dup` stores the file twice"
     );
@@ -143,9 +136,11 @@ fn a_nodatacow_write_on_a_dup_filesystem_reaches_both_copies() {
         assert_eq!(fs.write_at(ino, 0, &new).unwrap(), LEN);
     }
 
-    let after = std::fs::read(&img).unwrap();
     assert_eq!(
-        (count(&after, &new[..512]), count(&after, &old[..512])),
+        (
+            fs_btrfs_test_support::count_image_sector_matches(&img, &new[..512]).unwrap(),
+            fs_btrfs_test_support::count_image_sector_matches(&img, &old[..512]).unwrap()
+        ),
         (2, 0),
         "(copies of the new data, copies of the old): a dup data write must replace both"
     );

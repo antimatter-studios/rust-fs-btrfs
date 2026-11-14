@@ -171,7 +171,7 @@ fn seeds(corpus: &str) -> Vec<(String, Vec<u8>)> {
         .unwrap_or_else(|e| panic!("reading the corpus directory {}: {e}", dir.display()))
         .map(|entry| {
             let path = entry.expect("corpus directory entry").path();
-            let bytes = std::fs::read(&path)
+            let bytes = fs_btrfs_test_support::read_small_file(&path)
                 .unwrap_or_else(|e| panic!("reading the seed {}: {e}", path.display()));
             let name = path
                 .file_name()

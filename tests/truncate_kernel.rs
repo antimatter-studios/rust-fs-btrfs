@@ -179,12 +179,13 @@ fn files_truncated_through_the_abi_are_clean_and_the_kernel_agrees() {
     assert_eq!(read(fs, "/empty", 2 << 20), vec![0u8; 1 << 20]);
 
     // Each refusal names its errno and writes nothing.
-    let before = std::fs::read(&image).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&image).unwrap();
     refused(fs, "/dir", 0, EISDIR);
     refused(fs, "/missing", 0, ENOENT);
-    assert!(
-        std::fs::read(&image).unwrap() == before,
-        "a refused truncate wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &before,
+        "a refused truncate wrote to the image",
     );
     unsafe { fs_btrfs_umount(fs) };
 
@@ -192,9 +193,10 @@ fn files_truncated_through_the_abi_are_clean_and_the_kernel_agrees() {
     assert!(!ro.is_null(), "mount: {}", last_error());
     refused(ro, "/multi", 0, EROFS);
     unsafe { fs_btrfs_umount(ro) };
-    assert!(
-        std::fs::read(&image).unwrap() == before,
-        "a read-only handle wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &before,
+        "a read-only handle wrote to the image",
     );
 
     assert_btrfs_check_clean(

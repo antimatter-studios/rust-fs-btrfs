@@ -58,7 +58,7 @@ fn a_new_label_is_the_one_the_kernel_and_the_reference_tools_read() {
 fn a_label_too_long_is_refused_and_nothing_changes() {
     let image = scratch_dir("label-long").join("btrfs-default.img");
     copy_sparse(fixture("btrfs-default.img"), &image).expect("copy the fixture");
-    let before = std::fs::read(&image).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&image).unwrap();
     let out = tool("fs.btrfs")
         .arg(&image)
         .args(["set", "label", &"x".repeat(256)])
@@ -70,9 +70,10 @@ fn a_label_too_long_is_refused_and_nothing_changes() {
         "the refusal does not give the limit: {}",
         stderr(&out)
     );
-    assert!(
-        std::fs::read(&image).unwrap() == before,
-        "the refused label changed the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &before,
+        "the refused label changed the image",
     );
 }
 
@@ -96,7 +97,7 @@ fn a_misplaced_primary_is_refused_without_changing_the_image() {
     file.seek(SeekFrom::Start(64 << 10)).unwrap();
     file.write_all(&mirror).unwrap();
     file.sync_all().unwrap();
-    let before = std::fs::read(&image).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&image).unwrap();
     let out = tool("fs.btrfs")
         .arg(&image)
         .args(["set", "label", "MISPLACED"])
@@ -106,10 +107,7 @@ fn a_misplaced_primary_is_refused_without_changing_the_image() {
         !out.status.success(),
         "a misplaced primary was accepted: {out:?}"
     );
-    assert!(
-        std::fs::read(&image).unwrap() == before,
-        "refusal changed the image"
-    );
+    fs_btrfs_test_support::assert_image_unchanged(&image, &before, "refusal changed the image");
     // Restore only the deliberately damaged input; independent readers must
     // still see the original volume and label after the refused operation.
     file.seek(SeekFrom::Start(64 << 10)).unwrap();

@@ -35,6 +35,7 @@ use fs_btrfs::fs::Filesystem;
 use fs_btrfs_test_support::{fixture, le16, le64, temp_path};
 use fs_core::FileDevice;
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -74,13 +75,16 @@ fn recorded_blocks(fs: &Filesystem) -> BTreeSet<u64> {
 /// blocks that a transaction is measured in.
 fn present_blocks(fs: &Filesystem, path: &Path) -> BTreeSet<(u64, u64, u64)> {
     let sb = fs.superblock();
-    let bytes = std::fs::read(path).expect("reading a fixture");
+    let mut file = std::fs::File::open(path).expect("open the fixture");
     let n = sb.nodesize as usize;
+    let size = file.metadata().unwrap().len();
+    let mut bytes = vec![0u8; n];
     let mut out = BTreeSet::new();
-    let mut at = 0usize;
-    while at + n <= bytes.len() {
-        let b = &bytes[at..at + n];
-        at += n;
+    let mut at = 0u64;
+    while at + n as u64 <= size {
+        file.read_exact(&mut bytes).expect("read a fixture block");
+        let b = &bytes[..];
+        at += n as u64;
         if b[o::FSID..o::FSID + 16] != sb.fsid[..] {
             continue;
         }
@@ -145,20 +149,14 @@ fn pairs() -> Vec<(String, PathBuf, PathBuf)> {
 /// So this descends: from the root tree, through every `ROOT_ITEM` it
 /// holds, through every node to every leaf. What that reaches is what
 /// the filesystem is. Anything else on the disk is debris.
-fn reachable(fs: &Filesystem, image: &[u8]) -> BTreeSet<u64> {
+fn reachable(fs: &Filesystem, image: &Path) -> BTreeSet<u64> {
     let sb = fs.superblock();
     let nodesize = sb.nodesize as usize;
 
-    // Read one block by logical address, through the chunk map, from
-    // the image already in memory.
+    // Read one block by logical address, through the chunk map.
     let read = |logical: u64| -> Option<Vec<u8>> {
         let m = fs.chunk_map().map(logical).ok()?;
-        let at = m.physical as usize;
-        let end = at.checked_add(nodesize)?;
-        if end > image.len() {
-            return None;
-        }
-        let b = image[at..end].to_vec();
+        let b = fs_btrfs_test_support::read_image_region(image, m.physical, nodesize).ok()?;
         sb.csum_type.verify(&b[32..], &b[..32]).then_some(b)
     };
 
@@ -216,9 +214,8 @@ fn every_reachable_block_is_recorded_as_allocated() {
     for (what, before, after) in &pairs {
         for (side, path) in [("before", before), ("after", after)] {
             let fs = mount(path);
-            let image = std::fs::read(path).expect("reading a fixture");
             let recorded = recorded_blocks(&fs);
-            let live = reachable(&fs, &image);
+            let live = reachable(&fs, path);
 
             assert!(
                 live.len() > 1,
@@ -379,9 +376,9 @@ fn an_image_whose_accounts_disagree_is_caught() {
 fn accounts_that_disagree_are_caught(label: &str, suffix: &str) {
     let path = fixture(&format!("btrfs-cow-before{suffix}.img"));
 
-    let mut bytes = std::fs::read(&path).expect("reading a fixture");
     let sb_at = fs_btrfs::superblock::SUPER_OFFSETS[0] as usize;
-    let mut raw = bytes[sb_at..sb_at + 4096].to_vec();
+    let mut raw = fs_btrfs_test_support::read_image_region(&path, sb_at as u64, 4096)
+        .expect("read the fixture superblock");
 
     let nodesize = {
         let fs = mount(&path);
@@ -400,13 +397,14 @@ fn accounts_that_disagree_are_caught(label: &str, suffix: &str) {
     ))
     .expect("captured superblock names a supported checksum");
     fs_btrfs::super_write::stamp_checksum(&mut raw, csum_type);
-    bytes[sb_at..sb_at + 4096].copy_from_slice(&raw);
 
     // Inside the repository, like every scratch file this suite writes:
     // the guest that runs the oracle tools sees this tree and nothing
     // else of the host.
     let broken = PathBuf::from(temp_path!("cow-accounts-disagree{suffix}.img"));
-    std::fs::write(&broken, &bytes).expect("writing the broken copy");
+    fs_btrfs_test_support::copy_sparse(&path, &broken).expect("copy the fixture sparsely");
+    fs_btrfs_test_support::write_image_region(&broken, sb_at as u64, &raw)
+        .expect("write the edited superblock");
 
     let fs = mount(&broken);
     assert_eq!(

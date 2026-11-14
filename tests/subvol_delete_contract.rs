@@ -4,7 +4,7 @@
 use fs_btrfs::error::Error;
 use fs_btrfs::subvol::FS_TREE_OBJECTID;
 use fs_btrfs::{mkfs, Filesystem};
-use fs_btrfs_test_support::{sha256_hex, temp_path};
+use fs_btrfs_test_support::temp_path;
 use fs_core::{BlockDevice, FileDevice};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ impl Scratch {
     }
 
     fn digest(&self) -> String {
-        sha256_hex(&std::fs::read(&self.0).unwrap())
+        fs_btrfs_test_support::sha256_file(&self.0).unwrap()
     }
 }
 

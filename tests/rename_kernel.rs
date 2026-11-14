@@ -136,16 +136,17 @@ fn names_moved_through_the_abi_are_clean_and_the_kernel_agrees() {
     ok(fs, "/keep", "/keep");
 
     // Each refusal names its errno and writes nothing.
-    let before = std::fs::read(&image).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&image).unwrap();
     refused(fs, "/d3", "/d3/full/inside", EINVAL);
     refused(fs, "/d3/emptydir", "/d3/full", ENOTEMPTY);
     refused(fs, "/keep", "/d3", EISDIR);
     refused(fs, "/d3/full", "/keep", ENOTDIR);
     refused(fs, "/nope", "/x", ENOENT);
     refused(fs, "/keep", "/d1/missing/x", ENOENT);
-    assert!(
-        std::fs::read(&image).unwrap() == before,
-        "a refused rename wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &before,
+        "a refused rename wrote to the image",
     );
     unsafe { fs_btrfs_umount(fs) };
 
@@ -153,9 +154,10 @@ fn names_moved_through_the_abi_are_clean_and_the_kernel_agrees() {
     assert!(!ro.is_null(), "mount: {}", last_error());
     refused(ro, "/keep", "/kept", EROFS);
     unsafe { fs_btrfs_umount(ro) };
-    assert!(
-        std::fs::read(&image).unwrap() == before,
-        "a read-only handle wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &before,
+        "a read-only handle wrote to the image",
     );
 
     assert_btrfs_check_clean(

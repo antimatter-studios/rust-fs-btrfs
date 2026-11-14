@@ -118,16 +118,17 @@ fn a_filesystem_grown_through_the_abi_is_clean_and_the_kernel_fills_it() {
     let image = scratch.image();
 
     // Past the device: refused, and nothing written.
-    let before = std::fs::read(&image).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&image).unwrap();
     assert_eq!(
         resize(&image, 512 * MIB),
         -1,
         "growing past the device succeeded"
     );
     assert_eq!(fs_btrfs_last_errno(), ENOTSUP, "{}", last_error());
-    assert!(
-        std::fs::read(&image).unwrap() == before,
-        "a refused resize wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &before,
+        "a refused resize wrote to the image",
     );
 
     scratch.set_len(512 * MIB);
@@ -154,16 +155,17 @@ fn a_filesystem_shrunk_through_the_abi_is_clean_and_the_kernel_mounts_it() {
     let image = scratch.image();
 
     // Past the chunks mkfs placed: refused, and nothing written.
-    let before = std::fs::read(&image).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&image).unwrap();
     assert_eq!(
         resize(&image, 32 * MIB),
         -1,
         "shrinking past a chunk succeeded"
     );
     assert_eq!(fs_btrfs_last_errno(), ENOTSUP, "{}", last_error());
-    assert!(
-        std::fs::read(&image).unwrap() == before,
-        "a refused resize wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &before,
+        "a refused resize wrote to the image",
     );
 
     assert_eq!(resize(&image, 448 * MIB), 0, "{}", last_error());

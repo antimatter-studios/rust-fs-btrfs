@@ -122,20 +122,22 @@ fn defragment_reports_what_the_library_did_and_leaves_its_image() {
     let done = lib.defragment(ino).unwrap();
     drop(lib);
     assert_eq!((done.items_before, done.items_after), (APPENDS, 1));
-    assert!(
-        std::fs::read(&img).unwrap() == std::fs::read(&copy).unwrap(),
-        "fs.btrfs defragment and the library's defragment left different images"
+    fs_btrfs_test_support::assert_images_equal(
+        &img,
+        &copy,
+        "fs.btrfs defragment and the library's defragment left different images",
     );
 
     // Nothing left to do: reported, and nothing written.
-    let before = std::fs::read(&img).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&img).unwrap();
     let report = stdout(&ok(fs_btrfs(&img).args(["defragment", "/frag"])));
     assert_eq!(json_field(&report, "runs"), "0", "{report}");
     let text = stdout(&ok(fs_btrfs(&img).args(["--text", "defragment", "/whole"])));
     assert!(text.contains("/whole"), "{text}");
-    assert!(
-        std::fs::read(&img).unwrap() == before,
-        "a defragment with nothing to do wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &img,
+        &before,
+        "a defragment with nothing to do wrote to the image",
     );
 }
 
@@ -159,16 +161,17 @@ fn a_target_bounds_each_run_as_defragment_to_does() {
     let ino = lib.lookup_path("/frag").unwrap().ino;
     lib.defragment_to(ino, 16 << 10).unwrap();
     drop(lib);
-    assert!(
-        std::fs::read(&img).unwrap() == std::fs::read(&copy).unwrap(),
-        "fs.btrfs defragment --target and the library's defragment_to left different images"
+    fs_btrfs_test_support::assert_images_equal(
+        &img,
+        &copy,
+        "fs.btrfs defragment --target and the library's defragment_to left different images",
     );
 }
 
 #[test]
 fn refusals_name_their_reason_and_leave_the_image_as_it_was() {
     let img = volume("defragment-refusals");
-    let before = std::fs::read(&img).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&img).unwrap();
 
     // The volume's state refuses: a path that is not there, or one that is
     // not a regular file.
@@ -195,8 +198,9 @@ fn refusals_name_their_reason_and_leave_the_image_as_it_was() {
     );
     refused(fs_btrfs(&img).args(["defragment"]), 2);
 
-    assert!(
-        std::fs::read(&img).unwrap() == before,
-        "a refused defragment changed the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &img,
+        &before,
+        "a refused defragment changed the image",
     );
 }

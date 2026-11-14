@@ -21,7 +21,7 @@ pub use oracle::{guest_base64, guest_quote, oracle, Oracle, Run};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -210,6 +210,299 @@ pub fn copy_sparse(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<(
             }
         }
         at += read as u64;
+    }
+}
+
+/// A disk-backed, sparse copy of an image at one point in a test. The copy is
+/// removed when the snapshot drops, including when an assertion panics.
+pub struct ImageSnapshot(PathBuf);
+
+impl ImageSnapshot {
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ImageSnapshot {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Preserve an image without keeping its bytes in the test process's RAM.
+pub fn snapshot_image(image: impl AsRef<Path>) -> io::Result<ImageSnapshot> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = format!(
+        "image-snapshot-{}-{}.img",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let path = temp_dir().join(name);
+    copy_sparse(image, &path)?;
+    Ok(ImageSnapshot(path))
+}
+
+/// The first byte where two images differ, or their differing lengths.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ImageDifference {
+    Length { left: u64, right: u64 },
+    Byte { offset: u64, left: u8, right: u8 },
+}
+
+impl fmt::Display for ImageDifference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Length { left, right } => {
+                write!(f, "lengths differ: {left} versus {right} bytes")
+            }
+            Self::Byte {
+                offset,
+                left,
+                right,
+            } => write!(
+                f,
+                "first differing byte at 0x{offset:x}: 0x{left:02x} versus 0x{right:02x}"
+            ),
+        }
+    }
+}
+
+/// Compare two images with two 1 MiB buffers, independent of image size.
+pub fn first_image_difference(
+    left: impl AsRef<Path>,
+    right: impl AsRef<Path>,
+) -> io::Result<Option<ImageDifference>> {
+    let mut left_file = fs::File::open(left)?;
+    let mut right_file = fs::File::open(right)?;
+    let left_len = left_file.metadata()?.len();
+    let right_len = right_file.metadata()?.len();
+    if left_len != right_len {
+        return Ok(Some(ImageDifference::Length {
+            left: left_len,
+            right: right_len,
+        }));
+    }
+    let mut left_bytes = vec![0u8; 1 << 20];
+    let mut right_bytes = vec![0u8; 1 << 20];
+    let mut offset = 0u64;
+    while offset < left_len {
+        let n = (left_len - offset).min(left_bytes.len() as u64) as usize;
+        left_file.read_exact(&mut left_bytes[..n])?;
+        right_file.read_exact(&mut right_bytes[..n])?;
+        if let Some(index) = left_bytes[..n]
+            .iter()
+            .zip(&right_bytes[..n])
+            .position(|(a, b)| a != b)
+        {
+            return Ok(Some(ImageDifference::Byte {
+                offset: offset + index as u64,
+                left: left_bytes[index],
+                right: right_bytes[index],
+            }));
+        }
+        offset += n as u64;
+    }
+    Ok(None)
+}
+
+#[track_caller]
+pub fn assert_images_equal(left: impl AsRef<Path>, right: impl AsRef<Path>, context: &str) {
+    match first_image_difference(left, right).expect("compare the images") {
+        None => {}
+        Some(difference) => panic!("{context}: {difference}"),
+    }
+}
+
+#[track_caller]
+pub fn assert_images_differ(left: impl AsRef<Path>, right: impl AsRef<Path>, context: &str) {
+    assert!(
+        first_image_difference(left, right)
+            .expect("compare the images")
+            .is_some(),
+        "{context}: the images are identical"
+    );
+}
+
+#[track_caller]
+pub fn assert_image_unchanged(image: impl AsRef<Path>, before: &ImageSnapshot, context: &str) {
+    assert_images_equal(image, before.path(), context);
+}
+
+/// Compare a file with bytes already produced by a command, without loading
+/// the file into a second Vec.
+#[track_caller]
+pub fn assert_file_bytes(path: impl AsRef<Path>, expected: &[u8], context: &str) {
+    let mut file = fs::File::open(path).expect("open compared file");
+    let len = file.metadata().expect("stat compared file").len();
+    assert_eq!(len, expected.len() as u64, "{context}: file length differs");
+    let mut buffer = vec![0u8; 1 << 20];
+    for (part, chunk) in expected.chunks(buffer.len()).enumerate() {
+        file.read_exact(&mut buffer[..chunk.len()])
+            .expect("read compared file");
+        if let Some(index) = buffer[..chunk.len()]
+            .iter()
+            .zip(chunk)
+            .position(|(a, b)| a != b)
+        {
+            let offset = part * buffer.len() + index;
+            panic!(
+                "{context}: first differing byte at 0x{offset:x}: file 0x{:02x}, expected 0x{:02x}",
+                buffer[index], chunk[index]
+            );
+        }
+    }
+}
+
+/// Hash a file through a 1 MiB buffer. This is for digest checks that do
+/// not need to retain a second copy of a disk image.
+pub fn sha256_file(path: impl AsRef<Path>) -> io::Result<String> {
+    use sha2::Digest;
+    let mut file = fs::File::open(path)?;
+    let mut hash = sha2::Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            return Ok(format!("{:x}", hash.finalize()));
+        }
+        hash.update(&buffer[..n]);
+    }
+}
+
+/// Read a genuinely small file in full. The limit also catches a test that
+/// accidentally passes a disk image through a small-output assertion.
+pub fn read_small_file(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+    const MAX: u64 = 1 << 20;
+    let file = fs::File::open(path)?;
+    if file.metadata()?.len() > MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds the 1 MiB whole-read limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file grew beyond the 1 MiB whole-read limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Read one bounded region of a disk image, for superblocks and tree nodes.
+pub fn read_image_region(path: impl AsRef<Path>, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    if len > 1 << 20 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "image region exceeds 1 MiB",
+        ));
+    }
+    let mut file = fs::File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = vec![0; len];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Write just one edited region, preserving the rest of a sparse image.
+pub fn write_image_region(path: impl AsRef<Path>, offset: u64, bytes: &[u8]) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new().write(true).open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(bytes)
+}
+
+/// Visit fixed-size windows in place. A window is written only when `edit`
+/// returns true, so scanning a sparse image does not fill its holes.
+pub fn edit_image_windows(
+    path: impl AsRef<Path>,
+    window: usize,
+    step: usize,
+    mut edit: impl FnMut(u64, &mut [u8]) -> bool,
+) -> io::Result<usize> {
+    if window == 0 || window > 1 << 20 || step == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid image window",
+        ));
+    }
+    let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let size = file.metadata()?.len();
+    let mut bytes = vec![0; window];
+    let mut changed = 0;
+    let mut offset = 0u64;
+    while offset + window as u64 <= size {
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut bytes)?;
+        if edit(offset, &mut bytes) {
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(&bytes)?;
+            changed += 1;
+        }
+        offset += step as u64;
+    }
+    Ok(changed)
+}
+
+/// Count a pattern at 512-byte sector starts without retaining the image.
+pub fn count_image_sector_matches(path: impl AsRef<Path>, needle: &[u8]) -> io::Result<usize> {
+    if needle.is_empty() || needle.len() > 512 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid sector pattern",
+        ));
+    }
+    let mut file = fs::File::open(path)?;
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut count = 0;
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            return Ok(count);
+        }
+        count += buffer[..n]
+            .chunks_exact(512)
+            .filter(|sector| &sector[..needle.len()] == needle)
+            .count();
+    }
+}
+
+#[cfg(test)]
+mod image_compare_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_snapshot_and_comparison_report_the_first_offset() {
+        let image = temp_dir().join("comparison-source.img");
+        fs::File::create(&image).unwrap().set_len(4 << 20).unwrap();
+        write_image_region(&image, (1 << 20) + 3, &[0x11]).unwrap();
+        let before = snapshot_image(&image).unwrap();
+        assert_images_equal(&image, before.path(), "snapshot starts equal");
+
+        write_image_region(&image, (1 << 20) + 3, &[0x22]).unwrap();
+        assert_eq!(
+            first_image_difference(&image, before.path()).unwrap(),
+            Some(ImageDifference::Byte {
+                offset: (1 << 20) + 3,
+                left: 0x22,
+                right: 0x11,
+            })
+        );
+        fs::File::options()
+            .write(true)
+            .open(&image)
+            .unwrap()
+            .set_len(5 << 20)
+            .unwrap();
+        assert_eq!(
+            first_image_difference(&image, before.path()).unwrap(),
+            Some(ImageDifference::Length {
+                left: 5 << 20,
+                right: 4 << 20,
+            })
+        );
+        assert!(read_small_file(&image).is_err());
     }
 }
 

@@ -67,17 +67,17 @@ fn a_block_whose_record_is_not_under_the_expected_key_is_not_relocated() {
         root
     };
 
-    let mut bytes = std::fs::read(&img).unwrap();
-    let sb = Superblock::parse(&bytes[SUPERBLOCK..SUPERBLOCK + 4096]).unwrap();
+    let super_bytes =
+        fs_btrfs_test_support::read_image_region(&img, SUPERBLOCK as u64, 4096).unwrap();
+    let sb = Superblock::parse(&super_bytes).unwrap();
     let node = sb.nodesize as usize;
     let mut rekeyed = 0;
-    for at in (0..bytes.len() - node).step_by(4096) {
-        let block = &mut bytes[at..at + node];
+    fs_btrfs_test_support::edit_image_windows(&img, node, 4096, |_, block| {
         if block[header_offsets::FSID..header_offsets::FSID + 16] != sb.fsid
             || le64(block, header_offsets::OWNER) != objectid::EXTENT_TREE
             || block[header_offsets::LEVEL] != 0
         {
-            continue;
+            return false;
         }
         let nritems = u32::from_le_bytes(
             block[header_offsets::NRITEMS..header_offsets::NRITEMS + 4]
@@ -96,12 +96,13 @@ fn a_block_whose_record_is_not_under_the_expected_key_is_not_relocated() {
             stamp_checksum(block, &sb);
             rekeyed += 1;
         }
-    }
+        hit
+    })
+    .unwrap();
     assert!(
         rekeyed >= 1,
         "fixture: the root block's METADATA_ITEM was found"
     );
-    std::fs::write(&img, &bytes).unwrap();
 
     let fs = mount(&img);
     let generation = fs.superblock().generation + 1;
