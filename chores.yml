@@ -611,8 +611,8 @@ tasks:
 
   test:unit:
     desc: 'Tests that need no tool and no fixture: the library, and every tests/*.rs that reaches neither'
-    # In the DEBUG profile, which is the point: overflow-checks are on
-    # here and off in release, and EXPECT_OVERFLOW_CHECKS=1 arms
+    # In Cargo's test profile, which keeps dev-level overflow checks on
+    # (release turns them off), EXPECT_OVERFLOW_CHECKS=1 arms
     # overflow_checks::the_build_the_gate_asked_to_check_does_check in
     # src/lib.rs to prove it. `--lib` is what carries the library's own
     # unit tests -- the largest body of arithmetic in the crate -- which
@@ -634,7 +634,7 @@ tasks:
     # rather than skipped inside the tests, so what does not run there is
     # visible in the workflow rather than hidden in a green log.
     cmds:
-      - '../rust-fs-core/scripts/tier.sh test:images images 500 23500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh images)'
+      - '../rust-fs-core/scripts/tier.sh test:images images 500 23500 -- scripts/test.sh --locked --profile test $(scripts/test-targets.sh images)'
 
   test:oracle:
     desc: 'The driver writes, btrfs-progs reads back — every tool call made inside the harness VM'
@@ -658,7 +658,7 @@ tasks:
     cmds:
       - scripts/tools.sh --check
       - test-disks/build-fixtures.sh --check
-      - 'scripts/disk-watch.sh oracle ../rust-fs-core/scripts/tier.sh test:oracle oracle 775 42500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
+      - 'scripts/disk-watch.sh oracle ../rust-fs-core/scripts/tier.sh test:oracle oracle 775 42500 -- scripts/test.sh --locked --profile test $(scripts/test-targets.sh oracle) -- --show-output'
 
   test:kernel:
     desc: 'The driver writes, THE KERNEL reads back: our images loop-mounted by Linux in the guest'
@@ -720,7 +720,7 @@ tasks:
     # 375500 bytes.
     cmds:
       - test-disks/build-fixtures.sh --check
-      - 'scripts/disk-watch.sh kernel ../rust-fs-core/scripts/tier.sh test:kernel kernel 5650 375500 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - 'scripts/disk-watch.sh kernel ../rust-fs-core/scripts/tier.sh test:kernel kernel 5650 375500 -- scripts/test.sh --locked --profile test $(scripts/test-targets.sh kernel) -- --show-output'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
@@ -803,7 +803,7 @@ tasks:
         "{{.CHORE_EXE}}" test:native
 
   test:native:
-    desc: 'The suite on this (Linux) host: unit (debug), the oracles, the kernel oracles, everything (release), the scripts'
+    desc: 'The suite on this (Linux) host: unit, the oracles, the kernel oracles, everything (test profile), the scripts'
     # Checks for the host tools and the fixtures FIRST and fails naming
     # the task that provides them, rather than letting several hundred
     # tests each fail on the same missing image.
@@ -830,7 +830,7 @@ tasks:
       # suite in #668 measured 1891 / 104526 in the complete guest run
       # (989 passing cases, 2026-10-26). That includes the guest wrapper;
       # 2500 / 140000 gives about 30% beyond it for the native tier (#689).
-      - 'scripts/disk-watch.sh suite ../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 2500 140000 -- scripts/test.sh --locked --release'
+      - 'scripts/disk-watch.sh suite ../rust-fs-core/scripts/tier.sh "test:native (whole suite, test profile)" suite 2500 140000 -- scripts/test.sh --locked --profile test'
       - task: test:scripts
       # The command-line tools, built and staged from this checkout, then
       # tested as installed. A separate invocation because test:cli reads

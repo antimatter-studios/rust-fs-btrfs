@@ -16,6 +16,18 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The release profile is for shipped artifacts. Unit tests use Cargo's test
+# profile implicitly; the other tiers name it explicitly.
+previous_arg=""
+for arg in "$@"; do
+    [[ "$arg" == -- ]] && break
+    if [[ ( "$previous_arg" == --profile && "$arg" == release ) ||
+          "$arg" == --release || "$arg" == -r || "$arg" == --profile=release ]]; then
+        echo "test.sh: release optimisations are for shipped artifacts; use --profile test" >&2
+        exit 2
+    fi
+    previous_arg="$arg"
+done
 RUN_DIR=""
 recovery_sessions=""
 recovery_mode=""

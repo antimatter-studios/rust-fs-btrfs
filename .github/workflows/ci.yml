@@ -36,6 +36,8 @@ name: CI
 #                request, not the release. What btrfs-progs and the kernel
 #                make of the tools' work is judged in the oracle and kernel
 #                tiers (tests/cli_*.rs), where the VM is.
+#                The installed CLI keeps the release profile; Rust test
+#                binaries in the other tiers use [profile.test] without LTO.
 #   ci-ok        the one required check: all quick jobs must succeed on
 #                every event; all full jobs must also succeed in the queue.
 #                Only the listed full jobs may be skipped on quick runs.
