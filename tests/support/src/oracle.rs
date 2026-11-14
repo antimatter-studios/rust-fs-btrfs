@@ -458,14 +458,25 @@ impl Run {
     /// nothing (#762).
     pub fn streams(&self, tool: &str) -> (Vec<u8>, Vec<u8>) {
         let read = |path: &PathBuf| {
-            // Dump-tree output can exceed 1 MiB; it is command output, never an image.
-            let bytes = crate::read_bounded_file(path, 16 << 20).unwrap_or_else(|error| {
+            // Oracle::output returns std::process::Output, and dump_tree's
+            // callers need its complete text. These files are tool streams,
+            // never disk images; dump-tree may print more than 16 MiB.
+            let bytes = std::fs::read(path).unwrap_or_else(|error| {
                 panic!(
                     "`{tool}` finished in the fs-linux-test-harness VM, but its captured \
                      output {} could not be read: {error}. `chore vm:status` shows the VM.",
                     path.display()
                 )
             });
+            if bytes.len() > 16 << 20 {
+                let current = std::thread::current();
+                eprintln!(
+                    "[oracle output] {}: `{tool}` captured {} bytes in {}",
+                    current.name().unwrap_or("unnamed test"),
+                    bytes.len(),
+                    path.display()
+                );
+            }
             let _ = std::fs::remove_file(path);
             bytes
         };

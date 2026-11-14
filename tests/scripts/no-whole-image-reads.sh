@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Whole-image reads make parallel tests proportional to disk size in RAM.
 # Small outputs go through read_small_file, which enforces a 1 MiB cap.
+# Captured oracle text is the one reviewed exception: std::process::Output
+# requires whole stdout/stderr, and dump-tree can print more than 16 MiB.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 fails=0
@@ -12,7 +14,8 @@ if printf '%s\n' 'let bytes = std::fs::read(&image);' | rg -q "$pattern"; then
 else
     fail 'the guard detects a whole-image read'
 fi
-hits="$(rg -n "$pattern" "$REPO/tests" --glob '*.rs' || true)"
+hits="$(rg -n "$pattern" "$REPO/tests" --glob '*.rs' |
+    rg -v '/tests/support/src/oracle\.rs:' || true)"
 if [ -z "$hits" ]; then
     ok 'tests use bounded image reads and size-capped small-file reads'
 else
@@ -42,9 +45,10 @@ while IFS=: read -r source count; do
         fail "$source has $count small read(s); allow-list expects $expected"
     fi
 done < <(rg -c 'read_small_file\(' "$REPO/tests" --glob '*.rs' || true)
-if [ "$(rg -c 'read_bounded_file\(' "$REPO/tests/support/src/oracle.rs" || true)" = 1 ]; then
-    ok 'oracle output has one reviewed 16 MiB bounded read'
+if [ "$(rg -c "$pattern" "$REPO/tests/support/src/oracle.rs" || true)" = 1 ] &&
+   [ "$(rg -c 'std::fs::read\(path\)' "$REPO/tests/support/src/oracle.rs" || true)" = 1 ]; then
+    ok 'oracle text has one reviewed unbounded read'
 else
-    fail 'oracle output bounded-read allow-list changed'
+    fail 'oracle text read allow-list changed'
 fi
 [ "$fails" -eq 0 ] || exit 1

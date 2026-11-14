@@ -80,3 +80,15 @@ fn a_read_removes_both_stream_files() {
     assert!(!run.stdout.exists());
     assert!(!run.stderr.exists());
 }
+
+/// dump-tree may produce more text than the old 16 MiB cap allowed. Oracle
+/// streams are command output, not disk images, and must reach their callers.
+#[test]
+fn large_oracle_text_is_not_rejected_as_an_image() {
+    let expected = vec![b'x'; (16 << 20) + 1];
+    let run = finished_call(&expected, b"");
+    let (stdout, stderr) = run.streams(TOOL);
+    assert_eq!(stdout.len(), expected.len());
+    assert!(stdout.iter().all(|byte| *byte == b'x'));
+    assert!(stderr.is_empty());
+}
