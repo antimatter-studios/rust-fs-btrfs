@@ -273,7 +273,9 @@ vars:
   # 0.7.7 or newer, which `chore vm:host:check` says (harness #164).
   # v0.6.2: the stub engine runs no real `sync` whatever PATH a guard sets
   # (harness #202), and CI setup moves off a stalled Ubuntu mirror (harness #200).
-  LINUX_HARNESS_REF: v0.6.2
+  # v0.7.1: guest auto-updates are disabled on every boot, builds use one job
+  # by default, and transient destroy locks are retried safely.
+  LINUX_HARNESS_REF: v0.7.1
 
 # The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
 # harness is a sibling that `chore siblings` itself checks out: without
