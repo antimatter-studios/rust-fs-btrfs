@@ -113,8 +113,9 @@ pub(crate) fn guest_shell(script: &str) -> io::Result<Output> {
 /// it up for the whole tier. A test process that finds it down boots it
 /// rather than failing — a suite run by hand still works. Run through
 /// `scripts/test.sh` (every tier is), the run is a harness session, so
-/// the VM it booted comes down and the machine-wide slot is released when
-/// it ends; a bare `cargo test` leaves that to the chore reaper.
+/// its tree is detached when the session ends. The shared guest remains
+/// available for another run; a bare `cargo test` leaves run cleanup to
+/// the harness reaper.
 pub(crate) fn session() {
     static SESSION: OnceLock<()> = OnceLock::new();
     SESSION.get_or_init(|| {

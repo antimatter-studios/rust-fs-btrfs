@@ -279,8 +279,11 @@ jobs:
           key: ${{ steps.vm-host.outputs.box-cache-key }}
       - name: chore fixtures
         run: chore fixtures
-      - name: chore vm:status (the VM is down again)
-        run: '! chore vm:status'
+      - name: Stop the shared guest (no run is still using it)
+        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
+        # stops it only when no suite is using it, so a guest still up
+        # afterwards means a run leaked its session.
+        run: ../fs-linux-test-harness/scripts/vm.sh down && ! chore vm:status
       # TARRED, AND `--sparse` IS NOT OPTIONAL. These images total about
       # ten gigabytes of address space and a few hundred megabytes of
       # actual data: two 2 GiB populated filesystems, ten 400 MiB
@@ -365,8 +368,11 @@ jobs:
         run: chore lint
       - name: chore test
         run: chore test
-      - name: chore vm:status (the VM is down again)
-        run: '! chore vm:status'
+      - name: Stop the shared guest (no run is still using it)
+        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
+        # stops it only when no suite is using it, so a guest still up
+        # afterwards means a run leaked its session.
+        run: ../fs-linux-test-harness/scripts/vm.sh down && ! chore vm:status
       # THE FLOORS. Per target against the whole-suite log, which is the
       # one run that builds every integration target, plus a total for
       # each tier that runs on its own. A target missing from the log
@@ -516,8 +522,11 @@ jobs:
       # either.
       - name: chore test:vm
         run: chore test:vm
-      - name: chore vm:status (the VM is down again)
-        run: '! chore vm:status'
+      - name: Stop the shared guest (no run is still using it)
+        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
+        # stops it only when no suite is using it, so a guest still up
+        # afterwards means a run leaked its session.
+        run: ../fs-linux-test-harness/scripts/vm.sh down && ! chore vm:status
       - name: The in-guest suite executed its tests
         run: bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored vm 503
       # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to

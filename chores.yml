@@ -261,18 +261,22 @@ vars:
   # disposable (v0.3.0), a halt that hangs is forced and concurrent ups of
   # one machine wait for the boot under way (v0.4.0), and a boot that fails
   # prints its console (v0.4.1).
-  # v0.5.5 lets a host admit more than one VM (FLTH_SLOT_COUNT). v0.5.6 gives
+  # v0.5.5 lets a host admit more than one VM. v0.5.6 gives
   # back what a guest deletes and says what stopped a lost guest.
   # v0.5.8: a signal to a session stops everything its command started, and
   # leaves the shares of a VM that stays up (harness #117, #130). v0.5.9 runs a
   # `vm.sh run` or `vm.sh exec` command through `bash -c`, with no stdin.
   # v0.6.1: the VM-free suite runs no real `sync` on the host (harness #191), so
   # this repository's script guards over the stub engine stop flushing the
-  # machine's disks, and suites can share one guest through FLTH_SHARED_ROOT
+  # machine's disks, and suites can share one guest
   # (harness #153). A macOS host now needs vagrant-notify-forwarder-christhomas
   # 0.7.7 or newer, which `chore vm:host:check` says (harness #164).
   # v0.6.2: the stub engine runs no real `sync` whatever PATH a guard sets
   # (harness #202), and CI setup moves off a stalled Ubuntu mirror (harness #200).
+  # v0.7.0: one shared guest per host (harness #220,
+  # #222). A run ends its own session and leaves the guest up for the next;
+  # `vm:down` stops it when nobody is using it. A consumer's [vm] sizes are
+  # ignored: the host sets FLTH_SHARED_MEMORY/CPUS/DISK (#786).
   # v0.7.1: guest auto-updates are disabled on every boot, builds use one job
   # by default, and transient destroy locks are retried safely.
   LINUX_HARNESS_REF: v0.7.1
@@ -289,23 +293,10 @@ includes:
     taskfile: ../fs-linux-test-harness/vm.chores.yml
     optional: true
 
-# The reaper: any chore invocation stops a VM nothing else brought down
-# (a killed `chore fixtures`, a script run by hand). Fails soft, and does
-# nothing before the harness is checked out.
-#
-# THE SAFETY NET, NOT THE TEARDOWN. What it cannot cover is a path that
-# never reached a teardown at all: a bare `cargo test` that booted the
-# machine through an oracle call with chore not involved, or a run killed
-# outright, which unwinds nothing in chore or in a shell trap. Both
-# happened here in one afternoon, and on 2026-09-07 a VM was held for
-# THIRTEEN HOURS by a task whose process had been killed.
-#
-# It fails SOFT, and that is the right shape for a net rather than a
-# shortcoming: turning an unrelated `chore build` red because something
-# else left a VM running would teach people to ignore it. The harness's
-# own `vm.sh reap` probes with a process check rather than `vagrant
-# status` — about 20 ms against a second — which is what makes it
-# affordable on every task rather than wired into the few that use the VM.
+# Reap abandoned runs after chore commands. A session normally detaches its
+# own tree; a killed process can leave a marker or attachment behind. The
+# harness reaper checks those records and only stops an unfinished boot.
+# Fail soft so cleanup does not mask the command's result.
 lifecycle:
   after_all:
     - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh reap'
@@ -425,9 +416,9 @@ tasks:
   fixtures:
     desc: 'Build every test-disks/ fixture (kernel-made, in the fs-linux-test-harness VM); name targets to rebuild only those'
     # Up to date while the recipes are unchanged and every artefact
-    # exists; --force rebuilds. The VM comes down when the build ends,
-    # however it ends (build-fixtures.sh sources the harness's
-    # vm-session.sh).
+    # exists; --force rebuilds. The build's run ends when it finishes,
+    # however it finishes (build-fixtures.sh sources the harness's
+    # vm-session.sh); the shared guest stays available.
     #
     # THIS LIST AND test-disks/build-fixtures.sh MUST AGREE. The script
     # is the one that knows which target produces which file; this is
@@ -592,13 +583,13 @@ tasks:
       # a volume received through btrfs send --compressed-data, its
       # compressed extents stored by encoded writes
       - test-disks/encoded/btrfs-encoded.img
-    # A hung boot must not hold the VM and the machine-wide slot for
+    # A hung boot must not hold the shared guest for
     # ever. The split fixtures alone mount and unmount up to four hundred
     # times, and the populated pair writes eighty thousand files, so this
     # is the longest-running task here by a wide margin.
     timeout: 120m
     on_timeout:
-      - cmd: '../fs-linux-test-harness/scripts/vm.sh down || ../fs-linux-test-harness/scripts/vm.sh destroy'
+      - cmd: '../fs-linux-test-harness/scripts/vm.sh down'
     cmds:
       - 'test-disks/build-fixtures.sh {{.CLI_ARGS}}'
 
@@ -653,10 +644,9 @@ tasks:
     # process brings the VM up (idempotent, milliseconds when it is
     # already running) and every later call rides one shared SSH
     # connection. scripts/test.sh runs cargo inside a harness session,
-    # so the VM comes down and the machine-wide slot is released when the
-    # tier ends, passed, failed or killed — and run any way at all, not
-    # only through chore (#141). One boot per tier; the `after_all` reaper
-    # is the net for a run that never reached scripts/test.sh.
+    # so the run ends and detaches its tree when the tier ends, passed,
+    # failed or killed — including runs outside chore (#141). The guest
+    # stays up for another run; the `after_all` reaper handles abandoned runs.
     cmds:
       - scripts/tools.sh --check
       - test-disks/build-fixtures.sh --check
@@ -729,10 +719,10 @@ tasks:
     # scripts/guest-suite.sh, through the harness's [test] guest_command.
     # The toolchain and the build directory live on the VM's own disk, so
     # the first run pays a full build and later runs are incremental.
-    # FLTH_KEEP_VM=1 keeps the VM up for the next one.
+    # The shared guest stays up for the next run; `chore vm:down` stops it.
     timeout: 180m
     on_timeout:
-      - cmd: '../fs-linux-test-harness/scripts/vm.sh down || ../fs-linux-test-harness/scripts/vm.sh destroy'
+      - cmd: '../fs-linux-test-harness/scripts/vm.sh down'
     cmds:
       # The sibling crates this one builds against are staged on the
       # share first: the guest is given THIS repository, not the

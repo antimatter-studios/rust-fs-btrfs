@@ -85,8 +85,11 @@ jobs:
       - name: chore test
         run: chore test
 
-      - name: chore vm:status (the VM is down again)
-        run: '! chore vm:status'
+      - name: Stop the shared guest (no run is still using it)
+        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
+        # stops it only when no suite is using it, so a guest still up
+        # afterwards means a run leaked its session.
+        run: ../fs-linux-test-harness/scripts/vm.sh down && ! chore vm:status
 
       # THE TIER LOGS OUTLIVE THE RUNNER, as in every ci.yml job that runs
       # a tier. tier.sh prints one verdict line naming tmp/logs/<tier>.log
