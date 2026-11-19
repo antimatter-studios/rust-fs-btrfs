@@ -119,7 +119,7 @@ and holds whole nodes, which is the sizing the sector cache got wrong.
 ## How to take the measurement again
 
 ```sh
-cargo test --release --test read_path_cost -- --nocapture
+cargo test --profile test --test read_path_cost -- --nocapture
 ```
 
 It measures every one of `btrfs-rich.img`, `btrfs-deep4k.img` and

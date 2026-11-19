@@ -121,3 +121,9 @@ panic = "unwind"  # required for catch_unwind at the FFI boundary
 [profile.dev]
 opt-level = 1
 panic = "unwind"
+
+# Test binaries use dev-level optimisation without the release link-time
+# optimisation. The release profile above is reserved for shipped artifacts.
+[profile.test]
+opt-level = 1
+lto = false

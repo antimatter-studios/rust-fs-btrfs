@@ -20,10 +20,10 @@
 # the point of this file.
 #
 # THE NUMBERS ARE MEASURED, not guessed: each is what that target
-# executed on a known-good run of `chore test` (the whole suite, release
-# profile). They move UP with the suite and never down: raising one when
-# tests are added is bookkeeping, lowering one is a decision someone has
-# to write down in a diff.
+# executed on a known-good run of `chore test` (then using the release
+# profile; counts do not depend on optimisation). They move UP with the
+# suite and never down: raising one when tests are added is bookkeeping,
+# lowering one is a decision someone has to write down in a diff.
 #
 # `lib` is the library's own unit tests, which `cargo test` reports as
 # `Running unittests src/lib.rs`.
