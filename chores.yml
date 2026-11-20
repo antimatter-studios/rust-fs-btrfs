@@ -105,7 +105,11 @@ chore_min_version: 0.10.0
 #                                                    cold, over the old 850.
 #                                                    Warm on CI: 791 / 50,511
 #                                                    (run 41777793760).
-#     images      384 /  18,065      500 /  23,500   ~30%. 384 / 18,065 is
+#     images      410 /  18,796      535 /  24,500   ~30%: the 384 / 18,065
+#                                                    below plus 26 / 731
+#                                                    measured locally for
+#                                                    #805's layers_conformance.
+#                 384 /  18,065      500 /  23,500   ~30%. 384 / 18,065 is
 #                                                    CI's aarch64 job with
 #                                                    #301's
 #                                                    scrub_parity_oracle.rs,
@@ -160,7 +164,13 @@ chore_min_version: 0.10.0
 #                                                    cold (51 lines of
 #                                                    cargo), run 36616794750;
 #                                                    was 361 / 19,014
-#     kernel    4,341 / 288,816    5,650 / 375,500   ~30% over queue run
+#     kernel    4,409 / 300,739    5,735 / 391,000   ~30%: the 4,341 / 288,816
+#                                                    below plus 68 / 11,923
+#                                                    measured locally for
+#                                                    #805's layers_salvage_
+#                                                    conformance and
+#                                                    layers_kernel_oracle.
+#               4,341 / 288,816    5,650 / 375,500   ~30% over queue run
 #                                                    41911452972. Before it
 #                                                    3,271 / 199,874, ~30% over
 #                                                    run 41567697498
@@ -187,7 +197,15 @@ chore_min_version: 0.10.0
 #                                                    36610919288, logs-test).
 #                                                    Was 84 / 6,906 before
 #                                                    hard_link_extref's sweeps
-#     suite     1,891 / 104,526    2,500 / 140,000   ~30% beyond #668's full
+#     suite     2,537 / 150,041    3,300 / 195,000   ~30%: dispatch run
+#                                                    43585936171's 2,221 /
+#                                                    121,131, plus 222 /
+#                                                    16,256 for the salvage
+#                                                    targets of #799-#804 and
+#                                                    94 / 12,654 for #805's
+#                                                    layers targets, measured
+#                                                    locally.
+#               1,891 / 104,526    2,500 / 140,000   ~30% beyond #668's full
 #                                                    guest run, including
 #                                                    its wrapper (#689).
 #                                                    The native tier runs
@@ -224,7 +242,11 @@ chore_min_version: 0.10.0
 #                                                    both measured locally.
 #                                                    Was 72 / 3,400 -> 95 /
 #                                                    4,450 on 2026-09-26
-#     vm        2,324 / 123,797    3,020 / 161,000   ~30% over run 41587753376
+#     vm        2,752 / 160,254    3,580 / 208,500   ~30%: dispatch run
+#                                                    43585936171's 2,436 /
+#                                                    131,344, plus the same
+#                                                    316 / 28,910 as suite.
+#               2,324 / 123,797    3,020 / 161,000   ~30% over run 41587753376
 #                                                    (#713). Before it, a
 #                                                    conservative
 #                                                    projection through #533
@@ -284,7 +306,7 @@ vars:
   FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
   # It is also the version of every family script the tiers run in place
   # from that checkout, so moving it is how they are upgraded.
-  FS_CORE_REF: v0.4.3
+  FS_CORE_REF: v0.5.0
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   # v0.5.1: a consumer can choose `[vm] guest = "debian-13"`, whose kernel
   # 6.12 mounts what Debian 12's 6.1 refuses -- a simple-quota volume, to
@@ -667,7 +689,7 @@ tasks:
     # rather than skipped inside the tests, so what does not run there is
     # visible in the workflow rather than hidden in a green log.
     cmds:
-      - '../rust-fs-core/scripts/tier.sh test:images images 500 23500 -- scripts/test.sh --locked --profile test $(scripts/test-targets.sh images)'
+      - '../rust-fs-core/scripts/tier.sh test:images images 535 24500 -- scripts/test.sh --locked --profile test $(scripts/test-targets.sh images)'
 
   test:oracle:
     desc: 'The driver writes, btrfs-progs reads back — every tool call made inside the harness VM'
@@ -752,7 +774,7 @@ tasks:
     # 375500 bytes.
     cmds:
       - test-disks/build-fixtures.sh --check
-      - 'scripts/disk-watch.sh kernel ../rust-fs-core/scripts/tier.sh test:kernel kernel 5650 375500 -- scripts/test.sh --locked --profile test $(scripts/test-targets.sh kernel) -- --show-output'
+      - 'scripts/disk-watch.sh kernel ../rust-fs-core/scripts/tier.sh test:kernel kernel 5735 391000 -- scripts/test.sh --locked --profile test $(scripts/test-targets.sh kernel) -- --show-output'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
@@ -810,7 +832,7 @@ tasks:
         # Re-measured on run 41584240816 (#733, on main at #729): 2321 lines /
         # 123804 bytes, one line over the row with every test passing. About
         # 30% over that is 3020 / 161000.
-        bash ../rust-fs-core/scripts/tier.sh test:vm vm 3020 161000 -- \
+        bash ../rust-fs-core/scripts/tier.sh test:vm vm 3580 208500 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
 
   test:
@@ -863,7 +885,7 @@ tasks:
       # suite in #668 measured 1891 / 104526 in the complete guest run
       # (989 passing cases, 2026-10-26). That includes the guest wrapper;
       # 2500 / 140000 gives about 30% beyond it for the native tier (#689).
-      - 'scripts/disk-watch.sh suite ../rust-fs-core/scripts/tier.sh "test:native (whole suite, test profile)" suite 2500 140000 -- scripts/test.sh --locked --profile test'
+      - 'scripts/disk-watch.sh suite ../rust-fs-core/scripts/tier.sh "test:native (whole suite, test profile)" suite 3300 195000 -- scripts/test.sh --locked --profile test'
       - task: test:scripts
       # The command-line tools, built and staged from this checkout, then
       # tested as installed. A separate invocation because test:cli reads
