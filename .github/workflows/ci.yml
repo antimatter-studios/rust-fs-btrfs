@@ -755,7 +755,7 @@ jobs:
         run: chore check:semver
 
   ci-ok-gate:
-    needs: [changes, unit, fixtures, test, test-arm64, suite-in-vm, cli, semver]
+    needs: [changes-gate, changes, unit-gate, unit, fixtures-gate, fixtures, test-gate, test, test-arm64-gate, test-arm64, suite-in-vm-gate, suite-in-vm, cli-gate, cli, semver-gate, semver]
     if: always()
     runs-on: antimatter-vps-gate
     timeout-minutes: 1

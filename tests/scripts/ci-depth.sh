@@ -32,7 +32,7 @@ while True:
     for name, job in jobs.items():
         needs = job.get("needs", [])
         needs = [needs] if isinstance(needs, str) else needs
-        if name != "ci-ok" and set(needs) & expected:
+        if name not in ("ci-ok", "ci-ok-gate") and set(needs) & expected:
             expanded.add(name)
     if expanded == expected:
         break
