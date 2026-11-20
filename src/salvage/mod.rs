@@ -17,10 +17,14 @@
 //! damaged.
 
 pub mod chunks;
+pub mod roots;
+pub mod scan;
 pub mod superblock;
 pub mod tree;
 
 pub use chunks::{build_chunk_map, ChunkScan, ChunkSource, RejectedChunk};
+pub use roots::{read_root_items, root_tree_candidates, RootItem, RootSource, RootTreeCandidate};
+pub use scan::{metadata_ranges, physical_to_logical, scan_tree_blocks, FoundBlock, ScanSummary};
 pub use superblock::{best_copy, superblock_copies, CopyVerdict, SuperblockCopy};
 pub use tree::{
     decode_block, read_block, walk_tree, BlockFault, CopyAttempt, DamagedBlock, Expect, Layout,
