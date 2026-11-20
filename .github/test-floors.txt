@@ -346,3 +346,6 @@ oracle_streams 4
 # Salvage reads every superblock copy and its backup ring as dump-super
 # does, damaged copies included (#799).
 salvage_superblock_oracle 4
+# Salvage walks trees past damaged blocks and builds the chunk map from
+# what survives, checked against dump-tree (#800).
+salvage_tree_oracle 6
