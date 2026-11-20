@@ -821,15 +821,63 @@ impl Superblock {
                 "sys_chunk_array_size {sys_len} exceeds the {SYS_CHUNK_ARRAY_SIZE}-byte array"
             )));
         }
+
+        let sb = Self::decode(buf, csum_type);
+        sb.validate()?;
+        Ok(sb)
+    }
+
+    /// Decode every field of a superblock without verifying it: no
+    /// checksum, no incompat refusal, no geometry checks.
+    ///
+    /// For salvage, which has to read the fields of a copy whose checksum
+    /// failed or whose geometry is damaged, and report the damage rather
+    /// than stop at it. Nothing decoded here is trustworthy until
+    /// [`Self::parse`] accepts the same bytes. Only the magic and the
+    /// checksum type are required: without the magic the bytes are not a
+    /// superblock at all, and an unknown checksum type is a value no field
+    /// can be read past safely. A `sys_chunk_array_size` past the array is
+    /// clamped to the array.
+    ///
+    /// # Errors
+    ///
+    /// A buffer shorter than [`SUPER_INFO_SIZE`], [`Error::NotBtrfs`] and
+    /// [`Error::UnsupportedChecksum`].
+    pub fn parse_unverified(buf: &[u8]) -> Result<Self> {
+        if buf.len() < SUPER_INFO_SIZE {
+            return Err(malformed(format!(
+                "need {SUPER_INFO_SIZE} bytes, got {}",
+                buf.len()
+            )));
+        }
+        let magic: [u8; 8] = buf[offsets::MAGIC..offsets::MAGIC + 8]
+            .try_into()
+            .expect("8 bytes");
+        if magic != BTRFS_MAGIC {
+            return Err(Error::NotBtrfs { magic });
+        }
+        let csum_type = ChecksumType::from_raw(le16(buf, offsets::CSUM_TYPE))?;
+        Ok(Self::decode(buf, csum_type))
+    }
+
+    /// The fields of a buffer whose length, magic and checksum type the
+    /// caller has checked. A `sys_chunk_array_size` past the array is
+    /// clamped to it; [`Self::parse`] refuses one before getting here.
+    fn decode(buf: &[u8], csum_type: ChecksumType) -> Self {
+        let sys_len = (le32(buf, offsets::SYS_CHUNK_ARRAY_SIZE) as usize).min(SYS_CHUNK_ARRAY_SIZE);
         let sys_chunk_array =
             buf[offsets::SYS_CHUNK_ARRAY..offsets::SYS_CHUNK_ARRAY + sys_len].to_vec();
+        let incompat_flags = le64(buf, offsets::INCOMPAT_FLAGS);
+        let csum: [u8; CSUM_SIZE] = buf[offsets::CSUM..offsets::CSUM + CSUM_SIZE]
+            .try_into()
+            .expect("32 bytes");
 
         let label_raw = &buf[offsets::LABEL..offsets::LABEL + LABEL_SIZE];
         let label_end = label_raw.iter().position(|&b| b == 0).unwrap_or(LABEL_SIZE);
         let label = String::from_utf8_lossy(&label_raw[..label_end]).into_owned();
 
         let fsid = uuid_at(buf, offsets::FSID);
-        let sb = Superblock {
+        Superblock {
             csum,
             fsid,
             bytenr: le64(buf, offsets::BYTENR),
@@ -856,7 +904,8 @@ impl Superblock {
             root_level: buf[offsets::ROOT_LEVEL],
             chunk_root_level: buf[offsets::CHUNK_ROOT_LEVEL],
             log_root_level: buf[offsets::LOG_ROOT_LEVEL],
-            dev_item: DevItem::parse(&buf[offsets::DEV_ITEM..offsets::DEV_ITEM + DEV_ITEM_SIZE])?,
+            dev_item: DevItem::parse(&buf[offsets::DEV_ITEM..offsets::DEV_ITEM + DEV_ITEM_SIZE])
+                .expect("the superblock holds a whole dev_item"),
             label,
             cache_generation: le64(buf, offsets::CACHE_GENERATION),
             uuid_tree_generation: le64(buf, offsets::UUID_TREE_GENERATION),
@@ -874,10 +923,7 @@ impl Superblock {
             },
             nr_global_roots: le64(buf, offsets::NR_GLOBAL_ROOTS),
             sys_chunk_array,
-        };
-
-        sb.validate()?;
-        Ok(sb)
+        }
     }
 
     /// Parse a superblock that was read from `offset`, and additionally

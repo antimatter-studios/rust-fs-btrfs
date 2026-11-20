@@ -343,3 +343,6 @@ capi_two_handle_commit_kernel  1
 evidence_paths 2
 # A call's captured output comes back as it is, or the call fails (#762).
 oracle_streams 4
+# Salvage reads every superblock copy and its backup ring as dump-super
+# does, damaged copies included (#799).
+salvage_superblock_oracle 4

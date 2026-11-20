@@ -142,6 +142,52 @@ pub struct BackupRoots {
     pub num_devices: u64,
 }
 
+impl BackupRoots {
+    /// Decode one `btrfs_root_backup` slot, the inverse of [`write_backup`].
+    /// `None` when `slot` is shorter than [`ROOT_BACKUP_SIZE`].
+    ///
+    /// Nothing here is checked: a backup slot has no checksum of its own,
+    /// only the superblock's, and a slot that was never filled decodes as
+    /// all zeros ([`Self::is_empty`]).
+    pub fn parse(slot: &[u8]) -> Option<Self> {
+        use backup_offsets as b;
+        let slot = slot.get(..ROOT_BACKUP_SIZE)?;
+        let word = |off: usize| u64::from_le_bytes(slot[off..off + 8].try_into().expect("8 bytes"));
+        let root = |bytenr: usize, gen: usize, level: usize| BackupRoot {
+            bytenr: word(bytenr),
+            generation: word(gen),
+            level: slot[level],
+        };
+        Some(Self {
+            tree: root(b::TREE_ROOT, b::TREE_ROOT_GEN, b::TREE_ROOT_LEVEL),
+            chunk: root(b::CHUNK_ROOT, b::CHUNK_ROOT_GEN, b::CHUNK_ROOT_LEVEL),
+            extent: root(b::EXTENT_ROOT, b::EXTENT_ROOT_GEN, b::EXTENT_ROOT_LEVEL),
+            fs: root(b::FS_ROOT, b::FS_ROOT_GEN, b::FS_ROOT_LEVEL),
+            dev: root(b::DEV_ROOT, b::DEV_ROOT_GEN, b::DEV_ROOT_LEVEL),
+            csum: root(b::CSUM_ROOT, b::CSUM_ROOT_GEN, b::CSUM_ROOT_LEVEL),
+            total_bytes: word(b::TOTAL_BYTES),
+            bytes_used: word(b::BYTES_USED),
+            num_devices: word(b::NUM_DEVICES),
+        })
+    }
+
+    /// A slot no commit has filled: it names no tree root.
+    pub fn is_empty(&self) -> bool {
+        self.tree.bytenr == 0
+    }
+}
+
+/// The four backup slots of a raw superblock, in slot order, filled or
+/// not. Empty when `raw` is too short to hold the ring.
+pub fn read_backups(raw: &[u8]) -> Vec<BackupRoots> {
+    (0..ROOT_BACKUP_SLOTS as usize)
+        .filter_map(|slot| {
+            let at = offsets::ROOT_BACKUPS + slot * ROOT_BACKUP_SIZE;
+            BackupRoots::parse(raw.get(at..)?)
+        })
+        .collect()
+}
+
 /// Fill `generation`'s backup slot with `roots`, zeroing whatever else the
 /// slot held, as the kernel's `backup_super_roots` does (#78). Call before
 /// [`stamp_checksum`], which covers the ring.
