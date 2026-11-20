@@ -14,7 +14,7 @@ use fs_btrfs::balance::profile_bits;
 use fs_btrfs::capi::*;
 use fs_btrfs::chunk::block_group as bg;
 use fs_btrfs::{mkfs, ChunkProfile, Filesystem};
-use fs_btrfs_test_support::temp_path;
+use fs_btrfs_test_support::{assert_image_unchanged, snapshot_image, temp_path};
 use fs_core::{BlockDevice, FileDevice};
 use std::ffi::{c_void, CStr, CString};
 use std::path::{Path, PathBuf};
@@ -122,7 +122,7 @@ fn file_bytes(image: &Path) -> Vec<u8> {
 fn every_documented_error_has_its_errno_and_writes_nothing() {
     let scratch = Scratch::new("capi-balance-errors");
     let image = scratch.image();
-    let before = std::fs::read(&image).unwrap();
+    let before = snapshot_image(&image).unwrap();
 
     let (dup, raid1) = (
         profile_bits(ChunkProfile::Dup),
@@ -177,9 +177,10 @@ fn every_documented_error_has_its_errno_and_writes_nothing() {
         let (rc, got, message) = balance(&image, writable, kinds, convert);
         assert_eq!(rc, -1, "{what}: the balance was not refused");
         assert_eq!(got, errno, "{what}: errno {got}, {message}");
-        assert!(
-            std::fs::read(&image).unwrap() == before,
-            "{what}: the refused balance changed the image"
+        assert_image_unchanged(
+            &image,
+            &before,
+            &format!("{what}: the refused balance changed the image"),
         );
     }
 }
@@ -198,12 +199,13 @@ fn a_group_already_in_the_profile_stays_and_nothing_is_written() {
     assert!(profiles(&image, bg::DATA)
         .iter()
         .all(|p| *p == ChunkProfile::Single));
-    let before = std::fs::read(&image).unwrap();
+    let before = snapshot_image(&image).unwrap();
     let (rc, _, message) = balance(&image, true, bg::DATA, FS_BTRFS_BALANCE_SINGLE);
     assert_eq!(rc, 0, "{message}");
-    assert!(
-        std::fs::read(&image).unwrap() == before,
-        "a balance that relocated nothing changed the image"
+    assert_image_unchanged(
+        &image,
+        &before,
+        "a balance that relocated nothing changed the image",
     );
 }
 

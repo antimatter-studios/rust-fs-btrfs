@@ -311,9 +311,10 @@ fn a_sparse_copy_reads_the_same_bytes_and_keeps_its_holes() {
 
     copy_sparse(&from, &to).expect("copy");
 
-    assert!(
-        std::fs::read(&from).unwrap() == std::fs::read(&to).unwrap(),
-        "the copy reads differently from its source"
+    fs_btrfs_test_support::assert_images_equal(
+        &from,
+        &to,
+        "the copy reads differently from its source",
     );
     // Not exactly 16 KiB: APFS fills a gap of under about 1 MiB (1081344 bytes
     // measured). A copy written out in full takes all 64 MiB.

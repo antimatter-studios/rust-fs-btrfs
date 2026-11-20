@@ -2,7 +2,7 @@
 //! The independent on-disk validation lives in subvol_namespace_kernel.rs.
 
 use fs_btrfs::{capi::*, mkfs, Filesystem};
-use fs_btrfs_test_support::{sha256_hex, temp_path};
+use fs_btrfs_test_support::temp_path;
 use fs_core::{BlockDevice, FileDevice};
 use std::ffi::{CStr, CString};
 use std::path::PathBuf;
@@ -73,7 +73,7 @@ fn a_rename_across_a_subvolume_boundary_is_refused_without_writing() {
     let mut sv = top.open_subvolume(id).unwrap();
     sv.create(root, b"source", 0o644, 0, 0).unwrap();
     drop((sv, top));
-    let before = sha256_hex(&std::fs::read(&image.0).unwrap());
+    let before = fs_btrfs_test_support::sha256_file(&image.0).unwrap();
     let c = |s: &str| CString::new(s).unwrap();
     let handle = unsafe { fs_btrfs_mount_rw(c(image.0.to_str().unwrap()).as_ptr()) };
     assert!(!handle.is_null());
@@ -87,5 +87,8 @@ fn a_rename_across_a_subvolume_boundary_is_refused_without_writing() {
         assert!(error.contains("subvolume"), "wrong refusal: {error}");
     }
     unsafe { fs_btrfs_umount(handle) };
-    assert_eq!(sha256_hex(&std::fs::read(&image.0).unwrap()), before);
+    assert_eq!(
+        fs_btrfs_test_support::sha256_file(&image.0).unwrap(),
+        before
+    );
 }

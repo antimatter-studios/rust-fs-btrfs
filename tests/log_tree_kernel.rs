@@ -48,10 +48,10 @@ const SUPERBLOCK: usize = 0x1_0000;
 /// log root that superblock names. Nothing here goes through this crate's
 /// parser, so the check cannot agree with a misreading of ours. Returns
 /// the bound fsid, or why the transcript is not of this image.
-fn transcript_binding(transcript: &str, image: &[u8]) -> Result<String, String> {
-    let sb = image
-        .get(SUPERBLOCK..SUPERBLOCK + 0x68)
-        .ok_or("the image is too short to hold a superblock")?;
+fn transcript_binding(transcript: &str, image: &Path) -> Result<String, String> {
+    let sb = fs_btrfs_test_support::read_image_region(image, SUPERBLOCK as u64, 0x68)
+        .map_err(|error| format!("the image is too short to hold a superblock: {error}"))?;
+    let sb = sb.as_slice();
     if &sb[0x40..0x48] != b"_BHRfS_M" {
         return Err("the image has no btrfs superblock magic".into());
     }
@@ -104,10 +104,10 @@ fn transcript_binding(transcript: &str, image: &[u8]) -> Result<String, String> 
 fn the_native_log_transcript_is_bound_to_its_crash_image() {
     let transcript =
         std::fs::read_to_string(fixture(INODE_TRANSCRIPT)).expect("read the native log transcript");
-    let image = std::fs::read(fixture(INODE_FIXTURE)).expect("read the inode-only image");
+    let image = fixture(INODE_FIXTURE);
     let fsid = transcript_binding(&transcript, &image)
         .unwrap_or_else(|why| panic!("{INODE_TRANSCRIPT} is not of {INODE_FIXTURE}: {why}"));
-    let other = std::fs::read(fixture(REPLAY_FIXTURE)).expect("read another kernel-made image");
+    let other = fixture(REPLAY_FIXTURE);
     assert!(
         transcript_binding(&transcript, &other).is_err(),
         "the transcript bound to {REPLAY_FIXTURE}, a different volume"
@@ -126,10 +126,7 @@ fn the_native_log_transcript_is_bound_to_its_crash_image() {
         transcript_binding(&stripped, &image).is_err(),
         "a transcript with no fs uuid still bound"
     );
-    let digest = {
-        use sha2::Digest;
-        format!("{:x}", sha2::Sha256::digest(&image))
-    };
+    let digest = fs_btrfs_test_support::sha256_file(&image).unwrap();
     std::fs::create_dir_all("tmp/logs").expect("create transcript binding evidence directory");
     std::fs::write(
         "tmp/logs/inode-transcript-binding.txt",
@@ -148,11 +145,10 @@ fn the_native_log_transcript_is_bound_to_its_crash_image() {
 /// all refused.
 #[test]
 fn the_native_replay_transcript_is_bound_to_its_crash_image() {
-    use sha2::Digest;
     let transcript = std::fs::read_to_string(fixture(REPLAY_TRANSCRIPT))
         .expect("read the native data-and-names transcript");
-    let image = std::fs::read(fixture(REPLAY_FIXTURE)).expect("read the data-and-names image");
-    let digest = format!("{:x}", sha2::Sha256::digest(&image));
+    let image = fixture(REPLAY_FIXTURE);
+    let digest = fs_btrfs_test_support::sha256_file(&image).unwrap();
     let names = |transcript: &str, digest: &str| {
         let named: Vec<&str> = transcript
             .lines()
@@ -167,7 +163,7 @@ fn the_native_replay_transcript_is_bound_to_its_crash_image() {
     );
     let fsid = transcript_binding(&transcript, &image)
         .unwrap_or_else(|why| panic!("{REPLAY_TRANSCRIPT} is not of {REPLAY_FIXTURE}: {why}"));
-    let other = std::fs::read(fixture(INODE_FIXTURE)).expect("read another kernel-made image");
+    let other = fixture(INODE_FIXTURE);
     assert!(
         transcript_binding(&transcript, &other).is_err(),
         "the transcript bound to {INODE_FIXTURE}, a different volume"
@@ -177,7 +173,7 @@ fn the_native_replay_transcript_is_bound_to_its_crash_image() {
         transcript_binding(&relabelled, &image).is_err(),
         "a transcript relabelled to another fsid still bound"
     );
-    let other_digest = format!("{:x}", sha2::Sha256::digest(&other));
+    let other_digest = fs_btrfs_test_support::sha256_file(&other).unwrap();
     assert_ne!(
         other_digest, digest,
         "the forged-digest control needs two different images"
@@ -471,7 +467,7 @@ fn an_inode_only_log_replays_mode_and_identity_as_the_kernel_does() {
     let image = fixture(INODE_FIXTURE);
     let transcript =
         std::fs::read_to_string(fixture(INODE_TRANSCRIPT)).expect("read the native log transcript");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+    transcript_binding(&transcript, &image)
         .unwrap_or_else(|why| panic!("{INODE_TRANSCRIPT} is not of {INODE_FIXTURE}: {why}"));
     let committed = Filesystem::mount_ignoring_log(Arc::new(
         FileDevice::open(&image).expect("open inode-only fixture"),
@@ -525,10 +521,7 @@ fn an_inode_only_log_replays_mode_and_identity_as_the_kernel_does() {
     let ours = PathBuf::from(temp_path!("inode-only-crate.img"));
     copy_sparse(&image, &theirs).unwrap();
     copy_sparse(&image, &ours).unwrap();
-    let digest = |path: &std::path::Path| {
-        use sha2::Digest;
-        format!("{:x}", sha2::Sha256::digest(std::fs::read(path).unwrap()))
-    };
+    let digest = |path: &std::path::Path| fs_btrfs_test_support::sha256_file(path).unwrap();
     let crash_image = digest(&image);
     assert_eq!(
         digest(&theirs),
@@ -648,9 +641,8 @@ impl Drop for ScratchCopy {
 
 /// The inline transcript's single `image sha256:` header, if it names
 /// exactly `image`, and its superblock binding.
-fn inline_transcript_binding(transcript: &str, image: &[u8]) -> Result<String, String> {
-    use sha2::Digest;
-    let digest = format!("{:x}", sha2::Sha256::digest(image));
+fn inline_transcript_binding(transcript: &str, image: &Path) -> Result<String, String> {
+    let digest = fs_btrfs_test_support::sha256_file(image).map_err(|e| e.to_string())?;
     let named: Vec<&str> = transcript
         .lines()
         .filter_map(|line| line.strip_prefix("image sha256: "))
@@ -667,13 +659,12 @@ fn inline_transcript_binding(transcript: &str, image: &[u8]) -> Result<String, S
 /// transcript, a forged digest and a stripped header.
 #[test]
 fn the_native_inline_transcript_is_bound_to_its_crash_image() {
-    use sha2::Digest;
     let transcript = std::fs::read_to_string(fixture(INLINE_TRANSCRIPT))
         .expect("the native transcript of the inline overwrite log");
-    let image = std::fs::read(fixture(INLINE_FIXTURE)).unwrap();
+    let image = fixture(INLINE_FIXTURE);
     inline_transcript_binding(&transcript, &image)
         .unwrap_or_else(|why| panic!("{INLINE_TRANSCRIPT} is not of {INLINE_FIXTURE}: {why}"));
-    let other = std::fs::read(fixture("dirtylog/btrfs-dirty-log-sizechange.img")).unwrap();
+    let other = fixture("dirtylog/btrfs-dirty-log-sizechange.img");
     assert!(
         inline_transcript_binding(&transcript, &other).is_err(),
         "the inline transcript bound to another kernel-made image"
@@ -684,8 +675,8 @@ fn the_native_inline_transcript_is_bound_to_its_crash_image() {
         inline_transcript_binding(&wrong, &image).is_err(),
         "another shape's transcript bound to the inline image"
     );
-    let digest = format!("{:x}", sha2::Sha256::digest(&image));
-    let other_digest = format!("{:x}", sha2::Sha256::digest(&other));
+    let digest = fs_btrfs_test_support::sha256_file(&image).unwrap();
+    let other_digest = fs_btrfs_test_support::sha256_file(&other).unwrap();
     assert!(
         inline_transcript_binding(&transcript.replace(&digest, &other_digest), &image).is_err(),
         "a forged digest still bound"
@@ -707,7 +698,7 @@ const INLINE_LOGGED: &[u8] = b"replayed-inline-bytes-ABCDEFGHIJK";
 fn a_same_length_inline_overwrite_replays_as_the_kernel_does() {
     let image = fixture(INLINE_FIXTURE);
     let transcript = std::fs::read_to_string(fixture(INLINE_TRANSCRIPT)).unwrap();
-    inline_transcript_binding(&transcript, &std::fs::read(&image).unwrap())
+    inline_transcript_binding(&transcript, &image)
         .expect("the positive transcript is of this exact image");
     let committed = Filesystem::mount_ignoring_log(Arc::new(
         FileDevice::open(&image).expect("open inline overwrite fixture"),
@@ -791,18 +782,16 @@ fn a_same_length_inline_overwrite_replays_as_the_kernel_does() {
 /// whole image hashes the same before and after. The transcript is the
 /// native `dump-tree` of that exact image, bound by sha256 and superblock.
 fn an_unsupported_log_is_refused_without_writing(shape: &str, damage: impl FnOnce(&Path)) {
-    use sha2::Digest;
     let image = fixture(&format!("dirtylog/btrfs-dirty-log-{shape}.img"));
     let transcript = std::fs::read_to_string(fixture(&format!(
         "dirtylog/btrfs-dirty-log-{shape}.logdump"
     )))
     .expect("the native transcript of the unsupported log");
-    let bytes = std::fs::read(&image).unwrap();
-    transcript_binding(&transcript, &bytes).expect("transcript bound to this image");
+    transcript_binding(&transcript, &image).expect("transcript bound to this image");
     let guard = ScratchCopy::of(&image, temp_path!("refused-{shape}.img"));
     let copy = guard.0.clone();
     damage(&copy);
-    let before = format!("{:x}", sha2::Sha256::digest(std::fs::read(&copy).unwrap()));
+    let before = fs_btrfs_test_support::sha256_file(&copy).unwrap();
     let result =
         Filesystem::mount_rw(Arc::new(FileDevice::open_rw(&copy).unwrap()) as Arc<dyn BlockDevice>);
     assert!(
@@ -810,7 +799,7 @@ fn an_unsupported_log_is_refused_without_writing(shape: &str, damage: impl FnOnc
         "{shape}: an unsupported log must be refused with DirtyLog"
     );
     drop(result);
-    let after = format!("{:x}", sha2::Sha256::digest(std::fs::read(&copy).unwrap()));
+    let after = fs_btrfs_test_support::sha256_file(&copy).unwrap();
     assert_eq!(before, after, "{shape}: the refusal wrote to the image");
 }
 
@@ -880,9 +869,9 @@ fn a_log_whose_data_disagrees_with_its_checksums_is_refused_without_writing() {
         }
         let physical = physical
             .unwrap_or_else(|| panic!("no chunk in the dump holds logical {logical}:\n{chunks}"));
-        let mut bytes = std::fs::read(copy).unwrap();
-        bytes[physical as usize] ^= 0xff;
-        std::fs::write(copy, bytes).unwrap();
+        let mut byte = fs_btrfs_test_support::read_image_region(copy, physical, 1).unwrap();
+        byte[0] ^= 0xff;
+        fs_btrfs_test_support::write_image_region(copy, physical, &byte).unwrap();
     });
 }
 
@@ -957,8 +946,7 @@ fn an_inline_rewrite_replays_as_the_kernel_does(shape: &str, logged: &[u8]) {
         "dirtylog/btrfs-dirty-log-{shape}.logdump"
     )))
     .expect("the native transcript of the inline rewrite log");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
-        .expect("the transcript is of this exact image");
+    transcript_binding(&transcript, &image).expect("the transcript is of this exact image");
     let committed = Filesystem::mount_ignoring_log(Arc::new(
         FileDevice::open(&image).expect("open the inline rewrite fixture"),
     ) as Arc<dyn BlockRead>)
@@ -1067,8 +1055,7 @@ fn an_external_extent_overwrite_replays_as_the_kernel_does() {
     let image = fixture(EXTERNAL_FIXTURE);
     let transcript = std::fs::read_to_string(fixture(EXTERNAL_TRANSCRIPT))
         .expect("the native transcript of the external extent log");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
-        .expect("the transcript is of this exact image");
+    transcript_binding(&transcript, &image).expect("the transcript is of this exact image");
     let committed = Filesystem::mount_ignoring_log(Arc::new(
         FileDevice::open(&image).expect("open the external extent fixture"),
     ) as Arc<dyn BlockRead>)
@@ -1177,8 +1164,7 @@ fn a_write_inside_a_compressed_extent_replays_as_the_kernel_does() {
     let image = fixture(COMPRESSED_CUT_FIXTURE);
     let transcript = std::fs::read_to_string(fixture(COMPRESSED_CUT_TRANSCRIPT))
         .expect("the native transcript of the compressed cut log");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
-        .expect("the transcript is of this exact image");
+    transcript_binding(&transcript, &image).expect("the transcript is of this exact image");
     let committed = Filesystem::mount_ignoring_log(Arc::new(
         FileDevice::open(&image).expect("open the compressed cut fixture"),
     ) as Arc<dyn BlockRead>)
@@ -1274,8 +1260,7 @@ fn logged_xattr_changes_replay_as_the_kernel_does() {
     let image = fixture("dirtylog/btrfs-dirty-log-xattr.img");
     let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-xattr.logdump"))
         .expect("the native transcript of the xattr log");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
-        .expect("the transcript is of this exact image");
+    transcript_binding(&transcript, &image).expect("the transcript is of this exact image");
     let committed = Filesystem::mount_ignoring_log(Arc::new(
         FileDevice::open(&image).expect("open the xattr fixture"),
     ) as Arc<dyn BlockRead>)
@@ -1343,8 +1328,7 @@ fn a_log_creating_directories_replays_as_the_kernel_does() {
     let image = fixture(NEWDIR_FIXTURE);
     let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-newdir.logdump"))
         .expect("the native transcript of the new-directory log");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
-        .expect("the transcript is of this exact image");
+    transcript_binding(&transcript, &image).expect("the transcript is of this exact image");
     {
         let fs = Filesystem::mount_ignoring_log(Arc::new(
             FileDevice::open(&image).expect("open the new-directory fixture"),
@@ -1395,8 +1379,7 @@ fn a_log_creating_a_symlink_replays_as_the_kernel_does() {
     let image = fixture(SYMLINK_FIXTURE);
     let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-symlink.logdump"))
         .expect("the native transcript of the symlink log");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
-        .expect("the transcript is of this exact image");
+    transcript_binding(&transcript, &image).expect("the transcript is of this exact image");
     {
         let fs = Filesystem::mount_ignoring_log(Arc::new(
             FileDevice::open(&image).expect("open the symlink fixture"),
@@ -1461,8 +1444,7 @@ fn a_log_creating_device_fifo_and_socket_nodes_replays_as_the_kernel_does() {
     let image = fixture(SPECIAL_FIXTURE);
     let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-special.logdump"))
         .expect("the native transcript of the special-node log");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
-        .expect("the transcript is of this exact image");
+    transcript_binding(&transcript, &image).expect("the transcript is of this exact image");
     {
         let fs = Filesystem::mount_ignoring_log(Arc::new(
             FileDevice::open(&image).expect("open the special-node fixture"),
@@ -1538,8 +1520,7 @@ fn a_log_adding_hard_links_replays_as_the_kernel_does() {
     let image = fixture(HARDLINK_FIXTURE);
     let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-hardlink.logdump"))
         .expect("the native transcript of the hard-link log");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
-        .expect("the transcript is of this exact image");
+    transcript_binding(&transcript, &image).expect("the transcript is of this exact image");
     {
         let fs = Filesystem::mount_ignoring_log(Arc::new(
             FileDevice::open(&image).expect("open the hard-link fixture"),
@@ -1655,8 +1636,7 @@ fn a_log_adding_an_extended_reference_replays_as_the_kernel_does() {
     let image = fixture(EXTREF_FIXTURE);
     let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-extref.logdump"))
         .expect("the native transcript of the extended-reference log");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
-        .expect("the transcript is of this exact image");
+    transcript_binding(&transcript, &image).expect("the transcript is of this exact image");
     {
         let fs = Filesystem::mount_ignoring_log(Arc::new(
             FileDevice::open(&image).expect("open the extended-reference fixture"),
@@ -1789,8 +1769,7 @@ fn a_hard_link_made_durable_by_its_directory_replays_as_the_kernel_does() {
     let image = fixture(DIRLINK_FIXTURE);
     let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-dirlink.logdump"))
         .expect("the native transcript of the directory-fsync hard-link log");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
-        .expect("the transcript is of this exact image");
+    transcript_binding(&transcript, &image).expect("the transcript is of this exact image");
     {
         let fs = Filesystem::mount_ignoring_log(Arc::new(
             FileDevice::open(&image).expect("open the directory-fsync hard-link fixture"),
@@ -1939,8 +1918,7 @@ fn a_log_whose_inode_holds_a_stale_nbytes_replays_as_the_kernel_does() {
     let image = fixture(NBYTES_FIXTURE);
     let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-nbytes.logdump"))
         .expect("the native transcript of the stale-nbytes log");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
-        .expect("the transcript is of this exact image");
+    transcript_binding(&transcript, &image).expect("the transcript is of this exact image");
     {
         let fs = Filesystem::mount_ignoring_log(Arc::new(
             FileDevice::open(&image).expect("open the stale-nbytes fixture"),
@@ -2043,8 +2021,7 @@ fn a_hard_link_of_a_file_with_extended_references_replays_as_the_kernel_does() {
     let transcript =
         std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-extrefexists.logdump"))
             .expect("the native transcript of the extended-reference hard-link log");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
-        .expect("the transcript is of this exact image");
+    transcript_binding(&transcript, &image).expect("the transcript is of this exact image");
     {
         let fs = Filesystem::mount_ignoring_log(Arc::new(
             FileDevice::open(&image).expect("open the extended-reference hard-link fixture"),
@@ -2196,8 +2173,7 @@ fn a_file_the_log_creates_with_extended_references_replays_as_the_kernel_does() 
     let transcript =
         std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-extrefcreated.logdump"))
             .expect("the native transcript of the created extended-reference log");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
-        .expect("the transcript is of this exact image");
+    transcript_binding(&transcript, &image).expect("the transcript is of this exact image");
     let (n, committed_generation) = {
         let fs = Filesystem::mount_ignoring_log(Arc::new(
             FileDevice::open(&image).expect("open the created extended-reference fixture"),
@@ -2384,8 +2360,7 @@ fn a_file_the_log_creates_with_two_names_durable_by_its_directory_replays_as_the
     let transcript =
         std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-createdlink.logdump"))
             .expect("the native transcript of the created two-name log");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
-        .expect("the transcript is of this exact image");
+    transcript_binding(&transcript, &image).expect("the transcript is of this exact image");
     let (n, committed_generation) = {
         let fs = Filesystem::mount_ignoring_log(Arc::new(
             FileDevice::open(&image).expect("open the created two-name fixture"),
@@ -2545,8 +2520,7 @@ fn an_inode_whose_last_name_is_an_extended_reference_is_deleted_as_the_kernel_do
     let transcript =
         std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-extrefremoved.logdump"))
             .expect("the native transcript of the removed extended-reference log");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
-        .expect("the transcript is of this exact image");
+    transcript_binding(&transcript, &image).expect("the transcript is of this exact image");
     // f and the index of its last name, as the native tool prints the
     // committed trees: one INODE_EXTREF item, whose record reads
     // `index N parent P namelen L name: X`.
@@ -2700,8 +2674,7 @@ fn a_directory_whose_name_the_log_removes_is_removed_as_the_kernel_does() {
     let image = fixture(RMDIR_FIXTURE);
     let transcript = std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-rmdir.logdump"))
         .expect("the native transcript of the removed directory log");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
-        .expect("the transcript is of this exact image");
+    transcript_binding(&transcript, &image).expect("the transcript is of this exact image");
     let e = {
         let fs = Filesystem::mount_ignoring_log(Arc::new(
             FileDevice::open(&image).expect("open the removed directory fixture"),
@@ -2806,8 +2779,7 @@ fn a_name_whose_inode_keeps_another_is_removed_as_the_kernel_does() {
     let transcript =
         std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-linkremoved.logdump"))
             .expect("the native transcript of the removed name log");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
-        .expect("the transcript is of this exact image");
+    transcript_binding(&transcript, &image).expect("the transcript is of this exact image");
     let f = {
         let fs = Filesystem::mount_ignoring_log(Arc::new(
             FileDevice::open(&image).expect("open the removed name fixture"),
@@ -2937,8 +2909,7 @@ fn links_and_nodes_whose_last_names_the_log_removes_are_deleted_as_the_kernel_do
     let transcript =
         std::fs::read_to_string(fixture("dirtylog/btrfs-dirty-log-nodesremoved.logdump"))
             .expect("the native transcript of the removed links and nodes log");
-    transcript_binding(&transcript, &std::fs::read(&image).unwrap())
-        .expect("the transcript is of this exact image");
+    transcript_binding(&transcript, &image).expect("the transcript is of this exact image");
     let inodes: Vec<u64> = {
         let fs = Filesystem::mount_ignoring_log(Arc::new(
             FileDevice::open(&image).expect("open the removed links and nodes fixture"),
@@ -3051,11 +3022,8 @@ fn links_and_nodes_whose_last_names_the_log_removes_are_deleted_as_the_kernel_do
 fn the_logged_inline_extent_fields_match_the_native_transcript() {
     let transcript = std::fs::read_to_string(fixture(INLINE_TRANSCRIPT))
         .expect("the native transcript of the inline overwrite log");
-    inline_transcript_binding(
-        &transcript,
-        &std::fs::read(fixture(INLINE_FIXTURE)).unwrap(),
-    )
-    .expect("the transcript is of this exact image");
+    inline_transcript_binding(&transcript, &fixture(INLINE_FIXTURE))
+        .expect("the transcript is of this exact image");
     let ino = Filesystem::mount_ignoring_log(Arc::new(
         FileDevice::open(fixture(INLINE_FIXTURE)).unwrap(),
     ) as Arc<dyn BlockRead>)

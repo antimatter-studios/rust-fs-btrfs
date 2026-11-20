@@ -93,16 +93,15 @@ fn image(name: &str, window: impl Fn(u64, u64) -> (u64, u64)) -> (std::path::Pat
         .lookup_path("/file.bin")
         .unwrap()
         .ino;
-    let mut bytes = std::fs::read(&img).unwrap();
-    let sb = Superblock::parse(&bytes[SUPERBLOCK..SUPERBLOCK + 4096]).unwrap();
+    let super_bytes =
+        fs_btrfs_test_support::read_image_region(&img, SUPERBLOCK as u64, 4096).unwrap();
+    let sb = Superblock::parse(&super_bytes).unwrap();
     let node = sb.nodesize as usize;
     let sector = u64::from(sb.sectorsize);
     let ram_bytes = (PLAIN as u64).div_ceil(sector) * sector;
     let (offset, num_bytes) = window(sector, ram_bytes);
     let mut patched = 0;
-    let mut at = 0;
-    while at + node <= bytes.len() {
-        let block = &mut bytes[at..at + node];
+    fs_btrfs_test_support::edit_image_windows(&img, node, 4096, |_, block| {
         let owner = u64::from_le_bytes(
             block[header_offsets::OWNER..header_offsets::OWNER + 8]
                 .try_into()
@@ -139,12 +138,14 @@ fn image(name: &str, window: impl Fn(u64, u64) -> (u64, u64)) -> (std::path::Pat
             if hit {
                 stamp_checksum(block, &sb);
                 patched += 1;
+                return true;
             }
         }
-        at += 4096;
-    }
+        false
+    })
+    .unwrap();
     assert!(patched > 0, "fixture: the file's extent item was found");
-    std::fs::write(&img, &bytes).unwrap();
+
     (img, ino)
 }
 

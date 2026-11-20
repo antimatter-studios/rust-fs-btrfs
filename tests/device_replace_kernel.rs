@@ -386,13 +386,16 @@ fn a_replace_that_cannot_be_made_is_refused_and_writes_nothing() {
     let small = scratch.blank("small.img", 128 * MIB);
     let spare = scratch.blank("spare.img", 320 * MIB);
     let images = [&volume, &small, &spare];
-    let before: Vec<Vec<u8>> = images.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    let before: Vec<_> = images
+        .iter()
+        .map(|p| fs_btrfs_test_support::snapshot_image(p).unwrap())
+        .collect();
     let unchanged = |what: &str| {
         for (path, bytes) in images.iter().zip(&before) {
-            assert!(
-                std::fs::read(path).unwrap() == *bytes,
-                "{what}: {} was written to",
-                path.display()
+            fs_btrfs_test_support::assert_image_unchanged(
+                path,
+                bytes,
+                &format!("{what}: {} was written to", path.display()),
             );
         }
     };

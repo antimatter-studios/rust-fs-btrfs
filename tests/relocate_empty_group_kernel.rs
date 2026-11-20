@@ -22,7 +22,7 @@ use fs_btrfs::fs::Filesystem;
 use fs_btrfs::Error;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, dump_tree, guest_kernel_read_ok, guest_kernel_write_ok, oracle,
-    sha256_hex, temp_path,
+    temp_path,
 };
 use fs_core::{BlockDevice, FileDevice};
 use std::path::{Path, PathBuf};
@@ -164,7 +164,7 @@ fn an_empty_data_group_is_relocated_into_a_new_chunk_the_kernel_writes_into() {
 fn a_group_this_does_not_relocate_is_refused_before_anything_is_written() {
     let scratch = Scratch::new("relocate-refused");
     let image = scratch.image();
-    let before = sha256_hex(&std::fs::read(&image).unwrap());
+    let before = fs_btrfs_test_support::sha256_file(&image).unwrap();
 
     let mut fs = mount_rw(&image);
     let system = fs
@@ -187,7 +187,7 @@ fn a_group_this_does_not_relocate_is_refused_before_anything_is_written() {
     assert!(matches!(err, Error::NotFound), "{err}");
     drop(fs);
     assert_eq!(
-        sha256_hex(&std::fs::read(&image).unwrap()),
+        fs_btrfs_test_support::sha256_file(&image).unwrap(),
         before,
         "a refusal wrote to the image"
     );

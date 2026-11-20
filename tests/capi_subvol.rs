@@ -157,7 +157,7 @@ fn subvol_create_returns_the_new_subvolume_id() {
 #[test]
 fn subvol_create_refusals_change_nothing() {
     let image = scratch("refuse");
-    let before = std::fs::read(&image).expect("read the image");
+    let before = fs_btrfs_test_support::snapshot_image(&image).expect("snapshot the image");
     let c_img = cstr(image.to_str().unwrap());
 
     let path = cstr("/made");
@@ -228,8 +228,11 @@ fn subvol_create_refusals_change_nothing() {
     unsafe { fs_btrfs_umount(sub) };
     unsafe { fs_btrfs_umount(fs) };
 
-    let after = std::fs::read(&image).expect("read the image");
-    assert!(before == after, "a refused create changed the image");
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &before,
+        "a refused create changed the image",
+    );
     let _ = std::fs::remove_dir_all(image.parent().unwrap());
 }
 
@@ -384,7 +387,7 @@ fn subvol_delete_refusals_change_nothing() {
     let file = cstr("/file");
     assert_ne!(unsafe { fs_btrfs_create(fs, file.as_ptr(), 0o644) }, 0);
     unsafe { fs_btrfs_umount(fs) };
-    let before = std::fs::read(&image).expect("read the image");
+    let before = fs_btrfs_test_support::snapshot_image(&image).expect("snapshot the image");
     let c_img = cstr(image.to_str().unwrap());
 
     let kept = cstr("/kept");
@@ -423,8 +426,11 @@ fn subvol_delete_refusals_change_nothing() {
     unsafe { fs_btrfs_umount(sub) };
     unsafe { fs_btrfs_umount(fs) };
 
-    let after = std::fs::read(&image).expect("read the image");
-    assert!(before == after, "a refused delete changed the image");
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &before,
+        "a refused delete changed the image",
+    );
     let _ = std::fs::remove_dir_all(image.parent().unwrap());
 }
 
@@ -434,7 +440,7 @@ fn subvol_delete_refusals_change_nothing() {
 #[test]
 fn subvol_delete_refuses_a_subvolume_holding_another() {
     let image = scratch("delete-held");
-    let before = std::fs::read(&image).expect("read the image");
+    let before = fs_btrfs_test_support::snapshot_image(&image).expect("snapshot the image");
     let fs = mount_rw(&image);
     assert_eq!(subvol_delete(fs, "/sub"), -1);
     assert_eq!(
@@ -449,8 +455,11 @@ fn subvol_delete_refuses_a_subvolume_holding_another() {
         last_error()
     );
     unsafe { fs_btrfs_umount(fs) };
-    let after = std::fs::read(&image).expect("read the image");
-    assert!(before == after, "a refused delete changed the image");
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &before,
+        "a refused delete changed the image",
+    );
     let _ = std::fs::remove_dir_all(image.parent().unwrap());
 }
 
@@ -564,7 +573,7 @@ fn subvol_snapshot_refusals_change_nothing() {
     let file = cstr("/file");
     assert_ne!(unsafe { fs_btrfs_create(fs, file.as_ptr(), 0o644) }, 0);
     unsafe { fs_btrfs_umount(fs) };
-    let before = std::fs::read(&image).expect("read the image");
+    let before = fs_btrfs_test_support::snapshot_image(&image).expect("snapshot the image");
     let c_img = cstr(image.to_str().unwrap());
 
     assert_eq!(
@@ -638,8 +647,11 @@ fn subvol_snapshot_refusals_change_nothing() {
     unsafe { fs_btrfs_umount(sub) };
     unsafe { fs_btrfs_umount(fs) };
 
-    let after = std::fs::read(&image).expect("read the image");
-    assert!(before == after, "a refused snapshot changed the image");
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &before,
+        "a refused snapshot changed the image",
+    );
     let _ = std::fs::remove_dir_all(image.parent().unwrap());
 }
 

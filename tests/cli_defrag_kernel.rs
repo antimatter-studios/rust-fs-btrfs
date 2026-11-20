@@ -199,11 +199,12 @@ fn files_the_tool_defragments_are_judged_by_the_checker_and_the_kernel() {
          done",
     );
     assert_btrfs_check_clean(&image, "after the kernel snapshotted the volume");
-    let snapshotted = std::fs::read(&image).unwrap();
+    let snapshotted = fs_btrfs_test_support::snapshot_image(&image).unwrap();
     let message = refused(fs_btrfs(&image).args(["defragment", "/other"]), 3);
     assert!(message.contains("snapshot"), "{message}");
-    assert!(
-        std::fs::read(&image).unwrap() == snapshotted,
-        "a refused defragment wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &snapshotted,
+        "a refused defragment wrote to the image",
     );
 }

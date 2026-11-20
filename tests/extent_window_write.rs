@@ -64,17 +64,17 @@ fn image(name: &str) -> std::path::PathBuf {
 
 /// Apply `edit(key_type, body)` to `ino`'s items in every fs-tree leaf copy.
 fn edit_items(img: &std::path::Path, ino: u64, edit: impl Fn(u8, &mut [u8])) -> usize {
-    let mut bytes = std::fs::read(img).unwrap();
-    let sb = Superblock::parse(&bytes[SUPERBLOCK..SUPERBLOCK + 4096]).unwrap();
+    let super_bytes =
+        fs_btrfs_test_support::read_image_region(img, SUPERBLOCK as u64, 4096).unwrap();
+    let sb = Superblock::parse(&super_bytes).unwrap();
     let node = sb.nodesize as usize;
     let mut patched = 0;
-    for at in (0..bytes.len() - node).step_by(4096) {
-        let block = &mut bytes[at..at + node];
+    fs_btrfs_test_support::edit_image_windows(img, node, 4096, |_, block| {
         if block[header_offsets::FSID..header_offsets::FSID + 16] != sb.fsid
             || le64(block, header_offsets::OWNER) != objectid::FS_TREE
             || block[header_offsets::LEVEL] != 0
         {
-            continue;
+            return false;
         }
         let nritems = u32::from_le_bytes(
             block[header_offsets::NRITEMS..header_offsets::NRITEMS + 4]
@@ -98,8 +98,9 @@ fn edit_items(img: &std::path::Path, ino: u64, edit: impl Fn(u8, &mut [u8])) -> 
             stamp_checksum(block, &sb);
             patched += 1;
         }
-    }
-    std::fs::write(img, &bytes).unwrap();
+        hit
+    })
+    .unwrap();
     patched
 }
 
@@ -157,7 +158,7 @@ fn a_window_moved_past_its_extent_is_refused_before_anything_is_written() {
     assert!(patched >= 1, "fixture: the file's leaf was found");
 
     let fs = mount_rw(&img);
-    let before = std::fs::read(&img).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&img).unwrap();
     // The question a caller asks first gets the same answer the write
     // gives (Greptile on #156).
     assert!(
@@ -172,9 +173,10 @@ fn a_window_moved_past_its_extent_is_refused_before_anything_is_written() {
         Ok(n) => panic!("wrote {n} bytes through a window outside its extent"),
     }
     drop(fs);
-    assert!(
-        std::fs::read(&img).unwrap() == before,
-        "the image changed although the write was refused"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &img,
+        &before,
+        "the image changed although the write was refused",
     );
     let _ = std::fs::remove_dir_all(img.parent().unwrap());
 }

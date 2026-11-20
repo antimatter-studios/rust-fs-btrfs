@@ -39,6 +39,9 @@ fn xattr_output_requires_a_name_before_the_target_is_opened() {
         2,
     );
     assert!(message.contains("NAME"), "{message}");
-    assert_eq!(std::fs::read(&dest).unwrap(), b"keep me");
+    assert_eq!(
+        fs_btrfs_test_support::read_small_file(&dest).unwrap(),
+        b"keep me"
+    );
     assert!(!image.exists());
 }

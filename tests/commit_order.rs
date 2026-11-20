@@ -25,7 +25,7 @@ use fs_btrfs::commit::PlacedBlock;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::super_write::Commit;
 use fs_btrfs_test_support::fixture;
-use fs_core::{BlockDevice, BlockRead, Error as CoreError, Result as CoreResult};
+use fs_core::{BlockDevice, BlockRead, FileDevice, Result as CoreResult};
 use std::sync::{Arc, Mutex};
 
 /// What the device was asked to do, in order.
@@ -38,13 +38,13 @@ enum Op {
 /// A device that remembers the sequence, and passes reads through to a
 /// real image so the filesystem under test is a real one.
 struct Recorder {
-    image: Vec<u8>,
+    image: FileDevice,
     ops: Mutex<Vec<Op>>,
     written: Mutex<Vec<(u64, Vec<u8>)>>,
 }
 
 impl Recorder {
-    fn new(image: Vec<u8>) -> Self {
+    fn new(image: FileDevice) -> Self {
         Recorder {
             image,
             ops: Mutex::new(Vec::new()),
@@ -67,19 +67,10 @@ impl Recorder {
 
 impl BlockRead for Recorder {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> CoreResult<()> {
-        let at = offset as usize;
-        if at + buf.len() > self.image.len() {
-            return Err(CoreError::OutOfBounds {
-                offset,
-                len: buf.len() as u64,
-                size: self.image.len() as u64,
-            });
-        }
-        buf.copy_from_slice(&self.image[at..at + buf.len()]);
-        Ok(())
+        self.image.read_at(offset, buf)
     }
     fn size_bytes(&self) -> u64 {
-        self.image.len() as u64
+        self.image.size_bytes()
     }
 }
 
@@ -104,8 +95,9 @@ impl BlockDevice for Recorder {
 /// The named fixture, mounted read-write through a recording device.
 fn mounted(name: &str) -> (Filesystem, Arc<Recorder>) {
     let path = fixture(name);
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-    let dev = Arc::new(Recorder::new(bytes));
+    let image =
+        FileDevice::open(&path).unwrap_or_else(|e| panic!("opening {}: {e}", path.display()));
+    let dev = Arc::new(Recorder::new(image));
     let fs = Filesystem::mount_rw(dev.clone() as Arc<dyn BlockDevice>)
         .unwrap_or_else(|e| panic!("mounting {} read-write: {e}", path.display()));
     (fs, dev)

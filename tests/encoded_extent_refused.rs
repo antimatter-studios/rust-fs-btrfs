@@ -106,13 +106,12 @@ fn image(name: &str, encode: Encode) -> (std::path::PathBuf, u64, u64) {
         return (img, target_ino, other_ino);
     }
 
-    let mut bytes = std::fs::read(&img).unwrap();
-    let sb = Superblock::parse(&bytes[SUPERBLOCK..SUPERBLOCK + 4096]).unwrap();
+    let super_bytes =
+        fs_btrfs_test_support::read_image_region(&img, SUPERBLOCK as u64, 4096).unwrap();
+    let sb = Superblock::parse(&super_bytes).unwrap();
     let node = sb.nodesize as usize;
     let mut patched = 0;
-    let mut at = 0;
-    while at + node <= bytes.len() {
-        let block = &mut bytes[at..at + node];
+    fs_btrfs_test_support::edit_image_windows(&img, node, 4096, |_, block| {
         let owner = u64::from_le_bytes(
             block[header_offsets::OWNER..header_offsets::OWNER + 8]
                 .try_into()
@@ -151,15 +150,17 @@ fn image(name: &str, encode: Encode) -> (std::path::PathBuf, u64, u64) {
             if hit {
                 stamp_checksum(block, &sb);
                 patched += 1;
+                return true;
             }
         }
-        at += 4096;
-    }
+        false
+    })
+    .unwrap();
     assert!(
         patched > 0,
         "fixture: the target file's extent item was found"
     );
-    std::fs::write(&img, &bytes).unwrap();
+
     (img, target_ino, other_ino)
 }
 

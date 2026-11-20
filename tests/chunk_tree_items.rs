@@ -45,15 +45,16 @@ fn image_with_damaged_chunk(name: &str, damage: fn(&mut [u8])) -> std::path::Pat
         String::from_utf8_lossy(&made.stderr)
     );
 
-    let mut bytes = std::fs::read(&path).unwrap();
-    let sb = Superblock::parse(&bytes[SUPERBLOCK..SUPERBLOCK + 4096]).expect("superblock");
+    let super_bytes =
+        fs_btrfs_test_support::read_image_region(&path, SUPERBLOCK as u64, 4096).unwrap();
+    let sb = Superblock::parse(&super_bytes).expect("superblock");
     let map = ChunkMap::bootstrap(&sb).expect("bootstrap map");
     let at = map
         .map(sb.chunk_root)
         .expect("chunk root is mapped")
         .physical as usize;
     let node = sb.nodesize as usize;
-    let leaf = &mut bytes[at..at + node];
+    let mut leaf = fs_btrfs_test_support::read_image_region(&path, at as u64, node).unwrap();
     assert_eq!(
         leaf[header_offsets::LEVEL],
         0,
@@ -84,8 +85,8 @@ fn image_with_damaged_chunk(name: &str, damage: fn(&mut [u8])) -> std::path::Pat
         damaged,
         "fixture: the chunk tree holds a non-system chunk item"
     );
-    stamp_checksum(leaf, &sb);
-    std::fs::write(&path, &bytes).unwrap();
+    stamp_checksum(&mut leaf, &sb);
+    fs_btrfs_test_support::write_image_region(&path, at as u64, &leaf).unwrap();
     path
 }
 

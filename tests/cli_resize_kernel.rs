@@ -77,12 +77,15 @@ fn resize_ok(image: &Path, args: &[&str]) -> String {
 /// `fs.btrfs IMAGE resize ARGS...`, required to be refused with exit 3
 /// and to leave the image exactly as it was, length included.
 fn resize_refused(image: &Path, args: &[&str]) -> String {
-    let before = std::fs::read(image).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(image).unwrap();
     let message = refused(tool("fs.btrfs").arg(image).arg("resize").args(args), 3);
-    assert!(
-        std::fs::read(image).unwrap() == before,
-        "a refused `resize {}` changed the image: {message}",
-        args.join(" ")
+    fs_btrfs_test_support::assert_image_unchanged(
+        image,
+        &before,
+        &format!(
+            "a refused `resize {}` changed the image: {message}",
+            args.join(" ")
+        ),
     );
     message
 }

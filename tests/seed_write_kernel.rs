@@ -8,7 +8,7 @@
 
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs_test_support::copy_sparse;
-use fs_btrfs_test_support::{fixture, guest_kernel_pool_read, sha256_hex, temp_path};
+use fs_btrfs_test_support::{fixture, guest_kernel_pool_read, temp_path};
 use fs_core::{BlockDevice, FileDevice};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ fn the_kernel_reads_back_a_file_written_into_a_seed_and_sprout_pair() {
     ] {
         copy_sparse(fixture(&format!("seed/{name}")), copy).expect("copy the member");
     }
-    let seed_before = sha256_hex(&std::fs::read(&seed_path).expect("read the seed copy"));
+    let seed_before = fs_btrfs_test_support::sha256_file(&seed_path).unwrap();
     let seed = Arc::new(FileDevice::open_rw(&seed_path).expect("open the seed copy"))
         as Arc<dyn BlockDevice>;
     let sprout = Arc::new(FileDevice::open_rw(&sprout_path).expect("open the sprout copy"))
@@ -45,7 +45,7 @@ fn the_kernel_reads_back_a_file_written_into_a_seed_and_sprout_pair() {
     assert!(fs.superblock().generation > generation);
     drop(fs);
     assert_eq!(
-        sha256_hex(&std::fs::read(&seed_path).expect("read the seed after committing")),
+        fs_btrfs_test_support::sha256_file(&seed_path).unwrap(),
         seed_before,
         "the crate wrote the seed"
     );

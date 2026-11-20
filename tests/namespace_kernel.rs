@@ -158,7 +158,7 @@ fn names_made_and_removed_through_the_abi_are_clean_and_the_kernel_agrees() {
     );
 
     // Each refusal names its errno and writes nothing.
-    let before = std::fs::read(&image).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&image).unwrap();
     refused(
         unsafe { fs_btrfs_create(fs, c("/new").as_ptr(), 0o644) } == 0,
         EEXIST,
@@ -189,9 +189,10 @@ fn names_made_and_removed_through_the_abi_are_clean_and_the_kernel_agrees() {
         EISDIR,
         "link of a directory",
     );
-    assert!(
-        std::fs::read(&image).unwrap() == before,
-        "a refused change wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &before,
+        "a refused change wrote to the image",
     );
     unsafe { fs_btrfs_umount(fs) };
 
@@ -250,7 +251,7 @@ fn names_made_and_removed_through_the_abi_are_clean_and_the_kernel_agrees() {
 fn a_read_only_handle_refuses_every_name_change() {
     let scratch = Scratch::new("namespace-readonly", FILL);
     let image = scratch.image();
-    let before = std::fs::read(&image).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&image).unwrap();
     let fs = unsafe { fs_btrfs_mount(c(image.to_str().unwrap()).as_ptr()) };
     assert!(!fs.is_null(), "mount: {}", last_error());
     const EROFS: i32 = 30;
@@ -265,8 +266,9 @@ fn a_read_only_handle_refuses_every_name_change() {
         "unlink on a read-only handle",
     );
     unsafe { fs_btrfs_umount(fs) };
-    assert!(
-        std::fs::read(Path::new(&image)).unwrap() == before,
-        "a read-only handle wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        Path::new(&image),
+        &before,
+        "a read-only handle wrote to the image",
     );
 }

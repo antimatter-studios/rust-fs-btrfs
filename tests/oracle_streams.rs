@@ -27,7 +27,9 @@ fn finished_call(stdout: &[u8], stderr: &[u8]) -> Run {
 /// its message must name the tool, the file and the error.
 fn removing_it_fails_the_call(run: &Run, stream: &Path) {
     fs::remove_file(stream).unwrap();
-    let error = fs::read(stream).unwrap_err().to_string();
+    let error = fs_btrfs_test_support::read_small_file(stream)
+        .unwrap_err()
+        .to_string();
 
     let failure = catch_unwind(AssertUnwindSafe(|| run.streams(TOOL)))
         .expect_err("a stream file that cannot be read was reported as empty output");
@@ -77,4 +79,16 @@ fn a_read_removes_both_stream_files() {
     let _ = run.streams(TOOL);
     assert!(!run.stdout.exists());
     assert!(!run.stderr.exists());
+}
+
+/// dump-tree may produce more text than the old 16 MiB cap allowed. Oracle
+/// streams are command output, not disk images, and must reach their callers.
+#[test]
+fn large_oracle_text_is_not_rejected_as_an_image() {
+    let expected = vec![b'x'; (16 << 20) + 1];
+    let run = finished_call(&expected, b"");
+    let (stdout, stderr) = run.streams(TOOL);
+    assert_eq!(stdout.len(), expected.len());
+    assert!(stdout.iter().all(|byte| *byte == b'x'));
+    assert!(stderr.is_empty());
 }

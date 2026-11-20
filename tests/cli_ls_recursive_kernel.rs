@@ -17,7 +17,7 @@ use cli_support::*;
 use fs_btrfs::dir::{offsets, DIR_INDEX_KEY, MAX_NAME_LEN};
 use fs_btrfs::Filesystem;
 use fs_btrfs_test_support::copy_sparse;
-use fs_btrfs_test_support::{guest_kernel_write, oracle, sha256_hex};
+use fs_btrfs_test_support::{guest_kernel_write, oracle};
 use fs_core::FileDevice;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -183,7 +183,7 @@ fn retarget(ino: u64) -> impl Fn(&mut [u8]) {
 /// The bounded walk of `image` from its root, which must not change a
 /// byte of it.
 fn walk(image: &Path) -> Output {
-    let before = sha256_hex(&std::fs::read(image).unwrap());
+    let before = fs_btrfs_test_support::sha256_file(image).unwrap();
     let out = tool("fs.btrfs")
         .arg(image)
         .args(["ls", "-R"])
@@ -192,7 +192,7 @@ fn walk(image: &Path) -> Output {
         .output()
         .unwrap();
     assert_eq!(
-        sha256_hex(&std::fs::read(image).unwrap()),
+        fs_btrfs_test_support::sha256_file(image).unwrap(),
         before,
         "ls -R changed {}",
         image.display()

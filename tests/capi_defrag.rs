@@ -185,13 +185,14 @@ fn defragment_rewrites_the_file_as_the_library_does() {
         expect,
         "the library's own defragment"
     );
-    assert!(
-        std::fs::read(&image).unwrap() == std::fs::read(&twin).unwrap(),
-        "the C ABI's defragment and the library's left different images"
+    fs_btrfs_test_support::assert_images_equal(
+        &image,
+        &twin,
+        "the C ABI's defragment and the library's left different images",
     );
 
     let fs = c_mount_rw(&image);
-    let before = std::fs::read(&image).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&image).unwrap();
     let (rc, out) = defragment(fs, "/frag", 0);
     assert_eq!(rc, 0, "defragment /frag again: {}", last_error());
     assert_eq!(report(&out), (1, 1, 0, 0), "nothing left to do");
@@ -199,9 +200,10 @@ fn defragment_rewrites_the_file_as_the_library_does() {
     assert_eq!(rc, 0, "defragment /whole: {}", last_error());
     assert_eq!(report(&out), (1, 1, 0, 0), "a file of one extent");
     unsafe { fs_btrfs_umount(fs) };
-    assert!(
-        std::fs::read(&image).unwrap() == before,
-        "a defragment with nothing to do wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &before,
+        "a defragment with nothing to do wrote to the image",
     );
 }
 
@@ -234,9 +236,10 @@ fn a_target_bounds_each_run_as_defragment_to_does() {
         lib.defragment_to(ino, target).unwrap();
     }
     drop(lib);
-    assert!(
-        std::fs::read(&image).unwrap() == std::fs::read(&twin).unwrap(),
-        "the C ABI's defragment to a target and the library's left different images"
+    fs_btrfs_test_support::assert_images_equal(
+        &image,
+        &twin,
+        "the C ABI's defragment to a target and the library's left different images",
     );
 }
 
@@ -245,7 +248,7 @@ fn a_target_bounds_each_run_as_defragment_to_does() {
 fn refusals_set_their_errno_and_write_nothing() {
     let scratch = Scratch::new("refusals");
     let image = scratch.image();
-    let before = std::fs::read(&image).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&image).unwrap();
 
     let fs = c_mount_rw(&image);
     for (path, target, errno, what) in [
@@ -277,9 +280,10 @@ fn refusals_set_their_errno_and_write_nothing() {
     };
     assert_eq!(rc, -1, "a NULL handle defragmented");
 
-    assert!(
-        std::fs::read(&image).unwrap() == before,
-        "a refused defragment wrote to the image"
+    fs_btrfs_test_support::assert_image_unchanged(
+        &image,
+        &before,
+        "a refused defragment wrote to the image",
     );
 
     // The library is still the judge of what the file holds.

@@ -153,7 +153,7 @@ fn profiles_and_usage_narrow_what_is_selected() {
 #[test]
 fn a_refused_balance_leaves_the_image_as_it_was() {
     let img = volume("balance-refused");
-    let before = std::fs::read(&img).unwrap();
+    let before = fs_btrfs_test_support::snapshot_image(&img).unwrap();
     for args in [
         // One device holds single and DUP, nothing else.
         &["-dconvert=raid1"][..],
@@ -161,10 +161,13 @@ fn a_refused_balance_leaves_the_image_as_it_was() {
         &["-d", "-mconvert=raid1"][..],
     ] {
         let message = refused(tool("fs.btrfs").arg(&img).arg("balance").args(args), 3);
-        assert!(
-            std::fs::read(&img).unwrap() == before,
-            "a refused `balance {}` changed the image: {message}",
-            args.join(" ")
+        fs_btrfs_test_support::assert_image_unchanged(
+            &img,
+            &before,
+            &format!(
+                "a refused `balance {}` changed the image: {message}",
+                args.join(" ")
+            ),
         );
     }
 }

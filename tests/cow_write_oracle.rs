@@ -896,7 +896,7 @@ fn a_write_into_a_hole_adds_an_extent_the_checker_and_kernel_accept() {
             "{{\"image_sha256\":\"{}\",\"driver_nbytes\":{},\"control_nbytes\":{},\
              \"kernel_stat_bytes\":[{}],\"holey_sha256\":\"{}\",\"control_sha256\":\"{}\",\
              \"holey_extent_starts\":[{}],\"control_extent_starts\":[{}]}}\n",
-            sha256_hex(&std::fs::read(&image).unwrap()),
+            fs_btrfs_test_support::sha256_file(&image).unwrap(),
             inode.nbytes,
             control.nbytes,
             blocks
