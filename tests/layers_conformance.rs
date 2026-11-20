@@ -33,30 +33,11 @@ const HEALTHY: &[&str] = &[
     "btrfs-nodatacow.img",
 ];
 
-/// rust-fs-core#462 (#453, item 2), open in 0.5.0: `check_primitive` counts an
-/// encoded run's stored bytes against the file bytes it claims, so a
-/// compressed unit larger than its output fails it. `btrfs-comp-lzo.img`
-/// holds one: a 49-byte inline file stored LZO-compressed in 54 bytes,
-/// whose walk is complete and whose plan is exactly 49 bytes.
-fn is_misfit_2(check: &conformance::Check) -> bool {
-    let problems = check.detail.matches("claimed, end Complete").count();
-    check.name == "primitive.walks"
-        && problems > 0
-        && problems
-            == check
-                .detail
-                .matches("end Complete, inside true, in file order true, within the claim true")
-                .count()
-}
-
 /// Every healthy fixture passes the volume, primitive and file checks, and
-/// its candidates' walks rebuild its files: every check but the one
-/// rust-fs-core#462 fails, which has to fail on the LZO fixture
-/// until core fixes it, so this test changes when it does.
+/// its candidates' walks rebuild its files.
 #[test]
 fn healthy_fixtures_conform() {
     let mut failed = Vec::new();
-    let mut misfit_seen = false;
     for name in HEALTHY {
         let image = fixture(name);
         let volume = BtrfsVolume::open(FileDevice::open(&image).unwrap())
@@ -67,19 +48,10 @@ fn healthy_fixtures_conform() {
             &limits(),
         ));
         for check in report.failures() {
-            if is_misfit_2(check) {
-                misfit_seen = true;
-            } else {
-                failed.push(format!("{name}: {} {}", check.name, check.detail));
-            }
+            failed.push(format!("{name}: {} {}", check.name, check.detail));
         }
     }
     assert!(failed.is_empty(), "{failed:#?}");
-    assert!(
-        misfit_seen,
-        "rust-fs-core#462 no longer shows on btrfs-comp-lzo.img: \
-         the walk check is fixed, so drop is_misfit_2"
-    );
 }
 
 fn scratch(name: &str, tag: &str) -> PathBuf {

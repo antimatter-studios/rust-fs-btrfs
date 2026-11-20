@@ -17,7 +17,7 @@ use fs_btrfs::salvage::{
 };
 use fs_btrfs_test_support::guest_kernel_write_ok;
 use fs_btrfs_test_support::{oracle, read_bounded_file, temp_path};
-use fs_core::layers::conformance::salvage::{run, Damaged, Driver, Evidence, Rule, Violation};
+use fs_core::layers::conformance::salvage::{run, Damaged, Driver, Evidence};
 use fs_core::layers::{DamageKind, Extent};
 use fs_core::BlockRead;
 use std::ops::ControlFlow;
@@ -173,23 +173,5 @@ impl Driver for Btrfs {
 
 #[test]
 fn the_salvage_adapter_conforms() {
-    let report = run(&Btrfs);
-    // rust-fs-core#463 (#453, item 7), open in 0.5.0: the set's walk shape check
-    // calls two adjacent extents unmerged without asking whether they are
-    // encoded, and two compressed units cannot be one extent. Btrfs lays
-    // consecutive zstd units back to back, so every multi-unit compressed
-    // file shows it. Nothing else may fail, and that has to, until core
-    // fixes it: then this test fails and the filter goes.
-    let misfit = |v: &&Violation| {
-        v.rule == Rule::Consistency
-            && v.detail.contains("leaves adjacent extents unmerged")
-            && v.detail.contains("encoded: Some(")
-    };
-    let others: Vec<&Violation> = report.violations().iter().filter(|v| !misfit(v)).collect();
-    assert!(others.is_empty(), "{others:#?}");
-    assert!(
-        report.violations().iter().any(|v| misfit(&v)),
-        "rust-fs-core#463 no longer shows: the walk shape check is fixed, so use \
-         assert_conforms again"
-    );
+    run(&Btrfs).assert_conforms();
 }
