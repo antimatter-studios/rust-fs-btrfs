@@ -1537,7 +1537,22 @@ impl Filesystem {
     ///
     /// As [`Filesystem::mount`], except that a non-empty log is not
     /// refused.
+    ///
+    /// Deprecated: `layers::BtrfsVolume::open_for_salvage` opens a
+    /// volume whose log is not replayed, through this same path, and
+    /// reports the log in its health. This stays, unchanged, for one
+    /// release.
+    #[deprecated(
+        since = "0.12.0",
+        note = "open the volume through rust-fs-core's `OpenVolume`, `layers::BtrfsVolume::open_for_salvage`, which reads past an unreplayed log; kept for one release"
+    )]
     pub fn mount_ignoring_log(device: Arc<dyn BlockRead>) -> Result<Self> {
+        Self::open_ignoring_log(device)
+    }
+
+    /// The open behind [`Filesystem::mount_ignoring_log`] and
+    /// `layers::BtrfsVolume::open_for_salvage`'s fallback.
+    pub(crate) fn open_ignoring_log(device: Arc<dyn BlockRead>) -> Result<Self> {
         let (mut sb, copy) = crate::superblock::read_superblock(&*device)?;
         let log_root = sb.log_root;
         let log_root_level = sb.log_root_level;

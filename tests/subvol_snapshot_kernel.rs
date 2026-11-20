@@ -17,6 +17,10 @@
 //! - after the kernel's writes the volume must still be clean, and this
 //!   crate must read each side's bytes back as the kernel left them.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use std::sync::Arc;
 
 use fs_btrfs::fs::Filesystem;

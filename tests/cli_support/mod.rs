@@ -5,6 +5,9 @@
 //! turns it on for every tier; a bare `cargo test` does not, and then
 //! these tests FAIL naming the fix rather than skipping.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
 #![allow(dead_code)]
 
 use fs_btrfs::chunk::DiskKey;

@@ -11,6 +11,10 @@
 //! Build the images with `chore fixtures cow` (the real kernel makes
 //! them, inside the fs-linux-test-harness VM).
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::btree::header_offsets as o;
 use fs_btrfs::chunk::{key_type, DiskKey};
 use fs_btrfs::fs::Filesystem;

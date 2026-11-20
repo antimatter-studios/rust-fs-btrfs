@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 fn emptied_tree(keep_right: bool) -> (Filesystem, Plan, DataWrite, u64, Vec<u64>) {
     let dev = Arc::new(Sparse::default());
     crate::mkfs::format(dev.as_ref(), &crate::mkfs::Options::default()).unwrap();
-    let fs = Filesystem::mount(dev.clone() as Arc<dyn BlockRead>).unwrap();
+    let fs = Filesystem::open_read_only(dev.clone() as Arc<dyn BlockRead>, 0).unwrap();
     let root = fs.tree_root(objectid::FS_TREE).unwrap();
     let block = fs.read_tree_block(root).unwrap();
     let id = BlockIdentity {
@@ -179,7 +179,7 @@ fn emptied_tree(keep_right: bool) -> (Filesystem, Plan, DataWrite, u64, Vec<u64>
     }
     drop(fs);
     (
-        Filesystem::mount(dev as Arc<dyn BlockRead>).unwrap(),
+        Filesystem::open_read_only(dev as Arc<dyn BlockRead>, 0).unwrap(),
         plan,
         data,
         root,
@@ -344,7 +344,7 @@ fn cascade_with_items(root_room: usize, height: u8, added: usize) -> (Plan, Vec<
         },
     )
     .unwrap();
-    let fs = Filesystem::mount(dev.clone() as Arc<dyn BlockRead>).unwrap();
+    let fs = Filesystem::open_read_only(dev.clone() as Arc<dyn BlockRead>, 0).unwrap();
     let root = fs.tree_root(objectid::FS_TREE).unwrap();
     let original = fs.read_tree_block(root).unwrap();
     let id = BlockIdentity {
@@ -443,7 +443,7 @@ fn cascade_with_items(root_room: usize, height: u8, added: usize) -> (Plan, Vec<
     // Reopen to discard cached blocks. The root address stays the same;
     // this test calls the planner directly, without committing the shape.
     drop(fs);
-    let fs = Filesystem::mount(dev as Arc<dyn BlockRead>).unwrap();
+    let fs = Filesystem::open_read_only(dev as Arc<dyn BlockRead>, 0).unwrap();
     let leaf = path[0];
     let data = DataWrite {
         root: objectid::FS_TREE,
@@ -568,7 +568,7 @@ fn the_levels_above_a_split_root_hold_every_part_in_key_order() {
         },
     )
     .unwrap();
-    let fs = Filesystem::mount(dev as Arc<dyn BlockRead>).unwrap();
+    let fs = Filesystem::open_read_only(dev as Arc<dyn BlockRead>, 0).unwrap();
     let capacity = tree_write::key_ptr_capacity(&fs.sb);
     let parts: Vec<_> = (0..capacity as u64 + 1)
         .map(|i| (key(i + 1), 0x10_0000 + i * 4096))
@@ -633,7 +633,7 @@ fn the_levels_above_a_split_root_hold_every_part_in_key_order() {
 fn an_extent_record_precedes_a_leaf_starting_with_its_keyed_references() {
     let dev = Arc::new(Sparse::default());
     crate::mkfs::format(dev.as_ref(), &crate::mkfs::Options::default()).unwrap();
-    let fs = Filesystem::mount(dev.clone() as Arc<dyn BlockRead>).unwrap();
+    let fs = Filesystem::open_read_only(dev.clone() as Arc<dyn BlockRead>, 0).unwrap();
     let group = fs
         .block_groups()
         .unwrap()

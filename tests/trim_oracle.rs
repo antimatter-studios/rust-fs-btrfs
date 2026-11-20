@@ -15,6 +15,10 @@
 //! different offsets of the one device, copy `k` of a run is stripe `k`'s
 //! offset plus the run's offset into its chunk.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::trim::TrimRange;
 use fs_btrfs_test_support::{dump_tree, fixture, temp_path};

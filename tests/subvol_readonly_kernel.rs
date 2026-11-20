@@ -9,6 +9,10 @@
 //! accept one created in `rosnap` -- the flag is what it enforces, not
 //! only what it prints -- without logging a complaint while mounting it.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use std::sync::Arc;
 
 use fs_btrfs::error::Error;

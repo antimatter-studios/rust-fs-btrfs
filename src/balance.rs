@@ -2125,7 +2125,7 @@ mod tests {
             let device = Arc::new(FileDevice::open_rw(image.path()).unwrap());
             // mount_rw replays this log. Open the committed trees without
             // replay, then supply the writer to exercise evacuation itself.
-            let mut fs = Filesystem::mount_ignoring_log(device.clone()).unwrap();
+            let mut fs = Filesystem::open_ignoring_log(device.clone()).unwrap();
             assert_ne!(fs.sb.log_root, 0, "the kernel fixture must retain its log");
             assert!(fs.log().unwrap().is_some(), "the log tree must be readable");
             fs.writable = Some(device as Arc<dyn BlockDevice>);

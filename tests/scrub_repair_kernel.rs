@@ -34,6 +34,10 @@
 //! data, and it must hash to what the kernel's own repairing scrub wrote
 //! there.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::chunk::DiskKey;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::scrub::ScrubTarget;
