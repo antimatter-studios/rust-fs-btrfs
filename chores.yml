@@ -112,7 +112,12 @@ chore_min_version: 0.10.0
 #                                                    run 38099812942, over
 #                                                    the old 18,000 bytes;
 #                                                    was 296 / 13,865
-#     oracle      783 /  40,018    1,020 /  52,000   ~30%: the 716 / 33,950
+#     oracle      818 /  42,127    1,065 /  54,800   ~30%: the 783 / 40,018
+#                                                    below plus 35 / 2,109
+#                                                    measured locally for
+#                                                    #801's
+#                                                    salvage_roots_oracle.
+#                 783 /  40,018    1,020 /  52,000   ~30%: the 716 / 33,950
 #                                                    below plus 67 / 6,068
 #                                                    measured locally for
 #                                                    #800's
@@ -666,7 +671,7 @@ tasks:
     cmds:
       - scripts/tools.sh --check
       - test-disks/build-fixtures.sh --check
-      - 'scripts/disk-watch.sh oracle ../rust-fs-core/scripts/tier.sh test:oracle oracle 1020 52000 -- scripts/test.sh --locked --profile test $(scripts/test-targets.sh oracle) -- --show-output'
+      - 'scripts/disk-watch.sh oracle ../rust-fs-core/scripts/tier.sh test:oracle oracle 1065 54800 -- scripts/test.sh --locked --profile test $(scripts/test-targets.sh oracle) -- --show-output'
 
   test:kernel:
     desc: 'The driver writes, THE KERNEL reads back: our images loop-mounted by Linux in the guest'
