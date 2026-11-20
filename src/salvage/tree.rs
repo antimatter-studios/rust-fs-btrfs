@@ -84,6 +84,38 @@ impl Layout {
     }
 }
 
+impl Layout {
+    /// The physical `(offset, length)` runs on the source that copy
+    /// `mirror` of `[logical, logical + length)` occupies, in order.
+    pub fn physical_runs(
+        &self,
+        logical: u64,
+        length: u64,
+        mirror: usize,
+    ) -> Result<Vec<(u64, u64)>, BlockFault> {
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        let mut done = 0u64;
+        while done < length {
+            let mapping = self
+                .chunks
+                .map_mirror(logical + done, mirror)
+                .map_err(|_| BlockFault::Unmapped)?;
+            if mapping.devid != self.devid {
+                return Err(BlockFault::OtherDevice {
+                    devid: mapping.devid,
+                });
+            }
+            let take = (length - done).min(mapping.len.max(1));
+            match runs.last_mut() {
+                Some(last) if last.0 + last.1 == mapping.physical => last.1 += take,
+                _ => runs.push((mapping.physical, take)),
+            }
+            done += take;
+        }
+        Ok(runs)
+    }
+}
+
 /// One check a tree block failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockFault {
