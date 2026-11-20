@@ -39,12 +39,25 @@ permissions:
   contents: read
 
 jobs:
+  fuzz-gate:
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
   fuzz:
     name: fuzz the superblock, tree and item decoders
-    runs-on: ubuntu-latest
+    needs: fuzz-gate
+    runs-on: ${{ needs.fuzz-gate.outputs.runner }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      - name: Packages the hosted image has
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential curl jq
 
       # Nightly, not the pin in rust-toolchain.toml. cargo-fuzz needs
       # `-Z sanitizer`, which stable does not have. The explicit
