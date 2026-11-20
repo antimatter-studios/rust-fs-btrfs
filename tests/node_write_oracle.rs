@@ -17,6 +17,10 @@
 //! it: the leaf oracle beside this one spent a release returning early
 //! on fixtures it never found, and reported green throughout.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::btree::{header_offsets as o, KeyPtr, HEADER_SIZE, ITEM_SIZE, KEY_PTR_SIZE};
 use fs_btrfs::chunk::DiskKey;
 use fs_btrfs::fs::Filesystem;

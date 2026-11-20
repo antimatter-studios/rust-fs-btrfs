@@ -25,7 +25,7 @@ Everything below is read-only. The writable surface (`mount_rw`, the
 
 | Trait | Type | Built on |
 |---|---|---|
-| `VolumeAPI`, `OpenVolume` | `layers::BtrfsVolume` | `salvage::superblock_copies`, `Filesystem::mount` for `open` |
+| `VolumeAPI`, `OpenVolume` | `layers::BtrfsVolume` | `salvage::superblock_copies`, the validating read-only open for `open`, and the open that leaves the log unreplayed when `open_for_salvage` meets a dirty log |
 | `PrimitiveAPI` | `layers::BtrfsVolume` | superblock copies, the chunk, root and filesystem tree roots |
 | `SalvageAdapter` | `layers::BtrfsAdapter` | `salvage::scan_tree_blocks`, `walk_tree`, `search_range`, `build_chunk_map`, `root_tree_candidates`, `compression::decompress` |
 | `FileAPI` | `layers::BtrfsVolume`, node `BtrfsNode { tree, ino }` | `Filesystem`, one mount per subvolume |
@@ -39,7 +39,14 @@ file's last record is evidence of unknown standing. A compressed run is an
 extent's `ram_bytes`, and whose `offset` and `length` are the window of the
 decoded extent the file extent item references.
 
-The old API, `Filesystem` and the C ABI, is unchanged.
+The read-only openers `Filesystem::mount`, `Filesystem::mount_with_cache`
+and `Filesystem::mount_ignoring_log` are deprecated from 0.12.0 and stay for
+one release: `BtrfsVolume::open` and `BtrfsVolume::open_for_salvage` replace
+them, and `BtrfsVolume::filesystem` lends the mount for what the layers do
+not cover. The rest of `Filesystem`, the write path and the C ABI are
+unchanged. The crate's own tests, examples and command-line tools still call
+the deprecated openers for that release, each file marked
+`#![allow(deprecated)]`.
 
 ## VolumeAPI
 

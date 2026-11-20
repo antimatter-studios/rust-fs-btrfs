@@ -13,6 +13,10 @@
 //! which is the one place the btrfs-progs tools live, so it is always
 //! there and nothing here skips.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::btree::{header_offsets, HEADER_SIZE, ITEM_SIZE};
 use fs_btrfs::chunk::objectid;
 use fs_btrfs::fs::Filesystem;

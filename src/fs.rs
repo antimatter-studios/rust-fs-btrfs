@@ -597,8 +597,17 @@ pub const DEFAULT_CACHE_BLOCKS: usize = 0;
 
 impl Filesystem {
     /// Open `device` as a Btrfs filesystem.
+    ///
+    /// Deprecated: `layers::BtrfsVolume::open` opens the volume
+    /// through rust-fs-core's `OpenVolume`, on the same validating mount,
+    /// and `layers::BtrfsVolume::filesystem` lends it. This stays,
+    /// unchanged, for one release.
+    #[deprecated(
+        since = "0.12.0",
+        note = "open the volume through rust-fs-core's `OpenVolume`, `layers::BtrfsVolume::open`; `BtrfsVolume::filesystem` lends this mount. Kept for one release"
+    )]
     pub fn mount(device: Arc<dyn BlockRead>) -> Result<Self> {
-        Self::mount_with_cache(device, DEFAULT_CACHE_BLOCKS)
+        Self::open_read_only(device, DEFAULT_CACHE_BLOCKS)
     }
 
     /// Open `device` for reading, caching `blocks` metadata blocks.
@@ -619,7 +628,21 @@ impl Filesystem {
     ///
     /// `blocks` of zero disables it, which is what the measurement in
     /// `tests/read_path_cost.rs` uses to take its baseline.
+    ///
+    /// Deprecated with [`Filesystem::mount`]; this stays, unchanged, for one
+    /// release.
+    #[deprecated(
+        since = "0.12.0",
+        note = "open the volume through rust-fs-core's `OpenVolume`, `layers::BtrfsVolume::open`; `BtrfsVolume::filesystem` lends this mount. Kept for one release"
+    )]
     pub fn mount_with_cache(device: Arc<dyn BlockRead>, blocks: usize) -> Result<Self> {
+        Self::open_read_only(device, blocks)
+    }
+
+    /// The validating read-only open behind [`Filesystem::mount`] and
+    /// `layers::BtrfsVolume::open`, with `blocks` metadata blocks
+    /// cached; see [`Filesystem::mount_with_cache`].
+    pub(crate) fn open_read_only(device: Arc<dyn BlockRead>, blocks: usize) -> Result<Self> {
         if blocks == 0 {
             return Self::open(device, None);
         }
@@ -3716,7 +3739,7 @@ mod needs_host {
             "{}",
             String::from_utf8_lossy(&made.stderr)
         );
-        let fs = Filesystem::mount(Arc::new(FileDevice::open(&img).unwrap())).unwrap();
+        let fs = Filesystem::open_read_only(Arc::new(FileDevice::open(&img).unwrap()), 0).unwrap();
 
         let collect = |tree: &Tree<'_>| {
             let mut keys = Vec::new();

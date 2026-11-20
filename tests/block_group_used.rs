@@ -49,6 +49,10 @@
 //! naming each layout (#343). A driver fault on a block that does
 //! qualify fails on the first volume, as it always did.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::super_write::Commit;
 use fs_btrfs_test_support::{

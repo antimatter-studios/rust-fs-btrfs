@@ -16,6 +16,10 @@
 //! setting the bit on a volume btrfs-progs made is the case that matters.
 //! `mkfs.btrfs` runs in the harness VM, so nothing here skips.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::error::Error;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::super_write::stamp_checksum;

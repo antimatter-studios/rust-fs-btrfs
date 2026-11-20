@@ -13,6 +13,10 @@
 //! nothing undamaged is reported either. Every damaged copy has a good
 //! twin, so every error is repairable.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::scrub::ScrubTarget;
 use fs_btrfs_test_support::fixture;

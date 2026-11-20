@@ -24,6 +24,10 @@
 //! decoder suite that ran against no fixture reports `ok` exactly like
 //! one that decoded everything correctly.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::Filesystem;
 use fs_btrfs_test_support::{fixture, sha256_hex};
 use fs_core::FileDevice;

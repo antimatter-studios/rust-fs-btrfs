@@ -14,6 +14,10 @@
 //! manifest is every file's size and SHA-256 as the kernel read it, the
 //! seed's before sprouting and the sprout's after.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{

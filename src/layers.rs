@@ -15,7 +15,7 @@
 
 use crate::btree::{Header, Item, LEAF_DATA_OFFSET};
 use crate::compression::{decompress, Compression, ShortDecode, MAX_UNCOMPRESSED};
-use crate::fs::{Filesystem, EXTENT_DATA_KEY};
+use crate::fs::{Filesystem, DEFAULT_CACHE_BLOCKS, EXTENT_DATA_KEY};
 use crate::inode::{Inode, INODE_ITEM_KEY, INODE_REF_KEY};
 use crate::salvage::{
     self as native, best_copy, build_chunk_map, read_root_items, root_tree_candidates,
@@ -247,9 +247,17 @@ impl<S: BlockRead + 'static> BtrfsVolume<S> {
         let sb = chosen.superblock.clone().ok_or(LayerError::NoGeometry)?;
         let chosen = chosen.mirror;
         let device: Arc<dyn BlockRead> = source.clone();
-        let (fs, refusal) = match Filesystem::mount(device) {
+        let mounted = Filesystem::open_read_only(Arc::clone(&device), DEFAULT_CACHE_BLOCKS);
+        let (fs, refusal) = match mounted {
             Ok(fs) => (Some(fs), None),
             Err(error) if mount_required => return Err(error.into()),
+            // A volume whose log was never replayed still has committed
+            // trees to browse: the kernel's `ro,nologreplay`. The health
+            // verdict says the log is there.
+            Err(crate::Error::DirtyLog) => match Filesystem::open_ignoring_log(device) {
+                Ok(fs) => (Some(fs), None),
+                Err(error) => (None, Some(error.to_string())),
+            },
             Err(error) => (None, Some(error.to_string())),
         };
         let adapter = BtrfsAdapter::for_source(&*source);

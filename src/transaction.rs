@@ -4981,7 +4981,7 @@ mod needs_host {
             String::from_utf8_lossy(&made.stderr)
         );
 
-        let fs = Filesystem::mount(Arc::new(FileDevice::open(&img).unwrap())).unwrap();
+        let fs = Filesystem::open_read_only(Arc::new(FileDevice::open(&img).unwrap()), 0).unwrap();
         let nodesize = fs.sb.nodesize as u64;
 
         // The windows, from the chunk items: for each stripe on a device
@@ -5057,7 +5057,7 @@ mod needs_host {
             String::from_utf8_lossy(&made.stderr)
         );
 
-        let fs = Filesystem::mount(Arc::new(FileDevice::open(&img).unwrap())).unwrap();
+        let fs = Filesystem::open_read_only(Arc::new(FileDevice::open(&img).unwrap()), 0).unwrap();
         let nodesize = fs.sb.nodesize as u64;
         let group = fs
             .block_groups()

@@ -13,6 +13,10 @@
 //!   each one (a nonzero status), or the case is not damage and the test
 //!   says so; then `fsck.btrfs` must find it too (exit 4).
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 mod cli_support;
 
 use cli_support::*;

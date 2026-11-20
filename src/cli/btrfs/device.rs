@@ -1,6 +1,10 @@
 //! Opening a target: an image file or a device, read-only or writable,
 //! optionally `--offset` bytes in (a partition inside a whole-disk image).
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use std::ffi::OsString;
 use std::sync::Arc;
 
