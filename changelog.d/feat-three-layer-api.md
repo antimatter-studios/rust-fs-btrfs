@@ -14,4 +14,4 @@
 
 ### Changed
 
-- rust-fs-core is pinned at 0.5.0, with its `layers` feature, resolved from its v0.5.0 git tag until crates.io serves 0.5.0 (the `version` is what a published crate keeps); serde is a new dependency, for the salvage candidate detail. The family scripts move to v0.5.0 with it, and AGENTS.md takes the agent-core v10 block they check.
+- rust-fs-core is pinned at `=0.5.1` from crates.io, with its `layers` feature; serde is a new dependency, for the salvage candidate detail. The family scripts move to v0.5.1 with it, and AGENTS.md takes the agent-core v10 block they check.

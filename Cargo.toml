@@ -89,7 +89,7 @@ blake2b_simd = "1.0"
 # rust-fs-core's scripts in place from the ../rust-fs-core checkout that
 # `chore siblings` makes at chores.yml's FS_CORE_REF. Move the two
 # together.
-rust-fs-core = { version = "=0.5.0", git = "https://github.com/antimatter-studios/rust-fs-core", tag = "v0.5.0", features = ["layers"] }
+rust-fs-core = { version = "=0.5.1", features = ["layers"] }
 # The three layers' evidence types are serde data, so the salvage
 # candidate detail derives Serialize and Deserialize. MIT OR Apache-2.0.
 serde = { version = "1", features = ["derive"] }

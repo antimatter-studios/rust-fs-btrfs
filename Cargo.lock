@@ -346,8 +346,9 @@ dependencies = [
 
 [[package]]
 name = "rust-fs-core"
-version = "0.5.0"
-source = "git+https://github.com/antimatter-studios/rust-fs-core?tag=v0.5.0#6d39ad1f2ba4695ea1cc17b2f5a0d4a02206c106"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5565c39c9e33464399bb7ad1c2061d52d113ffacce8a23af919e69347969552"
 dependencies = [
  "clap",
  "clap_complete",
