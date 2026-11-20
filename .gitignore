@@ -57,3 +57,8 @@ tmp/
 # Build output. `chore staticlib` writes the archive and headers here for a
 # consumer to copy out of (`chore artifact` prints this directory).
 /dist/
+
+# A local `[patch.crates-io]` for rust-fs-core (see Cargo.toml). The
+# manifest pins core by version; an override to an unreleased checkout is
+# one developer's, and never reaches a commit.
+/.cargo/config.toml

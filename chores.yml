@@ -246,9 +246,9 @@ vars:
   # org, and a URL rebuilt from a repo name points at a repository that
   # does not exist for exactly the ones that are not.
   #
-  # FS_CORE_REF must match the `rust-fs-core` version recorded in
-  # Cargo.lock, or `--locked` will refuse to build. Bump it in lockstep
-  # with the constraint in Cargo.toml.
+  # FS_CORE_REF must match the exact `rust-fs-core` version Cargo.toml
+  # pins from crates.io (tests/ci_profile.rs holds them together). Bump
+  # the two in lockstep.
   FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
   # It is also the version of every family script the tiers run in place
   # from that checkout, so moving it is how they are upgraded.
@@ -728,10 +728,11 @@ tasks:
     on_timeout:
       - cmd: '../fs-linux-test-harness/scripts/vm.sh down'
     cmds:
-      # The sibling crates this one builds against are staged on the
-      # share first: the guest is given THIS repository, not the
-      # directory that holds it, so a path dependency on ../rust-fs-core
-      # has nothing to resolve to until it is put there. From the pinned
+      # The sibling checkouts are staged on the share first: the guest is
+      # given THIS repository, not the directory that holds it, so
+      # ../rust-fs-core -- the family scripts, and a local
+      # `[patch.crates-io]` override when one is set -- has nothing to
+      # resolve to until it is put there. From the pinned
       # checkout's HEAD, so what the guest builds against is what
       # `chore siblings` pinned and nothing uncommitted.
       - |
