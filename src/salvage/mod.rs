@@ -21,6 +21,7 @@ pub mod csums;
 pub mod files;
 pub mod roots;
 pub mod scan;
+pub mod search;
 pub mod superblock;
 pub mod tree;
 
@@ -32,8 +33,9 @@ pub use files::{
 };
 pub use roots::{read_root_items, root_tree_candidates, RootItem, RootSource, RootTreeCandidate};
 pub use scan::{metadata_ranges, physical_to_logical, scan_tree_blocks, FoundBlock, ScanSummary};
+pub use search::{object_items, search_range, SearchReport};
 pub use superblock::{best_copy, superblock_copies, CopyVerdict, SuperblockCopy};
 pub use tree::{
-    decode_block, read_block, walk_tree, BlockFault, CopyAttempt, DamagedBlock, Expect, Layout,
-    RootPointer, SalvagedBlock, SalvagedBody, WalkReport,
+    decode_block, read_block, salvaged_from_bytes, walk_tree, BlockFault, CopyAttempt,
+    DamagedBlock, Expect, Layout, RootPointer, SalvagedBlock, SalvagedBody, WalkReport,
 };
