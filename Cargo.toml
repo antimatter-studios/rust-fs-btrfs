@@ -69,15 +69,27 @@ blake2b_simd = "1.0"
 # Block-device trait surface shared with the sister fs-* drivers and the
 # img-* disk-image readers.
 #
-# THE VERSION IS ALSO THE FAMILY SCRIPTS' VERSION: every tier, floor and
-# check runs rust-fs-core's scripts in place from this checkout, so moving
-# the pin is how they are upgraded, and nothing here is a copy of them.
+# PINNED BY VERSION, FROM CRATES.IO, AND NOTHING ELSE. A path dependency
+# made this crate impossible to pin by git revision from another
+# repository: the path resolved against whatever happened to sit beside
+# the consumer's checkout. Exact, so a build never picks up a newer core
+# than the one this crate was tested against.
 #
-# The path dependency is deliberate and stays: `chore test:vm` stages this
-# sibling onto the VM share and guest-suite.sh links it into place, so
-# ../rust-fs-core resolves inside the guest as well as on the host. An
-# absolute path written into a .cargo/config.toml override would not.
-rust-fs-core = { path = "../rust-fs-core", version = "0.4.3" }
+# Working against an unreleased core is a local override, kept out of
+# this manifest: a `.cargo/config.toml` (ignored by git) holding
+#
+#     [patch.crates-io]
+#     rust-fs-core = { path = "../rust-fs-core" }
+#
+# The path is relative to this repository, so it resolves inside the
+# harness VM too, where guest-suite.sh links the staged sibling into
+# place. Cargo.lock then records the path source; never commit that.
+#
+# The family scripts are a separate pin: every tier, floor and check runs
+# rust-fs-core's scripts in place from the ../rust-fs-core checkout that
+# `chore siblings` makes at chores.yml's FS_CORE_REF. Move the two
+# together.
+rust-fs-core = "=0.4.3"
 # Decompressors, one per compression type Btrfs defines. All three are
 # pure Rust with no C bindings, and permissively licensed like the rest.
 #

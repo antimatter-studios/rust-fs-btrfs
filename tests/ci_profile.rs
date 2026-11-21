@@ -2618,7 +2618,7 @@ jobs:
 
 /// Which `rust-fs-core` this crate is built against, as stated in one file.
 ///
-/// Four spellings, because the pin is a dependency version in a
+/// Five spellings, because the pin is a dependency version in a
 /// manifest, a resolved version in a lockfile, an environment variable
 /// in a workflow, and an argument to `git clone`. All four are returned
 /// normalised without the leading `v`, paired with the spelling that
@@ -2646,7 +2646,11 @@ fn am_fs_core_versions_declared(text: &str) -> Vec<(String, String)> {
         }
         previous = line;
         if line.contains("rust-fs-core") {
-            if let Some(v) = quoted_value_after(line, "version") {
+            // `=0.4.3` pins exactly what `0.4.3` names: the same version.
+            let dependency = quoted_value_after(line, "version")
+                .or_else(|| quoted_value_after(line, "rust-fs-core"))
+                .and_then(|v| as_version(v.trim_start_matches('=')));
+            if let Some(v) = dependency {
                 found.push(("the rust-fs-core dependency's `version`".to_string(), v));
             }
         }
@@ -2703,14 +2707,15 @@ fn as_version(raw: &str) -> Option<String> {
 /// known to carry a pin, so one that stops carrying it is a failure
 /// rather than a file the walk no longer visits. `fuzz/Cargo.toml` is
 /// not here: it reaches `rust-fs-core` only through this crate, so its
-/// pin lives in `fuzz/Cargo.lock` alone.
+/// pin lives in `fuzz/Cargo.lock` alone. Nor is `fuzz.yml`, which cloned
+/// core beside the checkout while the dependency was a path and has
+/// nothing to clone now that it comes from crates.io.
 const FILES_THAT_PIN_AM_FS_CORE: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
     "fuzz/Cargo.lock",
     "chores.yml",
     ".github/workflows/release.yml",
-    ".github/workflows/fuzz.yml",
 ];
 
 /// How many declarations the files above carry between them: one each,
@@ -2722,7 +2727,7 @@ const FILES_THAT_PIN_AM_FS_CORE: &[&str] = &[
 /// appearing in one of them -- a second clone step, a duplicated
 /// lockfile entry -- is a failure to look at rather than a count that
 /// quietly grew.
-const AM_FS_CORE_DECLARATIONS: usize = 7;
+const AM_FS_CORE_DECLARATIONS: usize = 6;
 
 /// Every file that names the `rust-fs-core` this crate is built against
 /// names the same one.
@@ -2787,7 +2792,33 @@ fn every_declaration_of_the_am_fs_core_pin_names_the_same_version() {
 mod core_pin_parser {
     use super::{am_fs_core_versions_declared, as_version};
 
-    /// The real dependency line.
+    /// The real dependency line: an exact version, from crates.io.
+    #[test]
+    fn an_exact_registry_dependency_declares_its_version() {
+        for toml in [
+            "rust-fs-core = \"=0.4.3\"\n",
+            "rust-fs-core = \"0.4.3\"\n",
+            "rust-fs-core = { version = \"=0.4.3\" }\n",
+        ] {
+            assert_eq!(
+                am_fs_core_versions_declared(toml),
+                vec![(
+                    "the rust-fs-core dependency's `version`".to_string(),
+                    "0.4.3".to_string()
+                )],
+                "{toml}"
+            );
+        }
+    }
+
+    /// The feature list and a lockfile name are not dependency lines.
+    #[test]
+    fn a_feature_naming_core_is_not_a_declaration() {
+        let toml = "cli = [\"dep:clap\", \"rust-fs-core/cli\"]\nname = \"rust-fs-core\"\n";
+        assert!(am_fs_core_versions_declared(toml).is_empty());
+    }
+
+    /// The spelling the dependency had while it was a path.
     #[test]
     fn a_path_dependency_declares_its_version() {
         let toml = "rust-fs-core = { path = \"../rust-fs-core\", version = \"0.2.13\" }\n";
@@ -2838,7 +2869,7 @@ mod core_pin_parser {
         );
     }
 
-    /// The clone spelling, which is how fuzz.yml carries its pin.
+    /// The clone spelling, which is how fuzz.yml carried its pin.
     #[test]
     fn a_clone_branch_declares_its_version() {
         let line = "run: git clone --depth 1 --branch v0.2.13 \

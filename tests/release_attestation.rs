@@ -350,19 +350,27 @@ fn release_cli_gaps(yaml: &str, pin: &str, toolchain: &str) -> Vec<String> {
     gaps
 }
 
-/// The `version` of the `rust-fs-core` dependency in Cargo.toml.
+/// The version of the `rust-fs-core` dependency in Cargo.toml, without the
+/// `=` of an exact requirement: `rust-fs-core = "=0.4.3"` and
+/// `rust-fs-core = { version = "0.4.3" }` both pin 0.4.3.
 fn am_fs_core_pin() -> String {
     let manifest =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
             .expect("read Cargo.toml");
     manifest
         .lines()
-        .filter(|l| l.trim_start().starts_with("rust-fs-core"))
-        .find_map(|l| {
-            l.split_once("version = \"")
-                .and_then(|(_, r)| r.split_once('"'))
+        .filter_map(|l| l.trim_start().strip_prefix("rust-fs-core"))
+        .find_map(|rest| {
+            let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+            let quoted = match rest.split_once("version = \"") {
+                Some((_, after)) => after,
+                None => rest.strip_prefix('"')?,
+            };
+            quoted
+                .split_once('"')
+                .map(|(v, _)| v.trim_start_matches('='))
         })
-        .map(|(v, _)| v.to_owned())
+        .map(str::to_owned)
         .expect("Cargo.toml pins rust-fs-core by version")
 }
 

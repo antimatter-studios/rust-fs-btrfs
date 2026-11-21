@@ -313,13 +313,25 @@ chore lint       # cargo fmt --check, and clippy with -D warnings
 
 ## Building
 
-The crate has a path dependency on the sibling `rust-fs-core` repository. Clone it
-alongside this one:
+`rust-fs-core` comes from crates.io, pinned to an exact version in `Cargo.toml`, so a
+plain build needs nothing beside this checkout:
 
 ```sh
-git clone https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
 cargo build --release
 ```
+
+The test tiers and lints run rust-fs-core's scripts in place from a sibling checkout;
+`chore siblings` puts it at `../rust-fs-core` at the pinned tag.
+
+To build against an unreleased rust-fs-core, override the registry version locally with a
+`.cargo/config.toml` in this repository (git ignores it):
+
+```toml
+[patch.crates-io]
+rust-fs-core = { path = "../rust-fs-core" }
+```
+
+Cargo.lock then records the path source. Do not commit that change.
 
 ## Verifying a release
 
