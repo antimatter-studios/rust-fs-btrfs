@@ -349,3 +349,6 @@ salvage_superblock_oracle 4
 # Salvage walks trees past damaged blocks and builds the chunk map from
 # what survives, checked against dump-tree (#800).
 salvage_tree_oracle 6
+# Salvage finds root trees, current, backup and scanned, as restore -l and
+# btrfs-find-root do (#801).
+salvage_roots_oracle 4
