@@ -352,3 +352,6 @@ salvage_tree_oracle 6
 # Salvage finds root trees, current, backup and scanned, as restore -l and
 # btrfs-find-root do (#801).
 salvage_roots_oracle 4
+# Salvage recovers files as btrfs restore does, and more of them past a
+# broken leaf (#802).
+salvage_files_oracle 2
