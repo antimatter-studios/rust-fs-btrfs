@@ -16,6 +16,13 @@
 //! the source could not be asked at all, never that what it held was
 //! damaged.
 
+pub mod chunks;
 pub mod superblock;
+pub mod tree;
 
+pub use chunks::{build_chunk_map, ChunkScan, ChunkSource, RejectedChunk};
 pub use superblock::{best_copy, superblock_copies, CopyVerdict, SuperblockCopy};
+pub use tree::{
+    decode_block, read_block, walk_tree, BlockFault, CopyAttempt, DamagedBlock, Expect, Layout,
+    RootPointer, SalvagedBlock, SalvagedBody, WalkReport,
+};
