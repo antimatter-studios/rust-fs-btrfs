@@ -355,3 +355,6 @@ salvage_roots_oracle 4
 # Salvage recovers files as btrfs restore does, and more of them past a
 # broken leaf (#802).
 salvage_files_oracle 2
+# Salvage checks file data against the checksum tree as btrfs check
+# --check-data-csum does, and places extents as btrfs-map-logical does (#803).
+salvage_data_oracle 3

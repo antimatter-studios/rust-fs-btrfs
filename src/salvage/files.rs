@@ -7,6 +7,7 @@
 //! leaves and damaged ones alike, so a caller can rebuild the namespace
 //! and read each file by its extents without trusting any one path.
 
+use super::csums::{verify_data, CsumTree, SectorTally};
 use super::tree::{walk_tree, Layout, RootPointer, WalkReport};
 use crate::compression::{decompress, Compression, ShortDecode};
 use crate::dir::{parse_dir_items, DIR_INDEX_KEY};
@@ -131,6 +132,9 @@ pub enum DataFault {
     Decompress(String),
     /// An encoding this crate cannot undo: encryption or another encoding.
     Unsupported(String),
+    /// These logical bytes were read, but their checksum matched on no
+    /// copy. They are kept as read: damaged evidence, not zeros.
+    Checksum { logical: u64, length: u64 },
 }
 
 /// Read `length` bytes at `logical`, trying each copy, sector by sector
@@ -185,9 +189,11 @@ pub fn read_data(
 pub fn read_file_extent(
     source: &dyn BlockRead,
     layout: &Layout,
+    csums: Option<&CsumTree>,
     item: &FileExtentItem,
     last: bool,
-) -> (Vec<u8>, Vec<DataFault>) {
+) -> (Vec<u8>, Vec<DataFault>, SectorTally) {
+    let none = SectorTally::default();
     let length = item.num_bytes as usize;
     if item.encryption != 0 || item.other_encoding != 0 {
         return (
@@ -196,6 +202,7 @@ pub fn read_file_extent(
                 "encryption {} other encoding {}",
                 item.encryption, item.other_encoding
             ))],
+            none,
         );
     }
     let algo = match Compression::from_byte(item.compression) {
@@ -204,6 +211,7 @@ pub fn read_file_extent(
             return (
                 vec![0u8; length],
                 vec![DataFault::Unsupported(error.to_string())],
+                none,
             )
         }
     };
@@ -239,23 +247,35 @@ pub fn read_file_extent(
             if algo == Compression::None {
                 let mut out = item.inline.clone();
                 out.resize(length, 0);
-                (out, Vec::new())
+                (out, Vec::new(), none)
             } else {
-                decode(&item.inline, (0, length))
+                let (out, faults) = decode(&item.inline, (0, length));
+                (out, faults, none)
             }
         }
-        ExtentType::Prealloc => (vec![0u8; length], Vec::new()),
-        ExtentType::Regular if item.disk_bytenr == 0 => (vec![0u8; length], Vec::new()),
+        ExtentType::Prealloc => (vec![0u8; length], Vec::new(), none),
+        ExtentType::Regular if item.disk_bytenr == 0 => (vec![0u8; length], Vec::new(), none),
         ExtentType::Regular => {
             let (logical, span) = item.logical_range().expect("a regular extent on disk");
-            let (raw, faults) = read_data(source, layout, logical, span);
+            let (mut raw, mut faults) = read_data(source, layout, logical, span);
+            let mut tally = none;
+            if let Some(csums) = csums {
+                let (checked, failed) = verify_data(source, layout, csums, logical, &mut raw);
+                tally = checked;
+                faults.extend(
+                    failed
+                        .into_iter()
+                        .map(|(logical, length)| DataFault::Checksum { logical, length }),
+                );
+            } else {
+                tally.unchecked = span.div_ceil(u64::from(layout.sectorsize));
+            }
             if algo == Compression::None {
-                return (raw, faults);
+                return (raw, faults, tally);
             }
             let (out, mut more) = decode(&raw, (item.offset, length));
-            let mut all = faults;
-            all.append(&mut more);
-            (out, all)
+            faults.append(&mut more);
+            (out, faults, tally)
         }
     }
 }
@@ -280,7 +300,25 @@ pub struct NameClaim {
 pub struct ExtentClaim {
     pub item: FileExtentItem,
     pub verified: bool,
+    /// The leaf the item is in, and the copy of it that was read.
+    pub leaf: u64,
+    pub leaf_mirror: usize,
+    /// Where the item's data starts within the leaf, in bytes from the
+    /// block's start. An inline extent's bytes begin 21 bytes later.
+    pub data_offset: u32,
 }
+
+impl ExtentClaim {
+    /// The logical address of an inline extent's stored bytes, inside its
+    /// leaf. `None` for any other kind.
+    pub fn inline_logical(&self) -> Option<u64> {
+        (self.item.kind == ExtentType::Inline)
+            .then(|| self.leaf + u64::from(self.data_offset) + INLINE_HEADER)
+    }
+}
+
+/// Bytes of an inline extent item before its data.
+const INLINE_HEADER: u64 = 21;
 
 /// Everything a filesystem tree says about one inode.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -378,6 +416,9 @@ pub fn collect_inodes(source: &dyn BlockRead, layout: &Layout, root: RootPointer
                         record(&mut inodes, key.objectid).extents.push(ExtentClaim {
                             item: extent,
                             verified,
+                            leaf: leaf.logical,
+                            leaf_mirror: leaf.mirror,
+                            data_offset: (crate::btree::LEAF_DATA_OFFSET as u32) + item.offset,
                         });
                     }
                 }
@@ -405,6 +446,8 @@ pub struct FileCopy {
     pub faults: Vec<(u64, DataFault)>,
     /// Whether every extent item came from a verified leaf.
     pub extents_verified: bool,
+    /// How the file's data sectors checked against the checksum tree.
+    pub sectors: SectorTally,
 }
 
 /// Write a file's bytes to `sink` from its extent items, in file order,
@@ -413,6 +456,7 @@ pub struct FileCopy {
 pub fn copy_file(
     source: &dyn BlockRead,
     layout: &Layout,
+    csums: Option<&CsumTree>,
     record: &InodeRecord,
     sink: &mut dyn io::Write,
 ) -> io::Result<FileCopy> {
@@ -453,7 +497,9 @@ pub fn copy_file(
             zeros(sink, item.file_offset - at)?;
             at = item.file_offset;
         }
-        let (bytes, faults) = read_file_extent(source, layout, item, index + 1 == count);
+        let (bytes, faults, tally) =
+            read_file_extent(source, layout, csums, item, index + 1 == count);
+        report.sectors.add(tally);
         let take = (bytes.len() as u64).min(size - at) as usize;
         sink.write_all(&bytes[..take])?;
         at += take as u64;
