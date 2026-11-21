@@ -110,6 +110,14 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CHORE_VERSION: "0.11.0"
+  # The shared guest's size, not the harness's `low` resource profile (2G,
+  # 2 CPUs on GitHub Actions). The kernel-made volumes these tests build
+  # depend on it: with 2G, tests/full_backref_move.rs's balanced volume kept
+  # its free-space records across two leaves and every candidate leaf was
+  # passed over (merge-queue run 44873389372), where 4G and 4 CPUs, the size
+  # this suite was validated on before harness v0.7.0, pass.
+  FLTH_SHARED_MEMORY: 4G
+  FLTH_SHARED_CPUS: "4"
 
 jobs:
   # Pull requests, including every stack layer, run the quick checks. The
@@ -269,6 +277,11 @@ jobs:
         run: scripts/ci-install-chore.sh
       - name: chore siblings
         run: chore siblings
+      - name: Upstream virtiofsd 1.14.0
+        # Ubuntu 24.04 packages virtiofsd 1.10.0, which never answers a
+        # non-UTF-8 xattr name (tests/getxattr_byte_names.rs hung, #794).
+        # The tag must match LINUX_HARNESS_REF in chores.yml.
+        uses: antimatter-studios/fs-linux-test-harness/.github/actions/install-virtiofsd@v0.8.0
       - name: KVM, QEMU and Vagrant
         id: vm-host
         run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
@@ -279,8 +292,11 @@ jobs:
           key: ${{ steps.vm-host.outputs.box-cache-key }}
       - name: chore fixtures
         run: chore fixtures
-      - name: chore vm:status (the VM is down again)
-        run: '! chore vm:status'
+      - name: Stop the shared guest (no run is still using it)
+        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
+        # stops it only when no suite is using it, so a guest still up
+        # afterwards means a run leaked its session.
+        run: ../fs-linux-test-harness/scripts/vm.sh down && ! chore vm:status
       # TARRED, AND `--sparse` IS NOT OPTIONAL. These images total about
       # ten gigabytes of address space and a few hundred megabytes of
       # actual data: two 2 GiB populated filesystems, ten 400 MiB
@@ -327,6 +343,11 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Upstream virtiofsd 1.14.0
+        # Ubuntu 24.04 packages virtiofsd 1.10.0, which never answers a
+        # non-UTF-8 xattr name (tests/getxattr_byte_names.rs hung, #794).
+        # The tag must match LINUX_HARNESS_REF in chores.yml.
+        uses: antimatter-studios/fs-linux-test-harness/.github/actions/install-virtiofsd@v0.8.0
       - name: KVM, QEMU and Vagrant
         id: vm-host
         run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
@@ -364,9 +385,16 @@ jobs:
       - name: chore lint
         run: chore lint
       - name: chore test
+        # A good run of this step takes about 66 minutes. A call that never
+        # returns (run 44790427420 sat 2.7 hours in one `setfattr`) fails here
+        # instead of holding the runner until the job's 180 minutes end.
+        timeout-minutes: 120
         run: chore test
-      - name: chore vm:status (the VM is down again)
-        run: '! chore vm:status'
+      - name: Stop the shared guest (no run is still using it)
+        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
+        # stops it only when no suite is using it, so a guest still up
+        # afterwards means a run leaked its session.
+        run: ../fs-linux-test-harness/scripts/vm.sh down && ! chore vm:status
       # THE FLOORS. Per target against the whole-suite log, which is the
       # one run that builds every integration target, plus a total for
       # each tier that runs on its own. A target missing from the log
@@ -497,6 +525,11 @@ jobs:
         run: scripts/ci-install-chore.sh
       - name: chore siblings
         run: chore siblings
+      - name: Upstream virtiofsd 1.14.0
+        # Ubuntu 24.04 packages virtiofsd 1.10.0, which never answers a
+        # non-UTF-8 xattr name (tests/getxattr_byte_names.rs hung, #794).
+        # The tag must match LINUX_HARNESS_REF in chores.yml.
+        uses: antimatter-studios/fs-linux-test-harness/.github/actions/install-virtiofsd@v0.8.0
       - name: KVM, QEMU and Vagrant
         id: vm-host
         run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
@@ -516,8 +549,11 @@ jobs:
       # either.
       - name: chore test:vm
         run: chore test:vm
-      - name: chore vm:status (the VM is down again)
-        run: '! chore vm:status'
+      - name: Stop the shared guest (no run is still using it)
+        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
+        # stops it only when no suite is using it, so a guest still up
+        # afterwards means a run leaked its session.
+        run: ../fs-linux-test-harness/scripts/vm.sh down && ! chore vm:status
       - name: The in-guest suite executed its tests
         run: bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored vm 503
       # THE TIER LOGS OUTLIVE THE RUNNER. Every tier writes its whole run to

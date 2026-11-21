@@ -81,7 +81,14 @@ impl Scratch {
         bytes: u64,
         script: &str,
     ) -> Self {
-        let dir = PathBuf::from(temp_path!("{name}"));
+        // A directory of its own each time. A test that makes one scratch per
+        // feature set under one name deleted the first directory and made the
+        // second at the same path, and the guest, which sees this tree through
+        // virtiofs, still held the first image's cached entries: its mkfs
+        // reported "No such file", or mounted what it called a bad superblock.
+        static MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let serial = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = PathBuf::from(temp_path!("{name}-{serial}"));
         std::fs::create_dir_all(&dir).unwrap();
         let image = dir.join("fs.img");
         std::fs::File::create(&image)

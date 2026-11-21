@@ -113,8 +113,9 @@ pub(crate) fn guest_shell(script: &str) -> io::Result<Output> {
 /// it up for the whole tier. A test process that finds it down boots it
 /// rather than failing — a suite run by hand still works. Run through
 /// `scripts/test.sh` (every tier is), the run is a harness session, so
-/// the VM it booted comes down and the machine-wide slot is released when
-/// it ends; a bare `cargo test` leaves that to the chore reaper.
+/// its tree is detached when the session ends. The shared guest remains
+/// available for another run; a bare `cargo test` leaves run cleanup to
+/// the harness reaper.
 pub(crate) fn session() {
     static SESSION: OnceLock<()> = OnceLock::new();
     SESSION.get_or_init(|| {
@@ -212,6 +213,11 @@ pub fn oracle(tool: &str) -> Oracle {
         stdin: None,
     }
 }
+
+/// Where a test may put a tree on the guest's own disk, outside the
+/// repository. `/var/tmp` is never tmpfs, which stores `user.*` attributes
+/// only from Linux 6.6.
+pub const GUEST_LOCAL_SCRATCH: &str = "/var/tmp/fs-btrfs-";
 
 /// One argument, as the guest will receive it.
 enum Arg {
@@ -398,6 +404,13 @@ impl Oracle {
     #[track_caller]
     fn check_path(&self, argument: &str) {
         if !argument.starts_with('/') || !Path::new(argument).exists() {
+            return;
+        }
+        // The guest's own disk, for the one thing the repository's virtiofs
+        // tree cannot carry: an attribute name that is not UTF-8, which
+        // panics virtiofsd's setxattr (tests/getxattr_byte_names.rs).
+        // Inside the guest that directory exists, so it is named here.
+        if argument.starts_with(GUEST_LOCAL_SCRATCH) {
             return;
         }
         let repo = repo();

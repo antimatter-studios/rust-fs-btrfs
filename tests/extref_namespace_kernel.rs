@@ -278,7 +278,7 @@ fn the_last_extended_reference_is_unlinked_and_the_kernel_agrees() {
             "extent data disk byte",
         ),
     ] {
-        let dir = PathBuf::from(temp_path!("last-extref"));
+        let dir = PathBuf::from(temp_path!("last-extref-{kind}"));
         std::fs::create_dir_all(&dir).unwrap();
         let image = dir.join("fs.img");
         std::fs::File::create(&image)
