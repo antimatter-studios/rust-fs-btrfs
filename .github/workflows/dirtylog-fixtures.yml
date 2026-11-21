@@ -27,15 +27,28 @@ env:
   FLTH_SHARED_CPUS: "4"
 
 jobs:
+  dirtylog-gate:
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64-kvm
+
   dirtylog:
     name: dirtylog fixtures (harness VM, x86_64 KVM)
-    runs-on: ubuntu-24.04
+    needs: dirtylog-gate
+    runs-on: ${{ needs.dirtylog-gate.outputs.runner }}
     timeout-minutes: 60
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+      - name: Packages the hosted image has
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential curl jq
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings
@@ -55,12 +68,6 @@ jobs:
           key: ${{ steps.vm-host.outputs.box-cache-key }}
       - name: Build the dirtylog target only
         run: test-disks/build-fixtures.sh dirtylog
-      - name: Stop the shared guest (no run is still using it)
-        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
-        # stops it only when no suite is using it, so a guest still up
-        # afterwards means a run leaked its session.
-        if: always()
-        run: ../fs-linux-test-harness/scripts/vm.sh down && ! chore vm:status
       - name: Keep the native transcripts
         if: always()
         uses: actions/upload-artifact@v4
