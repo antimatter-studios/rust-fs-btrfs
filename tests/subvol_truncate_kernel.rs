@@ -1,5 +1,9 @@
 //! A chosen subvolume's truncates preserve its kernel-made snapshot (#519).
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::Filesystem;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, dump_tree, guest_kernel_read_ok, guest_kernel_write_ok, oracle,

@@ -19,6 +19,10 @@
 //! first block from it and refused the file whole. That is the behaviour
 //! held here: the untouched block reads, the file does not.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::error::Error;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs_test_support::{fixture, sha256_hex, temp_path};

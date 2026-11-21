@@ -25,6 +25,10 @@
 //! the kernel's, the source keeps its bytes and its blocks, and the kernel
 //! then reads, writes and deletes both sides.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

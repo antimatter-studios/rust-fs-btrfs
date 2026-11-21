@@ -41,6 +41,10 @@
 //! This crate writes no log tree, so "a log tree this crate wrote,
 //! replayed by the kernel" has no subject here.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

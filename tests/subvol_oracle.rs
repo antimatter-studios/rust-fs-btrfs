@@ -20,6 +20,10 @@
 //! here rather than skipping: this suite skipped on the run that added
 //! it, and the CI workflow carried a note saying so for months.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::subvol::FS_TREE_OBJECTID;
 use fs_btrfs_test_support::fixture;

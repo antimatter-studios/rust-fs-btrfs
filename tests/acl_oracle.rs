@@ -25,6 +25,10 @@
 //! crate and read back by the kernel, and inheritance applied by this
 //! crate, are not things it can be asked to do yet.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::Filesystem;
 use fs_btrfs_test_support::{assert_btrfs_check_clean, fixture};
 use fs_core::FileDevice;

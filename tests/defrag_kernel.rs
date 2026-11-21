@@ -23,6 +23,10 @@
 //! defragmented files and `btrfs check` looks again. Last, once the kernel
 //! has snapshotted the volume, a defragment is refused and writes nothing.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::Error;
 use fs_btrfs_test_support::{

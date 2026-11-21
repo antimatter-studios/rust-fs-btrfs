@@ -6,6 +6,10 @@
 //! btrfs-progs must find the volume clean, its dump of tree 5 must show
 //! that root over two level-1 nodes, and the kernel must list every name.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::capi::*;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs_test_support::{

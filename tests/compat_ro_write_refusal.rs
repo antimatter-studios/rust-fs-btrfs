@@ -9,6 +9,10 @@
 //! lives, so it is always there: a run either has the VM or fails saying
 //! so, and nothing here reads as a pass for want of a tool.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::super_write::stamp_checksum;
 use fs_btrfs::superblock::{compat_ro, ChecksumType};

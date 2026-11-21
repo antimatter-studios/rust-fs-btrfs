@@ -13,6 +13,10 @@
 //! `btrfs check` and the kernel make of the result is
 //! `tests/leaf_split_oracle.rs`.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::inode::FIRST_FREE_OBJECTID;
 use fs_core::{BlockDevice, BlockRead};

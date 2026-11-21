@@ -19,6 +19,10 @@
 //! which is how this repository's leaf oracle ran against nothing at
 //! all; there is now no list to be empty and no image to be skipped.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::btree::{header_offsets as o, TreeBlock, TreeGeometry, HEADER_SIZE};
 use fs_btrfs::chunk::DiskKey;
 use fs_btrfs::fs::Filesystem;

@@ -332,7 +332,7 @@ unsafe fn borrow_str<'a>(p: *const c_char, what: &str) -> Option<&'a str> {
 }
 
 fn mount_device(device: Arc<dyn BlockRead>) -> *mut fs_btrfs_fs {
-    match Filesystem::mount(device) {
+    match Filesystem::open_read_only(device, crate::fs::DEFAULT_CACHE_BLOCKS) {
         Ok(fs) => Box::into_raw(Box::new(fs_btrfs_fs { fs })),
         Err(e) => {
             record(&e);

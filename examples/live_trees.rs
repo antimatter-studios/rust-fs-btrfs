@@ -3,6 +3,10 @@
 //! Scanning a disk turns up leaves nothing points at any more. This
 //! walks from the current roots, which is the only way to ask what the
 //! filesystem believes right now.
+
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
 use fs_btrfs::chunk::{key_type, objectid, DiskKey};
 use fs_btrfs::fs::Filesystem;
 use fs_core::FileDevice;

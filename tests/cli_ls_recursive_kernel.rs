@@ -11,6 +11,10 @@
 //! walk with exit 1 and everything before it on stdout, and no run changes
 //! a byte of its image. What the damage leaves intact is still held to
 //! what find printed.
+
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
 mod cli_support;
 
 use cli_support::*;

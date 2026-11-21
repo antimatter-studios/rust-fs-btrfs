@@ -1,4 +1,8 @@
 //! Every item of the live free-space tree, in order.
+
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
 use fs_btrfs::chunk::{objectid, DiskKey};
 use fs_btrfs::fs::Filesystem;
 use fs_core::FileDevice;
