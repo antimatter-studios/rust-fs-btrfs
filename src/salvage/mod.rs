@@ -17,12 +17,17 @@
 //! damaged.
 
 pub mod chunks;
+pub mod files;
 pub mod roots;
 pub mod scan;
 pub mod superblock;
 pub mod tree;
 
 pub use chunks::{build_chunk_map, ChunkScan, ChunkSource, RejectedChunk};
+pub use files::{
+    collect_inodes, copy_file, read_data, read_file_extent, DataFault, ExtentClaim, ExtentType,
+    FileCopy, FileExtentItem, InodeRecord, InodeScan, NameClaim,
+};
 pub use roots::{read_root_items, root_tree_candidates, RootItem, RootSource, RootTreeCandidate};
 pub use scan::{metadata_ranges, physical_to_logical, scan_tree_blocks, FoundBlock, ScanSummary};
 pub use superblock::{best_copy, superblock_copies, CopyVerdict, SuperblockCopy};
