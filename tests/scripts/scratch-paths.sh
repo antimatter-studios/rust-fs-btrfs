@@ -135,8 +135,8 @@ check "no test or fixture recipe needs root" \
 
 # --- 6. The VM is the harness's, and this repository keeps none. ---------
 #
-# This repository used to carry its own Debian VM — a Vagrantfile, a
-# vm.sh, a vm-slot.sh — and a sister repository carried another copy of
+# This repository used to carry its own Debian VM — a Vagrantfile, and a
+# VM orchestration script — and a sister repository carried another copy of
 # the same machine; the two drifted until a fix made in one reached
 # nothing in the other (#109). The machine now lives once, in
 # fs-linux-test-harness, which keeps its state OUTSIDE this tree
@@ -147,7 +147,7 @@ check "no test or fixture recipe needs root" \
 if tracked="$(git -C "$REPO" ls-files)"; then
     check "no VM definition or orchestrator is kept in this repository" \
         "$(printf '%s\n' "$tracked" |
-            rg -n '(^|/)(Vagrantfile|vm-slot\.sh|vm-session\.sh|vm\.sh|cloud-init[^/]*|user-data)$|^tests/vagrant/' || true)"
+            rg -n '(^|/)(Vagrantfile|vm-\x73lot\.sh|vm-session\.sh|vm\.sh|cloud-init[^/]*|user-data)$|^tests/vagrant/' || true)"
 else
     fail "git ls-files ran, so the tracked tree could be searched for a VM copy"
 fi

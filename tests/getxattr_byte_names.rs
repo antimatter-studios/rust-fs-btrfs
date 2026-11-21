@@ -6,11 +6,17 @@
 //! a file carrying `user.caf\xe9\xff`, set by `setfattr` and copied in by
 //! `mkfs.btrfs --rootdir`, which needs no mount and no root.
 //!
-//! Both tools run in the harness VM, against a scratch tree inside this
-//! repository -- the only tree the guest can see -- so there is no host
-//! btrfs-progs to be absent and nothing here skips. `setfattr` runs there
-//! too: an attribute the guest cannot store fails this test and says so,
-//! rather than reading as a pass.
+//! Both tools run in the harness VM. The attribute is set on a tree in the
+//! guest's own disk (`/var/tmp`), not in this repository's scratch tree,
+//! which the guest sees through virtiofs. virtiofsd before 1.14.0 panics in
+//! `setxattr` on a name that is not UTF-8, after which the guest's
+//! `setfattr` never returns (#794); the harness requires 1.14.0 on Linux
+//! from v0.8.0. On a macOS host the scratch tree is on APFS, which refuses
+//! such a name with `EINVAL`. `mkfs.btrfs --rootdir` reads the guest tree and
+//! writes the image into the scratch tree, which needs no attribute call
+//! over virtiofs.
+//! `setfattr` runs in the guest too: an attribute the guest cannot store
+//! fails this test and says so, rather than reading as a pass.
 
 use fs_btrfs::capi::*;
 use fs_btrfs_test_support::{oracle, temp_path};
@@ -23,10 +29,23 @@ const VALUE: &[u8] = b"read back by exact bytes";
 /// An image whose `/f` carries [`NAME`] = [`VALUE`].
 fn image() -> std::path::PathBuf {
     let dir = std::path::PathBuf::from(temp_path!("xattr-bytes"));
-    let root = dir.join("root");
-    std::fs::create_dir_all(&root).unwrap();
-    let file = root.join("f");
-    std::fs::write(&file, b"f").unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    // A guest path the host does not have, on the guest's disk. `/var/tmp`
+    // is never tmpfs, which stores `user.*` attributes only from Linux 6.6.
+    let root = format!("/var/tmp/fs-btrfs-xattr-bytes-{}", std::process::id());
+    let file = format!("{root}/f");
+    let made_tree = oracle("mkdir").args(["-p", &root]).output();
+    assert!(
+        made_tree.status.success(),
+        "mkdir failed: {}",
+        String::from_utf8_lossy(&made_tree.stderr)
+    );
+    let made_file = oracle("touch").arg(&file).output();
+    assert!(
+        made_file.status.success(),
+        "touch failed: {}",
+        String::from_utf8_lossy(&made_file.stderr)
+    );
     let mut value_arg = b"0x".to_vec();
     value_arg.extend(VALUE.iter().flat_map(|b| format!("{b:02x}").into_bytes()));
     let set = oracle("setfattr")
@@ -51,6 +70,7 @@ fn image() -> std::path::PathBuf {
         .arg(&root)
         .arg(&img)
         .output();
+    let _ = oracle("rm").args(["-rf", &root]).output();
     assert!(
         made.status.success(),
         "mkfs.btrfs failed: {}",

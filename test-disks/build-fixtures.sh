@@ -27,8 +27,8 @@
 # THE FIXTURE LIST lives here (ARTEFACTS below) and in chores.yml's
 # `fixtures` generates:, which must name the same files.
 #
-# The VM comes down when this script exits (FLTH_KEEP_VM=1 keeps it up
-# for a quicker next run).
+# The script's use of the shared guest ends when it exits; the guest stays
+# up for the next run (`chore vm:down` stops it).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -261,11 +261,10 @@ cd "$REPO"
 
 share="$("$VM" share)"
 out="$share/fixtures"
-# EMPTIED, NOT REPLACED. The share is mounted in the guest over 9p, and
-# a VM that is already up (a previous run left it with FLTH_KEEP_VM, or
-# this one is a retry) holds this directory by inode. Removing it on the
-# host and making a new one leaves the guest writing into the deleted
-# one: `cp` succeeds, and the `mv` beside it cannot find what it just
+# EMPTIED, NOT REPLACED. The run attaches this share to the shared
+# guest over virtiofs. A live mount can still hold the directory by inode.
+# Removing it on the host and making a new one leaves the guest writing
+# into the deleted one: `cp` succeeds, and the `mv` beside it cannot find what it just
 # wrote. Measured here, as `mv: cannot stat .../btrfs-default.img.partial`.
 mkdir -p "$out"
 find "$out" -mindepth 1 -delete

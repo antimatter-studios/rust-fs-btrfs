@@ -50,9 +50,25 @@ sampler=$!
 "$@"
 status=$?
 
-kill "$sampler" 2>/dev/null
-wait "$sampler" 2>/dev/null
-sampler=""
+# A TERM sent right after the fork can reach the sampler before it has set its
+# own signal handling up, and is then lost: a command that ends at once (`true`)
+# left this script waiting on a sampler that never stopped. So the TERM is sent
+# until the sampler is gone, and KILL ends what ignores it.
+stop_sampler() {
+    local tries=0
+    while kill -0 "$sampler" 2>/dev/null; do
+        if [ "$tries" -ge 50 ]; then
+            kill -KILL "$sampler" 2>/dev/null
+            break
+        fi
+        kill "$sampler" 2>/dev/null
+        tries=$((tries + 1))
+        sleep 0.05
+    done
+    wait "$sampler" 2>/dev/null
+    sampler=""
+}
+stop_sampler
 
 after="$(free_mb)"
 lowest="$(cat "$lowest_file")"
