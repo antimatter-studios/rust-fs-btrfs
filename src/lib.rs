@@ -70,6 +70,7 @@
 //!   rewrites and the commit of a new generation, separate from file writes
 //! - [`send`] — send streams: parsed, and written from a read-only subvolume
 //! - [`log_tree`] — reading an unreplayed log tree, and a mount that ignores it
+//! - [`salvage`] — read-only primitives for a damaged volume, each structure with its verdict
 //! - [`capi`] — the C ABI
 
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -101,6 +102,7 @@ pub mod mkfs;
 pub mod namespace;
 pub mod raid56;
 pub mod resize;
+pub mod salvage;
 pub mod scrub;
 pub mod send;
 pub mod subvol;
