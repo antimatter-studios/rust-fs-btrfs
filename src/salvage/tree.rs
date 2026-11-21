@@ -356,6 +356,23 @@ fn decode_key_ptrs(bytes: &[u8], header: &Header, faults: &mut Vec<BlockFault>) 
     pointers
 }
 
+/// A block from bytes already read, as copy 0 of `logical`.
+pub fn salvaged_from_bytes(bytes: Vec<u8>, logical: u64, geometry: &TreeGeometry) -> SalvagedBlock {
+    let (header, faults, body) = decode_block(&bytes, logical, geometry, Expect::default());
+    SalvagedBlock {
+        logical,
+        mirror: 0,
+        header,
+        attempts: vec![CopyAttempt {
+            mirror: 0,
+            faults: faults.clone(),
+        }],
+        faults,
+        body,
+        bytes,
+    }
+}
+
 /// Read the block at `logical`, trying each copy until one verifies.
 ///
 /// When none does, the copy returned is the first whose header was read,
@@ -419,7 +436,7 @@ pub fn read_block(
 }
 
 /// Where a tree starts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RootPointer {
     pub bytenr: u64,
     /// The generation the root's referrer recorded, when it recorded one.

@@ -361,3 +361,10 @@ salvage_data_oracle 3
 # Salvage on truncated images names what lies past the end and keeps
 # the rest (#804).
 salvage_truncated_oracle 3
+# The three layers pass rust-fs-core's conformance checks on the fixtures
+# and damaged copies (#805).
+layers_conformance 2
+# rust-fs-core's salvage conformance set over a kernel-written volume (#805).
+layers_salvage_conformance 1
+# The file layer and the salvage verbs read what the kernel reads (#805).
+layers_kernel_oracle 2

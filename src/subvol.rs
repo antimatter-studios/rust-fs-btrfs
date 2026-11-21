@@ -531,7 +531,7 @@ impl Filesystem {
     ///
     /// This handle knows its tree by root block, not by id, so the parent
     /// id is found as the tree whose `ROOT_ITEM` points at that block.
-    fn subvolume_behind(
+    pub(crate) fn subvolume_behind(
         &self,
         dir_ino: u64,
         entry: &crate::dir::DirEntry,

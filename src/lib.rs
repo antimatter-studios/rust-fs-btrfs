@@ -70,6 +70,7 @@
 //!   rewrites and the commit of a new generation, separate from file writes
 //! - [`send`] — send streams: parsed, and written from a read-only subvolume
 //! - [`log_tree`] — reading an unreplayed log tree, and a mount that ignores it
+//! - [`layers`] — rust-fs-core's three API layers: volume, primitive with the salvage verbs, files
 //! - [`salvage`] — read-only primitives for a damaged volume, each structure with its verdict
 //! - [`capi`] — the C ABI
 
@@ -96,6 +97,7 @@ pub mod extent_write;
 pub mod fallocate;
 pub mod fs;
 pub mod inode;
+pub mod layers;
 pub mod leaf_edit;
 pub mod log_tree;
 pub mod mkfs;
