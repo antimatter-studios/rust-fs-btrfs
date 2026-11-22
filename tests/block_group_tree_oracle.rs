@@ -14,7 +14,7 @@
 //! feature.
 
 use fs_btrfs::fs::Filesystem;
-use fs_btrfs_test_support::{dump_tree, fixture, sha256_hex};
+use fs_btrfs_test_support::{dump_tree, fixture, sha256_hex, tree_item_header};
 use fs_core::FileDevice;
 use std::sync::Arc;
 
@@ -39,7 +39,10 @@ fn reference() -> Vec<(u64, u64, u64)> {
     let mut out = Vec::new();
     let mut key: Option<(u64, u64)> = None;
     for line in dump.lines().map(str::trim) {
-        if let Some(rest) = line.split("key (").nth(1) {
+        if let Some((_, rest)) = line
+            .split_once("key (")
+            .filter(|_| tree_item_header(line, "key ("))
+        {
             let f: Vec<&str> = rest.split([' ', ')']).collect();
             key = (f.get(1) == Some(&"BLOCK_GROUP_ITEM"))
                 .then(|| (f[0].parse().expect("start"), f[2].parse().expect("length")));

@@ -22,7 +22,7 @@ use fs_btrfs::fs::Filesystem;
 use fs_btrfs::Error;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, dump_tree, guest_kernel_read_ok, guest_kernel_write_ok, oracle,
-    temp_path,
+    temp_path, tree_item_header,
 };
 use fs_core::{BlockDevice, FileDevice};
 use std::path::{Path, PathBuf};
@@ -80,6 +80,7 @@ fn data_groups(fs: &Filesystem) -> Vec<BlockGroup> {
 fn dumped_chunks(image: &Path) -> Vec<u64> {
     dump_tree(image, "chunk")
         .lines()
+        .filter(|line| tree_item_header(line, "key ("))
         .filter_map(|line| {
             let key = line.split("key (").nth(1)?;
             let words: Vec<&str> = key.split([' ', ')']).collect();

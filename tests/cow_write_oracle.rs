@@ -32,7 +32,7 @@
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, dump_tree, guest_kernel_read_ok, guest_kernel_write_ok, oracle,
-    sha256_hex, temp_path,
+    sha256_hex, temp_path, tree_item_header,
 };
 use fs_core::{BlockDevice, FileDevice};
 use std::collections::{BTreeMap, BTreeSet};
@@ -2012,7 +2012,7 @@ fn inline_extent(image: &Path, ino: u64) -> Option<(u64, u64, String)> {
     let needle = format!("key ({ino} EXTENT_DATA 0)");
     let at = lines
         .iter()
-        .position(|l| l.contains(&needle))
+        .position(|line| tree_item_header(line, &needle))
         .unwrap_or_else(|| panic!("inode {ino} has no extent item at 0\n{tree}"));
     let line = lines[at + 1..]
         .iter()
@@ -2822,7 +2822,7 @@ fn write_keyed_reference(count: usize, another_leaf: bool) {
         let needle = format!("key ({} EXTENT_DATA 0)", inos["orig.bin"]);
         let at = lines
             .iter()
-            .position(|l| l.contains(&needle))
+            .position(|line| tree_item_header(line, &needle))
             .unwrap_or_else(|| panic!("orig.bin has no extent item at 0\n{tree}"));
         lines[at + 1..]
             .iter()
@@ -2858,13 +2858,12 @@ fn write_keyed_reference(count: usize, another_leaf: bool) {
                 .parse::<u64>()
                 .unwrap();
         }
-        if line.contains(&format!("key ({bytenr} EXTENT_ITEM ")) {
+        if tree_item_header(line, &format!("key ({bytenr} EXTENT_ITEM ")) {
             record_leaf = Some(leaf);
         }
         if line.contains(" key (") {
-            keyed_leaf = line
-                .contains(&format!("key ({bytenr} EXTENT_DATA_REF "))
-                .then_some(leaf);
+            keyed_leaf =
+                tree_item_header(line, &format!("key ({bytenr} EXTENT_DATA_REF ")).then_some(leaf);
         } else if let Some(at) = keyed_leaf {
             let words: Vec<_> = line.split_whitespace().collect();
             if let Some(i) = words.iter().position(|w| *w == "objectid") {
@@ -3030,7 +3029,7 @@ fn a_write_drops_a_keyed_reference_filed_above_its_taken_hash_key() {
         let needle = format!("key ({} EXTENT_DATA 0)", inos["orig.bin"]);
         let at = lines
             .iter()
-            .position(|l| l.contains(&needle))
+            .position(|line| tree_item_header(line, &needle))
             .unwrap_or_else(|| panic!("orig.bin has no extent item at 0\n{tree}"));
         lines[at + 1..]
             .iter()
@@ -5346,7 +5345,31 @@ fn neighbouring_growing_crossing_writes_match_the_kernel() {
 fn growing_crossing_kernel_cases<const COUNT: usize>(
     cases: [(&str, u64, u64, usize, bool); COUNT],
 ) {
-    let mut script = String::new();
+    let controlled = |name| matches!(name, "whole-regular-over-hole" | "own-sector-over-hole");
+    let mut script = String::from(
+        r#"writeback_from_old_end() {
+python3 - "$@" <<'PY'
+import ctypes
+import os
+import sys
+
+path, start, length, old_end = sys.argv[1:]
+start, length, old_end = int(start), int(length), int(old_end)
+sync_range = ctypes.CDLL(None, use_errno=True).sync_file_range
+sync_range.argtypes = (ctypes.c_int, ctypes.c_int64, ctypes.c_int64, ctypes.c_uint)
+wait_before, write, wait_after = 1, 2, 4
+with open(path, 'r+b', buffering=0) as control:
+    fd = control.fileno()
+    if os.pwrite(fd, b'Z' * length, start) != length:
+        raise RuntimeError('short write to native oracle control')
+    if sync_range(fd, old_end, start + length - old_end, wait_before | write | wait_after) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    os.fsync(fd)
+PY
+}
+"#,
+    );
     for (name, old, at, len, truncated) in cases {
         if truncated {
             script.push_str(&format!(
@@ -5363,18 +5386,33 @@ fn growing_crossing_kernel_cases<const COUNT: usize>(
                  fallocate -n -o 65536 -l 65536 \"$MNT/$f\"; done\nsync\n"
             ));
         }
+        if controlled(name) {
+            script.push_str(&format!(
+                "if [ \"$writeback_mode\" = old-end ]; then\n\
+                 writeback_from_old_end \"$MNT/{name}-control\" {at} {len} {old}\n\
+                 else\n"
+            ));
+        }
         script.push_str(&format!(
             "head -c {len} /dev/zero | tr '\\000' '\\132' \
              | dd of=\"$MNT/{name}-control\" bs={len} iflag=fullblock oflag=seek_bytes seek={at} conv=notrunc status=none\n\
              sync\n"
         ));
+        if controlled(name) {
+            script.push_str("fi\n");
+        }
     }
     for features in ["^no-holes", "no-holes"] {
+        let writeback_mode = if features == "no-holes" {
+            "old-end"
+        } else {
+            "default"
+        };
         let scratch = Scratch::made(
             &format!("cow-prealloc-crossing-{}", cases[0].0),
             "crc32c",
             features,
-            &script,
+            &format!("writeback_mode={writeback_mode}\n{script}"),
         );
         let image = scratch.image();
         let mut fs = mount_rw(&image);
@@ -5400,6 +5438,9 @@ fn growing_crossing_kernel_cases<const COUNT: usize>(
                 "{features} {name}: size and nbytes"
             );
             let (ours, theirs) = (extent_windows(&image, ino), extent_windows(&image, control));
+            if features == "no-holes" && controlled(name) {
+                println!("[cow writeback] {features} {name} {writeback_mode}: kernel {theirs:?}");
+            }
             assert_eq!(ours, theirs, "{features} {name}: extent windows");
             for (item, _, disk_len, _, _) in theirs {
                 if disk_len != 0 {

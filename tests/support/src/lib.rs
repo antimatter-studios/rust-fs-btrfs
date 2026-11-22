@@ -642,6 +642,10 @@ pub fn dump_tree(image: &Path, tree: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+pub fn tree_item_header(line: &str, key: &str) -> bool {
+    line.trim_start().starts_with("item ") && line.contains(key) && line.contains(" itemoff ")
+}
+
 /// SHA-256 of some bytes, as the hex `sha256sum` prints in the guest.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};

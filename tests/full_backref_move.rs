@@ -16,7 +16,8 @@
 //! search for a cross-group move happened to pick. This test picks such a
 //! leaf on purpose: btrfs-progs' own dump of the extent tree names the
 //! parents of the shared data references, and one of them that is an
-//! fs-tree leaf is moved. Where the free space lies does not matter here.
+//! fs-tree leaf is moved. A layout with no movable candidate is rebuilt
+//! within a fixed attempt budget rather than treated as a passing test.
 //!
 //! THE VOLUME IS MADE BY THE KERNEL, in the harness guest, the way
 //! `block_group_used` makes its own: 4 KiB nodes, mixed block groups, a
@@ -27,8 +28,10 @@
 
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::super_write::Commit;
+use fs_btrfs::Error;
 use fs_btrfs_test_support::{
-    assert_btrfs_check_clean, dump_tree, guest_kernel_write_ok, oracle, temp_path,
+    assert_btrfs_check_clean, dump_tree, guest_kernel_read_ok, guest_kernel_write_ok, oracle,
+    temp_path,
 };
 use fs_core::{BlockDevice, FileDevice};
 use std::collections::BTreeSet;
@@ -54,24 +57,22 @@ fn shared_data_parents(image: &Path) -> BTreeSet<u64> {
         .collect()
 }
 
-#[test]
-fn moving_a_leaf_that_holds_data_by_full_back_reference_keeps_the_volume_consistent() {
-    let dir = PathBuf::from(temp_path!("full-backref-move"));
-    std::fs::create_dir_all(&dir).unwrap();
-    let image = dir.join("fs.img");
-    std::fs::File::create(&image)
+const MAX_FIXTURE_ATTEMPTS: usize = 4;
+const READBACK: &str = "cd \"$MNT\"; LC_ALL=C sha256sum f*";
+
+fn make_fixture(image: &Path) -> String {
+    std::fs::File::create(image)
         .and_then(|f| f.set_len(2 << 30))
         .unwrap();
     let made = oracle("mkfs.btrfs")
         .args(["-q", "-f", "-M", "-n", "4096", "-s", "4096"])
-        .arg(&image)
+        .arg(image)
         .output();
     assert!(
         made.status.success(),
         "{}",
         String::from_utf8_lossy(&made.stderr)
     );
-    // Zeros: never read, and the copy back to the host is sparse.
     guest_kernel_write_ok(
         &image.to_string_lossy(),
         "files relocated by a balance",
@@ -85,11 +86,14 @@ fn moving_a_leaf_that_holds_data_by_full_back_reference_keeps_the_volume_consist
          done | sort -n | awk 'NR <= 128 && NR % 2 == 1' | while read -r _ f; do rm \"$MNT/$f\"; done\n\
          sync",
     );
+    guest_kernel_read_ok(&image.to_string_lossy(), "before the move", READBACK)
+}
 
+fn move_in_fixture(image: &Path) -> Result<(), String> {
     // The case itself, named by btrfs-progs rather than by this driver:
     // fs-tree leaves that data extents name as their parent.
-    let leaves = fs_tree_leaves(&image);
-    let parents = shared_data_parents(&image);
+    let leaves = fs_tree_leaves(image);
+    let parents = shared_data_parents(image);
     let candidates: Vec<u64> = parents.intersection(&leaves).copied().collect();
     assert!(
         !candidates.is_empty(),
@@ -99,7 +103,7 @@ fn moving_a_leaf_that_holds_data_by_full_back_reference_keeps_the_volume_consist
         leaves.len()
     );
 
-    let dev = Arc::new(FileDevice::open_rw(&image).unwrap());
+    let dev = Arc::new(FileDevice::open_rw(image).unwrap());
     let fs = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>).expect("mount rw");
     let generation = fs.superblock().generation + 1;
 
@@ -118,23 +122,23 @@ fn moving_a_leaf_that_holds_data_by_full_back_reference_keeps_the_volume_consist
                 chosen = Some((leaf, plan, blocks));
                 break;
             }
-            Err(e)
-                if e.to_string().contains("does not fit")
-                    || e.to_string()
-                        .contains("free-space records of the block group") =>
+            Err(Error::UnsupportedFeature(message))
+                if message.starts_with("the free-space records of the block group at ")
+                    || (message.starts_with("the item ") && message.contains("does not fit")) =>
             {
-                passed_over.push(format!("{leaf}: {e}"));
+                passed_over.push(format!("{leaf}: {message}"));
             }
             Err(e) => panic!("rendering a plan moving the leaf at {leaf}: {e}"),
         }
     }
-    let (leaf, plan, blocks) = chosen.unwrap_or_else(|| {
-        panic!(
+    let Some((leaf, plan, blocks)) = chosen else {
+        return Err(format!(
             "every one of the {} fs-tree leaves holding data by full back reference was \
-             passed over: {passed_over:#?}",
-            candidates.len()
-        )
-    });
+             passed over ({} refusals): {passed_over:#?}",
+            candidates.len(),
+            passed_over.len()
+        ));
+    };
     let root = fs
         .planned_root(&plan)
         .expect("the plan moves the root tree");
@@ -162,6 +166,48 @@ fn moving_a_leaf_that_holds_data_by_full_back_reference_keeps_the_volume_consist
         plan.rewrites.len() - 1
     );
 
-    assert_btrfs_check_clean(&image, "moving a full-backref leaf");
+    Ok(())
+}
+
+fn with_movable_fixture(
+    mut attempt: impl FnMut() -> Result<(), String>,
+) -> Result<usize, Vec<String>> {
+    let mut refusals = Vec::new();
+    for fixture in 1..=MAX_FIXTURE_ATTEMPTS {
+        match attempt() {
+            Ok(()) => return Ok(fixture),
+            Err(refused) => refusals.push(refused),
+        }
+    }
+    Err(refusals)
+}
+
+#[test]
+fn every_fixture_refused_still_fails() {
+    let refusal = "all candidates refused for cross-leaf free space".to_string();
+    let result = with_movable_fixture(|| Err(refusal.clone()));
+    assert_eq!(result, Err(vec![refusal; MAX_FIXTURE_ATTEMPTS]));
+}
+
+#[test]
+fn moving_a_leaf_that_holds_data_by_full_back_reference_keeps_the_volume_consistent() {
+    let dir = PathBuf::from(temp_path!("full-backref-move"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("fs.img");
+    let fixture = with_movable_fixture(|| {
+        let expected = make_fixture(&image);
+        move_in_fixture(&image)?;
+        assert_btrfs_check_clean(&image, "moving a full-backref leaf");
+        let actual = guest_kernel_read_ok(&image.to_string_lossy(), "after the move", READBACK);
+        assert_eq!(
+            actual, expected,
+            "the kernel reads all the same files after the move"
+        );
+        Ok(())
+    })
+    .unwrap_or_else(|refusals| {
+        panic!("no movable full-backref leaf after {MAX_FIXTURE_ATTEMPTS} fixtures: {refusals:#?}");
+    });
+    println!("[full-backref] moved on fixture {fixture}");
     let _ = std::fs::remove_dir_all(&dir);
 }

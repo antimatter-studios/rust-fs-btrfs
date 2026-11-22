@@ -180,7 +180,7 @@ free_space_oracle         4
 free_space_straddle       2
 fs_oracle                 13
 fstree_oracle             2
-full_backref_move         1
+full_backref_move         2
 fuzz_decoders             5
 getxattr_byte_names       1
 guest_scripts_drain_pipes 2
@@ -323,7 +323,7 @@ subvol_snapshot_tall_kernel 14
 superblock_mirrors        4
 super_flags_refusals      3
 super_write_oracle        3
-test_contract             7
+test_contract             8
 transaction_oracle        5
 transaction_plan          7
 truncate_kernel           5

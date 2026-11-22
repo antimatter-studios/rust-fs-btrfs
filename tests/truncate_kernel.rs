@@ -29,7 +29,7 @@
 use fs_btrfs::capi::*;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, dump_tree, guest_kernel_read_ok, guest_kernel_write_ok, oracle,
-    sha256_hex, temp_path,
+    sha256_hex, temp_path, tree_item_header,
 };
 use std::ffi::{c_void, CStr, CString};
 use std::path::{Path, PathBuf};
@@ -271,6 +271,9 @@ fn dumped_extents(image: &Path, ino: u64) -> Vec<(u64, u64, u64)> {
     let needle = format!("key ({ino} EXTENT_DATA ");
     let mut items = Vec::new();
     for (at, line) in lines.iter().enumerate() {
+        if !tree_item_header(line, &needle) {
+            continue;
+        }
         let Some(start) = line.find(&needle) else {
             continue;
         };

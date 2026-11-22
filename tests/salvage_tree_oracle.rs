@@ -13,7 +13,7 @@ use fs_btrfs::salvage::{
     best_copy, build_chunk_map, superblock_copies, walk_tree, BlockFault, Layout, RootPointer,
 };
 use fs_btrfs::superblock::Superblock;
-use fs_btrfs_test_support::{copy_sparse, fixture, oracle, temp_path};
+use fs_btrfs_test_support::{copy_sparse, fixture, oracle, temp_path, tree_item_header};
 use fs_core::FileDevice;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
@@ -208,7 +208,7 @@ fn root_from_dump(image: &Path, tree: &str) -> RootPointer {
     assert!(ok, "dump-tree -t root:\n{text}");
     let mut lines = text.lines();
     while let Some(line) = lines.next() {
-        if line.contains(&format!("key ({tree} ROOT_ITEM 0)")) {
+        if tree_item_header(line, &format!("key ({tree} ROOT_ITEM 0)")) {
             let body: Vec<&str> = lines.by_ref().take(6).collect();
             let body = body.join(" ");
             return RootPointer {

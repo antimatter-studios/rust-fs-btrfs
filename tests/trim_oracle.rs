@@ -17,7 +17,7 @@
 
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::trim::TrimRange;
-use fs_btrfs_test_support::{dump_tree, fixture, temp_path};
+use fs_btrfs_test_support::{dump_tree, fixture, temp_path, tree_item_header};
 use fs_core::{BlockDevice, FileDevice};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,6 +56,7 @@ fn merged(mut runs: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
 fn progs_block_groups(image: &Path) -> Vec<(u64, u64)> {
     let groups: Vec<(u64, u64)> = dump_tree(image, "extent")
         .lines()
+        .filter(|line| tree_item_header(line, "key ("))
         .filter_map(|line| {
             let rest = line.split("key (").nth(1)?;
             let f: Vec<&str> = rest.split([' ', ')']).collect();
@@ -97,6 +98,7 @@ fn progs_free(image: &Path) -> Vec<(u64, u64)> {
     );
     let runs: Vec<(u64, u64)> = dump
         .lines()
+        .filter(|line| tree_item_header(line, "key ("))
         .filter_map(|line| {
             let rest = line.split("key (").nth(1)?;
             let f: Vec<&str> = rest.split([' ', ')']).collect();

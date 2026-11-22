@@ -34,6 +34,24 @@
 
 use std::path::{Path, PathBuf};
 
+#[test]
+fn a_node_pointer_is_not_the_first_item_in_its_leaf() {
+    let key = "key (259 EXTENT_DATA 0)";
+    let transcript = "node 31752192 level 1 items 1\n\
+        \tkey (259 EXTENT_DATA 0) block 31756288 gen 7\n\
+        leaf 31756288 items 1 free space 3520 generation 7 owner FS_TREE\n\
+        \titem 0 key (259 EXTENT_DATA 0) itemoff 3942 itemsize 53\n\
+        \t\textent data disk byte 13631488 nr 4096\n";
+    let matching: Vec<_> = transcript
+        .lines()
+        .filter(|line| fs_btrfs_test_support::tree_item_header(line, key))
+        .collect();
+    assert_eq!(
+        matching,
+        ["\titem 0 key (259 EXTENT_DATA 0) itemoff 3942 itemsize 53"]
+    );
+}
+
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
