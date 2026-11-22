@@ -307,7 +307,9 @@ vars:
   # one. The shared guest is sized by a host resource profile.
   # v0.9.1: a macOS host needs the virtiofsd port 1.14.0.1 or newer, and a
   # grep check under pipefail no longer fails on its own match.
-  LINUX_HARNESS_REF: v0.9.1
+  # v0.10.0: a call waiting on a run's virtiofsd that has gone or stopped
+  # answering fails within FLTH_WATCHDOG_TREE_SECS instead of hanging.
+  LINUX_HARNESS_REF: v0.10.0
 
 # The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
 # harness is a sibling that `chore siblings` itself checks out: without
