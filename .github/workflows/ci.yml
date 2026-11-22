@@ -281,7 +281,7 @@ jobs:
         # Ubuntu 24.04 packages virtiofsd 1.10.0, which never answers a
         # non-UTF-8 xattr name (tests/getxattr_byte_names.rs hung, #794).
         # The tag must match LINUX_HARNESS_REF in chores.yml.
-        uses: antimatter-studios/fs-linux-test-harness/.github/actions/install-virtiofsd@v0.8.0
+        uses: antimatter-studios/fs-linux-test-harness/.github/actions/install-virtiofsd@v0.9.1
       - name: KVM, QEMU and Vagrant
         id: vm-host
         run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
@@ -347,7 +347,7 @@ jobs:
         # Ubuntu 24.04 packages virtiofsd 1.10.0, which never answers a
         # non-UTF-8 xattr name (tests/getxattr_byte_names.rs hung, #794).
         # The tag must match LINUX_HARNESS_REF in chores.yml.
-        uses: antimatter-studios/fs-linux-test-harness/.github/actions/install-virtiofsd@v0.8.0
+        uses: antimatter-studios/fs-linux-test-harness/.github/actions/install-virtiofsd@v0.9.1
       - name: KVM, QEMU and Vagrant
         id: vm-host
         run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
@@ -529,7 +529,7 @@ jobs:
         # Ubuntu 24.04 packages virtiofsd 1.10.0, which never answers a
         # non-UTF-8 xattr name (tests/getxattr_byte_names.rs hung, #794).
         # The tag must match LINUX_HARNESS_REF in chores.yml.
-        uses: antimatter-studios/fs-linux-test-harness/.github/actions/install-virtiofsd@v0.8.0
+        uses: antimatter-studios/fs-linux-test-harness/.github/actions/install-virtiofsd@v0.9.1
       - name: KVM, QEMU and Vagrant
         id: vm-host
         run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
