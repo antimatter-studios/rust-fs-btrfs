@@ -21,7 +21,7 @@ use fs_btrfs::Error;
 use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, dump_tree, fixture, guest_kernel_read_ok, guest_kernel_report,
-    guest_kernel_write_ok, oracle, sha256_hex, temp_path,
+    guest_kernel_write_ok, oracle, sha256_hex, temp_path, tree_item_header,
 };
 use fs_core::{BlockDevice, BlockRead, FileDevice};
 use std::collections::BTreeMap;
@@ -2528,7 +2528,10 @@ fn an_inode_whose_last_name_is_an_extended_reference_is_deleted_as_the_kernel_do
     let mut extrefs: Vec<(u64, u64, u64, String)> = Vec::new();
     let mut lines = committed.lines();
     while let Some(line) = lines.next() {
-        let Some((_, key)) = line.split_once("key (") else {
+        let Some((_, key)) = line
+            .split_once("key (")
+            .filter(|_| tree_item_header(line, "key ("))
+        else {
             continue;
         };
         let words: Vec<&str> = key.split_whitespace().collect();
@@ -2627,7 +2630,10 @@ fn an_inode_whose_last_name_is_an_extended_reference_is_deleted_as_the_kernel_do
     let items_of_f = |image: &Path| -> Vec<String> {
         dump_tree(image, "5")
             .lines()
-            .filter(|l| l.contains(&format!("key ({f} ")))
+            .filter(|line| {
+                tree_item_header(line, &format!("key ({f} "))
+                    || line.contains(&format!("location key ({f} "))
+            })
             .map(|l| l.trim().to_string())
             .collect()
     };
@@ -2732,8 +2738,9 @@ fn a_directory_whose_name_the_log_removes_is_removed_as_the_kernel_does() {
     let items_of_e = |image: &Path| -> Vec<String> {
         dump_tree(image, "5")
             .lines()
-            .filter(|l| {
-                l.contains(&format!("key ({e} ")) || l.contains(&format!("location key ({e} "))
+            .filter(|line| {
+                tree_item_header(line, &format!("key ({e} "))
+                    || line.contains(&format!("location key ({e} "))
             })
             .map(|l| l.trim().to_string())
             .collect()
@@ -2838,7 +2845,7 @@ fn a_name_whose_inode_keeps_another_is_removed_as_the_kernel_does() {
         let mut lines = dump.lines().map(str::trim);
         let mut refs = Vec::new();
         while let Some(line) = lines.next() {
-            if line.contains(&format!("key ({f} INODE_REF ")) {
+            if tree_item_header(line, &format!("key ({f} INODE_REF ")) {
                 refs.push(line.split(" itemoff").next().unwrap_or(line).to_string());
                 refs.extend(
                     lines
@@ -2971,10 +2978,10 @@ fn links_and_nodes_whose_last_names_the_log_removes_are_deleted_as_the_kernel_do
     let items_of = |image: &Path| -> Vec<String> {
         dump_tree(image, "5")
             .lines()
-            .filter(|l| {
+            .filter(|line| {
                 inodes.iter().any(|ino| {
-                    l.contains(&format!("key ({ino} "))
-                        || l.contains(&format!("location key ({ino} "))
+                    tree_item_header(line, &format!("key ({ino} "))
+                        || line.contains(&format!("location key ({ino} "))
                 })
             })
             .map(|l| l.trim().to_string())
@@ -3036,7 +3043,7 @@ fn the_logged_inline_extent_fields_match_the_native_transcript() {
     let header = format!("key ({ino} EXTENT_DATA 0)");
     let line = transcript
         .lines()
-        .skip_while(|l| !l.contains(&header))
+        .skip_while(|line| !tree_item_header(line, &header))
         .skip(1)
         .take_while(|l| !l.trim_start().starts_with("item "))
         .find(|l| l.contains("inline extent data size"))

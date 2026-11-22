@@ -29,7 +29,7 @@ use fs_btrfs::block_group::BlockGroup;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::Error;
 use fs_btrfs_test_support::{
-    dump_tree, guest_kernel_read_ok, guest_kernel_write_ok, oracle, temp_path,
+    dump_tree, guest_kernel_read_ok, guest_kernel_write_ok, oracle, temp_path, tree_item_header,
 };
 use fs_core::{BlockRead, FileDevice};
 use std::collections::{BTreeMap, BTreeSet};
@@ -111,6 +111,7 @@ fn data_groups(fs: &Filesystem) -> Vec<BlockGroup> {
 fn dumped_extents(image: &Path, start: u64, end: u64) -> BTreeSet<(u64, u64)> {
     dump_tree(image, "extent")
         .lines()
+        .filter(|line| tree_item_header(line, "key ("))
         .filter_map(|line| {
             let key = line.split("key (").nth(1)?;
             let words: Vec<&str> = key.split([' ', ')']).collect();

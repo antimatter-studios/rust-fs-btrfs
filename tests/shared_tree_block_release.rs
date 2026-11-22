@@ -19,7 +19,7 @@
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, dump_tree, fixture, guest_kernel_read_ok, guest_kernel_write_ok,
-    sha256_hex, temp_path,
+    sha256_hex, temp_path, tree_item_header,
 };
 use fs_core::{BlockDevice, FileDevice};
 use std::path::{Path, PathBuf};
@@ -30,7 +30,10 @@ fn shared_tree_block(image: &Path) -> u64 {
     let dump = dump_tree(image, "extent");
     let lines: Vec<&str> = dump.lines().collect();
     for (i, line) in lines.iter().enumerate() {
-        let Some(key) = line.split("key (").nth(1) else {
+        let Some((_, key)) = line
+            .split_once("key (")
+            .filter(|_| tree_item_header(line, "key ("))
+        else {
             continue;
         };
         let mut words = key.split_whitespace();

@@ -26,7 +26,7 @@ use fs_btrfs::compression::Compression;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, dump_super, dump_tree, guest_kernel_read_ok, guest_kernel_write_ok,
-    oracle, sha256_hex, temp_path,
+    oracle, sha256_hex, temp_path, tree_item_header,
 };
 use fs_core::{BlockDevice, FileDevice};
 use std::collections::BTreeMap;
@@ -131,7 +131,10 @@ fn extent_compression(dump: &str) -> BTreeMap<u64, Vec<u8>> {
     let mut out: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     let mut inode = None;
     for line in dump.lines() {
-        if let Some(key) = line.split("key (").nth(1) {
+        if let Some((_, key)) = line
+            .split_once("key (")
+            .filter(|_| tree_item_header(line, "key ("))
+        {
             inode = key
                 .contains(" EXTENT_DATA ")
                 .then(|| key.split(' ').next().and_then(|n| n.parse::<u64>().ok()))
@@ -160,7 +163,10 @@ fn extent_lengths(dump: &str) -> BTreeMap<u64, Vec<u64>> {
     let mut out: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
     let mut inode = None;
     for line in dump.lines() {
-        if let Some(key) = line.split("key (").nth(1) {
+        if let Some((_, key)) = line
+            .split_once("key (")
+            .filter(|_| tree_item_header(line, "key ("))
+        {
             inode = key
                 .contains(" EXTENT_DATA ")
                 .then(|| key.split(' ').next().and_then(|n| n.parse::<u64>().ok()))
