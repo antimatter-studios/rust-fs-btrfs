@@ -123,7 +123,7 @@ fn salvaged(device: &FileDevice, layout: &Layout, scan: &InodeScan) -> Listing {
                 }
                 S_IFREG => {
                     let mut bytes = Vec::new();
-                    copy_file(device, layout, record, &mut bytes).unwrap();
+                    copy_file(device, layout, None, record, &mut bytes).unwrap();
                     listing.insert(path, Some(sha256_hex(&bytes)));
                 }
                 _ => {}

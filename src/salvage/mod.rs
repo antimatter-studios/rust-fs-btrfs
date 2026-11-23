@@ -17,6 +17,7 @@
 //! damaged.
 
 pub mod chunks;
+pub mod csums;
 pub mod files;
 pub mod roots;
 pub mod scan;
@@ -24,6 +25,7 @@ pub mod superblock;
 pub mod tree;
 
 pub use chunks::{build_chunk_map, ChunkScan, ChunkSource, RejectedChunk};
+pub use csums::{verify_data, CsumTree, SectorCsum, SectorTally};
 pub use files::{
     collect_inodes, copy_file, read_data, read_file_extent, DataFault, ExtentClaim, ExtentType,
     FileCopy, FileExtentItem, InodeRecord, InodeScan, NameClaim,
