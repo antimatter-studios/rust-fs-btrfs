@@ -37,6 +37,10 @@
 //! in-place `nodatacow`, #61), so the kernel does the writing and the
 //! direction checked is the read.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;

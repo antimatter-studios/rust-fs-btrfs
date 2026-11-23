@@ -11,6 +11,10 @@
 //! given for an image file that does not exist yet. A device that already
 //! holds a filesystem or a partition table is refused without `-f`.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use std::sync::Arc;
 
 use clap::{Arg, ArgAction, ArgMatches, Command as Cmd};

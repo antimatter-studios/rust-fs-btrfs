@@ -22,6 +22,10 @@
 //! at the extent tree, but `fsck.btrfs` does, and its handling of that
 //! inline reference waits for a guest that can make one.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs_test_support::copy_sparse;
 use fs_btrfs_test_support::{fixture, sha256_hex, temp_path};

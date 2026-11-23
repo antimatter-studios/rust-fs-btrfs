@@ -13,6 +13,10 @@
 //! link count and file modification time, the contents of every file as
 //! the kernel reads them back, and `btrfs check` clean on both.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::dir::{parse_dir_items, DIR_INDEX_KEY, XATTR_ITEM_KEY};
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs::inode::{INODE_ITEM_KEY, INODE_REF_KEY};

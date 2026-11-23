@@ -1,6 +1,10 @@
 //! A truncate keeps its handle on the chosen tree across every commit (#519).
 //! Independent on-disk validation lives in subvol_truncate_kernel.rs.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::{mkfs, Error, Filesystem};
 use fs_btrfs_test_support::temp_path;
 use fs_core::FileDevice;

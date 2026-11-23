@@ -13,6 +13,10 @@
 //! subvolume, a snapshot of it, a level-1 group holding the subvolume,
 //! limits on both, and a rescan so every count is the kernel's own.
 
+// The read-only openers deprecated in 0.12.0 stay in use here for their
+// deprecation release (`layers::BtrfsVolume` replaces them).
+#![allow(deprecated)]
+
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, guest_kernel_read_ok, guest_kernel_write_ok, oracle, sha256_hex,
