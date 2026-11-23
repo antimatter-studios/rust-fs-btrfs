@@ -11,10 +11,35 @@ rust-fs-core:
 
 This page records what the crate already has for each layer, where it
 stops short, and the work that closes each gap. It was surveyed at
-0.11.0. Rows move to `docs/features.md` as the work lands.
+0.11.0. Rows move to `docs/features.md` as the work lands. The tables
+below are the survey; the next section says what implements each layer.
 
 Everything below is read-only. The writable surface (`mount_rw`, the
 `BlockDevice` paths) stays the crate's own and is not part of any layer.
+
+## Where each layer is implemented
+
+`src/layers.rs` implements rust-fs-core's traits (`fs_core::layers`, the
+`layers` feature). The Btrfs-specific primitives they are built from stay in
+`src/salvage/`, and nothing Btrfs-specific moves to core.
+
+| Trait | Type | Built on |
+|---|---|---|
+| `VolumeAPI`, `OpenVolume` | `layers::BtrfsVolume` | `salvage::superblock_copies`, `Filesystem::mount` for `open` |
+| `PrimitiveAPI` | `layers::BtrfsVolume` | superblock copies, the chunk, root and filesystem tree roots |
+| `SalvageAdapter` | `layers::BtrfsAdapter` | `salvage::scan_tree_blocks`, `walk_tree`, `search_range`, `build_chunk_map`, `root_tree_candidates`, `compression::decompress` |
+| `FileAPI` | `layers::BtrfsVolume`, node `BtrfsNode { tree, ino }` | `Filesystem`, one mount per subvolume |
+
+Candidates are inode items, found by scanning node-sized windows for
+filesystem tree leaves. A leaf the current trees reach gives `Live`
+candidates. A leaf only an older generation or nothing reaches gives
+candidates of `Unknown` state: Btrfs records no deletion, so a removed
+file's last record is evidence of unknown standing. A compressed run is an
+`Encoding` whose codec is `zlib`, `lzo` or `zstd`, whose `decoded` is the
+extent's `ram_bytes`, and whose `offset` and `length` are the window of the
+decoded extent the file extent item references.
+
+The old API, `Filesystem` and the C ABI, is unchanged.
 
 ## VolumeAPI
 
