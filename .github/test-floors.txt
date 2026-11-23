@@ -358,3 +358,6 @@ salvage_files_oracle 2
 # Salvage checks file data against the checksum tree as btrfs check
 # --check-data-csum does, and places extents as btrfs-map-logical does (#803).
 salvage_data_oracle 3
+# Salvage on truncated images names what lies past the end and keeps
+# the rest (#804).
+salvage_truncated_oracle 3
