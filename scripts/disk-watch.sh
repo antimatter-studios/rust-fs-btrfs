@@ -71,7 +71,9 @@ stop_sampler() {
 stop_sampler
 
 after="$(free_mb)"
-lowest="$(cat "$lowest_file")"
+# A missing sample file is quiet: the lowest is then the end, not a stderr line
+# that a tier's output budget counts (CI saw one such line, #808).
+lowest="$(cat "$lowest_file" 2>/dev/null || true)"
 # The last sample can be a second old, and COMMAND's end may be the lowest of all.
 case "$after" in '' | *[!0-9]*) ;; *) { [ -n "$lowest" ] && [ "$lowest" -le "$after" ]; } || lowest="$after" ;; esac
 echo "disk: $label: ${before:-unknown} MB free before, ${lowest:-unknown} MB at the lowest, ${after:-unknown} MB after"
