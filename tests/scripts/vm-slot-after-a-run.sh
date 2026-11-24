@@ -81,6 +81,13 @@ export FLTH_TEST_GUEST_BASH="${FLTH_TEST_GUEST_BASH:-bash}"
 export FLTH_CACHE_DIR="$sandbox/cache"
 export FLTH_STATE_DIR="$sandbox/state"
 unset FLTH_CONFIG FLTH_KEEP_VM FLTH_GUEST FLTH_SLOT_WAIT FLTH_SLOT_BOOT_GRACE FS_BTRFS_TEST_TMPDIR
+unset FLTH_SHARED_MEMORY FLTH_SHARED_CPUS FLTH_SHARED_DISK
+export FLTH_CONFIG="$SUT/fs-linux-test-harness.toml"
+# The guest's memory check reads the host's free memory. A runner with less
+# than the guest's request plus the host reserve would refuse `vm.sh up`, and
+# this test is about session lifecycle, not memory. Pin a host that has room.
+printf 'MemTotal: 33554432 kB\nMemAvailable: 30000000 kB\n' > "$sandbox/meminfo"
+export FLTH_TEST_MEMINFO="$sandbox/meminfo"
 
 reset() { rm -rf "$FLTH_CACHE_DIR/machines"; echo absent > "$FLTH_TEST_STUB/state"; : > "$FLTH_TEST_STUB/calls"; : > "$FLTH_TEST_STUB/vm-calls"; }
 vm_cmd() { (cd "$SUT" && "$H/scripts/vm.sh" "$@"); }
