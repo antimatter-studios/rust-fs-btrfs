@@ -791,7 +791,7 @@ tasks:
     # `[kernel vm]` lines. Not yet measured; the first run's log sizes it.
     cmds:
       - scripts/tools.sh --check
-      - 'FLTH_CONFIG="$PWD/fs-linux-test-harness.debian-13.toml" ../rust-fs-core/scripts/tier.sh test:kernel-new kernel-new 600 60000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel-new) -- --show-output'
+      - 'FLTH_CONFIG="$PWD/fs-linux-test-harness.debian-13.toml" ../rust-fs-core/scripts/tier.sh test:kernel-new kernel-new 600 60000 -- scripts/test.sh --locked --profile test $(scripts/test-targets.sh kernel-new) -- --show-output'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
