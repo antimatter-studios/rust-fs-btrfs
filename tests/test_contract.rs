@@ -50,6 +50,20 @@ fn a_node_pointer_is_not_the_first_item_in_its_leaf() {
         matching,
         ["\titem 0 key (259 EXTENT_DATA 0) itemoff 3942 itemsize 53"]
     );
+    // The readers built on it count the one item and take its body, not the
+    // pointer's.
+    assert_eq!(fs_btrfs_test_support::tree_item_count(transcript, key), 1);
+    assert_eq!(
+        fs_btrfs_test_support::tree_item(transcript, key).expect("the item"),
+        [
+            "\titem 0 key (259 EXTENT_DATA 0) itemoff 3942 itemsize 53",
+            "\t\textent data disk byte 13631488 nr 4096",
+        ]
+    );
+    assert_eq!(
+        fs_btrfs_test_support::tree_item(transcript, "key (260 "),
+        None
+    );
 }
 
 fn manifest_dir() -> PathBuf {

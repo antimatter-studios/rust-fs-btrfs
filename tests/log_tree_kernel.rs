@@ -855,7 +855,7 @@ fn a_log_whose_data_disagrees_with_its_checksums_is_refused_without_writing() {
                     .and_then(|at| words.get(at + 1))
                     .and_then(|w| w.trim_end_matches(')').parse::<u64>().ok())
             };
-            if line.contains("CHUNK_ITEM") {
+            if tree_item_header(line, "CHUNK_ITEM") {
                 start = after("CHUNK_ITEM");
                 length = None;
             } else if let Some(n) = after("length") {

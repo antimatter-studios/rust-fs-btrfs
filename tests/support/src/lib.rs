@@ -646,6 +646,24 @@ pub fn tree_item_header(line: &str, key: &str) -> bool {
     line.trim_start().starts_with("item ") && line.contains(key) && line.contains(" itemoff ")
 }
 
+/// The first leaf item whose key holds `key`: its header line, then its body
+/// up to the next line naming a key, so a body that names one (a directory
+/// entry's) is cut there. A node's child pointer carries the same key as the
+/// first item of its leaf and is passed over (#782).
+pub fn tree_item<'a>(dump: &'a str, key: &str) -> Option<Vec<&'a str>> {
+    let mut lines = dump.lines().skip_while(|line| !tree_item_header(line, key));
+    let header = lines.next()?;
+    let body = lines.take_while(|line| !line.contains("key ("));
+    Some(std::iter::once(header).chain(body).collect())
+}
+
+/// How many leaf items have a key holding `key`. Node pointers are not items.
+pub fn tree_item_count(dump: &str, key: &str) -> usize {
+    dump.lines()
+        .filter(|line| tree_item_header(line, key))
+        .count()
+}
+
 /// SHA-256 of some bytes, as the hex `sha256sum` prints in the guest.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
