@@ -75,7 +75,9 @@ HARNESS="$REPO/../fs-linux-test-harness"
 # target requires it), so every tier reaches their tests. The library a
 # consumer links is built without it, and gains nothing from it.
 if [[ -x "$HARNESS/scripts/vm.sh" ]]; then
-    export FLTH_CONFIG="$REPO/fs-linux-test-harness.toml"
+    # The Debian 12 guest, unless the caller chose another config:
+    # `chore test:kernel-new` points this at the Debian 13 one.
+    export FLTH_CONFIG="${FLTH_CONFIG:-$REPO/fs-linux-test-harness.toml}"
     "$HARNESS/scripts/vm.sh" session cargo test --features cli "$@"
 else
     cargo test --features cli "$@"

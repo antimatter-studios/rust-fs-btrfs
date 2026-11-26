@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# test-targets.sh unit|images|oracle|kernel — print the `cargo test`
-# target arguments for one tier of the suite.
+# test-targets.sh unit|images|oracle|kernel|kernel-new — print the
+# `cargo test` target arguments for one tier of the suite.
 #
 #   unit    the library and every tests/*.rs that reaches neither a
 #           fixture nor the VM: no tool, no kernel, no harness
@@ -10,6 +10,11 @@
 #   oracle  every tests/*.rs that runs a btrfs-progs tool (in the VM)
 #   kernel  every tests/*.rs that mounts one of our images with the real
 #           kernel (in the VM)
+#   kernel-new  every tests/kernel_new/*.rs, with the `kernel-new-tests`
+#           feature that builds them: the suites that need the Debian 13
+#           guest's kernel 6.12, run by `chore test:kernel-new` and by no
+#           other tier, since every other tier boots Debian 12. Cargo
+#           does not discover them; each has a [[test]] in Cargo.toml.
 #
 # DERIVED FROM THE TESTS THEMSELVES, not from a list someone has to
 # keep. That is not a preference here, it is the defect this replaces:
@@ -44,6 +49,19 @@ KERNEL='guest_kernel_'
 
 tier="${1:-}"
 args=()
+if [ "$tier" = kernel-new ]; then
+    args=(--features kernel-new-tests)
+    for f in "$REPO"/tests/kernel_new/*.rs; do
+        [ -f "$f" ] || continue
+        args+=(--test "$(basename "$f" .rs)")
+    done
+    [ "${#args[@]}" -gt 2 ] || {
+        echo "test-targets.sh: no suite in tests/kernel_new/" >&2
+        exit 1
+    }
+    printf '%s\n' "${args[@]}"
+    exit 0
+fi
 for f in "$REPO"/tests/*.rs; do
     name="$(basename "$f" .rs)"
     case "$tier" in
@@ -59,7 +77,7 @@ for f in "$REPO"/tests/*.rs; do
             fi
             ;;
         kernel) grep -qE "$KERNEL" "$f" && args+=(--test "$name") ;;
-        *) echo "usage: test-targets.sh unit|images|oracle|kernel" >&2; exit 2 ;;
+        *) echo "usage: test-targets.sh unit|images|oracle|kernel|kernel-new" >&2; exit 2 ;;
     esac
 done
 case "$tier" in
