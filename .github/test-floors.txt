@@ -222,6 +222,7 @@ leaf_split_oracle         1
 # full suite (#772, #773).
 lib                       404
 link_extref_kernel        1
+log_replay_removed_extref 2
 log_tree_kernel           31
 lookup_by_name_key        1
 namespace_kernel          2
