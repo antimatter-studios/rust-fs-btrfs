@@ -10,6 +10,7 @@ ok() { echo "ok $*"; }
 fail() { echo "not ok $*" >&2; fails=$(( fails + 1 )); }
 
 mkdir -p "$sandbox/repo/tests/scripts" "$sandbox/repo/scripts"
+cp -R "$REPO/tests/script-support" "$sandbox/repo/tests/"
 ln -s "$REPO/../fs-linux-test-harness" "$sandbox/fs-linux-test-harness"
 cp "$REPO/fs-linux-test-harness.toml" "$sandbox/repo/"
 sed 's/echo absent > "\$FLTH_TEST_STUB\/state"/echo "${BOOT_OBSERVATION_NEXT:-absent}" > "\$FLTH_TEST_STUB\/state"/' \

@@ -65,7 +65,11 @@ host_tools 0
 cat > "$sandbox/bin/cargo" <<STUB
 #!/usr/bin/env bash
 if [ "\${CARGO_STUB:-}" = no-vm ]; then exit 0; fi
-"$H/scripts/vm.sh" up >/dev/null 2>&1 || exit 1
+if ! "$H/scripts/vm.sh" up > "\$FLTH_TEST_STUB/up.log" 2>&1; then
+    echo "the stand-in cargo's vm.sh up failed:" >&2
+    cat "\$FLTH_TEST_STUB/up.log" >&2
+    exit 1
+fi
 case "\${CARGO_STUB:-pass}" in
     pass) exit 0 ;;
     fail) exit 101 ;;
@@ -83,16 +87,17 @@ export FLTH_STATE_DIR="$sandbox/state"
 unset FLTH_CONFIG FLTH_KEEP_VM FLTH_GUEST FLTH_SLOT_WAIT FLTH_SLOT_BOOT_GRACE FS_BTRFS_TEST_TMPDIR
 unset FLTH_SHARED_MEMORY FLTH_SHARED_CPUS FLTH_SHARED_DISK
 export FLTH_CONFIG="$SUT/fs-linux-test-harness.toml"
-# The guest's memory check reads the host's free memory. A runner with less
-# than the guest's request plus the host reserve would refuse `vm.sh up`, and
-# this test is about session lifecycle, not memory. Pin a host that has room.
-printf 'MemTotal: 33554432 kB\nMemAvailable: 30000000 kB\n' > "$sandbox/meminfo"
-export FLTH_TEST_MEMINFO="$sandbox/meminfo"
+# The harness's memory admission, at CI's 4 GiB guest, answered by this guard
+# and not by the machine running it.
+export FLTH_SHARED_MEMORY=4G
+# shellcheck source=../script-support/host-memory.sh
+source "$REPO/tests/script-support/host-memory.sh"
+give_host_memory "$sandbox" 65536
 
 reset() { rm -rf "$FLTH_CACHE_DIR/machines"; echo absent > "$FLTH_TEST_STUB/state"; : > "$FLTH_TEST_STUB/calls"; : > "$FLTH_TEST_STUB/vm-calls"; }
 vm_cmd() { (cd "$SUT" && "$H/scripts/vm.sh" "$@"); }
 vm_state() { cat "$FLTH_TEST_STUB/state"; }
-run() { (cd "$SUT" && scripts/test.sh --test oracle_stand_in) >/dev/null 2>&1; }
+run() { (cd "$SUT" && scripts/test.sh --test oracle_stand_in) > "$sandbox/out" 2>&1; }
 
 expect_session_ended() {
     # expect_session_ended <how the run ended>
@@ -117,7 +122,12 @@ expect_session_ended() {
 # --- 1. A run that PASSES ends its session. ------------------------------
 reset
 CARGO_STUB=pass run; rc=$?
-[ "$rc" = 0 ] && ok "a passing run exits 0" || fail "a passing run exits 0 (got $rc)"
+if [ "$rc" = 0 ]; then
+    ok "a passing run exits 0"
+else
+    fail "a passing run exits 0 (got $rc)"
+    cat "$sandbox/out" >&2
+fi
 expect_session_ended "a passing run"
 
 # --- 2. A run that FAILS gives it back, and keeps its own status. --------
@@ -182,6 +192,25 @@ CARGO_STUB=no-vm run; rc=$?
     && ok "on a host that cannot run the VM the run makes no harness call" \
     || fail "on a host that cannot run the VM the run makes no harness call (rc $rc; calls: $(tr '\n' ' ' < "$FLTH_TEST_STUB/calls"))"
 host_tools 0
+
+# --- 6. THE CONTROL: the admission is the harness's own, and says so. -----
+#
+# A host with 3700 MiB, about what a 4 GiB guest shows a run inside it, has no
+# room for a 4 GiB guest. The run fails, nothing boots, and the output names
+# the step that refused and the numbers it read.
+reset
+give_host_memory "$sandbox" 3700
+CARGO_STUB=pass run; rc=$?
+[ "$rc" != 0 ] && ok "a host without room fails the run" || fail "a host without room fails the run (got $rc)"
+if grep -Fq 'not enough host memory for the shared guest: 3700 MiB available' "$sandbox/out" &&
+    grep -Fq '4096 MiB for the guest' "$sandbox/out"; then
+    ok "the refusal and its numbers reach the output"
+else
+    fail "the refusal and its numbers reach the output"
+    cat "$sandbox/out" >&2
+fi
+[ "$(vm_state)" != running ] && ok "no guest was booted without room" || fail "no guest was booted without room"
+give_host_memory "$sandbox" 65536
 
 if [ "$fails" -gt 0 ]; then
     echo "FAIL  $fails vm-slot-after-a-run violation(s)" >&2

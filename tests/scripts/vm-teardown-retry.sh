@@ -48,7 +48,11 @@ WRAPPER
 
 cat > "$sandbox/bin/cargo" <<STUB
 #!/usr/bin/env bash
-"$H/scripts/vm.sh" up >/dev/null 2>&1 || exit 1
+if ! "$H/scripts/vm.sh" up > "\$FLTH_TEST_STUB/up.log" 2>&1; then
+    echo "the stand-in cargo's vm.sh up failed:" >&2
+    cat "\$FLTH_TEST_STUB/up.log" >&2
+    exit 1
+fi
 case "\${CARGO_STUB:-pass}" in
     pass) exit 0 ;;
     fail) exit 101 ;;
@@ -63,6 +67,13 @@ export FLTH_TEST_GUEST_BASH="${FLTH_TEST_GUEST_BASH:-bash}"
 export FLTH_CACHE_DIR="$sandbox/cache"
 export FLTH_STATE_DIR="$sandbox/state"
 unset FLTH_CONFIG FLTH_KEEP_VM FLTH_GUEST FLTH_SLOT_WAIT FLTH_SLOT_BOOT_GRACE FS_BTRFS_TEST_TMPDIR
+unset FLTH_SHARED_CPUS FLTH_SHARED_DISK
+# The harness's memory admission, at CI's 4 GiB guest, answered by this guard
+# and not by the machine running it.
+export FLTH_SHARED_MEMORY=4G
+# shellcheck source=../script-support/host-memory.sh
+source "$REPO/tests/script-support/host-memory.sh"
+give_host_memory "$sandbox" 65536
 
 reset() {
     rm -rf "$FLTH_CACHE_DIR/machines"
@@ -77,7 +88,12 @@ run() { (cd "$SUT" && scripts/test.sh --test oracle_stand_in) > "$sandbox/out" 2
 # --- 1. A successful run ends its session, not the shared guest. ---------
 reset
 CARGO_STUB=pass run; rc=$?
-[ "$rc" = 0 ] && ok || fail "a passing run exits 0 (got $rc)"
+if [ "$rc" = 0 ]; then
+    ok
+else
+    fail "a passing run exits 0 (got $rc)"
+    cat "$sandbox/out" >&2
+fi
 [ "$(vm_state)" = running ] && ok || fail "the shared guest stays running (state: $(vm_state))"
 grep -q '^session-end ' "$FLTH_TEST_STUB/vm-calls" && ok || fail "the harness ends the run's session"
 grep -qE '^(down|destroy)( |$)' "$FLTH_TEST_STUB/vm-calls" && fail "the run never stops or destroys the shared guest" || ok
