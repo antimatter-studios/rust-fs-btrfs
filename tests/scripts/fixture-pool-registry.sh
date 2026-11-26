@@ -104,7 +104,14 @@ cat > "$sandbox/bin/btrfs" <<'STUB'
 mkdir -p "$KERNEL/reg" "$KERNEL/mounted"
 case "$1 $2 ${3:-}" in
     "--version  ") echo "btrfs-progs v0 (stub)" ;;
-    "filesystem df "*) printf 'Data, RAID0: x\nData, RAID1: x\nData, RAID5: x\nData, RAID6: x\n' ;;
+    # One line at a time, with a pause: a reader that stops at its own line
+    # leaves the next write with no reader, as a loaded runner sometimes did.
+    "filesystem df "*)
+        for level in RAID0 RAID1 RAID5 RAID6; do
+            echo "Data, $level: x" || exit 141
+            sleep 0.05
+        done
+        ;;
     "device scan --forget")
         shift 3
         if [ $# -eq 0 ]; then
@@ -295,6 +302,13 @@ done
 found="$(grep -nE 'btrfs device scan --forget *(>|2>|\|\||$)' "$RECIPES")"
 [ -z "$found" ] && ok "every forget in the recipes names its devices" \
     || fail "every forget in the recipes names its devices: $found"
+
+# --- 4. No recipe pipes into a grep that stops early. --------------------
+# Under pipefail the writer's SIGPIPE becomes the pipeline's status, so a line
+# that WAS found reads as missing, on some runs and not on others.
+found="$(grep -nE '(^|[^|])\|[[:space:]]*grep +-[A-Za-z]*q' "$RECIPES")"
+[ -z "$found" ] && ok "no recipe pipes into grep -q" \
+    || fail "no recipe pipes into grep -q: $found"
 
 if [ "$fails" -gt 0 ]; then
     echo "FAIL  $fails fixture-pool-registry violation(s)" >&2
