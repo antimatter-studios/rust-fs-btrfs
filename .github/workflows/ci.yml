@@ -312,7 +312,7 @@ jobs:
           ../rust-fs-core/scripts/tier.sh hole-prealloc hole-prealloc 400 30000 -- \
             scripts/test.sh --locked --profile test --test cow_write_oracle \
             a_write_within_size_from_a_hole_into_preallocation -- --show-output
-          bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored hole-prealloc 4
+          bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored hole-prealloc 5
       - name: Keep the tier logs
         uses: actions/upload-artifact@v4
         if: always()
