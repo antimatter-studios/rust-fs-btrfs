@@ -226,6 +226,13 @@ jobs:
         run: chore lint
       - name: chore test:scripts
         run: chore test:scripts
+      # The two guards whose verdict has depended on timing, repeated: 200 runs
+      # of one and 20 of the other under load (#813). Asked for by a pull
+      # request's title, and run by nothing else.
+      - name: Soak the timing guards, for a title holding [soak]
+        if: github.event_name == 'pull_request' && contains(github.event.pull_request.title, '[soak]')
+        timeout-minutes: 60
+        run: scripts/soak-timing-guards.sh
       - name: chore test:unit
         # The DEBUG profile, which is the point: overflow-checks are on
         # here and off in release, and the task sets
