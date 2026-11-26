@@ -10,7 +10,7 @@
 use fs_btrfs::capi::*;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, dump_tree, guest_kernel_read_ok, guest_kernel_write_ok, oracle,
-    temp_path,
+    sha256_file, temp_path,
 };
 use std::ffi::{c_void, CStr, CString};
 use std::path::{Path, PathBuf};
@@ -173,6 +173,11 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(name: &str) -> Self {
+        Self::with_features(name, "no-holes")
+    }
+
+    /// A volume made with `mkfs.btrfs -O features`.
+    fn with_features(name: &str, features: &str) -> Self {
         let dir = PathBuf::from(temp_path!("{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         let image = dir.join("fs.img");
@@ -180,7 +185,7 @@ impl Scratch {
             .and_then(|f| f.set_len(512 << 20))
             .unwrap();
         let made = oracle("mkfs.btrfs")
-            .args(["-q", "-f", "-s", "4096", "-n", "16384", "-O", "no-holes"])
+            .args(["-q", "-f", "-s", "4096", "-n", "16384", "-O", features])
             .arg(&image)
             .output();
         assert!(
@@ -595,4 +600,107 @@ fn what_is_not_written_yet_is_refused_and_changes_nothing() {
         fs_btrfs_umount(fs);
     }
     digests_clean(&image, "after everything was refused");
+}
+
+/// Every mode in `modes` on `path` is refused as `why` says, and the whole
+/// image is the same bytes afterwards.
+#[track_caller]
+fn refused_without_writing(image: &str, path: &str, why: &str, modes: &[u32]) {
+    let before = sha256_file(image).unwrap();
+    let fs = unsafe { fs_btrfs_mount_rw(c(image).as_ptr()) };
+    assert!(!fs.is_null(), "mount_rw: {}", last_error());
+    for &mode in modes {
+        assert_eq!(
+            fallocate(fs, path, mode, 0, 64 * K),
+            -1,
+            "{path}, mode {mode}: {why}"
+        );
+        assert_eq!(fs_btrfs_last_errno(), ENOTSUP, "{why}: {}", last_error());
+        assert!(
+            last_error().contains(why),
+            "{path}, mode {mode}: refused for another reason than {why:?}: {}",
+            last_error()
+        );
+    }
+    unsafe { fs_btrfs_umount(fs) };
+    assert_eq!(
+        before,
+        sha256_file(image).unwrap(),
+        "{path}: a refusal wrote to the image ({why})"
+    );
+}
+
+/// The shapes a range change does not write yet where a hole or a file's data
+/// is recorded in another way (#735): a volume without the no-holes feature,
+/// an explicit hole item left on a volume that has since gained it, and inline
+/// data. Each is refused before anything is written. A punch over the explicit
+/// hole item is not refused, so it is compared with the kernel's own.
+#[test]
+fn explicit_holes_and_inline_data_are_refused_without_writing_or_match_the_kernel() {
+    // Without no-holes, the kernel records the gap of a sparse file as an item.
+    let plain = Scratch::with_features("fallocate-explicit-holes", "^no-holes");
+    let image = plain.image();
+    let sparse = "cd \"$MNT\"\nhead -c 65536 /dev/urandom > source\nfor f in held a k; do\n\
+                  dd if=source of=$f bs=4096 count=1 status=none\n\
+                  dd if=source of=$f bs=4096 seek=8 count=1 conv=notrunc status=none\ndone\nsync";
+    guest_kernel_write_ok(&image, "sparse files with hole items", sparse);
+    refused_without_writing(&image, "/held", "no-holes", &[0, KEEP, PUNCH]);
+
+    let tuned = oracle("btrfstune").arg("-n").arg(&image).output();
+    assert!(
+        tuned.status.success(),
+        "btrfstune -n: {}",
+        String::from_utf8_lossy(&tuned.stderr)
+    );
+    let tree = dump_tree(Path::new(&image), "5");
+    assert!(
+        tree.contains("extent data disk byte 0 nr 0"),
+        "the volume no longer holds an explicit hole item:\n{tree}"
+    );
+    refused_without_writing(&image, "/held", "explicit hole item", &[0, KEEP]);
+
+    // A punch from inside the first extent to inside the second, across the
+    // hole item.
+    let fs = unsafe { fs_btrfs_mount_rw(c(&image).as_ptr()) };
+    assert!(!fs.is_null(), "mount_rw: {}", last_error());
+    assert_eq!(
+        fallocate(fs, "/a", PUNCH, 2 * K, 32 * K),
+        0,
+        "a punch across an explicit hole item: {}",
+        last_error()
+    );
+    unsafe { fs_btrfs_umount(fs) };
+    digests_clean(&image, "after the ABI's punch across a hole item");
+    guest_kernel_write_ok(
+        &image,
+        "the kernel's own punch",
+        "cd \"$MNT\"\nfallocate -p -o 2048 -l 32768 k\nsync",
+    );
+    digests_clean(&image, "after the kernel's punch across a hole item");
+    let seen = kernel_reads(&image, &["a".to_string(), "k".to_string()]);
+    assert_eq!(
+        seen[0].2, seen[1].2,
+        "the kernel reads the twins differently"
+    );
+    let tree = dump_tree(Path::new(&image), "5");
+    assert_eq!(
+        shape(&tree, seen[0].1),
+        shape(&tree, seen[1].1),
+        "a punch across a hole item is not what the kernel left"
+    );
+
+    // Inline data.
+    let inline = Scratch::new("fallocate-inline");
+    let image = inline.image();
+    guest_kernel_write_ok(
+        &image,
+        "an inline file",
+        "cd \"$MNT\"\nhead -c 100 /dev/urandom > inline\nsync",
+    );
+    let tree = dump_tree(Path::new(&image), "5");
+    assert!(
+        tree.contains("inline extent data"),
+        "the kernel did not keep the file inline:\n{tree}"
+    );
+    refused_without_writing(&image, "/inline", "inline data", &[0, KEEP, PUNCH]);
 }
