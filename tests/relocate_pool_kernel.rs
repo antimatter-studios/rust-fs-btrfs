@@ -67,10 +67,15 @@ impl Scratch {
     /// An image of `size` bytes holding a filesystem `mkfs.btrfs` made,
     /// single data and DUP metadata.
     fn formatted(&self, name: &str, size: u64) -> PathBuf {
+        self.formatted_with_metadata(name, size, "dup")
+    }
+
+    /// [`Scratch::formatted`] with its metadata in `metadata`.
+    fn formatted_with_metadata(&self, name: &str, size: u64, metadata: &str) -> PathBuf {
         let image = self.blank(name, size);
         let made = oracle("mkfs.btrfs")
             .args([
-                "-q", "-f", "-d", "single", "-m", "dup", "-s", "4096", "-n", "16384",
+                "-q", "-f", "-d", "single", "-m", metadata, "-s", "4096", "-n", "16384",
             ])
             .arg(&image)
             .output();
@@ -387,6 +392,162 @@ fn groups_relocated_off_each_member_in_turn_leave_pools_the_kernel_reads() {
         files,
         "the kernel reads the files differently after the removal"
     );
+}
+
+/// The `(flags, length)` of every block group, in order.
+fn group_shapes(fs: &Filesystem) -> Vec<(u64, u64)> {
+    let mut shapes: Vec<(u64, u64)> = fs
+        .block_groups()
+        .unwrap()
+        .into_iter()
+        .map(|g| (g.flags, g.length))
+        .collect();
+    shapes.sort_unstable();
+    shapes
+}
+
+/// A two-member pool whose data and metadata are on device 2, which the
+/// kernel has since written to, has that device removed in one call: every
+/// group moves to device 1 in its own profile, and device 1 alone is a
+/// volume `btrfs check` finds clean and the kernel reads whole (#816,
+/// POOL-01).
+fn removal_evacuates_a_member(metadata: &str) {
+    let scratch = Scratch::new(&format!("evacuate-{metadata}"));
+    let a = scratch.formatted_with_metadata("a.img", 256 * MIB, metadata);
+    let b = scratch.blank("b.img", 256 * MIB);
+    guest_kernel_write_ok(
+        &a.to_string_lossy(),
+        "the kernel writes the first files",
+        "mkdir \"$MNT/files\"\n\
+         for i in $(seq 1 160); do head -c 8192 /dev/urandom > \"$MNT/files/f$i\"; done\n\
+         head -c 3000000 /dev/urandom > \"$MNT/large.bin\"\n\
+         sync\n",
+    );
+
+    // Every data and metadata group onto a second device, and then the
+    // kernel writes to the pool and takes the manifest.
+    let mut fs = Filesystem::mount_rw(open_rw(&a)).expect("the volume mounts read-write");
+    assert_eq!(fs.add_device(open_rw(&b)).expect("adding b"), 2);
+    empty_device(&mut fs, 1);
+    drop(fs);
+    let images = [
+        a.to_string_lossy().into_owned(),
+        b.to_string_lossy().into_owned(),
+    ];
+    let images: Vec<&str> = images.iter().map(String::as_str).collect();
+    let written = guest_kernel_pool_write(
+        &images,
+        &format!("head -c 2000000 /dev/urandom > \"$MNT/pool.bin\"\nsync\n{MANIFEST}"),
+    );
+    let out = String::from_utf8_lossy(&written.out.stdout).into_owned();
+    assert!(
+        written.out.status.success(),
+        "the kernel could not write to the pool:\n{out}{}",
+        String::from_utf8_lossy(&written.out.stderr)
+    );
+    assert_eq!(written.check_status, 0, "{}", written.check);
+    let files = manifest(&out);
+    assert_eq!(files.len(), 162, "the kernel's manifest:\n{out}");
+
+    let mut fs = Filesystem::mount_pool_rw(vec![open_rw(&a), open_rw(&b)])
+        .expect("the pool mounts read-write");
+    let held = on_device(&fs, 2);
+    assert!(
+        held.iter().any(|g| g.holds_metadata()) && held.iter().any(|g| !g.holds_metadata()),
+        "device 2 does not hold both data and metadata"
+    );
+    let shapes = group_shapes(&fs);
+    fs.remove_device(2)
+        .unwrap_or_else(|e| panic!("removing a device that holds chunks: {e}"));
+    assert_eq!(fs.superblock().num_devices, 1);
+    assert_eq!(
+        group_shapes(&fs),
+        shapes,
+        "the removal changed a group's profile, kind or size"
+    );
+    for (path, digest) in &files {
+        let data = fs
+            .read_path(path)
+            .expect("a manifest file, through this driver");
+        assert_eq!(
+            &sha256_hex(&data),
+            digest,
+            "{path} reads back differently through this driver after the removal"
+        );
+    }
+    drop(fs);
+    assert!(
+        fs_btrfs::superblock::read_superblock(&FileDevice::open(&b).unwrap()).is_err(),
+        "the removed device still carries a superblock"
+    );
+
+    let read = guest_kernel_pool_read(&[&a.to_string_lossy()], &format!("{SHOW}{MANIFEST}"));
+    assert_eq!(
+        read.check_status, 0,
+        "btrfs check --readonly does not find the volume clean after the removal:\n{}",
+        read.check
+    );
+    let out = String::from_utf8_lossy(&read.out.stdout).into_owned();
+    assert!(
+        read.out.status.success(),
+        "the kernel could not mount and read the volume the removal left:\n{out}{}",
+        String::from_utf8_lossy(&read.out.stderr)
+    );
+    assert_eq!(
+        shown_used(&out),
+        recorded_used(&[&a]),
+        "btrfs filesystem show does not list device 1 alone with its usage:\n{out}"
+    );
+    let extents = extents_by_chunk(&out);
+    assert!(
+        !extents.is_empty() && extents.values().all(|d| *d == BTreeSet::from([1])),
+        "dump-tree -t dev: a device extent is not on device 1:\n{out}"
+    );
+    assert_eq!(
+        manifest(&out),
+        files,
+        "the kernel reads the files differently after the removal"
+    );
+}
+
+#[test]
+fn removing_a_member_with_data_and_single_metadata_evacuates_it() {
+    removal_evacuates_a_member("single");
+}
+
+#[test]
+fn removing_a_member_with_data_and_dup_metadata_evacuates_it() {
+    removal_evacuates_a_member("dup");
+}
+
+/// The system group cannot be moved yet, so the member holding it is refused
+/// before any other group on it is touched.
+#[test]
+fn removing_the_member_with_the_system_group_is_refused_and_writes_nothing() {
+    let scratch = Scratch::new("system");
+    let a = scratch.blank("a.img", 256 * MIB);
+    let b = scratch.blank("b.img", 256 * MIB);
+    fs_btrfs::mkfs::format(&*open_rw(&a), &fs_btrfs::mkfs::Options::default())
+        .expect("this crate's mkfs");
+    let mut fs = Filesystem::mount_rw(open_rw(&a)).expect("mounts read-write");
+    assert_eq!(fs.add_device(open_rw(&b)).expect("adding b"), 2);
+    let before: Vec<_> = [&a, &b]
+        .iter()
+        .map(|p| fs_btrfs_test_support::snapshot_image(p).unwrap())
+        .collect();
+    let msg = fs
+        .remove_device(1)
+        .expect_err("the device holding the system group was removed")
+        .to_string();
+    assert!(msg.contains("system block group"), "{msg}");
+    drop(fs);
+    for (path, bytes) in [&a, &b].iter().zip(&before) {
+        fs_btrfs_test_support::assert_image_unchanged(
+            path,
+            bytes,
+            &format!("a refusal wrote to {}", path.display()),
+        );
+    }
 }
 
 /// Every refusal leaves every image exactly as it was.
