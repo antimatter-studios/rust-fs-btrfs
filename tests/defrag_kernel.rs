@@ -31,7 +31,7 @@ use fs_btrfs::fs::Filesystem;
 use fs_btrfs::Error;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, dump_tree, guest_kernel_read_ok, guest_kernel_write_ok, oracle,
-    sha256_hex, temp_path,
+    sha256_hex, temp_path, tree_item_count,
 };
 use fs_core::{BlockDevice, BlockRead, FileDevice};
 use std::collections::BTreeMap;
@@ -147,7 +147,7 @@ fn kernel_view(image: &Path, what: &str) -> BTreeMap<String, (u64, String, u64)>
 /// top-level subvolume.
 fn dumped_items(image: &Path, ino: u64) -> usize {
     let needle = format!("key ({ino} EXTENT_DATA ");
-    dump_tree(image, "5").matches(&needle).count()
+    tree_item_count(&dump_tree(image, "5"), &needle)
 }
 
 #[test]

@@ -981,6 +981,9 @@ fn extent_layout_to(image: &Path, ino: u64, to: u64) -> Vec<(u64, u64, bool)> {
     let mut end = 0;
     let mut layout = Vec::new();
     for (at, line) in lines.iter().enumerate() {
+        if !tree_item_header(line, &needle) {
+            continue;
+        }
         let Some((_, key)) = line.split_once(&needle) else {
             continue;
         };
@@ -2439,6 +2442,9 @@ fn extent_offsets(image: &Path, ino: u64) -> (Vec<u64>, bool) {
     let mut offsets = Vec::new();
     let mut inline = false;
     for (at, line) in lines.iter().enumerate() {
+        if !tree_item_header(line, &needle) {
+            continue;
+        }
         let Some(open) = line.find(&needle) else {
             continue;
         };
@@ -4484,6 +4490,9 @@ fn extent_items(image: &Path, ino: u64) -> Vec<(u64, u64, bool)> {
     let needle = format!("key ({ino} EXTENT_DATA ");
     let mut items = Vec::new();
     for (at, line) in lines.iter().enumerate() {
+        if !tree_item_header(line, &needle) {
+            continue;
+        }
         let Some((_, key)) = line.split_once(&needle) else {
             continue;
         };
@@ -4941,7 +4950,7 @@ fn extent_compressions(image: &Path, ino: u64) -> Vec<String> {
     let needle = format!("key ({ino} EXTENT_DATA ");
     let mut found = Vec::new();
     for (at, line) in lines.iter().enumerate() {
-        if !line.contains(&needle) {
+        if !tree_item_header(line, &needle) {
             continue;
         }
         let Some(line) = lines[at + 1..]

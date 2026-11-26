@@ -7,7 +7,7 @@
 use fs_btrfs::Filesystem;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, dump_tree, guest_kernel_read_ok, guest_kernel_write_ok, oracle,
-    sha256_hex, temp_path,
+    sha256_hex, temp_path, tree_item,
 };
 use fs_core::FileDevice;
 use std::{path::PathBuf, sync::Arc};
@@ -67,8 +67,8 @@ sync
             "the test needs shared child leaves"
         );
         let marker = format!("key ({nc} EXTENT_DATA 0)");
-        let item = tree.split(&marker).nth(1).expect("nc extent item");
-        let disk_line = item.lines().find(|l| l.contains("disk byte ")).unwrap();
+        let item = tree_item(&tree, &marker).expect("nc extent item");
+        let disk_line = item.iter().find(|l| l.contains("disk byte ")).unwrap();
         let bytenr = disk_line
             .split("disk byte ")
             .nth(1)
