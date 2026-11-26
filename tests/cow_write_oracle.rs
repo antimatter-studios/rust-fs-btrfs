@@ -5494,33 +5494,28 @@ PY
                  fallocate -n -o 65536 -l 65536 \"$MNT/$f\"; done\nsync\n"
             ));
         }
+        // The kernel writes a controlled case back as one extent or two, as
+        // its writeback happens to run, on a volume of either kind (#785,
+        // #809; ^no-holes in run 45103471581). Writing back from the old end
+        // first fixes the order, so its control is made that way on both.
         if controlled(name) {
             script.push_str(&format!(
-                "if [ \"$writeback_mode\" = old-end ]; then\n\
-                 writeback_from_old_end \"$MNT/{name}-control\" {at} {len} {old}\n\
-                 else\n"
+                "writeback_from_old_end \"$MNT/{name}-control\" {at} {len} {old}\n"
             ));
-        }
-        script.push_str(&format!(
-            "head -c {len} /dev/zero | tr '\\000' '\\132' \
-             | dd of=\"$MNT/{name}-control\" bs={len} iflag=fullblock oflag=seek_bytes seek={at} conv=notrunc status=none\n\
-             sync\n"
-        ));
-        if controlled(name) {
-            script.push_str("fi\n");
+        } else {
+            script.push_str(&format!(
+                "head -c {len} /dev/zero | tr '\\000' '\\132' \
+                 | dd of=\"$MNT/{name}-control\" bs={len} iflag=fullblock oflag=seek_bytes seek={at} conv=notrunc status=none\n\
+                 sync\n"
+            ));
         }
     }
     for features in ["^no-holes", "no-holes"] {
-        let writeback_mode = if features == "no-holes" {
-            "old-end"
-        } else {
-            "default"
-        };
         let scratch = Scratch::made(
             &format!("cow-prealloc-crossing-{}", cases[0].0),
             "crc32c",
             features,
-            &format!("writeback_mode={writeback_mode}\n{script}"),
+            &script,
         );
         let image = scratch.image();
         let mut fs = mount_rw(&image);
@@ -5546,8 +5541,8 @@ PY
                 "{features} {name}: size and nbytes"
             );
             let (ours, theirs) = (extent_windows(&image, ino), extent_windows(&image, control));
-            if features == "no-holes" && controlled(name) {
-                println!("[cow writeback] {features} {name} {writeback_mode}: kernel {theirs:?}");
+            if controlled(name) {
+                println!("[cow writeback] {features} {name} old-end: kernel {theirs:?}");
             }
             assert_eq!(ours, theirs, "{features} {name}: extent windows");
             for (item, _, disk_len, _, _) in theirs {
