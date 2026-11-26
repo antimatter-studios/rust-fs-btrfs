@@ -144,7 +144,9 @@ compression_oracle        3
 # A write past a kept preallocated item and the refusals that stay add two
 # (#526). The kernel's layouts for growing writes off a sector or from before
 # the item add one (#767).
-cow_write_oracle          38
+# Both hole representations of a within-size write from a hole into
+# preallocation add two (#774), counted from the 38 above.
+cow_write_oracle          40
 crash_consistency         3
 csum_oracle               6
 csum_width_populated      1
