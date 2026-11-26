@@ -240,7 +240,7 @@ forget_detached() {
     attached="$(losetup -a | cut -d: -f1)"
     for dev in "$LOOP_DEV_DIR"/loop[0-9]*; do
         [ -e "$dev" ] || continue
-        printf '%s\n' "$attached" | grep -qx "/dev/${dev##*/}" && continue
+        grep -qx "/dev/${dev##*/}" <<<"$attached" && continue
         btrfs device scan --forget "$dev" >/dev/null 2>&1 || true
     done
     registry_give
@@ -911,7 +911,9 @@ build_nodatacow() {
     # a build where chattr silently did nothing would produce two
     # ordinary files and an oracle that compares nothing.
     lsattr "$MNT/nc/inplace.bin" "$MNT/cow.bin"
-    lsattr -d "$MNT/nc" | grep -q 'C' || {
+    local attrs
+    attrs="$(lsattr -d "$MNT/nc")"
+    grep -q 'C' <<<"$attrs" || {
         echo "guest-build-images: the nc/ directory is not NODATACOW — chattr +C did not take" >&2
         umount "$MNT"
         exit 1
@@ -1302,8 +1304,14 @@ build_parity_pool() {
         dd if=/dev/urandom of="$MNT/nosum.bin" bs=64K count=5 status=none
         sync
     fi
-    btrfs filesystem df "$MNT" | grep -qi "data, $profile" || {
+    # Read the whole listing first, here and wherever a recipe looks for one
+    # line: a grep that stops early on a pipe leaves the writer to die of
+    # SIGPIPE, and pipefail then reads the line that was found as missing.
+    local df
+    df="$(btrfs filesystem df "$MNT")"
+    grep -qi "data, $profile" <<<"$df" || {
         echo "guest-build-images: the $profile pool holds no $profile data chunk" >&2
+        printf '%s\n' "$df" >&2
         exit 1
     }
 
@@ -2414,7 +2422,9 @@ build_cli() {
     sync
     btrfs subvolume snapshot -r "$MNT/vol" "$MNT/snap" >/dev/null
     echo "written after the snapshot" > "$MNT/vol/later.txt"
-    lsattr "$MNT/nocow/data.bin" | grep -q '^[^ ]*C' || {
+    local attrs
+    attrs="$(lsattr "$MNT/nocow/data.bin")"
+    grep -q '^[^ ]*C' <<<"$attrs" || {
         echo "guest-build-images: btrfs-cli's nocow/data.bin is not NODATACOW -- chattr +C did not take" >&2
         umount "$MNT"
         exit 1
@@ -2503,7 +2513,9 @@ build_features() {
             "$(sha256sum "$p" | cut -d' ' -f1)"
       done ) > "$manifest"
     umount "$MNT"
-    btrfs inspect-internal dump-super "$img" | grep -q 'BLOCK_GROUP_TREE' || {
+    local super
+    super="$(btrfs inspect-internal dump-super "$img")"
+    grep -q 'BLOCK_GROUP_TREE' <<<"$super" || {
         echo "guest-build-images: btrfs-bgt has no block group tree" >&2
         exit 1
     }
@@ -3030,7 +3042,9 @@ build_seed() {
     losetup -d "$lp"
     trap cleanup EXIT
 
-    btrfs inspect-internal dump-super "$seed" | grep -q 'SEEDING' || {
+    local super
+    super="$(btrfs inspect-internal dump-super "$seed")"
+    grep -q 'SEEDING' <<<"$super" || {
         echo "guest-build-images: btrfs-seed does not carry the SEEDING flag" >&2
         exit 1
     }
@@ -3082,7 +3096,9 @@ build_squota() {
     truncate -s 512M "$img"
     "$STATIC_PROGS/mkfs.btrfs" -f -O squota --rootdir "$src" "$img" >/dev/null
     rm -rf "$src"
-    "$STATIC_PROGS/btrfs" inspect-internal dump-super "$img" | grep -q 'SIMPLE_QUOTA' || {
+    local super
+    super="$("$STATIC_PROGS/btrfs" inspect-internal dump-super "$img")"
+    grep -q 'SIMPLE_QUOTA' <<<"$super" || {
         echo "guest-build-images: btrfs-squota does not carry SIMPLE_QUOTA" >&2
         exit 1
     }
