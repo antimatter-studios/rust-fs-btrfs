@@ -287,8 +287,10 @@ scrub_oracle              2
 # Ten cases: the allocation regression adds a committed write and a pair check (#625),
 # the subvolume handle a second write (#628), and the overwritten seed file a
 # kernel readback of the pair (#563).
+# The registry-serialization regression moved to a binary of its own (#822).
+seed_oracle               10
 # One registry-serialization regression holds a kernel mount while a checker waits.
-seed_oracle               11
+seed_pool_registry_kernel 1
 # One declared kernel case reads the exact crate-written binary payload
 # from the complete seed and sprout pair (#626); CI must execute it.
 seed_write_kernel         1
