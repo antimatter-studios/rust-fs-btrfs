@@ -4660,6 +4660,138 @@ fn write_from_a_hole_over_a_shared_preallocated_item(features: &str) {
     }
 }
 
+/// The same write from a hole, over a whole preallocated item whose extent
+/// another file reflinks, on a no-holes volume: the kernel copies the range
+/// into a new extent and the writing file drops its reference. The other file
+/// keeps its item, its reference and its bytes.
+#[test]
+fn a_write_within_size_from_a_hole_into_preallocation_another_file_reflinks_matches_the_no_holes_kernel(
+) {
+    const OURS: &str = "reflinked-prealloc.bin";
+    const OURS_OTHER: &str = "reflinked-prealloc-other.bin";
+    const CONTROL: &str = "reflinked-prealloc-control.bin";
+    const CONTROL_OTHER: &str = "reflinked-prealloc-control-other.bin";
+    const SIZE: usize = 200000;
+    const AT: usize = 40960;
+    const LEN: usize = 90112;
+    let script = format!(
+        "for name in {OURS} {CONTROL}; do\n\
+         truncate -s {SIZE} \"$MNT/$name\"\n\
+         fallocate -n -o 65536 -l 65536 \"$MNT/$name\"\n\
+         done\n\
+         sync\n\
+         cp --reflink=always \"$MNT/{OURS}\" \"$MNT/{OURS_OTHER}\"\n\
+         cp --reflink=always \"$MNT/{CONTROL}\" \"$MNT/{CONTROL_OTHER}\"\n\
+         sync\n\
+         head -c {LEN} /dev/zero | tr '\\000' W | \
+         dd of=\"$MNT/{CONTROL}\" bs=4096 seek=10 iflag=fullblock conv=notrunc status=none\n\
+         sync"
+    );
+    let scratch = Scratch::made(
+        "cow-write-reflinked-prealloc",
+        "crc32c",
+        "no-holes",
+        &script,
+    );
+    let image = scratch.image();
+    let mut fs = mount_rw(&image);
+    let ours = ino_of(&fs, OURS);
+    let ours_other = ino_of(&fs, OURS_OTHER);
+    let control = ino_of(&fs, CONTROL);
+    let control_other = ino_of(&fs, CONTROL_OTHER);
+    // Every item of one file with its kind and reference count.
+    let layout = |ino: u64| {
+        extent_items(&image, ino)
+            .into_iter()
+            .map(|(offset, len, hole)| {
+                let extent = (!hole).then(|| {
+                    let (kind, _, refs) = extent_kind_and_refs(&image, ino, offset);
+                    (kind, refs)
+                });
+                (offset, len, extent)
+            })
+            .collect::<Vec<_>>()
+    };
+    let (kernel_layout, kernel_other) = (layout(control), layout(control_other));
+    println!("[cow reflinked prealloc] kernel writer {kernel_layout:?}");
+    println!("[cow reflinked prealloc] kernel other {kernel_other:?}");
+    let shared_extent = extent_kind_and_refs(&image, ours_other, 65536).1;
+
+    assert_eq!(
+        fs.write(ours, AT as u64, &[b'W'; LEN])
+            .unwrap_or_else(|error| panic!(
+                "write from a hole over preallocation another file reflinks: {error}"
+            )),
+        LEN
+    );
+    let mut expected = vec![0; SIZE];
+    expected[AT..AT + LEN].fill(b'W');
+    let untouched = vec![0; SIZE];
+    assert_eq!(fs.read_file(ours).unwrap(), expected, "driver bytes");
+    assert_eq!(
+        fs.read_file(ours_other).unwrap(),
+        untouched,
+        "the other file's bytes, as the driver reads them"
+    );
+    for (mine, theirs) in [(ours, control), (ours_other, control_other)] {
+        let (written, kernel) = (fs.read_inode(mine).unwrap(), fs.read_inode(theirs).unwrap());
+        assert_eq!(
+            (written.size, written.nbytes),
+            (kernel.size, kernel.nbytes),
+            "size and nbytes differ from the kernel's"
+        );
+    }
+    drop(fs);
+
+    assert_eq!(
+        layout(ours),
+        kernel_layout,
+        "the writing file's items differ from the kernel's"
+    );
+    assert_eq!(
+        layout(ours_other),
+        kernel_other,
+        "the other file's items differ from the kernel's"
+    );
+    assert_eq!(
+        extent_kind_and_refs(&image, ours_other, 65536).1,
+        shared_extent,
+        "the other file's item left its extent"
+    );
+    let checked = oracle("btrfs")
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(&image)
+        .output();
+    assert!(
+        checked.status.success(),
+        "btrfs check --readonly --check-data-csum:\n{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    guest_kernel_write_ok(
+        &image.to_string_lossy(),
+        "scrub after a write over reflinked preallocation",
+        "btrfs scrub start -B \"$MNT\" >/dev/null",
+    );
+    let seen = kernel_view(
+        &image,
+        "read after a write over reflinked preallocation",
+        &[OURS, CONTROL, OURS_OTHER, CONTROL_OTHER],
+    );
+    for (name, bytes) in [
+        (OURS, &expected),
+        (CONTROL, &expected),
+        (OURS_OTHER, &untouched),
+        (CONTROL_OTHER, &untouched),
+    ] {
+        assert_eq!(
+            seen[name].0,
+            sha256_hex(bytes),
+            "{name}: the kernel's bytes"
+        );
+    }
+}
+
 #[test]
 fn extent_layout_comparison_keeps_holes_and_gaps_distinct() {
     assert!(coalesced_layout(&[]).is_empty());
