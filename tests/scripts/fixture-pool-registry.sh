@@ -194,6 +194,24 @@ reach_gate() {
     while [ ! -e "$KERNEL/gate.reached" ] && [ "$n" -lt 600 ]; do sleep 0.1; n=$((n + 1)); done
     [ -e "$KERNEL/gate.reached" ]
 }
+# waits_or_ends NAME: until that build says it is waiting for the registry, or
+# ends. Looking after a fixed time found a loaded host's build not there yet
+# (#784). Bounded, like every wait here.
+waits_or_ends() {
+    local pid n=0
+    pid="$(eval echo "\$pid_$1")"
+    while kill -0 "$pid" 2>/dev/null &&
+        ! grep -q "waiting for the kernel's device registry" "$sandbox/$1.log" &&
+        [ "$n" -lt 600 ]; do
+        sleep 0.1
+        n=$((n + 1))
+    done
+    grep -q "waiting for the kernel's device registry" "$sandbox/$1.log" || ! kill -0 "$pid" 2>/dev/null
+}
+# names_holder NAME PID: that build's wait names PID as the holder.
+names_holder() {
+    grep -qF "waiting for the kernel's device registry, held by pid $2, " "$sandbox/$1.log"
+}
 fresh() { rm -rf "$KERNEL" "$BTRFS_REGISTRY_DIR" "$sandbox"/out-* "$sandbox"/*.log; mkdir -p "$KERNEL"; }
 
 # --- 1. Another build's forget does not take a pool's members. -----------
@@ -202,7 +220,7 @@ fresh
 start first pool
 reach_gate || fail "the first build never reached its pool's mount ($(tail -n 3 "$sandbox/first.log"))"
 start second cow
-sleep 3
+waits_or_ends second || fail "the other build neither finished nor waited for the registry"
 rm -f "$KERNEL/gate"
 finish first
 first_rc=$rc
@@ -217,17 +235,18 @@ fresh
 start first pool
 reach_gate || fail "the first build never reached its pool's mount"
 start second pool
-sleep 3
+waits_or_ends second || fail "the second pool neither waited nor ended"
 registered="$(find "$KERNEL/reg" -type f 2>/dev/null | wc -l | tr -d ' ')"
 if kill -0 "$pid_second" 2>/dev/null && [ "$registered" = 2 ]; then
     ok "a second pool waits, unformatted, while the first is between its format and its unmount"
 else
     fail "a second pool waits, unformatted, while the first is between its format and its unmount ($registered devices registered; $(tail -n 1 "$sandbox/second.log"))"
 fi
-case "$(cat "$sandbox/second.log")" in
-    *"waiting for the kernel's device registry, held by pid $pid_first"*) ok "naming who holds it" ;;
-    *) fail "naming who holds it (got: $(grep -i wait "$sandbox/second.log" | head -n 1))" ;;
-esac
+if names_holder second "$pid_first"; then
+    ok "naming who holds it"
+else
+    fail "naming who holds it (got: $(grep -i wait "$sandbox/second.log" | head -n 1))"
+fi
 rm -f "$KERNEL/gate"
 finish first
 first_rc=$rc
@@ -237,6 +256,26 @@ finish second
 left="$(find "$KERNEL/reg" -type f 2>/dev/null)"
 [ -z "$left" ] && ok "with nothing of theirs left in the registry" \
     || fail "with nothing of theirs left in the registry: $left"
+
+# --- 2b. THE CONTROL: a missing or a wrong holder is seen as one. --------
+for holder in "" "pid 1, some other build"; do
+    fresh
+    : > "$KERNEL/gate"
+    start first pool
+    reach_gate || fail "control: the first build never reached its pool's mount"
+    printf '%s\n' "$holder" > "$BTRFS_REGISTRY_DIR/holder"
+    start second pool
+    waits_or_ends second || fail "control: the second pool neither waited nor ended"
+    if grep -q "waiting for the kernel's device registry" "$sandbox/second.log" &&
+        ! names_holder second "$pid_first"; then
+        ok "a holder file reading '$holder' is not taken for the first build"
+    else
+        fail "a holder file reading '$holder' passed for the first build ($(grep -i wait "$sandbox/second.log" | head -n 1))"
+    fi
+    rm -f "$KERNEL/gate"
+    finish first
+    finish second
+done
 
 # --- 3. No recipe forgets every device. ----------------------------------
 found="$(grep -nE 'btrfs device scan --forget *(>|2>|\|\||$)' "$RECIPES")"

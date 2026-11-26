@@ -42,7 +42,11 @@ host_tools 0
 cat > "$sandbox/bin/cargo" <<STUB
 #!/usr/bin/env bash
 if [ "\${CARGO_STUB:-}" = no-vm ]; then exit 0; fi
-"$H/scripts/vm.sh" up >/dev/null 2>&1 || exit 1
+if ! "$H/scripts/vm.sh" up > "\$FLTH_TEST_STUB/up.log" 2>&1; then
+    echo "the stand-in cargo's vm.sh up failed:" >&2
+    cat "\$FLTH_TEST_STUB/up.log" >&2
+    exit 1
+fi
 case "\${CARGO_STUB:-pass}" in
     pass) exit 0 ;;
     fail) exit 101 ;;
@@ -57,8 +61,12 @@ export FLTH_TEST_STUB="$sandbox/stub"
 export FLTH_TEST_GUEST_BASH="${FLTH_TEST_GUEST_BASH:-bash}"
 export FLTH_CACHE_DIR="$sandbox/cache"
 export FLTH_STATE_DIR="$sandbox/state"
-# Keep the stub boot below the host-memory gate on small CI runners.
-export FLTH_SHARED_MEMORY=1024M
+# The harness's memory admission, at CI's 4 GiB guest, answered by this guard
+# and not by the machine running it.
+export FLTH_SHARED_MEMORY=4G
+# shellcheck source=../script-support/host-memory.sh
+source "$REPO/tests/script-support/host-memory.sh"
+give_host_memory "$sandbox" 65536
 unset FLTH_GUEST FS_BTRFS_TEST_TMPDIR
 export FLTH_CONFIG="$SUT/fs-linux-test-harness.toml"
 
@@ -88,7 +96,12 @@ expect_finished() {
 
 reset
 CARGO_STUB=pass run; rc=$?
-[ "$rc" = 0 ] && ok "a passing run exits 0" || fail "a passing run exits 0 (got $rc)"
+if [ "$rc" = 0 ]; then
+    ok "a passing run exits 0"
+else
+    fail "a passing run exits 0 (got $rc)"
+    cat "$sandbox/out" >&2
+fi
 expect_finished "passing run"
 
 reset

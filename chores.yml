@@ -951,7 +951,7 @@ tasks:
           set -eu
           for t in tests/scripts/*.sh; do
             echo "== $t"
-            bash "$t"
+            bash scripts/run-bounded.sh 900 bash "$t"
           done
         '
 
