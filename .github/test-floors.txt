@@ -146,7 +146,8 @@ compression_oracle        3
 # the item add one (#767).
 # Both hole representations of a within-size write from a hole into
 # preallocation add two (#774), counted from the 38 above.
-cow_write_oracle          40
+# The same over a whole item whose extent is shared adds two (#779).
+cow_write_oracle          42
 crash_consistency         3
 csum_oracle               6
 csum_width_populated      1

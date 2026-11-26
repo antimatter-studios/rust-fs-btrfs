@@ -577,9 +577,10 @@ impl Filesystem {
                     ))
                 })?;
             last.len = stop - last.start;
-            let prealloc = self.prealloc_cuts(ino, at, stop)?;
+            let prealloc = self.prealloc_cuts(ino, at, stop, end <= inode.size)?;
             cuts.edits.extend(prealloc.edits);
             cuts.releases.extend(prealloc.releases);
+            cuts.unrefs.extend(prealloc.unrefs);
             cuts.bytes += prealloc.bytes;
         }
 
@@ -645,7 +646,7 @@ impl Filesystem {
             let from = inode.size / sector * sector;
             let stop = from + sector;
             let (extent_start, at, extent_len) =
-                self.prealloc_window(ino, &key, &item, from, sector)?;
+                self.prealloc_window(ino, &key, &item, from, sector, 1)?;
             let item_end = key.offset + le64(&item, fe::NUM_BYTES);
             let parts: Vec<_> = [
                 (key.offset, from, false),
@@ -1181,7 +1182,35 @@ impl Filesystem {
         {
             return Ok(None);
         }
-        let (extent_start, at, extent_len) = self.prealloc_window(ino, &key, &item, offset, len)?;
+        // A write within the size over a whole item may go where its extent
+        // lies though the record counts more than one reference, when every
+        // one of them is this file's own at this item's reference offset: no
+        // other item maps these sectors, and the kernel writes them in place
+        // (#779).
+        let ref_offset = key.offset.wrapping_sub(le64(&item, fe::OFFSET));
+        let whole = !grows && offset == key.offset && end == item_end;
+        let own = if whole {
+            self.file_references(ino, le64(&item, fe::DISK_BYTENR), ref_offset)?
+        } else {
+            1
+        };
+        let (extent_start, at, extent_len) =
+            self.prealloc_window(ino, &key, &item, offset, len, own)?;
+        // It then joins the written item to a written neighbour naming the
+        // extent the same way, and the neighbour's reference goes.
+        let joined = if own > 1 {
+            self.written_neighbours(ino, key.offset, item_end, extent_start, ref_offset)?
+        } else {
+            Vec::new()
+        };
+        let joined_from = joined
+            .iter()
+            .map(|(k, _)| k.offset)
+            .fold(key.offset, u64::min);
+        let joined_to = joined
+            .iter()
+            .map(|(k, len)| k.offset + len)
+            .fold(item_end, u64::max);
         let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
             Error::UnsupportedFeature("the generation counter is exhausted".into())
         })?;
@@ -1202,13 +1231,32 @@ impl Filesystem {
         .filter(|&(_, num_bytes, written)| written || num_bytes > 0)
         .collect();
         let mut edits = Vec::new();
+        let mut unrefs = Vec::new();
+        // Every item the joined one takes the place of, but the one whose key
+        // it is put under.
+        for k in joined.iter().map(|(k, _)| *k).chain([key]) {
+            if !joined.is_empty() && k.offset != joined_from {
+                edits.push(ItemEdit::Delete(k));
+            }
+        }
+        unrefs.extend(joined.iter().map(|_| DataRelease {
+            old: extent_start,
+            old_len: extent_len,
+            old_ref_offset: ref_offset,
+        }));
         for &(file_offset, num_bytes, written) in &parts {
+            // A joined write is the whole item, so its one part.
+            let (file_offset, num_bytes) = if joined.is_empty() {
+                (file_offset, num_bytes)
+            } else {
+                (joined_from, joined_to - joined_from)
+            };
             let mut part = item.clone();
             part[fe::GENERATION..fe::GENERATION + 8].copy_from_slice(&generation.to_le_bytes());
             if written {
                 part[fe::TYPE] = EXTENT_REGULAR;
             }
-            let into = le64(&item, fe::OFFSET) + (file_offset - key.offset);
+            let into = file_offset.wrapping_sub(ref_offset);
             part[fe::OFFSET..fe::OFFSET + 8].copy_from_slice(&into.to_le_bytes());
             part[fe::NUM_BYTES..fe::NUM_BYTES + 8].copy_from_slice(&num_bytes.to_le_bytes());
             edits.push(ItemEdit::Put(OwnedItem {
@@ -1226,7 +1274,7 @@ impl Filesystem {
             DataShare {
                 bytenr: extent_start,
                 len: extent_len,
-                ref_offset: key.offset.wrapping_sub(le64(&item, fe::OFFSET)),
+                ref_offset,
             };
             parts.len() - 1
         ];
@@ -1257,6 +1305,7 @@ impl Filesystem {
             edits,
             csum_edits,
             shares,
+            unrefs,
             ..Default::default()
         };
         self.commit_write(write, generation)?;
@@ -1284,7 +1333,9 @@ impl Filesystem {
 
     /// Check that `len` bytes at file offset `offset` of the preallocated
     /// `item` can be written where its extent lies, and return that extent's
-    /// address, where the bytes go, and its length.
+    /// address, where the bytes go, and its length. `own` is how many
+    /// references the extent may have: one, or the count of this file's items
+    /// that [`Filesystem::file_references`] finds.
     fn prealloc_window(
         &self,
         ino: u64,
@@ -1292,6 +1343,7 @@ impl Filesystem {
         item: &[u8],
         offset: u64,
         len: u64,
+        own: u64,
     ) -> Result<(u64, u64, u64)> {
         use crate::fs::file_extent as fe;
         use crate::superblock::le64;
@@ -1314,7 +1366,7 @@ impl Filesystem {
             )));
         }
         let last_snapshot = self.root_last_snapshot(self.written_tree())?;
-        if refs != 1 || made <= last_snapshot {
+        if refs != own || made <= last_snapshot {
             return Err(Error::UnsupportedFeature(format!(
                 "inode {ino}: the preallocated extent at {extent_start} has {refs} references \
                  or predates the snapshot taken at {last_snapshot}, and writing one another \
@@ -1332,7 +1384,7 @@ impl Filesystem {
         use crate::superblock::le64;
         if let Some((key, item)) = self.prealloc_item_holding(ino, from, from + 1)? {
             let stop = end.min(key.offset + le64(&item, fe::NUM_BYTES));
-            self.prealloc_window(ino, &key, &item, from, stop - from)?;
+            self.prealloc_window(ino, &key, &item, from, stop - from, 1)?;
         }
         Ok(())
     }
@@ -1426,14 +1478,18 @@ impl Filesystem {
 
     /// What a copy over `[at, stop)` does to the preallocated items there
     /// (#767), as the kernel's `btrfs_drop_extents` does it. An item wholly
-    /// inside goes, and its extent with it; one running past `stop` starts
-    /// again there, further into its extent, its reference unchanged, so the
-    /// sectors it no longer covers stay allocated and unreadable.
-    fn prealloc_cuts(&self, ino: u64, at: u64, stop: u64) -> Result<PreallocCuts> {
+    /// inside goes, and its extent with it when nothing else names that;
+    /// one running past `stop` starts again there, further into its extent,
+    /// its reference unchanged, so the sectors it no longer covers stay
+    /// allocated and unreadable. For a write within the size, an item wholly
+    /// inside whose extent has other references drops its own and leaves the
+    /// extent to them (#779); a growing one is refused there.
+    fn prealloc_cuts(&self, ino: u64, at: u64, stop: u64, within: bool) -> Result<PreallocCuts> {
         use crate::fs::file_extent as fe;
         use crate::superblock::le64;
         let last_snapshot = self.root_last_snapshot(self.written_tree())?;
         let mut cuts = PreallocCuts::default();
+        let mut covered = Vec::new();
         for (key, item) in self.items_of(ino)? {
             if key.key_type != EXTENT_DATA_KEY
                 || item.len() < fe::REGULAR_SIZE
@@ -1446,13 +1502,13 @@ impl Filesystem {
             let len = le64(&item, fe::NUM_BYTES);
             let extent_start = le64(&item, fe::DISK_BYTENR);
             let extent_offset = le64(&item, fe::OFFSET);
-            let (refs, extent_len, made) = self.extent_item(extent_start)?;
+            let (refs, _, made) = self.extent_item(extent_start)?;
             let whole = key.offset + len <= stop;
             if item[fe::COMPRESSION] != 0
                 || item[fe::ENCRYPTION] != 0
                 || item[fe::OTHER_ENCODING..fe::OTHER_ENCODING + 2] != [0, 0]
                 || made <= last_snapshot
-                || (whole && refs != 1)
+                || (whole && refs != 1 && !within)
             {
                 return Err(Error::UnsupportedFeature(format!(
                     "inode {ino}: offset {} is inline or preallocated, and replacing an item \
@@ -1464,11 +1520,7 @@ impl Filesystem {
             cuts.edits.push(ItemEdit::Delete(key));
             if whole {
                 cuts.bytes += len;
-                cuts.releases.push(DataRelease {
-                    old: extent_start,
-                    old_len: extent_len,
-                    old_ref_offset: key.offset.wrapping_sub(extent_offset),
-                });
+                covered.push((key, item));
             } else {
                 let gone = stop - key.offset;
                 cuts.bytes += gone;
@@ -1485,7 +1537,58 @@ impl Filesystem {
                 }));
             }
         }
+        (cuts.releases, cuts.unrefs) = self.drop_covered(ino, &covered)?;
         Ok(cuts)
+    }
+
+    /// How many extent items of `ino` name the extent at `bytenr` at
+    /// `ref_offset`, the file offset its first byte would sit at: the items
+    /// one `EXTENT_DATA_REF` counts, none of which maps another's sectors.
+    fn file_references(&self, ino: u64, bytenr: u64, ref_offset: u64) -> Result<u64> {
+        use crate::fs::file_extent as fe;
+        use crate::superblock::le64;
+        Ok(self
+            .items_of(ino)?
+            .into_iter()
+            .filter(|(k, d)| {
+                k.key_type == EXTENT_DATA_KEY
+                    && d.len() >= fe::REGULAR_SIZE
+                    && d[fe::TYPE] != 0
+                    && le64(d, fe::DISK_BYTENR) == bytenr
+                    && k.offset.wrapping_sub(le64(d, fe::OFFSET)) == ref_offset
+            })
+            .count() as u64)
+    }
+
+    /// The written items of `ino` ending at `from` or starting at `end` that
+    /// name the extent at `bytenr` at `ref_offset`, unencoded, each with its
+    /// length: what the kernel joins an item it has just written to.
+    fn written_neighbours(
+        &self,
+        ino: u64,
+        from: u64,
+        end: u64,
+        bytenr: u64,
+        ref_offset: u64,
+    ) -> Result<Vec<(DiskKey, u64)>> {
+        use crate::fs::file_extent as fe;
+        use crate::superblock::le64;
+        Ok(self
+            .items_of(ino)?
+            .into_iter()
+            .filter(|(k, d)| {
+                k.key_type == EXTENT_DATA_KEY
+                    && d.len() >= fe::REGULAR_SIZE
+                    && d[fe::TYPE] == EXTENT_REGULAR
+                    && d[fe::COMPRESSION] == 0
+                    && d[fe::ENCRYPTION] == 0
+                    && d[fe::OTHER_ENCODING..fe::OTHER_ENCODING + 2] == [0, 0]
+                    && le64(d, fe::DISK_BYTENR) == bytenr
+                    && k.offset.wrapping_sub(le64(d, fe::OFFSET)) == ref_offset
+                    && (k.offset.saturating_add(le64(d, fe::NUM_BYTES)) == from || k.offset == end)
+            })
+            .map(|(k, d)| (k, le64(&d, fe::NUM_BYTES)))
+            .collect())
     }
 
     /// Every extent item of `ino` holding something other than inline data,
