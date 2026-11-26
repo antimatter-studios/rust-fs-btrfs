@@ -263,8 +263,8 @@ jobs:
       - id: pick
         run: runner-gate pick linux-x64-kvm
 
-  # A quick job, on every pull request too: the two kernel-twin comparisons of a
-  # write from a hole into preallocation (#774), which a quick run would
+  # A quick job, on every pull request too: the kernel-twin comparisons of a
+  # write from a hole into preallocation (#774, #779), which a quick run would
   # otherwise leave to the merge queue.
   hole-prealloc:
     name: hole into preallocation (Linux kernel oracle)
@@ -307,12 +307,12 @@ jobs:
           key: ${{ steps.vm-host.outputs.box-cache-key }}
       - name: chore tools
         run: chore tools
-      - name: Both hole representations match the kernel
+      - name: Both hole representations match the kernel, shared items too
         run: |
           ../rust-fs-core/scripts/tier.sh hole-prealloc hole-prealloc 400 30000 -- \
             scripts/test.sh --locked --profile test --test cow_write_oracle \
             a_write_within_size_from_a_hole_into_preallocation -- --show-output
-          bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored hole-prealloc 2
+          bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored hole-prealloc 4
       - name: Keep the tier logs
         uses: actions/upload-artifact@v4
         if: always()
