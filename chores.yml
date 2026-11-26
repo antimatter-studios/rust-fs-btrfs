@@ -210,9 +210,15 @@ chore_min_version: 0.10.0
 #                                                    its wrapper (#689).
 #                                                    The native tier runs
 #                                                    every target once.
-#     scripts     232 /  12,205      300 /  15,900   ~30%: one line per
+#     scripts     302 /  15,500      400 /  21,000   ~30%: one line per
 #                                                    assertion, so it grows
-#                                                    with the guards. 223 /
+#                                                    with the guards. 300 /
+#                                                    15,265 in run
+#                                                    45728694656, which left
+#                                                    no room for #819's guard
+#                                                    (2 lines). Was 300 /
+#                                                    15,900 for 232 /
+#                                                    12,205: 223 /
 #                                                    11,744 on x86_64 CI, run
 #                                                    41777793760, plus #747's
 #                                                    fixture-copies-sparse.sh
@@ -941,7 +947,7 @@ tasks:
     cmds:
       - |
         set -eu
-        bash ../rust-fs-core/scripts/tier.sh test:scripts scripts 300 15900 -- bash -c '
+        bash ../rust-fs-core/scripts/tier.sh test:scripts scripts 400 21000 -- bash -c '
           set -eu
           for t in tests/scripts/*.sh; do
             echo "== $t"
@@ -976,6 +982,9 @@ tasks:
       # THIS PATH AND THE cp MUST AGREE, and nothing checks that they do —
       # it is the same path Cargo.toml resolves rust-fs-core from.
       - '../rust-fs-core/include/fs_core.h'
+      # The task's own definition: without it an edit to a command leaves the
+      # fingerprint unchanged, and chore ships the previous artefacts.
+      - chores.yml
 
     # Templated, which is fine here where it is not fine above: the check
     # renders these correctly, and every entry is an exact path rather than a
@@ -991,7 +1000,14 @@ tasks:
       - 'rustup target add {{.TRIPLE}}'
       - 'cargo build --release --target {{.TRIPLE}}'
       - 'mkdir -p "{{.OUT}}/include"'
-      - 'cp target/{{.TRIPLE}}/release/lib{{.LIBNAME}}.a "{{.OUT}}/lib{{.LIBNAME}}.a"'
+      # From where cargo built it, which only cargo can say: ./target,
+      # CARGO_TARGET_DIR (which may be relative), or build.target-dir in a
+      # config file. `cargo metadata` gives an absolute path for all of them.
+      # A path it cannot give leaves the cp failing rather than guessing.
+      # tests/scripts/test-staticlib-target-dir.sh holds this (#819).
+      - |
+        target_dir="$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+        cp "$target_dir/{{.TRIPLE}}/release/lib{{.LIBNAME}}.a" "{{.OUT}}/lib{{.LIBNAME}}.a"
       - 'cp include/{{.LIBNAME}}.h "{{.OUT}}/include/{{.LIBNAME}}.h"'
       # Shipping fs_core.h is ours: the header we emit #includes it, so a
       # consumer handed only fs_btrfs.h cannot compile.
