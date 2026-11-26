@@ -177,7 +177,7 @@ fallocate_kernel          2
 # The edges of the same: partial sectors in holes and preallocated items,
 # compressed and nodatacow files, what is refused (#713), and the same ranges
 # through a selected subvolume's handle: three executed in the guest (#735).
-fallocate_edges_kernel    3
+fallocate_edges_kernel    4
 fixture_magic_validation  8
 fixtures_present          2
 free_space_oracle         4

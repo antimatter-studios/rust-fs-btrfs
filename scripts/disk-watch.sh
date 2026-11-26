@@ -25,7 +25,7 @@ lowest_file="$(mktemp "${TMPDIR:-/tmp}/disk-watch.XXXXXX")"
 sampler=""
 cleanup() {
     [ -z "$sampler" ] || kill "$sampler" 2>/dev/null
-    rm -f -- "$lowest_file"
+    rm -f -- "$lowest_file" "$lowest_file.new"
 }
 trap cleanup EXIT
 trap 'exit 129' HUP
@@ -42,7 +42,10 @@ printf '%s\n' "$before" >"$lowest_file"
             '' | *[!0-9]*) lowest="$now" ;;
             *) [ "$now" -ge "$lowest" ] || lowest="$now" ;;
         esac
-        printf '%s\n' "$lowest" >"$lowest_file"
+        # Written beside the file and renamed over it. Writing in place empties
+        # the file first, and the sampler is stopped by a signal: one that
+        # landed there left it empty, and the lowest was lost (#813).
+        printf '%s\n' "$lowest" >"$lowest_file.new" && mv -f -- "$lowest_file.new" "$lowest_file"
     done
 ) >/dev/null 2>&1 &
 sampler=$!
