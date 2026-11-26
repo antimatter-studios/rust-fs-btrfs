@@ -17,6 +17,7 @@ mod cli_support;
 use cli_support::*;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, dump_tree, guest_kernel_read_ok, guest_kernel_write_ok, oracle,
+    tree_item_count,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -116,7 +117,7 @@ fn kernel_view(image: &Path, what: &str) -> BTreeMap<String, (u64, u64, String, 
 /// top-level subvolume.
 fn dumped_items(image: &Path, ino: u64) -> usize {
     let needle = format!("key ({ino} EXTENT_DATA ");
-    dump_tree(image, "5").matches(&needle).count()
+    tree_item_count(&dump_tree(image, "5"), &needle)
 }
 
 #[test]

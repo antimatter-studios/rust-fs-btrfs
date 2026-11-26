@@ -161,7 +161,11 @@ fn progs_chunks(image: &Path) -> Vec<ProgsChunk> {
     let dump = dump_tree(image, "3");
     let mut out: Vec<ProgsChunk> = Vec::new();
     for line in dump.lines().map(str::trim) {
-        if let Some(rest) = line.split("CHUNK_ITEM ").nth(1) {
+        if let Some(rest) = line
+            .split("CHUNK_ITEM ")
+            .nth(1)
+            .filter(|_| tree_item_header(line, "CHUNK_ITEM "))
+        {
             let logical = rest
                 .split(')')
                 .next()

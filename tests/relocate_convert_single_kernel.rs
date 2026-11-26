@@ -21,7 +21,7 @@ use fs_btrfs::chunk::{block_group as bg, ChunkProfile};
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs_test_support::{
     assert_btrfs_check_clean, dump_tree, guest_kernel_read_ok, guest_kernel_write_ok, oracle,
-    temp_path,
+    temp_path, tree_item,
 };
 use fs_core::{BlockDevice, FileDevice};
 use std::collections::BTreeMap;
@@ -98,10 +98,9 @@ fn manifest(output: &str) -> BTreeMap<String, String> {
 fn stripe_offsets(image: &Path, logical: u64, types: &[&str]) -> Vec<u64> {
     let chunks = dump_tree(image, "chunk");
     let head = format!("CHUNK_ITEM {logical})");
-    let item = chunks
-        .split("\titem ")
-        .find(|item| item.contains(&head))
-        .unwrap_or_else(|| panic!("no chunk item at {logical}:\n{chunks}"));
+    let item = tree_item(&chunks, &head)
+        .unwrap_or_else(|| panic!("no chunk item at {logical}:\n{chunks}"))
+        .join("\n");
     assert!(
         item.lines()
             .filter_map(|l| l.split_whitespace().skip_while(|w| *w != "type").nth(1))
