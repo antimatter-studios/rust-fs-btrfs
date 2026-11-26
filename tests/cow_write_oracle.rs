@@ -4990,8 +4990,9 @@ fn an_append_outgrowing_compressed_inline_data_moves_it_into_a_regular_extent() 
 /// same write into a control preallocated alongside, so the item kinds and
 /// offsets, the reference counts, `size` and `nbytes` the driver is held to
 /// are its own; `btrfs check --check-data-csum` and a kernel scrub verify
-/// the digests, and the kernel must read the old data, zeros for the
-/// preallocated sectors left unwritten, and the written bytes.
+/// the digests, `filefrag -v` must report the same unwritten ranges as the
+/// control, and the kernel must read the old data, zeros for the preallocated
+/// sectors left unwritten, and the written bytes.
 #[test]
 fn a_write_spanning_a_kept_preallocated_items_end_and_the_files_end_is_written() {
     const OURS: &str = "kept-end.bin";
@@ -5088,6 +5089,35 @@ fn a_write_spanning_a_kept_preallocated_items_end_and_the_files_end_is_written()
         "scrub after a write past a kept preallocated end",
         "btrfs scrub start -B \"$MNT\" >/dev/null",
     );
+    let unwritten = guest_kernel_read_ok(
+        &image.to_string_lossy(),
+        "unwritten ranges after a write past a kept preallocated end",
+        &format!(
+            "for f in {OURS} {THEIRS}; do \
+             printf '%s %s\\n' \"$f\" \"$(filefrag -v \"$MNT/$f\" | awk '/unwritten/ {{print $2, $3}}' | tr '\\n' ' ')\"; done\n"
+        ),
+    );
+    let ranges: BTreeMap<&str, &str> = unwritten
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .collect();
+    // The sectors from the old end to the write's start were preallocated and
+    // never written, so the kernel's control must still call them unwritten.
+    assert!(
+        !ranges
+            .get(THEIRS)
+            .copied()
+            .unwrap_or_default()
+            .trim()
+            .is_empty(),
+        "the kernel left no unwritten range in {THEIRS}:\n{unwritten}"
+    );
+    assert_eq!(
+        ranges.get(OURS).map(|r| r.trim()),
+        ranges.get(THEIRS).map(|r| r.trim()),
+        "{OURS}'s unwritten ranges differ from {THEIRS}'s:\n{unwritten}"
+    );
+    println!("[cow unwritten] kept end: {unwritten}");
     let seen = kernel_view(
         &image,
         "after a write past a kept preallocated end",
