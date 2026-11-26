@@ -208,6 +208,15 @@ waits_or_ends() {
     done
     grep -q "waiting for the kernel's device registry" "$sandbox/$1.log" || ! kill -0 "$pid" 2>/dev/null
 }
+# explain NAME...: the end of each build's output, and the kernel stub's log.
+explain() {
+    local name
+    for name in "$@"; do
+        echo "--- the end of the $name build's output:" >&2
+        tail -n 15 "$sandbox/$name.log" >&2
+    done
+    [ ! -f "$KERNEL/dmesg.log" ] || tail -n 5 "$KERNEL/dmesg.log" >&2
+}
 # names_holder NAME PID: that build's wait names PID as the holder.
 names_holder() {
     grep -qF "waiting for the kernel's device registry, held by pid $2, " "$sandbox/$1.log"
@@ -225,8 +234,13 @@ rm -f "$KERNEL/gate"
 finish first
 first_rc=$rc
 finish second
-[ "$first_rc" = 0 ] && ok "a pool mounts with another build running beside it" \
-    || fail "a pool mounts with another build running beside it (status $first_rc): $(grep -h 'BTRFS\|mount:' "$sandbox/first.log" "$KERNEL/dmesg.log" 2>/dev/null | head -n 2)"
+if [ "$first_rc" = 0 ]; then
+    ok "a pool mounts with another build running beside it"
+else
+    fail "a pool mounts with another build running beside it (status $first_rc): $(grep -h 'BTRFS\|mount:' "$sandbox/first.log" "$KERNEL/dmesg.log" 2>/dev/null | head -n 2)"
+    # A build can end without either message, so show where it stopped.
+    explain first second
+fi
 [ "$rc" = 0 ] && ok "and the other build finishes too" || fail "and the other build finishes too (status $rc): $(tail -n 2 "$sandbox/second.log")"
 
 # --- 2. A second pool waits for the first, and says for whom. ------------

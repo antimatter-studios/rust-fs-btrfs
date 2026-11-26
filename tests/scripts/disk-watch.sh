@@ -67,6 +67,16 @@ else
     fail "with no df: status $status, '$out'"
 fi
 
+# A df that succeeds and prints nothing is unknown too.
+printf '#!/usr/bin/env bash\nexit 0\n' >"$sandbox/bin/df"
+out="$(watch oracle true)"
+status=$?
+if [ "$status" -eq 0 ] && [ "$out" = "disk: oracle: unknown MB free before, unknown MB at the lowest, unknown MB after" ]; then
+    ok "a df that prints nothing is unknown, and does not fail the command"
+else
+    fail "with an empty df: status $status, '$out'"
+fi
+
 # Without a command there is nothing to run.
 watch oracle >/dev/null 2>&1
 status=$?
