@@ -104,7 +104,14 @@ cat > "$sandbox/bin/btrfs" <<'STUB'
 mkdir -p "$KERNEL/reg" "$KERNEL/mounted"
 case "$1 $2 ${3:-}" in
     "--version  ") echo "btrfs-progs v0 (stub)" ;;
-    "filesystem df "*) printf 'Data, RAID0: x\nData, RAID1: x\nData, RAID5: x\nData, RAID6: x\n' ;;
+    # One line at a time, with a pause: a reader that stops at its own line
+    # leaves the next write with no reader, as a loaded runner sometimes did.
+    "filesystem df "*)
+        for level in RAID0 RAID1 RAID5 RAID6; do
+            echo "Data, $level: x" || exit 141
+            sleep 0.05
+        done
+        ;;
     "device scan --forget")
         shift 3
         if [ $# -eq 0 ]; then
@@ -208,6 +215,15 @@ waits_or_ends() {
     done
     grep -q "waiting for the kernel's device registry" "$sandbox/$1.log" || ! kill -0 "$pid" 2>/dev/null
 }
+# explain NAME...: the end of each build's output, and the kernel stub's log.
+explain() {
+    local name
+    for name in "$@"; do
+        echo "--- the end of the $name build's output:" >&2
+        tail -n 15 "$sandbox/$name.log" >&2
+    done
+    [ ! -f "$KERNEL/dmesg.log" ] || tail -n 5 "$KERNEL/dmesg.log" >&2
+}
 # names_holder NAME PID: that build's wait names PID as the holder.
 names_holder() {
     grep -qF "waiting for the kernel's device registry, held by pid $2, " "$sandbox/$1.log"
@@ -225,8 +241,13 @@ rm -f "$KERNEL/gate"
 finish first
 first_rc=$rc
 finish second
-[ "$first_rc" = 0 ] && ok "a pool mounts with another build running beside it" \
-    || fail "a pool mounts with another build running beside it (status $first_rc): $(grep -h 'BTRFS\|mount:' "$sandbox/first.log" "$KERNEL/dmesg.log" 2>/dev/null | head -n 2)"
+if [ "$first_rc" = 0 ]; then
+    ok "a pool mounts with another build running beside it"
+else
+    fail "a pool mounts with another build running beside it (status $first_rc): $(grep -h 'BTRFS\|mount:' "$sandbox/first.log" "$KERNEL/dmesg.log" 2>/dev/null | head -n 2)"
+    # A build can end without either message, so show where it stopped.
+    explain first second
+fi
 [ "$rc" = 0 ] && ok "and the other build finishes too" || fail "and the other build finishes too (status $rc): $(tail -n 2 "$sandbox/second.log")"
 
 # --- 2. A second pool waits for the first, and says for whom. ------------
@@ -281,6 +302,13 @@ done
 found="$(grep -nE 'btrfs device scan --forget *(>|2>|\|\||$)' "$RECIPES")"
 [ -z "$found" ] && ok "every forget in the recipes names its devices" \
     || fail "every forget in the recipes names its devices: $found"
+
+# --- 4. No recipe pipes into a grep that stops early. --------------------
+# Under pipefail the writer's SIGPIPE becomes the pipeline's status, so a line
+# that WAS found reads as missing, on some runs and not on others.
+found="$(grep -nE '(^|[^|])\|[[:space:]]*grep +-[A-Za-z]*q' "$RECIPES")"
+[ -z "$found" ] && ok "no recipe pipes into grep -q" \
+    || fail "no recipe pipes into grep -q: $found"
 
 if [ "$fails" -gt 0 ]; then
     echo "FAIL  $fails fixture-pool-registry violation(s)" >&2
