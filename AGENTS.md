@@ -319,8 +319,10 @@ chore cli:install  # the command-line tools, staged in tmp/cli/bin
 chore test:cli     # those tools as installed, first on PATH
 ```
 
-CI runs `unit`, `fixtures`, `test`, `test-arm64`, `suite-in-vm`, `cli`,
-aggregated by `ci-ok`.
+CI runs `unit`, `fixtures`, `test`, `test-arm64`, `suite-in-vm`,
+`test-kernel-new`, `cli`, aggregated by `ci-ok`. `chore test:kernel-new`
+runs `tests/kernel_new/` on the Debian 13 guest, on a Linux host only;
+`chore test` does not include it.
 
 Pull requests, including every layer of a native `gh stack`, run lint, shell
 guards, unit tests and the API compatibility check. The merge queue runs the

@@ -28,6 +28,9 @@ name: CI
 #   suite-in-vm  `chore test:vm`: the whole suite COMPILED AND RUN INSIDE
 #                the guest. That is how a macOS host runs a Linux suite,
 #                and this job is what keeps that path working.
+#   test-kernel-new
+#                `chore test:kernel-new`: the suites that need a 6.7 or
+#                later kernel, on the harness's Debian 13 guest.
 #   cli          `chore cli:install` then `chore test:cli`: the command-line
 #                tools built in release mode, staged under every name first
 #                on PATH, and tested AS INSTALLED -- `rust-fs-btrfs doctor`
@@ -608,6 +611,68 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  test-kernel-new-gate:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64-kvm
+
+  # The suites in tests/kernel_new/ need a 6.7 or later kernel (#455, #818),
+  # so they boot the Debian 13 guest. They make their own volumes.
+  test-kernel-new:
+    name: test (newer kernel, Debian 13 guest)
+    needs: [changes, test-kernel-new-gate]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ${{ needs.test-kernel-new-gate.outputs.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packages the hosted image has
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential curl jq
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Upstream virtiofsd 1.14.0
+        uses: antimatter-studios/fs-linux-test-harness/.github/actions/install-virtiofsd@v0.10.0
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        env:
+          FLTH_CONFIG: ${{ github.workspace }}/fs-linux-test-harness.debian-13.toml
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}-debian-13
+      # The tier starts with `scripts/tools.sh --check`, and a self-hosted
+      # runner has no ripgrep until this installs it.
+      - name: chore tools
+        run: chore tools
+      - name: chore test:kernel-new
+        run: chore test:kernel-new
+      - name: The tier executed its tests
+        run: bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel-new 3
+      - name: Keep the tier logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-${{ github.job }}
+          path: tmp/logs/
+          if-no-files-found: error
+          retention-days: 7
+
   suite-in-vm-gate:
     needs: fixtures
     runs-on: antimatter-vps-gate
@@ -816,7 +881,7 @@ jobs:
         run: chore check:semver
 
   ci-ok-gate:
-    needs: [changes-gate, changes, unit-gate, unit, hole-prealloc-gate, hole-prealloc, fixtures-gate, fixtures, test-gate, test, test-arm64-gate, test-arm64, suite-in-vm-gate, suite-in-vm, cli-gate, cli, semver-gate, semver]
+    needs: [changes-gate, changes, unit-gate, unit, hole-prealloc-gate, hole-prealloc, fixtures-gate, fixtures, test-gate, test, test-arm64-gate, test-arm64, suite-in-vm-gate, suite-in-vm, test-kernel-new-gate, test-kernel-new, cli-gate, cli, semver-gate, semver]
     if: always()
     runs-on: antimatter-vps-gate
     timeout-minutes: 1
@@ -829,7 +894,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes-gate, changes, unit-gate, unit, hole-prealloc-gate, hole-prealloc, fixtures-gate, fixtures, test-gate, test, test-arm64-gate, test-arm64, suite-in-vm-gate, suite-in-vm, cli-gate, cli, semver-gate, semver, ci-ok-gate]
+    needs: [changes-gate, changes, unit-gate, unit, hole-prealloc-gate, hole-prealloc, fixtures-gate, fixtures, test-gate, test, test-arm64-gate, test-arm64, suite-in-vm-gate, suite-in-vm, test-kernel-new-gate, test-kernel-new, cli-gate, cli, semver-gate, semver, ci-ok-gate]
     runs-on: ${{ needs.ci-ok-gate.outputs.runner || 'ubuntu-latest' }}
     steps:
       - name: Packages the hosted image has
@@ -839,7 +904,7 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
           CODE: ${{ needs.changes.outputs.code }}
-          FULL_JOBS: '["fixtures", "fixtures-gate", "test", "test-gate", "test-arm64", "test-arm64-gate", "suite-in-vm", "suite-in-vm-gate", "cli", "cli-gate"]'
+          FULL_JOBS: '["fixtures", "fixtures-gate", "test", "test-gate", "test-arm64", "test-arm64-gate", "suite-in-vm", "suite-in-vm-gate", "test-kernel-new", "test-kernel-new-gate", "cli", "cli-gate"]'
         run: |
           set -euo pipefail
           case "$CODE" in true|false) ;; *) echo "::error::missing full-pipeline decision"; exit 1 ;; esac

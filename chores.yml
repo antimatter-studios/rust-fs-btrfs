@@ -782,6 +782,17 @@ tasks:
       - test-disks/build-fixtures.sh --check
       - 'scripts/disk-watch.sh kernel ../rust-fs-core/scripts/tier.sh test:kernel kernel 5735 391000 -- scripts/test.sh --locked --profile test $(scripts/test-targets.sh kernel) -- --show-output'
 
+  test:kernel-new:
+    desc: 'The suites that need a 6.7 or later kernel (tests/kernel_new/), on the Debian 13 guest; Linux hosts only'
+    # A second harness config boots the Debian 13 guest (kernel 6.12); the
+    # Debian 12 guest every other tier uses cannot mount a simple-quota
+    # volume (#455, #818). Needs no fixtures: the suite makes its volumes.
+    # Budget: three tests, each printing its `[oracle vm]` and
+    # `[kernel vm]` lines. Not yet measured; the first run's log sizes it.
+    cmds:
+      - scripts/tools.sh --check
+      - 'FLTH_CONFIG="$PWD/fs-linux-test-harness.debian-13.toml" ../rust-fs-core/scripts/tier.sh test:kernel-new kernel-new 600 60000 -- scripts/test.sh --locked --profile test $(scripts/test-targets.sh kernel-new) -- --show-output'
+
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
     # scripts/guest-suite.sh, through the harness's [test] guest_command.

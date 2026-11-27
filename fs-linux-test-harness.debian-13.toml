@@ -1,0 +1,25 @@
+# fs-linux-test-harness consumer config for the Debian 13 guest (see
+# ../fs-linux-test-harness/README.md, `[vm] guest`).
+#
+# A SECOND GUEST, NOT A SECOND SUITE. Every other tier boots the Debian 12
+# guest fs-linux-test-harness.toml describes, whose kernel 6.1 cannot mount
+# a simple-quota volume, so it can never have the kernel write the owner
+# references a 6.7 or later kernel adds to each data extent (#455, #818).
+# This config has a project name of its own and `[vm] guest = "debian-13"`,
+# whose kernel is 6.12: `chore test:kernel-new` points the harness at it
+# through FLTH_CONFIG, and the suites in tests/kernel_new/ run there and
+# nowhere else. The Debian 13 guest is for Linux hosts only, so the tier
+# runs on one, as CI's `test-kernel-new` job does.
+
+[project]
+name = "rust-fs-btrfs-deb13"
+
+[setup]
+# The same guest tooling as the Debian 12 config.
+script = "scripts/vm-setup.sh"
+
+[share]
+dir = ".vm-share"
+
+[vm]
+guest = "debian-13"

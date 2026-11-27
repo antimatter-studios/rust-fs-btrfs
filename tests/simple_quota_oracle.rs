@@ -19,8 +19,9 @@
 //! writes none for the files it copies in, as the kernel writes none for
 //! an extent older than the feature's enabling; only a kernel of 6.7 or
 //! later, writing under simple quotas, does. Reading a file never looks
-//! at the extent tree, but `fsck.btrfs` does, and its handling of that
-//! inline reference waits for a guest that can make one.
+//! at the extent tree, but `fsck.btrfs` does. Both are checked against
+//! kernel-written owner references, on a Debian 13 guest, by
+//! `tests/kernel_new/simple_quota_owner_kernel.rs`.
 
 // The read-only openers deprecated in 0.12.0 stay in use here for their
 // deprecation release (`layers::BtrfsVolume` replaces them).
