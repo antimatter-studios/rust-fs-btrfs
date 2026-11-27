@@ -28,8 +28,8 @@ use fs_btrfs::block_group::BlockGroup;
 use fs_btrfs::chunk::block_group::SYSTEM;
 use fs_btrfs::fs::Filesystem;
 use fs_btrfs_test_support::{
-    guest_kernel_pool_read, guest_kernel_pool_write, guest_kernel_write_ok, oracle, sha256_hex,
-    temp_path,
+    guest_kernel_pool_read, guest_kernel_pool_update, guest_kernel_pool_write,
+    guest_kernel_write_ok, oracle, sha256_hex, temp_path,
 };
 use fs_core::{BlockDevice, FileDevice};
 use std::collections::{BTreeMap, BTreeSet};
@@ -425,7 +425,8 @@ fn removal_evacuates_a_member(metadata: &str) {
     );
 
     // Every data and metadata group onto a second device, and then the
-    // kernel writes to the pool and takes the manifest.
+    // kernel writes to the pool, kept for the removal, and takes the
+    // manifest.
     let mut fs = Filesystem::mount_rw(open_rw(&a)).expect("the volume mounts read-write");
     assert_eq!(fs.add_device(open_rw(&b)).expect("adding b"), 2);
     empty_device(&mut fs, 1);
@@ -435,7 +436,7 @@ fn removal_evacuates_a_member(metadata: &str) {
         b.to_string_lossy().into_owned(),
     ];
     let images: Vec<&str> = images.iter().map(String::as_str).collect();
-    let written = guest_kernel_pool_write(
+    let written = guest_kernel_pool_update(
         &images,
         &format!("head -c 2000000 /dev/urandom > \"$MNT/pool.bin\"\nsync\n{MANIFEST}"),
     );

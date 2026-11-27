@@ -637,27 +637,38 @@ pub struct PoolRead {
 /// [`guest_script`] (#742).
 #[track_caller]
 pub fn guest_kernel_pool_read(images: &[&str], script: &str) -> PoolRead {
-    pool_run(images, script, false)
+    pool_run(images, script, false, false)
 }
 
 /// [`guest_kernel_pool_read`], mounted **read-write**: the kernel runs
 /// `script` against the pool and unmounts it, and then `btrfs check
 /// --readonly` inspects what the kernel left. The members are copies in
 /// the guest, thrown away afterwards; the images on the host are not
-/// changed.
+/// changed. [`guest_kernel_pool_update`] keeps them.
 ///
 /// What a writable mount proves that a read-only one cannot: that the
 /// kernel accepts the pool for writing and can allocate in it, on whichever
 /// device it chooses.
 #[track_caller]
 pub fn guest_kernel_pool_write(images: &[&str], script: &str) -> PoolRead {
-    pool_run(images, script, true)
+    pool_run(images, script, true, false)
 }
 
-/// The two pool oracles, the mount read-only (`btrfs check` first) or
-/// read-write (`btrfs check` after the unmount).
+/// [`guest_kernel_pool_write`], with what the kernel wrote **kept**: when the
+/// script succeeds, each member's copy in the guest is written back over its
+/// image on the host, after the unmount and `btrfs check`, as
+/// [`guest_kernel_write`] does for one image. For a test whose next step
+/// reads what the kernel wrote.
 #[track_caller]
-fn pool_run(images: &[&str], script: &str, writable: bool) -> PoolRead {
+pub fn guest_kernel_pool_update(images: &[&str], script: &str) -> PoolRead {
+    pool_run(images, script, true, true)
+}
+
+/// The pool oracles, the mount read-only (`btrfs check` first) or
+/// read-write (`btrfs check` after the unmount), and whether the members are
+/// copied back.
+#[track_caller]
+fn pool_run(images: &[&str], script: &str, writable: bool, keep: bool) -> PoolRead {
     let _bracket = GUEST_MOUNT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -686,6 +697,24 @@ fn pool_run(images: &[&str], script: &str, writable: bool) -> PoolRead {
         ("", "rw", String::from("true"), check_cmd)
     } else {
         ("--read-only", "ro", check_cmd, String::from("true"))
+    };
+    // The loop devices are detached before the copy, so that it reads
+    // everything the kernel wrote through them.
+    let copy_back = if keep {
+        format!(
+            "if [ \"$status\" = 0 ]; then\n\
+             for l in \"${{loops[@]}}\"; do losetup -d \"$l\"; done\n\
+             loops=()\n\
+             i=0\n\
+             for img in {}; do\n\
+             cp --sparse=always \"$work/member-$i\" \"$img\"\n\
+             i=$((i + 1))\n\
+             done\n\
+             fi",
+            members.join(" ")
+        )
+    } else {
+        String::from("true")
     };
     let guest = format!(
         r#"set -euo pipefail
@@ -716,6 +745,7 @@ status=0
 MNT="$mnt" bash -euo pipefail -c {script} > {stdout} 2> {stderr} || status=$?
 umount "$mnt"
 {check_after}
+{copy_back}
 printf %s "$status" > {status}"#,
         dir = guest_quote(&run.dir.to_string_lossy()),
         members = members.join(" "),
