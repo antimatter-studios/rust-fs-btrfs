@@ -23,6 +23,10 @@
 //! superblock, and the kernel reading every file of the manifest. The kernel
 //! also writes to the pool the first relocations left, and `btrfs check`
 //! looks again.
+//!
+//! A member of a pool, single, DUP or mirrored, is also removed whole
+//! (#816), and the members left are judged the same way, a mirrored pool by
+//! `btrfs scrub` as well.
 
 use fs_btrfs::block_group::BlockGroup;
 use fs_btrfs::chunk::block_group::SYSTEM;
@@ -519,6 +523,169 @@ fn removing_a_member_with_data_and_single_metadata_evacuates_it() {
 #[test]
 fn removing_a_member_with_data_and_dup_metadata_evacuates_it() {
     removal_evacuates_a_member("dup");
+}
+
+/// A pool in a mirrored `profile` of `copies` copies, with one member more
+/// than that, has a member holding its data and metadata removed: every
+/// group moves, in its own profile, onto `copies` members of those left,
+/// and they are a pool `btrfs check` finds clean, `btrfs scrub` finds no
+/// error in and the kernel reads whole (#816, POOL-03).
+fn removal_evacuates_a_mirrored_member(profile: &str, copies: usize) {
+    let scratch = Scratch::new(&format!("mirrored-{profile}"));
+    let members: Vec<PathBuf> = (1..=copies + 1)
+        .map(|i| scratch.blank(&format!("{i}.img"), 512 * MIB))
+        .collect();
+    let paths: Vec<String> = members
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+    // Made over one member fewer than the pool will have, so the system
+    // group has no stripe on the member added next, which is removed later.
+    let mkfs = members[..copies].iter().fold(
+        oracle("mkfs.btrfs").args([
+            "-q", "-f", "-d", profile, "-m", profile, "-s", "4096", "-n", "16384",
+        ]),
+        |mkfs, member| mkfs.arg(member),
+    );
+    let made = mkfs.output();
+    assert!(
+        made.status.success(),
+        "mkfs.btrfs: {}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let wrote = guest_kernel_pool_update(
+        &paths[..copies],
+        "mkdir \"$MNT/files\"\n\
+         for i in $(seq 1 160); do head -c 8192 /dev/urandom > \"$MNT/files/f$i\"; done\n\
+         head -c 3000000 /dev/urandom > \"$MNT/large.bin\"\n\
+         sync\n",
+    );
+    assert!(
+        wrote.out.status.success(),
+        "the kernel could not write the first files:\n{}",
+        String::from_utf8_lossy(&wrote.out.stderr)
+    );
+    assert_eq!(wrote.check_status, 0, "{}", wrote.check);
+
+    // The last member joins, every data and metadata group moves off the
+    // first and so onto it, and the kernel writes to that pool.
+    let added = copies as u64 + 1;
+    let open_all = || members.iter().map(|p| open_rw(p)).collect::<Vec<_>>();
+    let mut fs = Filesystem::mount_pool_rw(open_all()[..copies].to_vec())
+        .expect("the pool mounts read-write");
+    assert_eq!(
+        fs.add_device(open_rw(&members[copies]))
+            .expect("adding the last member"),
+        added
+    );
+    empty_device(&mut fs, 1);
+    drop(fs);
+    let written = guest_kernel_pool_update(
+        &paths,
+        &format!("head -c 2000000 /dev/urandom > \"$MNT/pool.bin\"\nsync\n{MANIFEST}"),
+    );
+    let out = String::from_utf8_lossy(&written.out.stdout).into_owned();
+    assert!(
+        written.out.status.success(),
+        "the kernel could not write to the pool:\n{out}{}",
+        String::from_utf8_lossy(&written.out.stderr)
+    );
+    assert_eq!(written.check_status, 0, "{}", written.check);
+    let files = manifest(&out);
+    assert_eq!(files.len(), 162, "the kernel's manifest:\n{out}");
+
+    let mut fs = Filesystem::mount_pool_rw(open_all()).expect("the pool mounts read-write");
+    let held = on_device(&fs, added);
+    assert!(
+        held.iter().any(|g| g.holds_metadata()) && held.iter().any(|g| !g.holds_metadata()),
+        "device {added} does not hold both data and metadata"
+    );
+    let shapes = group_shapes(&fs);
+    fs.remove_device(added)
+        .unwrap_or_else(|e| panic!("removing a member of a {profile} pool: {e}"));
+    assert_eq!(fs.superblock().num_devices, copies as u64);
+    assert_eq!(
+        group_shapes(&fs),
+        shapes,
+        "the removal changed a group's profile, kind or size"
+    );
+    let survivors: BTreeSet<u64> = (1..=copies as u64).collect();
+    for group in fs.block_groups().unwrap() {
+        assert_eq!(
+            devices_of(&fs, group.start),
+            survivors,
+            "the group at {} does not have a copy on each of {copies} survivors",
+            group.start
+        );
+    }
+    for (path, digest) in &files {
+        let data = fs
+            .read_path(path)
+            .expect("a manifest file, through this driver");
+        assert_eq!(
+            &sha256_hex(&data),
+            digest,
+            "{path} reads back differently through this driver after the removal"
+        );
+    }
+    drop(fs);
+    assert!(
+        fs_btrfs::superblock::read_superblock(&FileDevice::open(&members[copies]).unwrap())
+            .is_err(),
+        "the removed device still carries a superblock"
+    );
+
+    let read = guest_kernel_pool_read(
+        &paths[..copies],
+        &format!("{SHOW}btrfs scrub start -B -r \"$MNT\"\n{MANIFEST}"),
+    );
+    assert_eq!(
+        read.check_status, 0,
+        "btrfs check --readonly does not find the pool clean after the removal:\n{}",
+        read.check
+    );
+    let out = String::from_utf8_lossy(&read.out.stdout).into_owned();
+    assert!(
+        read.out.status.success(),
+        "the kernel could not mount, scrub and read the pool the removal left:\n{out}{}",
+        String::from_utf8_lossy(&read.out.stderr)
+    );
+    assert!(
+        out.contains("no errors found"),
+        "btrfs scrub does not report a clean pool:\n{out}"
+    );
+    let left: Vec<&PathBuf> = members[..copies].iter().collect();
+    assert_eq!(
+        shown_used(&out),
+        recorded_used(&left),
+        "btrfs filesystem show and the survivors' superblocks disagree:\n{out}"
+    );
+    let extents = extents_by_chunk(&out);
+    assert!(
+        !extents.is_empty() && extents.values().all(|d| *d == survivors),
+        "dump-tree -t dev: a chunk is not on each survivor:\n{out}"
+    );
+    assert_eq!(
+        manifest(&out),
+        files,
+        "the kernel reads the files differently after the removal"
+    );
+}
+
+#[test]
+fn removing_a_member_of_a_raid1_pool_evacuates_it() {
+    removal_evacuates_a_mirrored_member("raid1", 2);
+}
+
+#[test]
+fn removing_a_member_of_a_raid1c3_pool_evacuates_it() {
+    removal_evacuates_a_mirrored_member("raid1c3", 3);
+}
+
+#[test]
+fn removing_a_member_of_a_raid1c4_pool_evacuates_it() {
+    removal_evacuates_a_mirrored_member("raid1c4", 4);
 }
 
 /// The system group cannot be moved yet, so the member holding it is refused
