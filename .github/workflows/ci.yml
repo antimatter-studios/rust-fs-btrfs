@@ -656,6 +656,10 @@ jobs:
         with:
           path: ~/.vagrant.d/boxes
           key: ${{ steps.vm-host.outputs.box-cache-key }}-debian-13
+      # The tier starts with `scripts/tools.sh --check`, and a self-hosted
+      # runner has no ripgrep until this installs it.
+      - name: chore tools
+        run: chore tools
       - name: chore test:kernel-new
         run: chore test:kernel-new
       - name: The tier executed its tests
