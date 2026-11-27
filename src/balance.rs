@@ -58,8 +58,8 @@
 //! whichever member holds them (#702).
 //! [`Filesystem::relocate_block_group_off`] keeps one member out of it:
 //! no new chunk stripe is placed there, and tree blocks only when no other
-//! metadata group has room, which is how a device is emptied before it is
-//! removed.
+//! metadata group has room, which is how
+//! [`Filesystem::remove_device`] empties a device before it leaves (#816).
 //!
 //! Besides everything above, it refuses a system group, a conversion to
 //! another profile but a single data or metadata group's to DUP or a DUP
@@ -460,6 +460,87 @@ impl Filesystem {
         let done = self.relocate_block_group(start, None);
         self.leaving = was;
         done
+    }
+
+    /// Relocate every block group with a stripe on device `devid` onto the
+    /// other members, data groups first, so that the device can leave the
+    /// pool (#816).
+    ///
+    /// Every group is checked, and room for every new chunk found on the
+    /// other members, before the first one moves. Each relocation is then
+    /// its own committed transactions: an error or a cut between them
+    /// leaves a pool with some groups moved and the device still a member.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] for a group
+    /// [`Filesystem::relocate_block_group`] refuses, and when the other
+    /// members have no room for the new chunks, each before anything is
+    /// written.
+    pub(crate) fn evacuate_device(&mut self, devid: u64) -> Result<()> {
+        let extents = self.dev_extents()?;
+        let on_device: std::collections::BTreeSet<u64> = extents
+            .iter()
+            .filter(|e| e.devid == devid)
+            .map(|e| e.chunk_offset)
+            .collect();
+        let mut groups = on_device
+            .iter()
+            .map(|&start| self.block_group_at(start))
+            .collect::<Result<Vec<_>>>()?;
+        // The data groups' moves write tree blocks, which the metadata
+        // groups' moves then take with them.
+        groups.sort_by_key(BlockGroup::holds_metadata);
+
+        let others: Vec<u64> = self
+            .writable_pool
+            .iter()
+            .filter(|&(&id, device)| id != devid && device.is_writable())
+            .map(|(&id, _)| id)
+            .collect();
+        let mut spaces = self.device_spaces(&others, &extents)?;
+        for group in &groups {
+            self.refuse_unrelocatable(group, None)
+                .map_err(|e| match e {
+                    Error::UnsupportedFeature(why) => Error::UnsupportedFeature(format!(
+                        "device {devid} cannot be emptied, because balance cannot move the \
+                         block group at {} off it: {why}",
+                        group.start
+                    )),
+                    other => other,
+                })?;
+            let copies = stripe_copies(group.flags)?;
+            let (to, stripes) = choose_placement(&spaces, group.length, copies)
+                .ok_or_else(|| no_room(&others, group.length, copies))?;
+            if let Some(space) = spaces.iter_mut().find(|s| s.devid == to) {
+                space
+                    .taken
+                    .extend(stripes.into_iter().map(|at| (at, group.length)));
+            }
+        }
+        for group in groups {
+            self.relocate_block_group_off(group.start, devid)?;
+        }
+        Ok(())
+    }
+
+    /// The size of each device in `devids`, and what `extents` takes of it.
+    fn device_spaces(&self, devids: &[u64], extents: &[DevExtent]) -> Result<Vec<DeviceSpace>> {
+        devids
+            .iter()
+            .map(|&devid| {
+                let (_, item) = self.dev_item(devid)?;
+                Ok(DeviceSpace {
+                    devid,
+                    total: le64(&item, DEV_ITEM_TOTAL_BYTES),
+                    taken: extents
+                        .iter()
+                        .filter(|e| e.devid == devid)
+                        .map(|e| (e.physical, e.length))
+                        .collect(),
+                })
+            })
+            .collect()
     }
 
     /// Copy every tree block in the metadata group at `start` out of it,
@@ -881,16 +962,7 @@ impl Filesystem {
                 self.leaving.unwrap_or_default()
             )));
         }
-        let copies = match ChunkProfile::from_type(flags)? {
-            ChunkProfile::Single => 1,
-            ChunkProfile::Dup => 2,
-            other => {
-                return Err(Error::UnsupportedFeature(format!(
-                    "allocating a {} chunk is not implemented",
-                    other.name()
-                )))
-            }
-        };
+        let copies = stripe_copies(flags)?;
         // After every chunk there is, as the kernel places a new one.
         let logical = self
             .map
@@ -901,35 +973,9 @@ impl Filesystem {
             .unwrap_or(0);
 
         let extents = self.dev_extents()?;
-        // Of the devices with room, the one with the most unallocated
-        // space, as the kernel chooses; the lowest devid of any tie.
-        let mut chosen: Option<(u64, u64, Vec<u64>)> = None;
-        for &devid in &candidates {
-            let taken: Vec<(u64, u64)> = extents
-                .iter()
-                .filter(|e| e.devid == devid)
-                .map(|e| (e.physical, e.length))
-                .collect();
-            let (_, item) = self.dev_item(devid)?;
-            let total = le64(&item, DEV_ITEM_TOTAL_BYTES);
-            let Some(stripes) = place_stripes(&taken, total, length, copies) else {
-                continue;
-            };
-            let free = total.saturating_sub(taken.iter().map(|&(_, n)| n).sum());
-            if chosen.as_ref().is_none_or(|&(best, _, _)| free > best) {
-                chosen = Some((free, devid, stripes));
-            }
-        }
-        let (_, devid, stripes) = chosen.ok_or_else(|| {
-            Error::UnsupportedFeature(match candidates[..] {
-                [devid] => {
-                    format!("device {devid} has no room for {copies} stripe(s) of {length} bytes")
-                }
-                _ => format!(
-                    "no device of {candidates:?} has room for {copies} stripe(s) of {length} bytes"
-                ),
-            })
-        })?;
+        let spaces = self.device_spaces(&candidates, &extents)?;
+        let (devid, stripes) = choose_placement(&spaces, length, copies)
+            .ok_or_else(|| no_room(&candidates, length, copies))?;
         let (dev_item_key, mut dev_item) = self.dev_item(devid)?;
         let chunk_tree_uuid = extents
             .first()
@@ -1704,6 +1750,58 @@ struct DevExtent {
     chunk_tree_uuid: [u8; 16],
 }
 
+/// What a new chunk's placement knows of one device.
+struct DeviceSpace {
+    devid: u64,
+    /// Its size, as its device item records it.
+    total: u64,
+    /// Its extents, each `(physical, length)`.
+    taken: Vec<(u64, u64)>,
+}
+
+/// How many stripes a new chunk of `flags` has, all on one device.
+fn stripe_copies(flags: u64) -> Result<usize> {
+    match ChunkProfile::from_type(flags)? {
+        ChunkProfile::Single => Ok(1),
+        ChunkProfile::Dup => Ok(2),
+        other => Err(Error::UnsupportedFeature(format!(
+            "allocating a {} chunk is not implemented",
+            other.name()
+        ))),
+    }
+}
+
+/// The device a chunk of `copies` stripes of `length` bytes goes on, and
+/// where: of the devices with room, the one with the most unallocated
+/// space, as the kernel chooses, and the first listed of any tie.
+fn choose_placement(
+    devices: &[DeviceSpace],
+    length: u64,
+    copies: usize,
+) -> Option<(u64, Vec<u64>)> {
+    let mut chosen: Option<(u64, u64, Vec<u64>)> = None;
+    for device in devices {
+        let Some(stripes) = place_stripes(&device.taken, device.total, length, copies) else {
+            continue;
+        };
+        let free = device
+            .total
+            .saturating_sub(device.taken.iter().map(|&(_, n)| n).sum());
+        if chosen.as_ref().is_none_or(|&(best, _, _)| free > best) {
+            chosen = Some((free, device.devid, stripes));
+        }
+    }
+    chosen.map(|(_, devid, stripes)| (devid, stripes))
+}
+
+/// The refusal when no device of `devids` can take a new chunk.
+fn no_room(devids: &[u64], length: u64, copies: usize) -> Error {
+    Error::UnsupportedFeature(match devids {
+        [devid] => format!("device {devid} has no room for {copies} stripe(s) of {length} bytes"),
+        _ => format!("no device of {devids:?} has room for {copies} stripe(s) of {length} bytes"),
+    })
+}
+
 /// A `CHUNK_ITEM`'s body: `length` logical bytes of `flags`, over
 /// `stripes`, each `(devid, physical offset, device UUID)`.
 fn chunk_item(
@@ -1841,6 +1939,23 @@ mod tests {
                 physical + 5000
             );
         }
+    }
+
+    #[test]
+    fn a_chunk_goes_on_the_device_with_the_most_unallocated_space_that_fits_it() {
+        let device = |devid, total: u64, used: u64| DeviceSpace {
+            devid,
+            total: total * MIB,
+            taken: vec![(MIB, used * MIB)],
+        };
+        let devices = [device(1, 64, 32), device(2, 128, 32), device(3, 128, 32)];
+        let chosen = |len: u64, copies| choose_placement(&devices, len * MIB, copies);
+        // The most unallocated, and the first listed of a tie.
+        assert_eq!(chosen(8, 1).map(|c| c.0), Some(2));
+        assert_eq!(chosen(8, 2).map(|c| c.1.len()), Some(2));
+        // No device holds two stripes of this length.
+        assert_eq!(chosen(60, 2), None);
+        assert_eq!(choose_placement(&[], MIB, 1), None);
     }
 
     #[test]

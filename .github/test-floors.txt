@@ -280,7 +280,9 @@ relocate_prealloc_nodatasum_kernel 1
 relocate_shared_data_kernel 1
 # One kernel case relocates extents shared by a source subvolume and snapshot.
 relocate_shared_snapshot_data_kernel 1
-relocate_pool_kernel 2
+# Three removal cases: a member holding data and single or DUP metadata is
+# evacuated and removed, and the system group's member is refused (#816).
+relocate_pool_kernel 5
 rename_kernel             2
 render_plan               4
 send_stream_kernel        3
