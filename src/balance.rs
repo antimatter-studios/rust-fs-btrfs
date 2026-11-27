@@ -53,9 +53,11 @@
 //!    item and free-space records, and `bytes_used` lowered again. Metadata
 //!    allocation still excludes it during this final transaction.
 //!
-//! In a pool, the new chunk goes on the writable member with the most
-//! unallocated space, and the old one's device extents are removed from
-//! whichever member holds them (#702).
+//! In a pool, a new single or DUP chunk goes on the writable member with
+//! the most unallocated space, each copy of a RAID1, RAID1C3 or RAID1C4
+//! chunk on one of as many different members, the most unallocated first
+//! (#816), and the old chunk's device extents are removed from whichever
+//! members hold them (#702).
 //! [`Filesystem::relocate_block_group_off`] keeps one member out of it:
 //! no new chunk stripe is placed there, and tree blocks only when no other
 //! metadata group has room, which is how
@@ -63,10 +65,10 @@
 //!
 //! Besides everything above, it refuses a system group, a conversion to
 //! another profile but a single data or metadata group's to DUP or a DUP
-//! one's to single (#587, #588), a group of any other profile but single
-//! and DUP, a group with a stripe on a device the mount does not write (a
-//! seed's), one with no free-space tree, and a
-//! group holding an extent with a sector that a checksummed file's
+//! one's to single (#587, #588), a group of any other profile but single,
+//! DUP, RAID1, RAID1C3 and RAID1C4, a group with a stripe on a device
+//! the mount does not write (a seed's), one with no free-space tree, and
+//! a group holding an extent with a sector that a checksummed file's
 //! regular item names and that has no checksum, each before anything is
 //! written. Preallocated extents and those of `NODATASUM` files move with
 //! the checksums they have and no others (#496). A batch
@@ -94,6 +96,7 @@ use crate::inode::{Inode, INODE_ITEM_KEY, INODE_NODATASUM};
 use crate::leaf_edit::OwnedItem;
 use crate::super_write::Commit;
 use crate::transaction::{DataWrite, ItemEdit, RecordEdit};
+use std::collections::BTreeMap;
 
 /// How many rounds a chunk change's plan has to close over its own
 /// bookkeeping.
@@ -441,7 +444,8 @@ impl Filesystem {
     /// new group is.
     ///
     /// This is how a device is emptied before it leaves a pool: every
-    /// single and DUP group with a stripe on it relocated off it in turn.
+    /// single, DUP and RAID1-family group with a stripe on it relocated off
+    /// it in turn.
     ///
     /// # Errors
     ///
@@ -509,13 +513,18 @@ impl Filesystem {
                     )),
                     other => other,
                 })?;
-            let copies = stripe_copies(group.flags)?;
-            let (to, stripes) = choose_placement(&spaces, group.length, copies)
-                .ok_or_else(|| no_room(&others, group.length, copies))?;
-            if let Some(space) = spaces.iter_mut().find(|s| s.devid == to) {
-                space
-                    .taken
-                    .extend(stripes.into_iter().map(|at| (at, group.length)));
+            let stripes = place_chunk(&spaces, group.flags, group.length)?.ok_or_else(|| {
+                let why = no_room(&others, group.length, stripe_copies(group.flags));
+                Error::UnsupportedFeature(format!(
+                    "device {devid} cannot be emptied, because balance cannot move the \
+                         block group at {} off it: {why}",
+                    group.start
+                ))
+            })?;
+            for (to, at) in stripes {
+                if let Some(space) = spaces.iter_mut().find(|s| s.devid == to) {
+                    space.taken.push((at, group.length));
+                }
             }
         }
         for group in groups {
@@ -800,14 +809,10 @@ impl Filesystem {
                 )));
             }
         }
-        // A DUP group moves into DUP (#702) or single; a data group's
-        // extents are read from whichever of its two copies verifies.
-        if own != ChunkProfile::Single && own != ChunkProfile::Dup {
-            return Err(Error::UnsupportedFeature(format!(
-                "allocating a {} chunk is not implemented; only single and dup are",
-                own.name()
-            )));
-        }
+        // A DUP group moves into DUP (#702) or single, and a mirrored one
+        // into its own profile (#816); a data group's extents are read from
+        // whichever of its copies verifies.
+        stripe_copies_of(own)?;
         // In a pool, the old chunk's device extents are removed and its
         // device's `bytes_used` lowered in that device's own superblock, so
         // it has to be one this mount writes: not a seed's (#702).
@@ -928,9 +933,11 @@ impl Filesystem {
         Ok(Inode::parse(&data, ino)?.flags)
     }
 
-    /// Allocate a single or DUP chunk of `length` logical bytes and
-    /// `flags`, with its empty block group, in one committed transaction,
-    /// and return its logical address. DUP takes two stripes on this device.
+    /// Allocate a single, DUP, RAID1, RAID1C3 or RAID1C4 chunk of `length`
+    /// logical bytes and `flags`, with its empty block group, in one
+    /// committed transaction, and return its logical address. DUP takes two
+    /// stripes on one device, a RAID1 profile one on each of as many
+    /// devices as it keeps copies.
     fn allocate_chunk(&mut self, flags: u64, length: u64) -> Result<u64> {
         // A seed may have a device item and abundant physical space;
         // only a device this mount can write may supply a new stripe.
@@ -962,7 +969,6 @@ impl Filesystem {
                 self.leaving.unwrap_or_default()
             )));
         }
-        let copies = stripe_copies(flags)?;
         // After every chunk there is, as the kernel places a new one.
         let logical = self
             .map
@@ -974,45 +980,51 @@ impl Filesystem {
 
         let extents = self.dev_extents()?;
         let spaces = self.device_spaces(&candidates, &extents)?;
-        let (devid, stripes) = choose_placement(&spaces, length, copies)
-            .ok_or_else(|| no_room(&candidates, length, copies))?;
-        let (dev_item_key, mut dev_item) = self.dev_item(devid)?;
+        let stripes = place_chunk(&spaces, flags, length)?
+            .ok_or_else(|| no_room(&candidates, length, stripe_copies(flags)))?;
         let chunk_tree_uuid = extents
             .first()
             .map(|e| e.chunk_tree_uuid)
             .ok_or_else(|| Error::UnsupportedFeature("the device tree has no extents".into()))?;
-        let used = length
-            .checked_mul(copies as u64)
-            .and_then(|allocated| le64(&dev_item, DEV_ITEM_BYTES_USED).checked_add(allocated))
-            .ok_or_else(|| {
-                Error::UnsupportedFeature(format!("device {devid}'s bytes used overflow"))
-            })?;
-        dev_item[DEV_ITEM_BYTES_USED..DEV_ITEM_BYTES_USED + 8].copy_from_slice(&used.to_le_bytes());
-
-        let dev_uuid = crate::superblock::DevItem::parse(&dev_item)?.uuid;
-        let stripe_list: Vec<(u64, u64, [u8; 16])> =
-            stripes.iter().map(|&p| (devid, p, dev_uuid)).collect();
-        let mut tree_edits = vec![
-            (
+        let mut taking = BTreeMap::<u64, u64>::new();
+        for &(devid, _) in &stripes {
+            *taking.entry(devid).or_default() += 1;
+        }
+        let mut tree_edits = Vec::new();
+        let mut used_on = Vec::with_capacity(taking.len());
+        let mut uuids = BTreeMap::new();
+        for (&devid, &count) in &taking {
+            let (key, mut item) = self.dev_item(devid)?;
+            let used = length
+                .checked_mul(count)
+                .and_then(|allocated| le64(&item, DEV_ITEM_BYTES_USED).checked_add(allocated))
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(format!("device {devid}'s bytes used overflow"))
+                })?;
+            item[DEV_ITEM_BYTES_USED..DEV_ITEM_BYTES_USED + 8].copy_from_slice(&used.to_le_bytes());
+            uuids.insert(devid, crate::superblock::DevItem::parse(&item)?.uuid);
+            used_on.push((devid, used));
+            tree_edits.push((
                 objectid::CHUNK_TREE,
-                ItemEdit::Put(OwnedItem {
-                    key: dev_item_key,
-                    data: dev_item,
-                }),
-            ),
-            (
-                objectid::CHUNK_TREE,
-                ItemEdit::Put(OwnedItem {
-                    key: DiskKey {
-                        objectid: objectid::FIRST_CHUNK_TREE,
-                        key_type: key_type::CHUNK_ITEM,
-                        offset: logical,
-                    },
-                    data: chunk_item(length, flags, self.sb.sectorsize, &stripe_list),
-                }),
-            ),
-        ];
-        for &physical in &stripes {
+                ItemEdit::Put(OwnedItem { key, data: item }),
+            ));
+        }
+        let stripe_list: Vec<(u64, u64, [u8; 16])> = stripes
+            .iter()
+            .map(|&(devid, physical)| (devid, physical, uuids[&devid]))
+            .collect();
+        tree_edits.push((
+            objectid::CHUNK_TREE,
+            ItemEdit::Put(OwnedItem {
+                key: DiskKey {
+                    objectid: objectid::FIRST_CHUNK_TREE,
+                    key_type: key_type::CHUNK_ITEM,
+                    offset: logical,
+                },
+                data: chunk_item(length, flags, self.sb.sectorsize, &stripe_list),
+            }),
+        ));
+        for &(devid, physical) in &stripes {
             tree_edits.push((
                 objectid::DEV_TREE,
                 ItemEdit::Put(OwnedItem {
@@ -1061,7 +1073,7 @@ impl Filesystem {
                 }),
             ));
         }
-        self.commit_chunk_change(tree_edits, devid, used)?;
+        self.commit_chunk_change(tree_edits, &used_on)?;
         Ok(logical)
     }
 
@@ -1090,17 +1102,18 @@ impl Filesystem {
             .into_iter()
             .filter(|e| e.chunk_offset == start)
             .collect();
-        // A single or DUP chunk is on one device, which in a pool need not
-        // be the superblock's own (#702).
-        let devid = stripes.first().map_or(self.sb.dev_item.devid, |s| s.devid);
-        if stripes.len() != usize::from(chunk.num_stripes)
-            || stripes.iter().any(|s| s.devid != devid)
-        {
+        // Its stripes may be on any members, which in a pool need not
+        // include the superblock's own (#702): the device tree has to name
+        // exactly the places the chunk item does.
+        let mut named: Vec<(u64, u64)> =
+            chunk.stripes.iter().map(|s| (s.devid, s.offset)).collect();
+        named.sort_unstable();
+        let mut held: Vec<(u64, u64)> = stripes.iter().map(|s| (s.devid, s.physical)).collect();
+        held.sort_unstable();
+        if named != held {
             return Err(Error::UnsupportedFeature(format!(
-                "the chunk at {start} has {} stripes, and the device tree has {} extents for \
-                 it on device {devid}",
-                chunk.num_stripes,
-                stripes.len()
+                "the chunk at {start} has stripes at (device, offset) {named:?}, and the \
+                 device tree has extents for it at {held:?}"
             )));
         }
 
@@ -1112,9 +1125,9 @@ impl Filesystem {
                 offset: start,
             }),
         )];
-        let mut freed = 0u64;
+        let mut freed = BTreeMap::<u64, u64>::new();
         for s in &stripes {
-            freed += s.length;
+            *freed.entry(s.devid).or_default() += s.length;
             tree_edits.push((
                 objectid::DEV_TREE,
                 ItemEdit::Delete(DiskKey {
@@ -1124,20 +1137,24 @@ impl Filesystem {
                 }),
             ));
         }
-        let (key, mut item) = self.dev_item(devid)?;
-        let used = le64(&item, DEV_ITEM_BYTES_USED)
-            .checked_sub(freed)
-            .ok_or_else(|| {
-                Error::UnsupportedFeature(format!(
-                    "device {devid} records fewer bytes used than the chunk at {start} takes \
-                     on it"
-                ))
-            })?;
-        item[DEV_ITEM_BYTES_USED..DEV_ITEM_BYTES_USED + 8].copy_from_slice(&used.to_le_bytes());
-        tree_edits.push((
-            objectid::CHUNK_TREE,
-            ItemEdit::Put(OwnedItem { key, data: item }),
-        ));
+        let mut used_on = Vec::with_capacity(freed.len());
+        for (&devid, &freed) in &freed {
+            let (key, mut item) = self.dev_item(devid)?;
+            let used = le64(&item, DEV_ITEM_BYTES_USED)
+                .checked_sub(freed)
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(format!(
+                        "device {devid} records fewer bytes used than the chunk at {start} \
+                         takes on it"
+                    ))
+                })?;
+            item[DEV_ITEM_BYTES_USED..DEV_ITEM_BYTES_USED + 8].copy_from_slice(&used.to_le_bytes());
+            used_on.push((devid, used));
+            tree_edits.push((
+                objectid::CHUNK_TREE,
+                ItemEdit::Put(OwnedItem { key, data: item }),
+            ));
+        }
         tree_edits.push((
             self.block_group_tree_id(),
             ItemEdit::Delete(DiskKey {
@@ -1150,17 +1167,16 @@ impl Filesystem {
         for key in self.free_space_keys(&group)? {
             tree_edits.push((objectid::FREE_SPACE_TREE, ItemEdit::Delete(key)));
         }
-        self.commit_chunk_change(tree_edits, devid, used)
+        self.commit_chunk_change(tree_edits, &used_on)
     }
 
-    /// Plan, render and commit `tree_edits`, with device `devid`'s chunks
-    /// taking `bytes_used` in its superblock's device item as in the chunk
-    /// tree's, then remount.
+    /// Plan, render and commit `tree_edits`, with the chunks of each
+    /// `(devid, bytes_used)` in `used_on` taking `bytes_used` in that
+    /// device's superblock device item as in the chunk tree's, then remount.
     fn commit_chunk_change(
         &mut self,
         tree_edits: Vec<(u64, ItemEdit)>,
-        devid: u64,
-        bytes_used: u64,
+        used_on: &[(u64, u64)],
     ) -> Result<()> {
         let generation = self.sb.generation.checked_add(1).ok_or_else(|| {
             Error::UnsupportedFeature("the generation counter is exhausted".into())
@@ -1213,8 +1229,7 @@ impl Filesystem {
                 invalidate_free_space_tree: false,
                 ..Default::default()
             },
-            devid,
-            bytes_used,
+            used_on,
         )?;
         *self = self.remount_rw()?;
         Ok(())
@@ -1759,15 +1774,70 @@ struct DeviceSpace {
     taken: Vec<(u64, u64)>,
 }
 
-/// How many stripes a new chunk of `flags` has, all on one device.
+/// How many stripes a new chunk of `flags` has: one for each copy.
 fn stripe_copies(flags: u64) -> Result<usize> {
-    match ChunkProfile::from_type(flags)? {
+    stripe_copies_of(ChunkProfile::from_type(flags)?)
+}
+
+/// How many stripes a new chunk of `profile` has: one for each copy.
+fn stripe_copies_of(profile: ChunkProfile) -> Result<usize> {
+    match profile {
         ChunkProfile::Single => Ok(1),
-        ChunkProfile::Dup => Ok(2),
+        ChunkProfile::Dup | ChunkProfile::Raid1 => Ok(2),
+        ChunkProfile::Raid1c3 => Ok(3),
+        ChunkProfile::Raid1c4 => Ok(4),
         other => Err(Error::UnsupportedFeature(format!(
-            "allocating a {} chunk is not implemented",
+            "allocating a {} chunk is not implemented; only single, dup, raid1, raid1c3 \
+             and raid1c4 are",
             other.name()
         ))),
+    }
+}
+
+/// Where the stripes of a chunk of `flags` and `length` logical bytes go,
+/// each `(devid, physical offset)`: single and DUP stripes together on one
+/// device ([`choose_placement`]), the copies of a RAID1 profile each on a
+/// device of its own ([`choose_mirrors`]). `None` when `devices` lack room.
+fn place_chunk(
+    devices: &[DeviceSpace],
+    flags: u64,
+    length: u64,
+) -> Result<Option<Vec<(u64, u64)>>> {
+    let profile = ChunkProfile::from_type(flags)?;
+    let copies = stripe_copies_of(profile)?;
+    Ok(match profile {
+        ChunkProfile::Single | ChunkProfile::Dup => choose_placement(devices, length, copies)
+            .map(|(devid, stripes)| stripes.into_iter().map(|at| (devid, at)).collect()),
+        _ => choose_mirrors(devices, length, copies),
+    })
+}
+
+/// One stripe of `length` bytes on each of `copies` different devices: of
+/// those with room, the ones with the most unallocated space, as the kernel
+/// chooses, and the first listed of any tie.
+fn choose_mirrors(devices: &[DeviceSpace], length: u64, copies: usize) -> Option<Vec<(u64, u64)>> {
+    let mut fit: Vec<(u64, u64, u64)> = devices
+        .iter()
+        .filter_map(|device| {
+            let at = place_stripes(&device.taken, device.total, length, 1)?[0];
+            Some((device.unallocated(), device.devid, at))
+        })
+        .collect();
+    // Stable: devices equally free keep the order they were listed in.
+    fit.sort_by_key(|&(free, _, _)| std::cmp::Reverse(free));
+    (fit.len() >= copies).then(|| {
+        fit.into_iter()
+            .take(copies)
+            .map(|(_, devid, at)| (devid, at))
+            .collect()
+    })
+}
+
+impl DeviceSpace {
+    /// What no extent of the device takes.
+    fn unallocated(&self) -> u64 {
+        self.total
+            .saturating_sub(self.taken.iter().map(|&(_, n)| n).sum())
     }
 }
 
@@ -1784,9 +1854,7 @@ fn choose_placement(
         let Some(stripes) = place_stripes(&device.taken, device.total, length, copies) else {
             continue;
         };
-        let free = device
-            .total
-            .saturating_sub(device.taken.iter().map(|&(_, n)| n).sum());
+        let free = device.unallocated();
         if chosen.as_ref().is_none_or(|&(best, _, _)| free > best) {
             chosen = Some((free, device.devid, stripes));
         }
@@ -1795,10 +1863,14 @@ fn choose_placement(
 }
 
 /// The refusal when no device of `devids` can take a new chunk.
-fn no_room(devids: &[u64], length: u64, copies: usize) -> Error {
+fn no_room(devids: &[u64], length: u64, copies: Result<usize>) -> Error {
+    let copies = match copies {
+        Ok(copies) => copies,
+        Err(refused) => return refused,
+    };
     Error::UnsupportedFeature(match devids {
         [devid] => format!("device {devid} has no room for {copies} stripe(s) of {length} bytes"),
-        _ => format!("no device of {devids:?} has room for {copies} stripe(s) of {length} bytes"),
+        _ => format!("no devices of {devids:?} have room for {copies} stripe(s) of {length} bytes"),
     })
 }
 
@@ -1956,6 +2028,30 @@ mod tests {
         // No device holds two stripes of this length.
         assert_eq!(chosen(60, 2), None);
         assert_eq!(choose_placement(&[], MIB, 1), None);
+    }
+
+    #[test]
+    fn each_copy_of_a_mirrored_chunk_goes_on_a_device_of_its_own() {
+        let device = |devid, total: u64, used: u64| DeviceSpace {
+            devid,
+            total: total * MIB,
+            taken: vec![(MIB, used * MIB)],
+        };
+        let devices = [device(1, 64, 32), device(2, 128, 32), device(3, 128, 32)];
+        let chosen = |flags, len: u64| {
+            place_chunk(&devices, bg::DATA | flags, len * MIB)
+                .unwrap()
+                .map(|stripes| stripes.iter().map(|&(id, _)| id).collect::<Vec<_>>())
+        };
+        // The most unallocated first, and the first listed of a tie.
+        assert_eq!(chosen(bg::RAID1, 8), Some(vec![2, 3]));
+        assert_eq!(chosen(bg::RAID1C3, 8), Some(vec![2, 3, 1]));
+        // Fewer devices than copies, or than copies with room.
+        assert_eq!(chosen(bg::RAID1C4, 8), None);
+        assert_eq!(chosen(bg::RAID1C3, 60), None);
+        // DUP still keeps both copies on one device.
+        assert_eq!(chosen(bg::DUP, 8), Some(vec![2, 2]));
+        assert!(place_chunk(&devices, bg::DATA | bg::RAID0, MIB).is_err());
     }
 
     #[test]

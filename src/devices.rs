@@ -95,9 +95,10 @@
 //! before the wipe, the device still carries a superblock of an older
 //! generation, which the members' newer one does not count.
 //!
-//! Only single and DUP data and metadata groups can be moved so far: a
-//! device holding a system, mirrored or parity group is refused, as is one
-//! whose chunks the other members have no room for. The last device is
+//! Only single, DUP, RAID1, RAID1C3 and RAID1C4 data and metadata groups
+//! can be moved so far: a device holding a system, striped or parity group
+//! is refused, as is one whose chunks the other members have no room for,
+//! which for a mirrored group means a member for each copy. The last device is
 //! refused too, as is a mount that cannot write. An error or a cut part
 //! way through the emptying leaves a pool with some groups moved and the
 //! device still a member, and the removal can be asked for again.

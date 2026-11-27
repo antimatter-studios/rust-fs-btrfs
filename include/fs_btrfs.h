@@ -600,8 +600,8 @@ int fs_btrfs_resize(fs_btrfs_fs_t *fs, uint64_t size);
  * many groups were relocated, or -1: EROFS on a read-only handle, EINVAL
  * for no kinds, an unknown kind or a `convert` naming no single profile,
  * ENOTSUP for a group relocation refuses (a system group, a group in
- * another profile than single or DUP, a conversion other than single to
- * DUP or DUP to single), with nothing written. Every group selected is
+ * another profile than single, DUP, RAID1, RAID1C3 or RAID1C4, a
+ * conversion other than single to DUP or DUP to single), with nothing written. Every group selected is
  * checked before the first moves. An error while a group is moving stops
  * the balance there: the groups before it stay moved.
  */

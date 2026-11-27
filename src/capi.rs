@@ -2287,8 +2287,8 @@ pub const FS_BTRFS_BALANCE_SINGLE: u64 = crate::balance::AVAIL_ALLOC_BIT_SINGLE;
 /// Returns how many groups were relocated, or -1 with the error recorded:
 /// EROFS on a read-only handle, EINVAL for no kinds, an unknown kind or a
 /// `convert` naming no single profile, and ENOTSUP for a group relocation
-/// refuses (a system group, a group in another profile than single or DUP,
-/// a conversion other than single to DUP or DUP to single), with nothing
+/// refuses (a system group, a group in another profile than single, DUP,
+/// RAID1, RAID1C3 or RAID1C4, a conversion other than single to DUP or DUP to single), with nothing
 /// written. Every group selected is checked before the first moves. An
 /// error while a group is moving stops the balance there: the groups before
 /// it stay moved.
