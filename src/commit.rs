@@ -86,10 +86,11 @@ enum Membership<'a> {
     /// superblocks are not written: the caller wipes them after the
     /// commit, see [`crate::devices`].
     Removed { devid: u64, size: u64 },
-    /// A chunk is allocated or removed (#397): device `devid`'s chunks
-    /// now take `bytes_used`, which the chunk tree's device item records
-    /// and the device's superblock copy of it has to agree with.
-    BytesUsed { devid: u64, bytes_used: u64 },
+    /// A chunk is allocated or removed (#397): for each `(devid,
+    /// bytes_used)`, the device's chunks now take `bytes_used`, which the
+    /// chunk tree's device item records and the device's superblock copy of
+    /// it has to agree with. A mirrored chunk changes several devices.
+    BytesUsed(&'a [(u64, u64)]),
 }
 
 /// One tree block, built and placed, waiting to be written.
@@ -197,24 +198,17 @@ impl Filesystem {
         )
     }
 
-    /// [`Filesystem::commit`], setting device `devid`'s `bytes_used` to
-    /// `bytes_used` in its superblock's copy of its device item: a chunk
-    /// allocated or removed (#397). The transaction's chunk tree carries
-    /// the same number in the device's item.
+    /// [`Filesystem::commit`], setting the `bytes_used` of each `(devid,
+    /// bytes_used)` in `used_on` in that device's superblock copy of its
+    /// device item: a chunk allocated or removed (#397). The transaction's
+    /// chunk tree carries the same numbers in the devices' items.
     pub(crate) fn commit_bytes_used(
         &self,
         blocks: &[PlacedBlock],
         commit: &Commit,
-        devid: u64,
-        bytes_used: u64,
+        used_on: &[(u64, u64)],
     ) -> Result<()> {
-        self.commit_with(
-            blocks,
-            commit,
-            0,
-            Membership::BytesUsed { devid, bytes_used },
-            false,
-        )
+        self.commit_with(blocks, commit, 0, Membership::BytesUsed(used_on), false)
     }
 
     /// [`Filesystem::commit`], also emptying the superblock's log: the
@@ -461,9 +455,10 @@ impl Filesystem {
                     raw[at..at + 8].copy_from_slice(&size.to_le_bytes());
                 }
             }
-            if let Membership::BytesUsed { devid, bytes_used } = membership {
+            if let Membership::BytesUsed(used_on) = membership {
                 let at = so::DEV_ITEM + dev_item_offsets::DEVID;
-                if u64::from_le_bytes(raw[at..at + 8].try_into().expect("8 bytes")) == devid {
+                let own = u64::from_le_bytes(raw[at..at + 8].try_into().expect("8 bytes"));
+                if let Some(&(_, bytes_used)) = used_on.iter().find(|&&(id, _)| id == own) {
                     let at = so::DEV_ITEM + dev_item_offsets::BYTES_USED;
                     raw[at..at + 8].copy_from_slice(&bytes_used.to_le_bytes());
                     used_set += 1;
@@ -484,11 +479,12 @@ impl Filesystem {
         }
         // A count for a device no superblock written here carries would be
         // a change the chunk tree records and no superblock does.
-        if let Membership::BytesUsed { devid, .. } = membership {
-            if used_set != 1 {
+        if let Membership::BytesUsed(used_on) = membership {
+            if used_set != used_on.len() {
                 return Err(Error::UnsupportedFeature(format!(
-                    "device {devid}'s bytes used change, and {used_set} of the superblocks \
-                     this commit writes are its"
+                    "the bytes used of {} device(s) change, {used_on:?}, and {used_set} of \
+                     the superblocks this commit writes are theirs",
+                    used_on.len()
                 )));
             }
         }
