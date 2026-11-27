@@ -83,17 +83,24 @@
 //!
 //! # Removing a device
 //!
-//! A device leaves in one committed transaction, the add undone: its
+//! A device that holds chunks is emptied first: every block group with a
+//! stripe on it is relocated onto the other members (see
+//! [`crate::balance`]), each step its own committed transaction. Every
+//! group is checked, and room for it found, before the first one moves.
+//!
+//! The device then leaves in one committed transaction, the add undone: its
 //! `DEV_ITEM` deleted from the chunk tree, and every other member's
 //! superblock counting one device fewer and its size less. Then the
 //! device's own superblocks are wiped, after the commit is flushed: cut
 //! before the wipe, the device still carries a superblock of an older
 //! generation, which the members' newer one does not count.
 //!
-//! Only a device that holds no chunk can be removed so far: one with a
-//! `DEV_EXTENT` on it holds a stripe of some chunk, which has to be
-//! relocated onto the other devices first, and that is a balance (#304).
-//! The last device is refused too, as is a mount that cannot write.
+//! Only single and DUP data and metadata groups can be moved so far: a
+//! device holding a system, mirrored or parity group is refused, as is one
+//! whose chunks the other members have no room for. The last device is
+//! refused too, as is a mount that cannot write. An error or a cut part
+//! way through the emptying leaves a pool with some groups moved and the
+//! device still a member, and the removal can be asked for again.
 
 use std::sync::Arc;
 
@@ -370,7 +377,8 @@ impl Filesystem {
         Ok(())
     }
 
-    /// Remove device `devid` from the filesystem, as one committed
+    /// Remove device `devid` from the filesystem: relocate every block
+    /// group on it onto the other members, drop it in one committed
     /// transaction, and wipe its superblocks. The mount becomes the one of
     /// the devices that are left.
     ///
@@ -378,8 +386,9 @@ impl Filesystem {
     ///
     /// [`Error::ReadOnly`] unless the mount can write, and
     /// [`Error::UnsupportedFeature`] for a devid that is not a member, the
-    /// last device, and a device that holds a chunk, each before anything
-    /// is written.
+    /// last device, a device holding a group that cannot be relocated, and
+    /// one whose groups the other members have no room for, each before
+    /// anything is written.
     pub fn remove_device(&mut self, devid: u64) -> Result<()> {
         self.require_writable()?;
         let Some(device) = self.writable_pool.get(&devid).cloned() else {
@@ -391,12 +400,14 @@ impl Filesystem {
                 },
             ));
         };
-        let extents = self.device_extents(devid)?;
-        if !extents.is_empty() {
+        if !self.device_extents(devid)?.is_empty() {
+            self.evacuate_device(devid)?;
+        }
+        let left = self.device_extents(devid)?;
+        if !left.is_empty() {
             return Err(Error::UnsupportedFeature(format!(
-                "device {devid} holds {} device extents: moving its chunks onto the other \
-                 devices is a balance, which is not implemented",
-                extents.len()
+                "device {devid} still holds {} device extents after balance moved its chunks",
+                left.len()
             )));
         }
 
